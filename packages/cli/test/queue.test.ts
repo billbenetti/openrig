@@ -228,6 +228,29 @@ describe("rig queue CLI", () => {
     } finally { fs.rmSync(directory, { recursive: true, force: true }); }
   });
 
+  it("fallback sends --expect-state, --expect-destination and --wake, and only when given", async () => {
+    const { deps, calls } = makeDeps({ routes: { "POST /api/queue/q1/fallback": { status: 200, data: { qitemId: "q1", destinationSession: "c@rig" } } } });
+    await createProgram({ queueDeps: deps }).parseAsync(["node", "rig", "queue", "fallback", "q1", "--destination", "c@rig",
+      "--expect-state", "pending", "--expect-destination", "b@rig", "--wake", "--json"]);
+    expect(process.exitCode).toBeUndefined();
+    expect(calls.find((c) => c.path === "/api/queue/q1/fallback")?.body).toEqual({
+      fallbackDestination: "c@rig", reason: "manual", expectState: "pending", expectDestination: "b@rig", wake: true,
+    });
+
+    const plain = makeDeps({ routes: { "POST /api/queue/q1/fallback": { status: 200, data: { qitemId: "q1" } } } });
+    await createProgram({ queueDeps: plain.deps }).parseAsync(["node", "rig", "queue", "fallback", "q1", "--destination", "c@rig", "--json"]);
+    expect(plain.calls.find((c) => c.path === "/api/queue/q1/fallback")?.body).toEqual({ fallbackDestination: "c@rig", reason: "manual" });
+  });
+
+  it("fallback exits 1 and shows the daemon's refusal when the guard fails", async () => {
+    const refusal = { error: "fallback_state_mismatch", message: "qitem q1 is in-progress, not pending; it was not rerouted", state: "in-progress", destinationSession: "b@rig" };
+    const { deps } = makeDeps({ routes: { "POST /api/queue/q1/fallback": { status: 409, data: refusal } } });
+    await createProgram({ queueDeps: deps }).parseAsync(["node", "rig", "queue", "fallback", "q1", "--destination", "c@rig", "--expect-state", "pending"]);
+    expect(process.exitCode).toBe(1);
+    expect([...logs, ...errors].join("\n")).toContain("qitem q1 is in-progress, not pending; it was not rerouted");
+    process.exitCode = undefined;
+  });
+
   // #96 — --reply-to posts an update into an earlier item's Slack thread.
   it("create --reply-to without --human-intent update fails locally with a named error and never contacts the daemon", async () => {
     const { deps, calls } = makeDeps();
