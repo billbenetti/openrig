@@ -70,6 +70,11 @@ const toSlot = (row: SlotRow): SeatPoolSlot => ({
   intent: row.intent, opId: row.op_id, createdAt: row.created_at, retiredAt: row.retired_at,
 });
 
+/** A slot row whose pool's job is no longer active: no evaluation acts on it again, so its seat is free. A job that
+ *  stops or finishes with seats still in it leaves them running (a daemon without the seat-pool policy marks the job
+ *  terminal, `unknown_policy:seat-pool`). */
+const POOL_ENDED = "EXISTS (SELECT 1 FROM watchdog_jobs j WHERE j.job_id = seat_pool_slots.pool_job_id AND j.state <> 'active')";
+
 /** The `seat_pool_slots` rows: the only link between a pool and its seats. */
 export class SeatPoolSlots {
   constructor(private readonly db: Database.Database) {}
@@ -85,9 +90,9 @@ export class SeatPoolSlots {
     return row ? toSlot(row) : null;
   }
 
-  /** Whether any pool holds this node. */
+  /** Whether a pool holds this node. A pool that has ended (its job stopped or finished) holds nothing. */
   isLinked(nodeId: string): boolean {
-    return !!this.db.prepare("SELECT 1 FROM seat_pool_slots WHERE node_id = ? AND retired_at IS NULL").get(nodeId);
+    return !!this.db.prepare(`SELECT 1 FROM seat_pool_slots WHERE node_id = ? AND retired_at IS NULL AND NOT ${POOL_ENDED}`).get(nodeId);
   }
 
   /** The logical ids of the seats the pool removed. */
@@ -147,6 +152,15 @@ export class SeatPoolSlots {
 
   retire(slotId: number, at: string): void {
     this.db.prepare("UPDATE seat_pool_slots SET phase = 'retired', intent = NULL, retired_at = ? WHERE id = ?").run(at, slotId);
+  }
+
+  /** Links a seat the pool adopts, retiring first the link a pool that has ended left on it. */
+  adopt(input: { poolJobId: string; logicalId: string; nodeId: string; at: string }): SeatPoolSlot {
+    return this.db.transaction(() => {
+      this.db.prepare(`UPDATE seat_pool_slots SET phase = 'retired', intent = NULL, retired_at = ?
+        WHERE node_id = ? AND retired_at IS NULL AND ${POOL_ENDED}`).run(input.at, input.nodeId);
+      return this.insert({ ...input, phase: "live", intent: null, opId: null });
+    })();
   }
 }
 
@@ -682,7 +696,7 @@ export class SeatPoolExecutor {
   private adopt(jobId: string, run: Run, intent: Extract<SeatPoolIntent, { kind: "adopt" }>): void {
     const ctx = this.fresh(jobId, run);
     if (!ctx || ctx.spec.drain || !ctx.state.adoptable.some((seat) => seat.nodeId === intent.nodeId)) return;
-    const slot = this.deps.slots.insert({ poolJobId: jobId, logicalId: intent.logicalId, nodeId: intent.nodeId, phase: "live", intent: null, opId: null, at: this.at() });
+    const slot = this.deps.slots.adopt({ poolJobId: jobId, logicalId: intent.logicalId, nodeId: intent.nodeId, at: this.at() });
     this.record(jobId, false, "seat_pool_adopted", { slot: slot.logicalId, nodeId: intent.nodeId });
   }
 
