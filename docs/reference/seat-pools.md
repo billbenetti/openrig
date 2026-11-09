@@ -193,7 +193,9 @@ stop` refuses a pool that still holds seats (`pool_has_slots`); stop it once its
 A pool can still end with seats in it: a daemon that doesn't know the `seat-pool` policy, such as an earlier version
 started on the same `OPENRIG_HOME`, marks the job terminal (`unknown_policy:seat-pool`), and the job can't be updated
 or restarted. Its seats keep running and holding their rows, and no pool holds them any more. Register a new pool with
-those seats in `adopt` to take them over; drain the pool before going back to such a version to avoid this.
+those seats in `adopt` to take them over: a seat the ended pool added stays a seat a pool added, which the new pool
+drains and reaps, and only a seat that was there before any pool is treated as adopted. Drain the pool before going
+back to such a version to avoid this.
 
 ## Restarts and restores
 
