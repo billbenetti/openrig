@@ -563,6 +563,24 @@ describe("seat-pool executor", () => {
     expect(executor.submit(JOB, [])).toBe(false);
   });
 
+  it("stops without waiting for a launch that never settles, whether the run gave up on it or was waiting for it", async () => {
+    world.launchGate = new Promise(() => {});
+    const gaveUp = makeExecutor(20);
+    expect(gaveUp.submit(JOB, [{ kind: "add", count: 1 }])).toBe(true);
+    await new Promise((resolve) => setTimeout(resolve, 60));
+    const waiting = makeExecutor();
+    expect(waiting.submit("other-pool", [{ kind: "add", count: 1 }])).toBe(true);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    const stopped = await Promise.race([
+      Promise.all([gaveUp.stop(), waiting.stop()]).then(() => true),
+      new Promise((resolve) => setTimeout(() => resolve(false), 500)),
+    ]);
+    expect(stopped).toBe(true);
+    // Only the timeout is recorded; the cancel is not a failure, and the seat's intent is left for the next start.
+    expect(reasons()).toEqual(["seat_pool_launch_failed"]);
+    expect([...slots.listOpen(JOB), ...slots.listOpen("other-pool")].map((s) => s.intent)).toEqual(["launch", "launch"]);
+  });
+
   describe("dispatch and wake", () => {
     const waitingRow = (qitemId: string, destination = MODEL.sessionName) =>
       world.rows.set(qitemId, { destination, waitingSince: new Date(T0 - 600_000).toISOString() });
