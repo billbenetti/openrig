@@ -194,7 +194,7 @@ class World {
         };
       }),
       adoptable: [],
-      pending: [...this.rows].map(([qitemId, row]) => ({ qitemId, destination: row.destination, waitingSince: row.waitingSince })),
+      pending: [...this.rows].map(([qitemId, row]) => ({ qitemId, destination: row.destination, waitingSince: row.waitingSince, tags: [] })),
       demand: jobSpec.demandCmd ? executor.demandSample(JOB) : null,
       lastScaleAt: slots.lastScaleAt(JOB),
     };
@@ -1107,6 +1107,7 @@ describe("readSeatPoolState", () => {
     insert("q-blocked", "dev-impl@r", "blocked", "2026-11-09T11:00:00.000Z");
     insert("q-claimed", "dev-impl@r", "in-progress", "2026-11-09T11:00:00.000Z");
     insert("q-human", "human@kernel", "pending", "2026-11-09T11:00:00.000Z");
+    db.prepare("UPDATE queue_items SET tags = ? WHERE qitem_id = 'q-model'").run(JSON.stringify(["role:impl"]));
 
     const state = readSeatPoolState({
       db, slots,
@@ -1125,11 +1126,11 @@ describe("readSeatPoolState", () => {
 
     // Only pending rows, under the name the pool knows each seat by; a blocked, claimed or human row is never read.
     expect(state.pending).toEqual([
-      { qitemId: "q-old", destination: "dev-impl@r", waitingSince: "2026-11-09T11:05:00.000Z" },
-      { qitemId: "q-model", destination: "dev-impl@r", waitingSince: "2026-11-09T11:20:00.000Z" },
-      { qitemId: "q-slot", destination: "dev-impl-s1@r", waitingSince: "2026-11-09T11:30:00.000Z" },
-      { qitemId: "q-removed", destination: "dev-impl-s3@r", waitingSince: "2026-11-09T11:40:00.000Z" },
-      { qitemId: "q-moved", destination: "dev-impl@r", waitingSince: "2026-11-09T11:50:00.000Z" },
+      { qitemId: "q-old", destination: "dev-impl@r", waitingSince: "2026-11-09T11:05:00.000Z", tags: [] },
+      { qitemId: "q-model", destination: "dev-impl@r", waitingSince: "2026-11-09T11:20:00.000Z", tags: ["role:impl"] },
+      { qitemId: "q-slot", destination: "dev-impl-s1@r", waitingSince: "2026-11-09T11:30:00.000Z", tags: [] },
+      { qitemId: "q-removed", destination: "dev-impl-s3@r", waitingSince: "2026-11-09T11:40:00.000Z", tags: [] },
+      { qitemId: "q-moved", destination: "dev-impl@r", waitingSince: "2026-11-09T11:50:00.000Z", tags: [] },
     ]);
     // The model, which the pool can only launch, waits out the limit; a seat whose session is gone is reaped.
     expect(state.modelCause).toBe("usage_limit");
