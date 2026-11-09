@@ -87,6 +87,8 @@ interface NodeInventoryRead {
   identityVerdict?: { verdict?: string; reason?: string | null } | null;
   /** Present only on a community harness's seat. */
   communityHarness?: { harness: string } | null;
+  /** The logical id of the model seat whose seat pool holds this seat; absent for other seats. */
+  seatPoolModel?: string;
   canonicalSessionName: string | null;
   tmuxAttachCommand?: string | null;
   cwd?: string | null;
@@ -307,15 +309,36 @@ function toAgentRow(node: NodeInventoryRead): AgentRow {
 }
 
 function groupPods(nodes: NodeInventoryRead[]): PodNode[] {
-  const pods = new Map<string, AgentRow[]>();
+  const pods = new Map<string, NodeInventoryRead[]>();
   for (const node of nodes) {
     if (node.nodeKind !== "agent") continue;
     const pod = node.podNamespace ?? "(no pod)";
     const list = pods.get(pod) ?? [];
-    list.push(toAgentRow(node));
+    list.push(node);
     pods.set(pod, list);
   }
-  return [...pods.entries()].map(([name, agents]) => ({ name, agents }));
+  return [...pods.entries()].map(([name, members]) => ({ name, agents: groupSeatPoolSeats(members) }));
+}
+
+/** A pod's seats in their order, except that each seat a seat pool holds follows its model, after any earlier such
+ *  seat, and carries the model's name. A seat whose model is in another pod keeps its place, without the name. */
+function groupSeatPoolSeats(members: NodeInventoryRead[]): AgentRow[] {
+  const names = new Set(members.map((node) => node.logicalId));
+  const grouped = (node: NodeInventoryRead) => !!node.seatPoolModel && node.seatPoolModel !== node.logicalId && names.has(node.seatPoolModel);
+  const seatsOf = new Map<string, NodeInventoryRead[]>();
+  for (const node of members) if (grouped(node)) seatsOf.set(node.seatPoolModel!, [...(seatsOf.get(node.seatPoolModel!) ?? []), node]);
+  const out: AgentRow[] = [];
+  const placed = new Set<NodeInventoryRead>();
+  const place = (node: NodeInventoryRead) => {
+    if (placed.has(node)) return;
+    placed.add(node);
+    out.push(grouped(node) ? { ...toAgentRow(node), seatPoolModel: node.seatPoolModel! } : toAgentRow(node));
+    for (const seat of seatsOf.get(node.logicalId) ?? []) place(seat);
+  };
+  for (const node of members) if (!grouped(node)) place(node);
+  // Pools that hold each other's models have no seat to start from; they keep their order.
+  for (const node of members) place(node);
+  return out;
 }
 
 // Rigs are listed as `rig ps` lists them: by name, compared as SQLite's `ORDER BY r.name` does (so uppercase before

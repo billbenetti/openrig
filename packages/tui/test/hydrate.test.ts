@@ -4,7 +4,7 @@ import { describe, expect, it } from "vitest";
 import { DaemonClient } from "../src/daemon-client.js";
 import { hydrateSnapshot } from "../src/hydrate.js";
 import { renderScreen } from "../src/render.js";
-import { createViewState } from "../src/state.js";
+import { computeExplorerRows, createViewState } from "../src/state.js";
 import { rowStatusGlyph, statusGlyph } from "../src/topology/glyphs.js";
 
 // Fixtures mirror the SERVED shapes traced firsthand at 5f3b5bd4 (Phase-2
@@ -447,6 +447,44 @@ describe("snapshot hydration over the §4.A reads (Phase 2)", () => {
     expect(qa).toMatchObject({ context: null, tokens: null, status: "unknown", canRun: true });
     // infrastructure nodes are not agent rows
     expect(rig.pods.flatMap((p) => p.agents.map((a) => a.name))).not.toContain("svc.db");
+  });
+
+  it("draws a seat pool's seats under their model, by the served link, in the tree and the rig table", async () => {
+    const [impl, qa] = FIXTURES["/api/rigs/01JRIG/nodes"] as Array<Record<string, unknown>>;
+    const seat = (logicalId: string, extra: Record<string, unknown>) =>
+      ({ ...impl, nodeId: `01JNODE-${logicalId}`, logicalId, canonicalSessionName: `${logicalId.replace(".", "-")}@myrig`, ...extra });
+    const nodes = [
+      impl, qa,
+      seat("dev.impl-s1", { seatPoolModel: "dev.impl" }),
+      // An adopted seat in another pod stays in its pod; the name alone never links a seat.
+      seat("review.helper", { podNamespace: "review", seatPoolModel: "dev.impl" }),
+      seat("dev.impl-s9", {}),
+    ];
+    const snap = await hydrateSnapshot(fixtureClient({}, { "/api/rigs/01JRIG/nodes": nodes }));
+    const dev = myrig(snap).pods.find((p) => p.name === "dev")!;
+    expect(dev.agents.map((a) => [a.name, a.seatPoolModel])).toEqual([
+      ["dev.impl", undefined], ["dev.impl-s1", "dev.impl"], ["dev.qa", undefined], ["dev.impl-s9", undefined],
+    ]);
+    expect(myrig(snap).pods.find((p) => p.name === "review")!.agents[0]!.seatPoolModel).toBeUndefined();
+
+    const view = createViewState({ instanceId: "t", getSnapshot: () => snap });
+    view.dispatch({ type: "toggle-expand", key: `pod:${snap.hosts[0]!.name}/myrig/dev` });
+    const tree = computeExplorerRows(view.get(), snap).map((row) => row.label.trim()).filter((label) => label.includes("dev."));
+    expect(tree.map((label) => label.slice(2))).toEqual(["dev.impl", "└ dev.impl-s1", "dev.qa", "dev.impl-s9"]);
+
+    const tables: string[] = [];
+    for (const action of [
+      { type: "drill", resource: "host", name: snap.hosts[0]!.name },
+      { type: "drill", resource: "rig", name: "myrig", target: { host: snap.hosts[0]!.name } },
+    ] as const) {
+      view.dispatch(action);
+      tables.push(renderScreen(view.get(), snap, { cols: 140, rows: 60 }).lines.join("\n"));
+    }
+    // The tables keep the seat column narrow: the mark sits against the name, as the tree's doesn't.
+    for (const table of tables) {
+      expect(table).toMatch(/· └impl-s1 /);
+      expect(table).not.toMatch(/└ ?(impl-s9|helper)\b/);
+    }
   });
 
   it("keeps the two stuck legs DISTINCT — served evidence/threshold strings verbatim, no client threshold", async () => {

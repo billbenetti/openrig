@@ -8,6 +8,8 @@ import { execFileSync } from "node:child_process";
 import { RigRepository } from "../src/domain/rig-repository.js";
 import { getNodeInventory, getNodeInventoryForAllRigs, getNodeDetail, getNodeInventoryWithContext, getNodeDetailWithContext } from "../src/domain/node-inventory.js";
 import { setDaemonTmuxServer } from "../src/adapters/tmux-server.js";
+import { SeatPoolSlots } from "../src/domain/seat-pool-executor.js";
+import { WatchdogJobsRepository } from "../src/domain/watchdog-jobs-repository.js";
 import type { RuntimeAdapter } from "../src/domain/runtime-adapter.js";
 import type { ContextUsage } from "../src/domain/types.js";
 import type { ContextUsageStore } from "../src/domain/context-usage-store.js";
@@ -1264,5 +1266,73 @@ describe("Node inventory launchWrapper projection (#2328)", () => {
     db.prepare("UPDATE nodes SET runtime = 'terminal', launch_wrapper = ? WHERE id = ?")
       .run('["mtn","--"]', node.id);
     expect(() => getNodeInventory(db, rig.id)).toThrow(/pi|codex/i);
+  });
+});
+
+describe("Node inventory seatPoolModel projection", () => {
+  let db: Database.Database;
+  let repo: RigRepository;
+  let slots: SeatPoolSlots;
+  let rigId: string;
+  let poolJobId: string;
+  const at = "2026-11-09T12:00:00.000Z";
+  const specYaml = "policy: seat-pool\ncontext:\n  max: 2\n  cwd_template: /work/{slot}\n";
+  const entry = (logicalId: string) => getNodeInventory(db, rigId).find((e) => e.logicalId === logicalId)!;
+
+  beforeEach(() => {
+    db = createFullTestDb();
+    repo = new RigRepository(db);
+    slots = new SeatPoolSlots(db);
+    rigId = repo.createRig("pool-rig").id;
+    const model = repo.addNode(rigId, "dev.impl", { runtime: "claude-code", cwd: "/project" });
+    seedSession(db, model.id, "dev-impl@pool-rig");
+    poolJobId = new WatchdogJobsRepository(db).register({
+      policy: "seat-pool", specYaml, targetSession: "dev-impl@pool-rig", intervalSeconds: 60, registeredBySession: "ops@kernel",
+    }).jobId;
+  });
+  afterEach(() => { db.close(); });
+
+  it("names the model on each seat the pool holds, from its slot row, in the single-rig and all-rigs reads", () => {
+    const added = repo.addNode(rigId, "dev.impl-s1", { runtime: "claude-code", cwd: "/work/impl-s1" });
+    const adopted = repo.addNode(rigId, "dev.helper", { runtime: "claude-code", cwd: "/project" });
+    slots.insert({ poolJobId, logicalId: "dev.impl-s1", nodeId: added.id, phase: "live", intent: null, opId: "op-1", at });
+    slots.insert({ poolJobId, logicalId: "dev.helper", nodeId: adopted.id, phase: "live", intent: null, opId: null, at });
+
+    expect(entry("dev.impl-s1").seatPoolModel).toBe("dev.impl");
+    expect(entry("dev.helper").seatPoolModel).toBe("dev.impl");
+    expect("seatPoolModel" in entry("dev.impl")).toBe(false);
+    expect(Object.fromEntries(getNodeInventoryForAllRigs(db).get(rigId)!.map((e) => [e.logicalId, e.seatPoolModel]))).toEqual({
+      "dev.impl": undefined, "dev.impl-s1": "dev.impl", "dev.helper": "dev.impl",
+    });
+  });
+
+  it("never links a seat by its name, and drops the link once the pool retires the seat", () => {
+    repo.addNode(rigId, "dev.impl-s2", { runtime: "claude-code", cwd: "/work/impl-s2" });
+    const retired = repo.addNode(rigId, "dev.impl-s1", { runtime: "claude-code", cwd: "/work/impl-s1" });
+    const slot = slots.insert({ poolJobId, logicalId: "dev.impl-s1", nodeId: retired.id, phase: "live", intent: null, opId: "op-1", at });
+    expect(entry("dev.impl-s1").seatPoolModel).toBe("dev.impl");
+    slots.retire(slot.slotId, at);
+
+    expect("seatPoolModel" in entry("dev.impl-s1")).toBe(false);
+    expect("seatPoolModel" in entry("dev.impl-s2")).toBe(false);
+  });
+
+  it("leaves a seat without a model when the pool's model can't be resolved in the seat's own rig", () => {
+    const otherRig = repo.createRig("other-rig").id;
+    const elsewhere = repo.addNode(otherRig, "dev.impl-s1", { runtime: "claude-code", cwd: "/work/impl-s1" });
+    slots.insert({ poolJobId, logicalId: "dev.impl-s1", nodeId: elsewhere.id, phase: "live", intent: null, opId: "op-1", at });
+    const orphanJob = new WatchdogJobsRepository(db).register({
+      policy: "seat-pool", specYaml, targetSession: "dev-gone@pool-rig", intervalSeconds: 60, registeredBySession: "ops@kernel",
+    }).jobId;
+    const orphan = repo.addNode(rigId, "dev.gone-s1", { runtime: "claude-code", cwd: "/work/gone-s1" });
+    slots.insert({ poolJobId: orphanJob, logicalId: "dev.gone-s1", nodeId: orphan.id, phase: "live", intent: null, opId: "op-2", at });
+
+    expect("seatPoolModel" in getNodeInventory(db, otherRig)[0]!).toBe(false);
+    expect("seatPoolModel" in entry("dev.gone-s1")).toBe(false);
+  });
+
+  it("reads a database without seat pools", () => {
+    db.exec("DROP TABLE seat_pool_slots");
+    expect(getNodeInventory(db, rigId).map((e) => e.seatPoolModel)).toEqual([undefined]);
   });
 });
