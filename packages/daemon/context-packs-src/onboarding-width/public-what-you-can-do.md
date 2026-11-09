@@ -450,7 +450,8 @@ your context, your compaction and your replacement — and it is the only thing 
   A receipt reads `indeterminate`, not delivered or failed, when the text may have reached the
   seat: an unconfirmed send, or a write attempted before an error. Inspect before resending.
 - **`rig queue fallback`** — reroute a row whose destination cannot receive it, without losing it
-  or rewriting its history.
+  or rewriting its history. `--expect-state` and `--expect-destination` move it only if it is still
+  as you read it (refused if it was claimed or moved meanwhile); `--wake` wakes the new destination.
 
 ## Arranging to be woken
 
