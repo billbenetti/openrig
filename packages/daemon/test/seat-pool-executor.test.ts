@@ -1087,7 +1087,8 @@ describe("readSeatPoolState", () => {
     expect(state.adoptable).toEqual([{ logicalId: "dev.impl-s1", nodeId: left.id }]);
 
     const adopted = slots.adopt({ poolJobId: JOB, logicalId: "dev.impl-s1", nodeId: left.id, at });
-    expect(adopted).toMatchObject({ poolJobId: JOB, nodeId: left.id, phase: "live", opId: null });
+    // The ended pool added it: it stays a seat a pool added, which the new pool drains and reaps.
+    expect(adopted).toMatchObject({ poolJobId: JOB, nodeId: left.id, phase: "live", opId: "op-1" });
     expect(slots.get(old.slotId)).toMatchObject({ phase: "retired", retiredAt: at });
     expect(slots.isLinked(left.id)).toBe(true);
     // A seat a live pool holds is never taken over: its link stays and the insert is refused.

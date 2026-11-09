@@ -158,6 +158,7 @@ export interface SeatPoolSlotView {
   sessionName: string;
   nodeId: string | null;
   phase: Exclude<SeatPoolSlotPhase, "retired">;
+  /** The seat existed before any pool: the pool counts it and gives it rows, but never stops or removes it. */
   adopted: boolean;
   /** False once a linked node no longer exists (someone removed it). */
   nodeExists: boolean;
