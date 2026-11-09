@@ -204,7 +204,7 @@ export type SeatPoolIntent =
   | { kind: "relaunch"; seat: string; nodeId: string }
   /** Tell the model's escalation owner that a seat holding waiting rows needs input. */
   | { kind: "escalate"; seat: string; qitemIds: string[] }
-  /** Take out a seat whose session is gone (see seatPoolReapable). */
+  /** Take out a seat the pool added whose session is gone (see seatPoolReapable). */
   | { kind: "reap"; slotId: number };
 
 export interface SeatPoolPlan {
@@ -216,10 +216,11 @@ export interface SeatPoolPlan {
   current: number;
 }
 
-/** Whether a seat of the pool is to be reaped: it was live and its session is gone. The planner and, just before
- *  acting, the executor both ask this. */
+/** Whether a seat is to be reaped: the pool added it, it was live, and its session is gone. An adopted seat is never
+ *  reaped: it was someone else's before the pool, so it is only launched again. The planner and, just before acting,
+ *  the executor both ask this. */
 export function seatPoolReapable(slot: SeatPoolSlotView): boolean {
-  return slot.phase === "live" && slot.nodeExists && slot.cause === "stopped";
+  return !slot.adopted && slot.phase === "live" && slot.nodeExists && slot.cause === "stopped";
 }
 
 /** Whether the model or a seat of the pool is out of provider usage: the pool then adds and launches nothing. */
@@ -235,8 +236,9 @@ export function seatPoolOutOfUsage(state: Pick<SeatPoolState, "modelCause" | "sl
  * open row, no held message), the longest waiting first; one that finds no free seat is demand. A waiting row the pool
  * doesn't move wakes the seat holding it by why that seat isn't taking it: a stopped seat is launched and one that needs
  * input is escalated; an idle one is left to the queue's own wakes, and one out of usage waits. Only pending rows are read,
- * so a blocked or claimed row is never moved or counted. A seat of the pool whose session is gone is reaped rather
- * than launched, even under drain or a usage limit.
+ * so a blocked or claimed row is never moved or counted. A seat the pool added whose session is gone is reaped rather
+ * than launched, even under drain or a usage limit; an adopted one is launched when it holds a waiting row, and while
+ * it is stopped it is not counted.
  *
  * The target is the demand (the demand command's last answer, or the waiting rows no free seat takes plus the seats
  * holding work), never below the seats holding work plus the seats still starting, clamped to min..max; with `drain`
@@ -261,7 +263,8 @@ export function planSeatPool(spec: SeatPoolSpec, state: SeatPoolState, nowMs: nu
   for (const slot of present.filter(seatPoolReapable)) intents.push({ kind: "reap", slotId: slot.slotId });
 
   const starting = present.filter((slot) => slot.phase === "adding" || slot.phase === "added");
-  const live = present.filter((slot) => slot.phase === "live");
+  // A stopped adopted seat takes no row and is not reaped: it isn't one of the pool's seats until it runs again.
+  const live = present.filter((slot) => slot.phase === "live" && !(slot.adopted && slot.cause === "stopped"));
   const idle = (slot: SeatPoolSlotView) => slot.openRows === 0 && slot.heldMessages === 0 && slot.idleSince !== null;
   const usageLimited = seatPoolOutOfUsage(state);
 
@@ -278,9 +281,9 @@ export function planSeatPool(spec: SeatPoolSpec, state: SeatPoolState, nowMs: nu
     for (const row of waiting) {
       if (dispatched.includes(row)) continue;
       const slot = seatOf.get(row.destination);
-      // A seat of the pool whose session is gone is reaped, not launched: its rows go back to the model.
+      // A seat the pool added whose session is gone is reaped, not launched: its rows go back to the model.
       const holder = slot
-        ? (slot.phase === "live" && slot.nodeId && slot.cause !== "stopped" ? { nodeId: slot.nodeId, cause: slot.cause } : null)
+        ? (slot.phase === "live" && slot.nodeId && !seatPoolReapable(slot) ? { nodeId: slot.nodeId, cause: slot.cause } : null)
         : row.destination === model.sessionName ? { nodeId: model.nodeId, cause: state.modelCause } : null;
       if (!holder) continue; // a seat the pool removed: the row waits for a free seat
       const entry = holders.get(row.destination) ?? { ...holder, rows: [] };
