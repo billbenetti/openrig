@@ -200,9 +200,6 @@ export function slotMemberFragment(
   };
 }
 
-/** The note a nudge from the pool leaves on the row, followed by the seat it went to. */
-export const SEAT_POOL_NUDGE_NOTE = "seat-pool nudge:";
-
 export interface SeatPoolStateReaderDeps {
   db: Database.Database;
   slots: SeatPoolSlots;
@@ -222,9 +219,9 @@ export interface SeatPoolStateReaderDeps {
   demand(jobId: string): { desired: number; sampledAt: string } | null;
 }
 
-/** Pending rows addressed to any of `sessions` (in any of their addresses), longest waiting first, with whether the pool
- *  nudged that session about the row. A row waits from its latest reroute, or from its creation. Only pending rows: a
- *  claimed, blocked or closed row is never the pool's to move. */
+/** Pending rows addressed to any of `sessions` (in any of their addresses), longest waiting first. A row waits from its
+ *  latest reroute, or from its creation. Only pending rows: a claimed, blocked or closed row is never the pool's to
+ *  move. */
 function readPendingRows(deps: SeatPoolStateReaderDeps, sessions: string[]): SeatPoolPendingRow[] {
   const sessionOf = new Map<string, string>();
   for (const session of sessions) {
@@ -238,19 +235,7 @@ function readPendingRows(deps: SeatPoolStateReaderDeps, sessions: string[]): Sea
       WHERE q.state = 'pending' AND q.destination_session IN (${[...sessionOf.keys()].map(() => "?").join(",")})
       ORDER BY since, q.qitem_id`,
   ).all(FALLBACK_ACTOR, ...sessionOf.keys()) as Array<{ qitem_id: string; destination_session: string; since: string }>;
-  if (rows.length === 0) return [];
-  const nudges = new Set((deps.db.prepare(
-    `SELECT qitem_id, transition_note FROM queue_transitions
-      WHERE qitem_id IN (${rows.map(() => "?").join(",")}) AND transition_note LIKE ?`,
-  ).all(...rows.map((row) => row.qitem_id), `${SEAT_POOL_NUDGE_NOTE} %`) as Array<{ qitem_id: string; transition_note: string }>)
-    .map((t) => `${t.qitem_id} ${t.transition_note}`));
-  return rows.map((row) => {
-    const destination = sessionOf.get(row.destination_session)!;
-    return {
-      qitemId: row.qitem_id, destination, waitingSince: row.since,
-      nudged: nudges.has(`${row.qitem_id} ${SEAT_POOL_NUDGE_NOTE} ${destination}`),
-    };
-  });
+  return rows.map((row) => ({ qitemId: row.qitem_id, destination: sessionOf.get(row.destination_session)!, waitingSince: row.since }));
 }
 
 /** The pool's state as the planner sees it. */
@@ -356,8 +341,6 @@ export interface SeatPoolEffects {
   moveRow(input: { qitemId: string; from: string; to: string; reason: string; state?: "pending" | "blocked" }): SeatPoolEffectResult;
   /** Launches a seat whose session stopped, as `rig launch` does for it. */
   relaunchSeat(input: { rigId: string; logicalId: string }): Promise<SeatPoolEffectResult>;
-  /** Wakes `seat` about the row, after recording on the row that the pool did, so it never does it twice. */
-  nudgeRow(input: { qitemId: string; seat: string }): Promise<SeatPoolEffectResult & { result?: string | null }>;
   /** Where the model's escalations go, or why there is nowhere. */
   escalationOwner(modelSession: string): { owner: string | null; reason: string };
   /** Opens a row to the model's escalation owner about a seat that needs input, unless one about that seat is open. */
@@ -369,19 +352,18 @@ export interface SeatPoolEffects {
 export const SEAT_POOL_NEEDS_INPUT_TAG = "seat-pool-needs-input";
 /** The reason a reap gives each row it moves, followed by the seat; counting these reroutes counts the row's reaps. */
 export const SEAT_POOL_REAP_REASON = "reap:";
-const SEAT_POOL_ACTOR = "seat-pool@system";
 
 const errorCode = (error: unknown, fallback: string) => {
   const code = (error as { code?: unknown }).code;
   return typeof code === "string" ? code : fallback;
 };
 
-/** The executor's row moves, nudges and escalations, through the queue repository. */
+/** The executor's row moves and escalations, through the queue repository. */
 export function seatPoolQueueEffects(deps: {
   queueRepo: QueueRepository;
   /** Where an escalation about a seat of the pool goes: the model's escalation owner, or why it has none. */
   escalationOwner(modelSession: string): { owner: string | null; reason: string };
-}): Pick<SeatPoolEffects, "openRows" | "unclaimRow" | "reapCount" | "moveRow" | "nudgeRow" | "escalationOwner" | "escalate"> {
+}): Pick<SeatPoolEffects, "openRows" | "unclaimRow" | "reapCount" | "moveRow" | "escalationOwner" | "escalate"> {
   const { queueRepo } = deps;
   return {
     openRows: (sessionName) => queueRepo.listOpenObligations(sessionName, 500),
@@ -405,16 +387,6 @@ export function seatPoolQueueEffects(deps: {
       } catch (error) {
         return { ok: false, code: errorCode(error, "fallback_failed"), error: (error as Error).message };
       }
-    },
-    nudgeRow: async ({ qitemId, seat }) => {
-      try {
-        // Recorded before the send: a restart between the two loses a nudge rather than sending a second one.
-        queueRepo.update({ qitemId, actorSession: SEAT_POOL_ACTOR, transitionNote: `${SEAT_POOL_NUDGE_NOTE} ${seat}` });
-      } catch (error) {
-        return { ok: false, code: errorCode(error, "note_failed"), error: (error as Error).message };
-      }
-      await queueRepo.maybeNudge(qitemId, seat, true, OPENRIG_SENDER, undefined, "openrig");
-      return { ok: true, result: queueRepo.getById(qitemId)?.lastNudgeWireResult ?? null };
     },
     escalationOwner: deps.escalationOwner,
     escalate: async ({ jobId, seat, model, qitemIds }) => {
@@ -949,11 +921,11 @@ export class SeatPoolExecutor {
   }
 
   /**
-   * Wakes a seat holding a waiting row, by why it isn't taking it: launches it when it stopped, nudges it about the row
-   * when it is idle, escalates when it needs input. Nothing happens when the seat's cause or the row changed since the
-   * plan, or the pool was set to drain. False stops the run.
+   * Wakes a seat holding a waiting row, by why it isn't taking it: launches it when it stopped, escalates when it needs
+   * input. Nothing happens when the seat's cause changed since the plan, or the pool was set to drain. False stops the
+   * run.
    */
-  private async wake(jobId: string, run: Run, intent: Extract<SeatPoolIntent, { kind: "relaunch" | "nudge" | "escalate" }>): Promise<boolean> {
+  private async wake(jobId: string, run: Run, intent: Extract<SeatPoolIntent, { kind: "relaunch" | "escalate" }>): Promise<boolean> {
     const ctx = this.fresh(jobId, run);
     if (!ctx) return false;
     if (ctx.spec.drain) return true;
@@ -978,19 +950,6 @@ export class SeatPoolExecutor {
       }
       if (launched.ok) this.record(jobId, false, "seat_pool_relaunched", { seat: intent.seat });
       else this.record(jobId, true, "seat_pool_relaunch_failed", { seat: intent.seat, code: launched.code, error: launched.error });
-      return true;
-    }
-
-    if (intent.kind === "nudge") {
-      const row = ctx.state.pending.find((r) => r.qitemId === intent.qitemId && r.destination === intent.seat);
-      if (seat.cause !== "idle" || !row || row.nudged) return true;
-      const nudged = await this.within(run, () => this.deps.effects.nudgeRow({ qitemId: intent.qitemId, seat: intent.seat }));
-      if (nudged === TIMED_OUT) {
-        this.record(jobId, true, "seat_pool_nudge_failed", { seat: intent.seat, qitemId: intent.qitemId, code: "effect_timeout" });
-        return false;
-      }
-      if (nudged.ok) this.record(jobId, false, "seat_pool_nudged", { seat: intent.seat, qitemId: intent.qitemId, result: nudged.result ?? null });
-      else this.record(jobId, true, "seat_pool_nudge_failed", { seat: intent.seat, qitemId: intent.qitemId, code: nudged.code, error: nudged.error });
       return true;
     }
 
