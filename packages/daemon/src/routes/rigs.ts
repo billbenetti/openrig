@@ -768,6 +768,11 @@ rigsRoutes.post("/:rigId/pods/:podNamespace/members", async (c) => {
   const edges = Array.isArray(rawEdges)
     ? (rawEdges as Array<{ from: string; to: string; kind: string }>)
     : undefined;
+  // `launch: false` creates the seat without a session, for a caller that prepares it before `rig launch`.
+  const launch = body["launch"];
+  if (launch !== undefined && typeof launch !== "boolean") {
+    return c.json({ ok: false, code: "validation_failed", errors: ["launch: must be a boolean"] }, 400);
+  }
 
   const operation = reserveOperation(getRepo(c).db, header, "member.add", [rigId, podNamespace], text);
   if (operation.state === "conflict") return c.json({ code: "operation_id_conflict" }, 409);
@@ -778,7 +783,7 @@ rigsRoutes.post("/:rigId/pods/:podNamespace/members", async (c) => {
     rigId,
     { kind: "add_member", pod: podNamespace, member: member as Record<string, unknown>, edges },
     rigRoot,
-    operation.state === "fresh" ? { recordCreated: operation.recordCreated } : undefined,
+    { ...(operation.state === "fresh" ? { recordCreated: operation.recordCreated } : {}), launch },
   );
   // This route is the add_member sugar over the converge interface.
   if (converged.kind !== "add_member" || !converged.supported) {
@@ -802,8 +807,9 @@ rigsRoutes.post("/:rigId/pods/:podNamespace/members", async (c) => {
     }
   }
 
-  // 201 created. The node may still be failed/attention_required at launch; that
-  // is carried in outcome.result.node.status (mirrors expand's per-node status).
+  // 201 created. The node may still be failed/attention_required at launch, or
+  // materialized when not launched; that is carried in outcome.result.node.status
+  // (mirrors expand's per-node status).
   return c.json(operation.state === "fresh" ? { ...outcome, operation: operation.read() } : outcome, 201);
 });
 

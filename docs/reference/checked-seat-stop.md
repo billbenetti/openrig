@@ -20,3 +20,7 @@ A `selection_changed` or `stop_uncertain` response from a checked stop says how 
 | `kill_attempted` | The kill. |
 
 `partialEffect` is `true` whenever `stopPhase` isn't `none`, so on its own it doesn't say whether the kill went out. `selection_changed` with `stopPhase: "kill_attempted"` is a change seen after the kill, when the stop state is saved: the session was killed, so re-read the seat rather than offering the stop again.
+
+## Checked node removal
+
+`DELETE /api/rigs/:rigId/nodes/:logicalId` accepts the same `expected` in an optional JSON body. A controller that stopped a seat with a checked stop passes the same `expected` to remove its node: the stop keeps the latest session ID. The removal checks it under the seat's lifecycle lease, before it reroutes, stops or deletes anything, and refuses a changed node or latest session with HTTP 409 `selection_changed`. A node that no longer exists returns `node_not_found`. A malformed explicit value returns HTTP 400 `invalid_stop_precondition`, and a body that isn't a JSON object returns HTTP 400 `invalid_json`; neither removes anything. Without `expected`, removal behaves as before.
