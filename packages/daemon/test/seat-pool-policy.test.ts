@@ -136,9 +136,9 @@ describe("planSeatPool", () => {
     const recent = slot({ idleSince: ago(10) });
     const result = plan(spec(), state({ slots: [adopted, older, newer, recent] }));
     expect(result.intents).toEqual([
-      { kind: "drain", slotId: newer.slotId },
-      { kind: "drain", slotId: older.slotId },
-      { kind: "drain", slotId: adopted.slotId },
+      { kind: "drain", slotId: newer.slotId, idleSince: newer.idleSince },
+      { kind: "drain", slotId: older.slotId, idleSince: older.idleSince },
+      { kind: "drain", slotId: adopted.slotId, idleSince: adopted.idleSince },
     ]);
   });
 
@@ -147,7 +147,7 @@ describe("planSeatPool", () => {
     const free = slot();
     const result = plan(spec(), state({ slots: [holding, free] }));
     expect(result.target).toBe(1);
-    expect(result.intents).toEqual([{ kind: "drain", slotId: free.slotId }]);
+    expect(result.intents).toEqual([{ kind: "drain", slotId: free.slotId, idleSince: free.idleSince }]);
   });
 
   it("waits for the cooldown before adding or starting a drain, but finishes what it started", () => {
@@ -155,7 +155,7 @@ describe("planSeatPool", () => {
     const draining = slot({ phase: "draining" });
     const cooling = plan(spec(), state({ pending: rows(3), lastScaleAt: ago(10), slots: [starting, draining] }));
     expect(cooling.reason).toBe("cooldown");
-    expect(cooling.intents).toEqual([{ kind: "drain", slotId: draining.slotId }, { kind: "launch", slotId: starting.slotId }]);
+    expect(cooling.intents).toEqual([{ kind: "drain", slotId: draining.slotId, idleSince: draining.idleSince }, { kind: "launch", slotId: starting.slotId }]);
     expect(plan(spec(), state({ slots: [slot()], lastScaleAt: ago(10) })).intents).toEqual([]);
     // A surplus of free seats waiting out the cooldown never takes a starting seat in their place.
     const waiting = plan(spec(), state({ slots: [slot(), slot(), starting], lastScaleAt: ago(10) }));
@@ -171,7 +171,7 @@ describe("planSeatPool", () => {
     }));
     expect(result.target).toBe(0);
     expect(result.intents).toEqual<SeatPoolIntent[]>([
-      { kind: "drain", slotId: free.slotId },
+      { kind: "drain", slotId: free.slotId, idleSince: free.idleSince },
       { kind: "remove", slotId: starting.slotId },
     ]);
   });
@@ -313,7 +313,7 @@ describe("planSeatPool: dispatch and wake", () => {
   it("moves and wakes nothing under drain", () => {
     const free = slot();
     const result = plan(spec({ drain: true }), state({ modelCause: "stopped", pending: [...rows(2), ...rows(1, "dev-impl-s9@r")], slots: [free] }));
-    expect(result.intents).toEqual([{ kind: "drain", slotId: free.slotId }]);
+    expect(result.intents).toEqual([{ kind: "drain", slotId: free.slotId, idleSince: free.idleSince }]);
   });
 
   it("still moves and wakes while the demand command's answer is stale", () => {

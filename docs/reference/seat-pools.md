@@ -100,10 +100,12 @@ launch. If `prepare_cmd` or the launch fails, or the pool was set to `drain` whi
 removed without being launched.
 
 Draining a seat takes it out of the pool's count and, holding the seat's lifecycle lease so no delivery, launch or stop
-comes between the steps, checks that it still has no open row and no held message, runs `release_cmd`, checks again
-(the lease holds deliveries back, but a row can still be created while the command runs), stops it with a
-[checked stop](checked-seat-stop.md) and removes its node with the same `expected`. If work arrived, or `release_cmd`
-exits non-zero, the seat goes back into the pool untouched. The removal never passes a fallback: a seat that still has
+comes between the steps, checks that it still has no open row and no held message and is still idle since the moment
+the plan read, runs `release_cmd`, checks again (the lease holds deliveries back, but a row can still be created while
+the command runs), stops it with a [checked stop](checked-seat-stop.md) and removes its node with the same `expected`.
+A seat woken between the plan and the stop, by a message, a nudge or a delivery that left no row behind, is not idle
+since then, even once it is back at its prompt. If work arrived, the seat was woken, or `release_cmd` exits non-zero,
+the seat goes back into the pool untouched. The removal never passes a fallback: a seat that still has
 rows is not removed.
 
 Every add, launch, removal, row moved (`seat_pool_dispatched`, or `seat_pool_dispatch_skipped` when the row was claimed
