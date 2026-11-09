@@ -34,6 +34,7 @@ context:
   prepare_cmd: { argv: [/usr/local/bin/pool-prepare], timeout_s: 120 }
   release_cmd: { argv: [/usr/local/bin/pool-release], timeout_s: 60 }
   reap_cmd:    { argv: [/usr/local/bin/pool-reap], timeout_s: 60 }
+  remove_cmd:  { argv: [/usr/local/bin/pool-remove], timeout_s: 60 }
 ```
 
 Registration and `rig watchdog update --spec` refuse a spec with an unknown field, `max` below `min`, a relative
@@ -44,7 +45,7 @@ environment plus:
 | --- | --- | --- |
 | `OPENRIG_SEAT_POOL_JOB` | every command | the job id |
 | `OPENRIG_SEAT_POOL_MODEL` | every command | the model's session name |
-| `OPENRIG_SEAT_POOL_SLOT` | `prepare_cmd`, `release_cmd`, `reap_cmd` | the seat's session name |
+| `OPENRIG_SEAT_POOL_SLOT` | `prepare_cmd`, `release_cmd`, `reap_cmd`, `remove_cmd` | the seat's session name |
 | `OPENRIG_SEAT_POOL_SLOT_CWD` | `prepare_cmd` | the seat's working directory |
 | `OPENRIG_SEAT_POOL_SLOTS` | `demand_cmd` | JSON list of `{session, phase}` for the pool's seats |
 
@@ -118,6 +119,11 @@ since then, even once it is back at its prompt. If work arrived, the seat was wo
 the seat goes back into the pool untouched. The removal never passes a fallback: a seat that still has
 rows is not removed.
 
+Once the node of a seat the pool added is gone, whether drained, reaped, removed before its launch or removed by
+someone else, `remove_cmd` runs, so whatever `prepare_cmd` set up for the seat can be undone. The pool forgets the seat
+only when it exits 0; until then the seat stays on record, counted against `max` but taking no row, and each plan runs
+`remove_cmd` again (`seat_pool_remove_cmd_failed` records each refusal). An adopted seat never runs it.
+
 Every add, launch, removal, row moved (`seat_pool_dispatched`, or `seat_pool_dispatch_skipped` when the row was claimed
 or moved first), relaunch, escalation, refusal and failure is written to the job's history
 (`rig watchdog status <jobId>`). An evaluation that plans changes records the plan (`seat_pool_planned`), and one that
@@ -168,7 +174,8 @@ pick up:
 4. Each in-progress row addressed to the seat is unclaimed, and every open row is moved with `rig queue fallback`,
    `--expect-destination <the seat>` and the row's state expected, to the model, with a wake when the row is pending.
    A blocked row keeps its blocker; a one-shot `--wake-after` timer ends with the move, as with any reroute.
-5. The node is removed with the `expected` read at the start of the reap, as a drain removes it.
+5. The node is removed with the `expected` read at the start of the reap, as a drain removes it, and `remove_cmd` runs
+   as for a drained seat.
 
 Each move gives the reason `reap:<seat>`. A row that a reap already moved once (the pool counts the row's reroutes with
 that reason) goes to the model's escalation owner instead of the model, so a row whose seats keep dying stops cycling
