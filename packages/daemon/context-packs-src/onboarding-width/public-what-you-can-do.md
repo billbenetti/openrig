@@ -47,7 +47,7 @@ one command away. Your memory of the fleet is a claim about the past.
   says which seats need attention (`needsAttention` in `--json`; `--full` shows every field). Cells
   are one space apart, so read `--json`, with `--fields` to pick fields, rather than column
   positions.
-  **`rig ps --resources`** shows this host's load and transcript capture cost.
+  **`rig ps --resources`** shows this host's load, memory and transcript capture cost.
 - **`rig ps --all-hosts --nodes -A`** — the same across every registered machine. Rollup-only
   unless you ask for nodes.
 - **`rig discover`** — what is running on this box that OpenRig is *not* managing.
