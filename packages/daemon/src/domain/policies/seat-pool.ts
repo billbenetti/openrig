@@ -3,9 +3,10 @@
 // A pool job targets its model seat (`<pod>-<member>@<rig>`) and keeps between `min` and `max` extra seats beside it,
 // named `<member>-s<n>`. Evaluation is pure planning: it reads the pool's state through an injected reader, decides
 // what should change (add N seats, finish starting a seat, drain a free seat, remove a seat, move a waiting row to a
-// free seat, wake a seat holding a waiting row, reap a seat that stopped working) and hands those intents to the
-// executor, which applies them outside the scheduler tick (seat-pool-executor.ts). The policy itself never creates,
-// launches, stops, removes, moves or sends anything, so one slow launch can't hold every other job's evaluation.
+// free seat, wake a seat holding a waiting row, reap a seat whose session is gone, give an adopted seat back) and
+// hands those intents to the executor, which applies them outside the scheduler tick (seat-pool-executor.ts). The
+// policy itself never creates, launches, stops, removes, moves or sends anything, so one slow launch can't hold every
+// other job's evaluation.
 
 import type { Policy, PolicyEvaluation, PolicyJob } from "./types.js";
 
@@ -28,7 +29,7 @@ export interface SeatPoolSpec {
   dispatchTag: string | null;
   /** True empties the pool as its seats become free, and adds none: the kill switch. */
   drain: boolean;
-  /** Existing seats (logical ids) this pool takes over, so they are counted and drained like its own. */
+  /** Existing seats (logical ids) this pool counts and gives rows to like its own, but never stops or removes. */
   adopt: string[];
   /** Absolute working directory for a new seat; `{slot}` (required) and `{rig}` are replaced. */
   cwdTemplate: string;
