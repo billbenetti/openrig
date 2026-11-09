@@ -9,6 +9,9 @@ import { SessionRegistry } from "../src/domain/session-registry.js";
 import { EventBus } from "../src/domain/event-bus.js";
 import { SeatDeliveryGuard, resolveGuardTarget } from "../src/domain/seat-delivery-guard.js";
 import { SeatLifecycleService } from "../src/domain/seat-lifecycle-service.js";
+import { RigLifecycleService } from "../src/domain/rig-lifecycle-service.js";
+import { DiscoveryRepository } from "../src/domain/discovery-repository.js";
+import { QueueRepository } from "../src/domain/queue-repository.js";
 import { TmuxAdapter } from "../src/adapters/tmux.js";
 import { seatRoutes } from "../src/routes/seat.js";
 
@@ -206,5 +209,47 @@ describe("seat-stop.v1 checked stop", () => {
     expect(await stop(a.name, expected(a.name))).toMatchObject({ ok: false, code: "stop_uncertain", partialEffect: true });
     expect(status(a.session.id)).toBe("running");
     expect(registry.getBindingForNode(a.node.id)).not.toBeNull();
+  });
+
+  describe("checked node removal", () => {
+    const lifecycle = () => new RigLifecycleService({ db, rigRepo: repo, sessionRegistry: registry,
+      discoveryRepo: new DiscoveryRepository(db), eventBus: bus, queueRepo: new QueueRepository(db, bus), tmuxAdapter: adapter });
+    const logicalIds = (rigId: string) => repo.getRig(rigId)!.nodes.map(node => node.logicalId).sort();
+
+    it("removes the node with the expected its checked stop used", async () => {
+      const a = seat("dev.a"); const b = seat("dev.b"); const selected = expected(a.name);
+      expect(await stop(a.name, selected)).toMatchObject({ ok: true, sessionId: a.session.id });
+      onPanes = () => { throw new Error(`can't find session: ${a.name}`); };
+      expect(await lifecycle().removeNode(a.node.rigId, "dev.a", { expected: selected })).toMatchObject({ ok: true, nodeId: a.node.id });
+      expect(logicalIds(a.node.rigId)).toEqual(["dev.b"]);
+      expect(status(b.session.id)).toBe("running");
+    });
+
+    it("refuses a changed node or latest session before any effect", async () => {
+      const a = seat("dev.a"); const b = seat("dev.b"); const old = expected(a.name);
+      const replacement = registry.registerSession(a.node.id, a.name);
+      for (const stale of [old, { nodeId: b.node.id, sessionId: replacement.id }]) {
+        expect(await lifecycle().removeNode(a.node.rigId, "dev.a", { expected: stale })).toMatchObject({ ok: false, code: "selection_changed" });
+      }
+      expect(commands).toEqual([]);
+      expect(logicalIds(a.node.rigId)).toEqual(["dev.a", "dev.b"]);
+      expect(db.prepare("SELECT COUNT(*) AS n FROM events WHERE type IN ('session.detached', 'node.removed')").get()).toEqual({ n: 0 });
+    });
+
+    it("refuses a seat whose session changed while the removal waited for its lease", async () => {
+      const a = seat("dev.a"); const selected = expected(a.name);
+      let entered!: () => void; let release!: () => void;
+      const inside = new Promise<void>(resolve => { entered = resolve; });
+      const gate = new Promise<void>(resolve => { release = resolve; });
+      const held = adapter.deliveryGuard!.lifecycle([a.node.id], async () => { entered(); await gate; });
+      await inside;
+      const removal = lifecycle().removeNode(a.node.rigId, "dev.a", { expected: selected });
+      registry.registerSession(a.node.id, a.name);
+      release();
+      await held;
+      expect(await removal).toMatchObject({ ok: false, code: "selection_changed" });
+      expect(commands.some(command => command.includes("kill-session"))).toBe(false);
+      expect(logicalIds(a.node.rigId)).toEqual(["dev.a"]);
+    });
   });
 });

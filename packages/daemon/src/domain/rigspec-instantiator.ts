@@ -455,7 +455,8 @@ export interface AddMemberResult {
   node: {
     logicalId: string;
     nodeId: string;
-    status: "launched" | "failed" | "attention_required";
+    /** `materialized` when the add was asked not to launch: the node exists without a session. */
+    status: "launched" | "failed" | "attention_required" | "materialized";
     error?: string;
     sessionName?: string;
   };
@@ -1110,8 +1111,13 @@ export class PodRigInstantiator {
     rigRoot: string,
     opts?: { cwdOverride?: string; edges?: Array<{ from: string; to: string; kind: string }>;
       /** A fork's source seat: its launch additions are copied into this new seat once it is validated, and kept. */
-      launchAdditionsFrom?: SeatSkillPaths; recordCreated?: RecordCreated },
+      launchAdditionsFrom?: SeatSkillPaths; recordCreated?: RecordCreated;
+      /** False creates the node without a session; an ordinary `rig launch` of the seat starts it later. */
+      launch?: boolean },
   ): Promise<AddMemberOutcome> {
+    if (opts?.launch === false && opts.launchAdditionsFrom) {
+      return { ok: false, code: "validation_failed", errors: ["launchAdditionsFrom: a fork's launch additions are carried only by an add that launches"] };
+    }
     // 1. Resolve the rig.
     const rig = this.deps.rigRepo.getRig(rigId);
     if (!rig) {
@@ -1257,6 +1263,23 @@ export class PodRigInstantiator {
         return { ok: false, code: "member_conflict", message, ...(opts?.recordCreated && materialized.existingNodeId ? { existingNodeId: materialized.existingNodeId } : {}) };
       }
       return { ok: false, code: "materialize_error", message };
+    }
+
+    if (opts?.launch === false) {
+      const created = this.deps.rigRepo.getRig(rigId)?.nodes.find((node) => node.logicalId === qualifiedId);
+      if (!created) {
+        return { ok: false, code: "materialize_error", message: `Member "${qualifiedId}" was not found after materialization.` };
+      }
+      return {
+        ok: true,
+        result: {
+          podId: pod.id,
+          podNamespace,
+          node: { logicalId: qualifiedId, nodeId: created.id, status: "materialized" },
+          edges: resolvedEdges,
+          warnings: materialized.result.warnings ?? [],
+        },
+      };
     }
 
     // A fork's launch additions go only into the seat just validated and created above (OPR.0.7.0.9).
