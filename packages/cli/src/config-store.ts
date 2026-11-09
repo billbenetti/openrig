@@ -153,6 +153,12 @@ export interface RiggedConfig {
       autoRegister: string;
       optInSessions: string;
     };
+    seatPool: {
+      maxLaunchesInFlight: number;
+      maxLaunchesPerTick: number;
+      minFreeMemoryMb: number;
+      maxLoadPerCpuPercent: number;
+    };
   };
   snapshots: {
     periodic: {
@@ -367,6 +373,12 @@ const DEFAULTS = {
       autoRegister: "off",
       optInSessions: "",
     },
+    seatPool: {
+      maxLaunchesInFlight: 1,
+      maxLaunchesPerTick: 1,
+      minFreeMemoryMb: 1024,
+      maxLoadPerCpuPercent: 100,
+    },
   },
   snapshots: {
     periodic: {
@@ -542,6 +554,11 @@ export const VALID_KEYS = [
   // the daemon settings-store keys (see there for semantics).
   "policies.idle_gate_qitem.auto_register",
   "policies.idle_gate_qitem.opt_in_sessions",
+  // Seat pools' launch budget; twin of the daemon settings-store keys (see there for semantics).
+  "policies.seat_pool.max_launches_in_flight",
+  "policies.seat_pool.max_launches_per_tick",
+  "policies.seat_pool.min_free_memory_mb",
+  "policies.seat_pool.max_load_per_cpu_percent",
   "snapshots.periodic.enabled",
   "snapshots.periodic.interval_seconds",
   "snapshots.periodic.retention_keep",
@@ -686,6 +703,10 @@ export const ENV_MAP: Record<ValidKey, { primary: string; legacy?: string }> = {
   "policies.idle_gate_qitem.active_wake_interval_seconds": { primary: "OPENRIG_POLICIES_IDLE_GATE_QITEM_ACTIVE_WAKE_INTERVAL_SECONDS" },
   "policies.idle_gate_qitem.auto_register": { primary: "OPENRIG_POLICIES_IDLE_GATE_QITEM_AUTO_REGISTER" },
   "policies.idle_gate_qitem.opt_in_sessions": { primary: "OPENRIG_POLICIES_IDLE_GATE_QITEM_OPT_IN_SESSIONS" },
+  "policies.seat_pool.max_launches_in_flight": { primary: "OPENRIG_POLICIES_SEAT_POOL_MAX_LAUNCHES_IN_FLIGHT" },
+  "policies.seat_pool.max_launches_per_tick": { primary: "OPENRIG_POLICIES_SEAT_POOL_MAX_LAUNCHES_PER_TICK" },
+  "policies.seat_pool.min_free_memory_mb": { primary: "OPENRIG_POLICIES_SEAT_POOL_MIN_FREE_MEMORY_MB" },
+  "policies.seat_pool.max_load_per_cpu_percent": { primary: "OPENRIG_POLICIES_SEAT_POOL_MAX_LOAD_PER_CPU_PERCENT" },
   "snapshots.periodic.enabled": { primary: "OPENRIG_SNAPSHOTS_PERIODIC_ENABLED" },
   "snapshots.periodic.interval_seconds": { primary: "OPENRIG_SNAPSHOTS_PERIODIC_INTERVAL_SECONDS" },
   "snapshots.periodic.retention_keep": { primary: "OPENRIG_SNAPSHOTS_PERIODIC_RETENTION_KEEP" },
@@ -799,6 +820,10 @@ const KEY_TO_PATH: Record<ValidKey, string[]> = {
   "policies.idle_gate_qitem.active_wake_interval_seconds": ["policies", "idleGateQitem", "activeWakeIntervalSeconds"],
   "policies.idle_gate_qitem.auto_register": ["policies", "idleGateQitem", "autoRegister"],
   "policies.idle_gate_qitem.opt_in_sessions": ["policies", "idleGateQitem", "optInSessions"],
+  "policies.seat_pool.max_launches_in_flight": ["policies", "seatPool", "maxLaunchesInFlight"],
+  "policies.seat_pool.max_launches_per_tick": ["policies", "seatPool", "maxLaunchesPerTick"],
+  "policies.seat_pool.min_free_memory_mb": ["policies", "seatPool", "minFreeMemoryMb"],
+  "policies.seat_pool.max_load_per_cpu_percent": ["policies", "seatPool", "maxLoadPerCpuPercent"],
   "snapshots.periodic.enabled": ["snapshots", "periodic", "enabled"],
   "snapshots.periodic.interval_seconds": ["snapshots", "periodic", "intervalSeconds"],
   "snapshots.periodic.retention_keep": ["snapshots", "periodic", "retentionKeep"],
@@ -1116,6 +1141,20 @@ const KEY_CONSTRAINTS: Partial<Record<ValidKey, (raw: string, coerced: string | 
       throw new Error(`Invalid value for policies.idle_gate_qitem.auto_register: must be "off" or "all", got "${raw}"`);
     }
   },
+  "policies.seat_pool.max_launches_in_flight": positiveIntegerConstraint("policies.seat_pool.max_launches_in_flight"),
+  // 0 admits no launch: the pools start no seat.
+  "policies.seat_pool.max_launches_per_tick": (raw, coerced) => {
+    if (!/^\d+$/.test((raw ?? "").trim()) || typeof coerced !== "number" || !Number.isInteger(coerced) || coerced < 0) {
+      throw new Error(`Invalid value for policies.seat_pool.max_launches_per_tick: must be an integer >= 0 (0 starts no seat), got "${raw}"`);
+    }
+  },
+  // 0 sets no free-memory floor.
+  "policies.seat_pool.min_free_memory_mb": (raw, coerced) => {
+    if (!/^\d+$/.test((raw ?? "").trim()) || typeof coerced !== "number" || !Number.isInteger(coerced) || coerced < 0) {
+      throw new Error(`Invalid value for policies.seat_pool.min_free_memory_mb: must be an integer >= 0 (0 sets no floor), got "${raw}"`);
+    }
+  },
+  "policies.seat_pool.max_load_per_cpu_percent": positiveIntegerConstraint("policies.seat_pool.max_load_per_cpu_percent"),
   // Policy threshold: integer in [1, 100]. Documented contract from
   // slice 27 README §"What the operator gets" — operator can lower to
   // e.g. 50 = compact earlier; range is 1-100 inclusive. A value of 0
@@ -1468,6 +1507,12 @@ export class ConfigStore {
           activeWakeIntervalSeconds: v("policies.idle_gate_qitem.active_wake_interval_seconds") as number,
           autoRegister: v("policies.idle_gate_qitem.auto_register") as string,
           optInSessions: v("policies.idle_gate_qitem.opt_in_sessions") as string,
+        },
+        seatPool: {
+          maxLaunchesInFlight: v("policies.seat_pool.max_launches_in_flight") as number,
+          maxLaunchesPerTick: v("policies.seat_pool.max_launches_per_tick") as number,
+          minFreeMemoryMb: v("policies.seat_pool.min_free_memory_mb") as number,
+          maxLoadPerCpuPercent: v("policies.seat_pool.max_load_per_cpu_percent") as number,
         },
       },
       snapshots: {

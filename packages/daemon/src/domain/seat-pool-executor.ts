@@ -8,6 +8,7 @@ import { physicalSessionName } from "./session-registry.js";
 import { FALLBACK_ACTOR, type QueueRepository } from "./queue-repository.js";
 import { OPENRIG_SENDER } from "../lib/pane-envelope.js";
 import type { Node } from "./types.js";
+import type { LaunchBudget, LaunchTick } from "./launch-budget.js";
 import {
   seatPoolReapCause,
   slotWorkingDirectory,
@@ -33,8 +34,10 @@ import {
  * not launched is prepared and launched or removed, and a seat being drained finishes draining. Moving a row and waking
  * a seat check the row and the seat again just before, and change nothing when either changed since the plan or the
  * pool was set to drain. An add, a launch and a relaunch check provider usage again just before, and start nothing
- * while a seat of the pool is out of usage. A reap, under the seat's lifecycle lease, checks again why the seat is
- * reaped, and leaves a seat that recovered since the plan.
+ * while a seat of the pool is out of usage. Each add, launch and relaunch also holds a reservation of the daemon's
+ * launch budget (launch-budget.ts) until it settles, charged to the watchdog tick the plan was submitted in, and starts
+ * nothing when the host or that tick has no room. A reap, under the seat's lifecycle lease, checks again why the seat
+ * is reaped, and leaves a seat that recovered since the plan.
  */
 
 export interface SeatPoolSlot {
@@ -487,6 +490,8 @@ export interface SeatPoolExecutorDeps {
   /** Whether the model or a seat of the pool is out of provider usage, read now. Absent: never. */
   outOfUsage?(job: { jobId: string; targetSession: string; spec: SeatPoolSpec }): Promise<boolean>;
   effects: SeatPoolEffects;
+  /** The daemon's room for seat launches, shared by every pool. Absent: no limit. */
+  launchBudget?: LaunchBudget;
   /** Writes one history entry for the job. */
   record(jobId: string, entry: { failed: boolean; reason: string; notes: Record<string, unknown> }): void;
   now?: () => Date;
@@ -499,6 +504,8 @@ interface Run {
   /** Effects the run stopped waiting for; the pool stays owned until they settle. */
   lingering: Array<Promise<unknown>>;
   done: Promise<void>;
+  /** The launch budget's tick the plan was submitted in: every launch of the run counts against it. */
+  tick?: LaunchTick;
 }
 
 interface DrainOutcome {
@@ -524,6 +531,7 @@ const ROW_MOVED_ON = new Set(["fallback_state_mismatch", "fallback_destination_m
 const UNCLAIM_MOVED_ON = new Set(["qitem_not_in_progress", "qitem_not_found"]);
 const holdsWork = (slot: SeatPoolSlotView) => slot.openRows > 0 || slot.heldMessages > 0;
 const TIMED_OUT = Symbol("timed out");
+const NO_ROOM = Symbol("no room");
 
 export class SeatPoolExecutor {
   private readonly runs = new Map<string, Run>();
@@ -547,7 +555,7 @@ export class SeatPoolExecutor {
   /** Starts applying a plan; false when the pool already has a run, or the executor is stopping. */
   submit(jobId: string, intents: SeatPoolIntent[]): boolean {
     if (this.stopping || this.runs.has(jobId)) return false;
-    const run: Run = { controller: new AbortController(), lingering: [], done: Promise.resolve() };
+    const run: Run = { controller: new AbortController(), lingering: [], done: Promise.resolve(), tick: this.deps.launchBudget?.currentTick() };
     run.done = this.apply(jobId, intents, run)
       .catch((error) => this.deps.record(jobId, { failed: true, reason: "seat_pool_run_failed", notes: { error: (error as Error).message } }))
       .then(() => Promise.allSettled(run.lingering))
@@ -613,6 +621,27 @@ export class SeatPoolExecutor {
     }
   }
 
+  /**
+   * Runs `start` holding a reservation of the daemon's launch budget, charged to the run's tick, or records why there
+   * is no room and returns NO_ROOM without running it. The reservation lasts until every effect `start` began has
+   * settled, including one the run stopped waiting for, so a launch past its timeout still counts against the next one.
+   */
+  private async withLaunchRoom<T>(jobId: string, run: Run, notes: Record<string, unknown>, start: () => Promise<T>): Promise<T | typeof NO_ROOM> {
+    if (!this.deps.launchBudget) return start();
+    const room = this.deps.launchBudget.reserve(run.tick);
+    if (!room.ok) {
+      this.record(jobId, false, "seat_pool_held", { reason: "launch_budget", why: room.why, ...room.notes, ...notes });
+      return NO_ROOM;
+    }
+    const started = run.lingering.length;
+    try {
+      return await start();
+    } finally {
+      await Promise.allSettled(run.lingering.slice(started));
+      room.release();
+    }
+  }
+
   private commandEnv(ctx: Context, extra: Record<string, string>): Record<string, string> {
     return { OPENRIG_SEAT_POOL_JOB: ctx.jobId, OPENRIG_SEAT_POOL_MODEL: ctx.model.sessionName, ...extra };
   }
@@ -623,11 +652,20 @@ export class SeatPoolExecutor {
       if (intent.kind === "adopt") this.adopt(jobId, run, intent);
       else if (intent.kind === "add") {
         for (let i = 0; i < intent.count; i++) {
-          const slot = await this.allocate(jobId, run);
-          if (!slot || !(await this.bringUp(jobId, run, slot.slotId))) break;
+          // Room is reserved before the seat is recorded, so a host without room leaves no seat half-added.
+          const added = await this.withLaunchRoom(jobId, run, { add: intent.count - i }, async () => {
+            const slot = await this.allocate(jobId, run);
+            return !!slot && await this.bringUp(jobId, run, slot.slotId);
+          });
+          if (added !== true) break;
         }
       } else if (intent.kind === "launch") {
-        if (!(await this.bringUp(jobId, run, intent.slotId))) return;
+        const slot = this.deps.slots.get(intent.slotId);
+        // A retired seat, or one whose launch already ran (its result lost to a restart), starts nothing: no room needed.
+        const started = slot && !slot.retiredAt && !(slot.nodeId && this.deps.effects.sessionRunning(slot.nodeId))
+          ? await this.withLaunchRoom(jobId, run, { slot: slot.logicalId }, () => this.bringUp(jobId, run, intent.slotId))
+          : await this.bringUp(jobId, run, intent.slotId);
+        if (started === false) return;
       } else if (intent.kind === "drain") {
         if (!(await this.drain(jobId, run, intent.slotId))) return;
       } else if (intent.kind === "remove") {
@@ -982,7 +1020,9 @@ export class SeatPoolExecutor {
         this.record(jobId, false, "seat_pool_held", { reason: "usage_limit", seat: intent.seat });
         return true;
       }
-      const launched = await this.within(run, () => this.deps.effects.relaunchSeat({ rigId: ctx.model.rigId, logicalId: seat.logicalId }));
+      const launched = await this.withLaunchRoom(jobId, run, { seat: intent.seat },
+        () => this.within(run, () => this.deps.effects.relaunchSeat({ rigId: ctx.model.rigId, logicalId: seat.logicalId })));
+      if (launched === NO_ROOM) return true;
       if (launched === TIMED_OUT) {
         this.record(jobId, true, "seat_pool_relaunch_failed", { seat: intent.seat, code: "effect_timeout" });
         return false;

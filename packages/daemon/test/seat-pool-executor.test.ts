@@ -42,6 +42,7 @@ import {
   type SeatPoolState,
 } from "../src/domain/policies/seat-pool.js";
 import type { Node } from "../src/domain/types.js";
+import { LaunchBudget } from "../src/domain/launch-budget.js";
 
 const JOB = "pool-job";
 const MODEL: SeatPoolModel = {
@@ -213,7 +214,7 @@ describe("seat-pool executor", () => {
   let active: boolean;
   let history: Array<{ failed: boolean; reason: string; notes: Record<string, unknown> }>;
 
-  const makeExecutor = (effectTimeoutMs?: number): SeatPoolExecutor => {
+  const makeExecutor = (effectTimeoutMs?: number, launchBudget?: LaunchBudget): SeatPoolExecutor => {
     const executor: SeatPoolExecutor = new SeatPoolExecutor({
       slots,
       readJob: () => ({ active, targetSession: MODEL.sessionName, spec: jobSpec }),
@@ -223,6 +224,7 @@ describe("seat-pool executor", () => {
       record: (_jobId, entry) => { history.push(entry); },
       now: () => new Date(T0),
       effectTimeoutMs,
+      launchBudget,
     });
     return executor;
   };
@@ -854,6 +856,137 @@ describe("seat-pool executor", () => {
       expect(world.calls).toEqual(["lease dev.impl-s1", "run release", "lease released"]);
       expect(slots.get(stuck.slotId)).toMatchObject({ phase: "live", intent: null });
       expect(history).toEqual([]);
+    });
+  });
+
+  describe("launch budget", () => {
+    // The host itself always has room, so only launches in flight and the tick's launches refuse.
+    const budgetOf = (maxInFlight: number, maxPerTick: number) => new LaunchBudget({
+      limits: () => ({ maxInFlight, maxPerTick, minFreeMemoryBytes: 0, maxLoadPerCpu: 100 }),
+      sample: () => ({ cpuCount: 1, load1: 0, freeMemoryBytes: 1 }),
+    });
+    // Room for one launch at a time, and more launches per tick than these tests start.
+    const oneAtATime = () => budgetOf(1, 100);
+
+    it("adds nothing for a pool while another pool's launch holds the daemon's room, and adds once it settles", async () => {
+      const budget = oneAtATime();
+      const executor = makeExecutor(undefined, budget);
+      let release!: () => void;
+      world.launchGate = new Promise((resolve) => { release = resolve; });
+      expect(executor.submit("other-pool", [{ kind: "add", count: 1 }])).toBe(true);
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      expect(budget.launchesInFlight).toBe(1);
+      await run(executor, [{ kind: "add", count: 2 }]);
+      expect(world.calls).toEqual(["add impl-s1 /work/r/impl-s1", "run prepare", "launch dev.impl-s1"]);
+      expect(slots.listOpen(JOB)).toEqual([]);
+      expect(history).toEqual([{ failed: false, reason: "seat_pool_held", notes: { reason: "launch_budget", why: "launches_in_flight", inFlight: 1, maxInFlight: 1, add: 2 } }]);
+      release();
+      await executor.settled("other-pool");
+      expect(budget.launchesInFlight).toBe(0);
+      world.calls = [];
+      await run(executor, [{ kind: "add", count: 2 }]);
+      // One at a time: the second add reserves only once the first launch has settled.
+      expect(world.calls).toEqual([
+        "add impl-s2 /work/r/impl-s2", "run prepare", "launch dev.impl-s2",
+        "add impl-s3 /work/r/impl-s3", "run prepare", "launch dev.impl-s3",
+      ]);
+      expect(live()).toEqual(["dev.impl-s2", "dev.impl-s3"]);
+    });
+
+    it("holds a seat's first launch and a relaunch without room, but not a seat whose launch already ran", async () => {
+      const budget = oneAtATime();
+      const elsewhere = budget.reserve();
+      world.nodes.set("node-8", { logicalId: "dev.impl-s8", session: "none", sessionId: null, openRows: 0, idle: false });
+      const unstarted = slots.insert({ poolJobId: JOB, logicalId: "dev.impl-s8", nodeId: "node-8", phase: "added", intent: null, opId: "op-8", at: new Date(T0).toISOString() });
+      world.nodes.set("node-9", { logicalId: "dev.impl-s9", session: "running", sessionId: "sess-9", openRows: 0, idle: true });
+      const launched = slots.insert({ poolJobId: JOB, logicalId: "dev.impl-s9", nodeId: "node-9", phase: "added", intent: "launch", opId: "op-9", at: new Date(T0).toISOString() });
+      world.modelCause = "stopped";
+      await run(makeExecutor(undefined, budget), [
+        { kind: "launch", slotId: unstarted.slotId },
+        { kind: "relaunch", seat: MODEL.sessionName, nodeId: MODEL.nodeId },
+        { kind: "launch", slotId: launched.slotId },
+      ]);
+      expect(world.calls).toEqual([]);
+      expect(slots.get(unstarted.slotId)).toMatchObject({ phase: "added", intent: null });
+      expect(slots.get(launched.slotId)).toMatchObject({ phase: "live", intent: null });
+      const held = { failed: false, reason: "seat_pool_held" };
+      expect(history).toEqual([
+        { ...held, notes: { reason: "launch_budget", why: "launches_in_flight", inFlight: 1, maxInFlight: 1, slot: "dev.impl-s8" } },
+        { ...held, notes: { reason: "launch_budget", why: "launches_in_flight", inFlight: 1, maxInFlight: 1, seat: "dev-impl@r" } },
+        { failed: false, reason: "seat_pool_launched", notes: { slot: "dev.impl-s9", nodeId: "node-9", interrupted: "launch" } },
+      ]);
+      if (elsewhere.ok) elsewhere.release();
+      world.calls = [];
+      await run(makeExecutor(undefined, budget), [{ kind: "launch", slotId: unstarted.slotId }, { kind: "relaunch", seat: MODEL.sessionName, nodeId: MODEL.nodeId }]);
+      expect(world.calls).toEqual(["run prepare", "launch dev.impl-s8", "relaunch dev.impl"]);
+      expect(budget.launchesInFlight).toBe(0);
+    });
+
+    it("starts one seat of a plan per tick even when each launch settles before the next, and the next tick one more", async () => {
+      const budget = budgetOf(1, 1);
+      const executor = makeExecutor(undefined, budget);
+      await run(executor, [{ kind: "add", count: 3 }]);
+      expect(world.calls).toEqual(["add impl-s1 /work/r/impl-s1", "run prepare", "launch dev.impl-s1"]);
+      expect(budget.launchesInFlight).toBe(0);
+      expect(history.at(-1)).toEqual({ failed: false, reason: "seat_pool_held", notes: { reason: "launch_budget", why: "launches_per_tick", thisTick: 1, maxPerTick: 1, add: 2 } });
+      // A second plan in the same tick finds it spent.
+      world.calls = [];
+      await run(executor, [{ kind: "add", count: 2 }]);
+      expect(world.calls).toEqual([]);
+      budget.nextTick();
+      await run(executor, [{ kind: "add", count: 2 }]);
+      expect(world.calls).toEqual(["add impl-s2 /work/r/impl-s2", "run prepare", "launch dev.impl-s2"]);
+      expect(live()).toEqual(["dev.impl-s1", "dev.impl-s2"]);
+    });
+
+    it("shares a tick's launches with the pools planned in it, and charges a run that outlasts its tick to that tick", async () => {
+      const budget = budgetOf(2, 1);
+      const executor = makeExecutor(undefined, budget);
+      let release!: () => void;
+      world.launchGate = new Promise((resolve) => { release = resolve; });
+      expect(executor.submit("other-pool", [{ kind: "add", count: 1 }])).toBe(true);
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      // Room for a second launch in flight, but the tick's one launch went to the other pool.
+      await run(executor, [{ kind: "add", count: 1 }]);
+      expect(history.at(-1)).toEqual({ failed: false, reason: "seat_pool_held", notes: { reason: "launch_budget", why: "launches_per_tick", thisTick: 1, maxPerTick: 1, add: 1 } });
+      release();
+      await executor.settled("other-pool");
+      world.launchGate = new Promise((resolve) => { release = resolve; });
+      world.calls = [];
+      budget.nextTick();
+      expect(executor.submit(JOB, [{ kind: "add", count: 2 }])).toBe(true);
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      // The tick ends while the run's first launch is still in flight; its second add still counts against it.
+      budget.nextTick();
+      release();
+      await executor.settled(JOB);
+      expect(world.calls).toEqual(["add impl-s2 /work/r/impl-s2", "run prepare", "launch dev.impl-s2"]);
+      expect(history.at(-1)).toMatchObject({ reason: "seat_pool_held", notes: { why: "launches_per_tick", add: 1 } });
+      // The tick that began meanwhile still has its launch for the next plan.
+      world.launchGate = null;
+      world.calls = [];
+      await run(executor, [{ kind: "add", count: 1 }]);
+      expect(world.calls).toEqual(["add impl-s3 /work/r/impl-s3", "run prepare", "launch dev.impl-s3"]);
+    });
+
+    it("keeps the room until a launch past its timeout settles, and frees it after a failed launch", async () => {
+      const budget = oneAtATime();
+      let release!: () => void;
+      world.launchGate = new Promise((resolve) => { release = resolve; });
+      const executor = makeExecutor(20, budget);
+      expect(executor.submit(JOB, [{ kind: "add", count: 1 }])).toBe(true);
+      await new Promise((resolve) => setTimeout(resolve, 60));
+      expect(history).toEqual([{ failed: true, reason: "seat_pool_launch_failed", notes: { slot: "dev.impl-s1", code: "effect_timeout" } }]);
+      // The run stopped waiting, but the launch is still running: it still counts.
+      expect(budget.launchesInFlight).toBe(1);
+      release();
+      await executor.settled(JOB);
+      expect(budget.launchesInFlight).toBe(0);
+      world.launchGate = null;
+      world.launchResult = { ok: false, code: "startup_failed", error: "harness exited" };
+      await run(executor, [{ kind: "add", count: 1 }]);
+      expect(history.at(-1)).toMatchObject({ reason: "seat_pool_removed", notes: { slot: "dev.impl-s2" } });
+      expect(budget.launchesInFlight).toBe(0);
     });
   });
 
