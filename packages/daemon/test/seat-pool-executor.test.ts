@@ -22,7 +22,6 @@ import {
   readSeatPoolState,
   runSeatPoolCommand,
   SEAT_POOL_NEEDS_INPUT_TAG,
-  SEAT_POOL_QUARANTINE_TAG,
   SeatPoolExecutor,
   seatPoolQueueEffects,
   SeatPoolSlots,
@@ -59,7 +58,7 @@ function spec(overrides: Record<string, unknown> = {}): SeatPoolSpec {
 
 interface FakeNode {
   logicalId: string; session: "none" | "running" | "stopped"; sessionId: string | null; openRows: number; idle: boolean; held?: number;
-  cause?: SeatPoolSeatCause; stateSince?: string;
+  cause?: SeatPoolSeatCause;
 }
 interface FakeRow { destination: string; waitingSince: string; nudged: string[]; state?: "pending" | "in-progress" | "blocked"; reaps?: number }
 
@@ -171,12 +170,11 @@ class World {
         return { ok: true, result: "verified" };
       },
       escalationOwner: () => ({ owner: this.escalationOwner, reason: "no escalation destination declared" }),
-      escalate: async ({ seat, qitemIds, quarantine }) => {
-        const key = quarantine ? `quarantine ${seat}` : seat;
-        this.calls.push(`escalate ${key} ${qitemIds.join(",")}`);
+      escalate: async ({ seat, qitemIds }) => {
+        this.calls.push(`escalate ${seat} ${qitemIds.join(",")}`);
         if (!this.escalationOwner) return { ok: false, code: "no_escalation_owner", error: "no escalation destination declared" };
-        const existing = this.escalations.includes(key);
-        if (!existing) this.escalations.push(key);
+        const existing = this.escalations.includes(seat);
+        if (!existing) this.escalations.push(seat);
         return { ok: true, qitemId: `esc-${seat}`, destination: this.escalationOwner, existing };
       },
     };
@@ -194,9 +192,7 @@ class World {
           slotId: s.slotId, logicalId: s.logicalId, sessionName: seatSessionName(s.logicalId, "r"), nodeId: s.nodeId, phase: s.phase as "live",
           adopted: s.opId === null, nodeExists: !!node, openRows: node?.openRows ?? 0, heldMessages: node?.held ?? 0,
           idleSince: idle ? new Date(T0 - 3_600_000).toISOString() : null,
-          stateSince: node?.stateSince ?? (idle ? new Date(T0 - 3_600_000).toISOString() : null),
           cause: node?.cause ?? (node?.session !== "running" ? "stopped" : idle ? "idle" : "working"),
-          quarantined: this.escalations.includes(`quarantine ${seatSessionName(s.logicalId, "r")}`),
         };
       }),
       adoptable: [],
@@ -696,7 +692,6 @@ describe("seat-pool executor", () => {
       history = [];
       return added!;
     };
-    const STUCK_SINCE = new Date(T0 - 7_200_000).toISOString();
 
     it("reaps a seat whose session is gone under one lease: clean, reap_cmd, unclaim, rows back to the model, checked removal", async () => {
       jobSpec = spec({ reap_cmd: { argv: ["reap"] } });
@@ -705,7 +700,7 @@ describe("seat-pool executor", () => {
       row("q-1", "dev-impl-s1@r", "in-progress");
       row("q-2", "dev-impl-s1@r");
       row("q-3", "dev-impl-s1@r", "blocked");
-      await run(executor, [{ kind: "reap", slotId: dead.slotId, why: "no_session" }]);
+      await run(executor, [{ kind: "reap", slotId: dead.slotId }]);
       const expected = JSON.stringify({ nodeId: dead.nodeId, sessionId: "sess-2" });
       expect(world.calls).toEqual([
         "lease dev.impl-s1", "clean dev-impl-s1@r", "run reap", "unclaim q-1 reap:dev-impl-s1@r",
@@ -718,7 +713,7 @@ describe("seat-pool executor", () => {
       ]);
       expect(slots.listOpen(JOB)).toEqual([]);
       expect(history).toEqual([{ failed: false, reason: "seat_pool_reaped", notes: {
-        slot: "dev.impl-s1", why: "no_session",
+        slot: "dev.impl-s1",
         rows: ["q-1", "q-2", "q-3"].map((qitemId) => ({ qitemId, to: "dev-impl@r" })),
       } }]);
     });
@@ -728,7 +723,7 @@ describe("seat-pool executor", () => {
       const first = await seat(executor, { session: "stopped", idle: false });
       row("q-1", "dev-impl-s1@r", "in-progress", 1);
       row("q-2", "dev-impl-s1@r");
-      await run(executor, [{ kind: "reap", slotId: first.slotId, why: "no_session" }]);
+      await run(executor, [{ kind: "reap", slotId: first.slotId }]);
       expect(history.at(-1)).toMatchObject({ reason: "seat_pool_reaped", notes: { rows: [
         { qitemId: "q-1", to: "lead@r", escalated: true }, { qitemId: "q-2", to: "dev-impl@r" },
       ] } });
@@ -737,10 +732,10 @@ describe("seat-pool executor", () => {
       world.escalationOwner = null;
       const second = await seat(executor, { session: "stopped", idle: false });
       world.rows.get("q-2")!.destination = "dev-impl-s2@r";
-      await run(executor, [{ kind: "reap", slotId: second.slotId, why: "no_session" }]);
+      await run(executor, [{ kind: "reap", slotId: second.slotId }]);
       expect(history).toEqual([
         { failed: true, reason: "seat_pool_escalation_failed", notes: { seat: "dev-impl-s2@r", qitemId: "q-2", code: "no_escalation_owner", error: "no escalation destination declared" } },
-        { failed: false, reason: "seat_pool_reaped", notes: { slot: "dev.impl-s2", why: "no_session", rows: [{ qitemId: "q-2", to: "dev-impl@r" }] } },
+        { failed: false, reason: "seat_pool_reaped", notes: { slot: "dev.impl-s2", rows: [{ qitemId: "q-2", to: "dev-impl@r" }] } },
       ]);
     });
 
@@ -750,16 +745,16 @@ describe("seat-pool executor", () => {
       const dead = await seat(executor, { session: "stopped", idle: false, openRows: 1 });
       row("q-1", "dev-impl-s1@r", "in-progress");
       world.cleanResult = { ok: false, code: "session_live", error: "alive in tmux" };
-      await run(executor, [{ kind: "reap", slotId: dead.slotId, why: "no_session" }]);
+      await run(executor, [{ kind: "reap", slotId: dead.slotId }]);
       world.cleanResult = { ok: false, code: "nothing_to_clean", error: "already clean" };
       world.exit["reap"] = 3;
-      await run(executor, [{ kind: "reap", slotId: dead.slotId, why: "no_session" }]);
+      await run(executor, [{ kind: "reap", slotId: dead.slotId }]);
       expect(world.calls.filter((c) => /^(unclaim|move|remove)/.test(c))).toEqual([]);
       expect(world.rows.get("q-1")).toMatchObject({ destination: "dev-impl-s1@r", state: "in-progress" });
       expect(slots.get(dead.slotId)).toMatchObject({ phase: "live", intent: null });
       expect(history).toEqual([
-        { failed: true, reason: "seat_pool_reap_failed", notes: { slot: "dev.impl-s1", why: "no_session", step: "clean", code: "session_live", error: "alive in tmux" } },
-        { failed: true, reason: "seat_pool_reap_failed", notes: { slot: "dev.impl-s1", why: "no_session", step: "reap_cmd", exitCode: 3, error: null } },
+        { failed: true, reason: "seat_pool_reap_failed", notes: { slot: "dev.impl-s1", step: "clean", code: "session_live", error: "alive in tmux" } },
+        { failed: true, reason: "seat_pool_reap_failed", notes: { slot: "dev.impl-s1", step: "reap_cmd", exitCode: 3, error: null } },
       ]);
       world.exit["reap"] = 0;
       await run(executor, planSeatPool(jobSpec, world.state(slots, executor, jobSpec), T0, 120_000).intents);
@@ -770,93 +765,10 @@ describe("seat-pool executor", () => {
     it("leaves a seat that came back since the plan", async () => {
       const executor = makeExecutor();
       const back = await seat(executor, {});
-      await run(executor, [{ kind: "reap", slotId: back.slotId, why: "no_session" }]);
+      await run(executor, [{ kind: "reap", slotId: back.slotId }]);
       expect(world.calls).toEqual(["lease dev.impl-s1", "lease released"]);
       expect(history).toEqual([]);
       expect(live()).toEqual(["dev.impl-s1"]);
-    });
-
-    it("stops and reaps a stuck live seat only once its release command agrees", async () => {
-      jobSpec = spec({ stuck_after_s: 3600, release_cmd: { argv: ["release"] } });
-      const executor = makeExecutor();
-      const stuck = await seat(executor, { idle: false, cause: "working", stateSince: STUCK_SINCE, openRows: 1 });
-      row("q-1", "dev-impl-s1@r", "in-progress");
-      expect(planSeatPool(jobSpec, world.state(slots, executor, jobSpec), T0, 120_000).intents)
-        .toContainEqual({ kind: "reap", slotId: stuck.slotId, why: "stuck" });
-      await run(executor, [{ kind: "reap", slotId: stuck.slotId, why: "stuck" }]);
-      const expected = JSON.stringify({ nodeId: stuck.nodeId, sessionId: "sess-2" });
-      expect(world.calls).toEqual([
-        "lease dev.impl-s1", "run release", `stop dev-impl-s1@r ${expected}`, "clean dev-impl-s1@r",
-        "unclaim q-1 reap:dev-impl-s1@r", "move q-1 dev-impl-s1@r -> dev-impl@r", `remove dev.impl-s1 ${expected}`, "lease released",
-      ]);
-      expect(history).toEqual([{ failed: false, reason: "seat_pool_reaped", notes: { slot: "dev.impl-s1", why: "stuck", rows: [{ qitemId: "q-1", to: "dev-impl@r" }] } }]);
-    });
-
-    it("quarantines a live seat its release command refuses, or with no release command: no stop, no removal, one row to the owner", async () => {
-      jobSpec = spec({ stuck_after_s: 3600, release_cmd: { argv: ["release"] } });
-      const executor = makeExecutor();
-      const limited = await seat(executor, { idle: false, cause: "usage_limit", stateSince: STUCK_SINCE, openRows: 1 });
-      row("q-1", "dev-impl-s1@r", "in-progress");
-      world.exit["release"] = 1;
-      await run(executor, [{ kind: "reap", slotId: limited.slotId, why: "usage_limit" }]);
-      expect(world.calls).toEqual(["lease dev.impl-s1", "run release", "escalate quarantine dev-impl-s1@r q-1", "lease released"]);
-      expect(history).toEqual([{ failed: false, reason: "seat_pool_quarantined", notes: {
-        slot: "dev.impl-s1", why: "usage_limit", release: { exitCode: 1, error: null }, to: "lead@r", qitemId: "esc-dev-impl-s1@r",
-      } }]);
-      // While that row is open, the pool leaves the seat as it is.
-      expect(planSeatPool(jobSpec, world.state(slots, executor, jobSpec), T0, 120_000).intents.filter((i) => i.kind === "reap")).toEqual([]);
-
-      jobSpec = spec({ stuck_after_s: 3600 });
-      world.escalationOwner = null;
-      // A pool out of usage adds no seat: the limit lifts before the second one, which waits for input.
-      world.nodes.get(limited.nodeId!)!.cause = "working";
-      const stuck = await seat(executor, { idle: false, cause: "needs_input", stateSince: STUCK_SINCE });
-      await run(executor, [{ kind: "reap", slotId: stuck.slotId, why: "stuck" }]);
-      expect(world.calls).toEqual(["lease dev.impl-s2", "escalate quarantine dev-impl-s2@r ", "lease released"]);
-      expect(history).toEqual([{ failed: true, reason: "seat_pool_quarantined", notes: {
-        slot: "dev.impl-s2", why: "stuck", release: null, code: "no_escalation_owner", error: "no escalation destination declared",
-      } }]);
-      expect(live()).toEqual(["dev.impl-s1", "dev.impl-s2"]);
-      expect(world.rows.get("q-1")).toMatchObject({ destination: "dev-impl-s1@r", state: "in-progress" });
-    });
-
-    it("leaves a quarantined seat alone when its session ends or it becomes free, and reaps it once that row closes", async () => {
-      jobSpec = spec({ stuck_after_s: 3600 });
-      const executor = makeExecutor();
-      const stuck = await seat(executor, { idle: false, cause: "needs_input", stateSince: STUCK_SINCE, openRows: 1 });
-      row("q-1", "dev-impl-s1@r", "in-progress");
-      await run(executor, [{ kind: "reap", slotId: stuck.slotId, why: "stuck" }]);
-      expect(reasons()).toEqual(["seat_pool_quarantined"]);
-      const node = world.nodes.get(stuck.nodeId!)!;
-      const intents = () => planSeatPool(jobSpec, world.state(slots, executor, jobSpec), T0, 120_000).intents;
-      world.calls = [];
-
-      // Its session ends: a plan from before the quarantine reaps nothing.
-      Object.assign(node, { session: "stopped", cause: undefined });
-      expect(intents()).toEqual([]);
-      await run(executor, [{ kind: "reap", slotId: stuck.slotId, why: "no_session" }]);
-      // It comes back free: it takes no row and is not drained.
-      Object.assign(node, { session: "running", idle: true, openRows: 0 });
-      world.rows.get("q-1")!.destination = MODEL.sessionName;
-      await run(executor, [{ kind: "drain", slotId: stuck.slotId }, { kind: "dispatch", qitemId: "q-1", from: MODEL.sessionName, slotId: stuck.slotId }]);
-      expect(world.calls).toEqual(["lease dev.impl-s1", "lease released"]);
-      expect(world.rows.get("q-1")!.destination).toBe(MODEL.sessionName);
-      expect(slots.get(stuck.slotId)).toMatchObject({ phase: "live", intent: null });
-
-      world.escalations = [];
-      Object.assign(node, { session: "stopped", idle: false });
-      expect(intents()).toContainEqual({ kind: "reap", slotId: stuck.slotId, why: "no_session" });
-    });
-
-    it("keeps a live seat that recovers while its release command runs", async () => {
-      jobSpec = spec({ stuck_after_s: 3600, release_cmd: { argv: ["release"] } });
-      const executor = makeExecutor();
-      const stuck = await seat(executor, { idle: false, cause: "working", stateSince: STUCK_SINCE });
-      world.commandGate = async () => { Object.assign(world.nodes.get(stuck.nodeId!)!, { cause: "working", stateSince: new Date(T0).toISOString() }); };
-      await run(executor, [{ kind: "reap", slotId: stuck.slotId, why: "stuck" }]);
-      expect(world.calls).toEqual(["lease dev.impl-s1", "run release", "lease released"]);
-      expect(slots.get(stuck.slotId)).toMatchObject({ phase: "live", intent: null });
-      expect(history).toEqual([]);
     });
   });
 
@@ -1051,14 +963,13 @@ describe("readSeatPoolState", () => {
       heldMessages: (nodeId) => (nodeId === pooled.id ? 2 : 0),
       seatStopped: () => false,
       seatState: () => ({ activity: "idle-at-prompt", needsInput: { count: 0 }, backgroundWork: null, changedAt }) as never,
-      quarantined: () => false,
       restoring: () => false,
       demand: () => null,
     }, { jobId: JOB, targetSession: "dev-impl@r", spec: spec({ adopt: ["dev.impl2", "dev.impl", "dev.missing"] }) });
     expect(state.model).toEqual({ rigId: rig.id, rigName: "r", podNamespace: "dev", memberId: "impl", logicalId: "dev.impl", nodeId: model.id, sessionName: "dev-impl@r" });
     expect(state.slots).toEqual([{
       slotId: 1, logicalId: "dev.impl-s1", sessionName: "dev-impl-s1@r", nodeId: pooled.id, phase: "live", adopted: false, nodeExists: true,
-      openRows: 0, heldMessages: 2, idleSince: changedAt, stateSince: changedAt, cause: "idle", quarantined: false,
+      openRows: 0, heldMessages: 2, idleSince: changedAt, cause: "idle",
     }]);
     expect(state.adoptable).toEqual([{ logicalId: "dev.impl2", nodeId: fixed.id }]);
     expect(state.modelCause).toBe("idle");
@@ -1092,7 +1003,7 @@ describe("readSeatPoolState", () => {
     const state = readSeatPoolState({
       db, slots,
       openRows: () => [], sessionAddresses: (session) => [session], heldMessages: () => 0, seatStopped: () => false,
-      seatState: () => null, quarantined: () => false, restoring: () => false, demand: () => null,
+      seatState: () => null, restoring: () => false, demand: () => null,
     }, { jobId: JOB, targetSession: "dev-impl@r", spec: spec({ adopt: ["dev.impl-s1", "dev.impl-s2"] }) });
     expect(state.adoptable).toEqual([{ logicalId: "dev.impl-s1", nodeId: left.id }]);
 
@@ -1151,7 +1062,6 @@ describe("readSeatPoolState", () => {
       }) as never,
       // The model and s2 are both stopped and out of usage.
       usageLimited: (session) => session === "dev-impl@r" || session === "dev-impl-s2@r",
-      quarantined: (session) => session === "dev-impl-s1@r",
       restoring: () => false,
       demand: () => null,
     }, { jobId: JOB, targetSession: "dev-impl@r", spec: spec() });
@@ -1165,17 +1075,14 @@ describe("readSeatPoolState", () => {
       { qitemId: "q-removed", destination: "dev-impl-s3@r", waitingSince: "2026-11-09T11:40:00.000Z", nudged: false },
       { qitemId: "q-moved", destination: "dev-impl@r", waitingSince: "2026-11-09T11:50:00.000Z", nudged: false },
     ]);
-    // The model, which the pool can only launch, waits out the limit; a seat whose session is gone is reaped, with or
-    // without stuck_after_s.
+    // The model, which the pool can only launch, waits out the limit; a seat whose session is gone is reaped.
     expect(state.modelCause).toBe("usage_limit");
-    expect(state.slots.map((slot) => [slot.sessionName, slot.cause, slot.stateSince, slot.quarantined])).toEqual([
-      ["dev-impl-s1@r", "needs_input", "2026-11-09T11:00:00.000Z", true],
-      ["dev-impl-s2@r", "stopped", "2026-11-09T11:00:00.000Z", false],
+    expect(state.slots.map((slot) => [slot.sessionName, slot.cause])).toEqual([
+      ["dev-impl-s1@r", "needs_input"],
+      ["dev-impl-s2@r", "stopped"],
     ]);
-    for (const stuck of [{}, { stuck_after_s: 60 }]) {
-      expect(planSeatPool(spec(stuck), state, Date.parse("2026-11-09T12:00:00.000Z"), 120_000).intents.filter((i) => i.kind === "reap"))
-        .toEqual([{ kind: "reap", slotId: 2, why: "no_session" }]);
-    }
+    expect(planSeatPool(spec(), state, Date.parse("2026-11-09T12:00:00.000Z"), 120_000).intents.filter((i) => i.kind === "reap"))
+      .toEqual([{ kind: "reap", slotId: 2 }]);
   });
 
   it("builds a seat's member from the model's launch shape, with its own id and working directory", () => {
@@ -1287,21 +1194,5 @@ describe("seatPoolQueueEffects", () => {
     owner = { owner: null, reason: "no escalation destination declared" };
     expect(await effects.escalate({ jobId: "pool-1", seat: "dev-impl-s2@r", model: "dev-impl@r", qitemIds: ["q-3"] }))
       .toEqual({ ok: false, code: "no_escalation_owner", error: "no escalation destination declared" });
-  });
-
-  it("opens one quarantine row per seat while it is open, apart from its needs-input row", async () => {
-    const needsInput = await effects.escalate({ jobId: "pool-1", seat: "dev-impl-s1@r", model: "dev-impl@r", qitemIds: ["q-1"] });
-    const quarantine = { why: "stuck" as const, release: { exitCode: 2, error: null } };
-    const first = await effects.escalate({ jobId: "pool-1", seat: "dev-impl-s1@r", model: "dev-impl@r", qitemIds: ["q-1"], quarantine });
-    expect(first).toMatchObject({ ok: true, destination: "lead@r", existing: false });
-    expect(first.qitemId).not.toBe(needsInput.qitemId);
-    const row = repo.getById(first.qitemId!)!;
-    expect(row).toMatchObject({ destinationSession: "lead@r", tags: [`${SEAT_POOL_QUARANTINE_TAG}:dev-impl-s1@r`] });
-    expect(row.body).toContain("its release command exited 2");
-    expect(row.body).toContain("q-1");
-    expect(await effects.escalate({ jobId: "pool-1", seat: "dev-impl-s1@r", model: "dev-impl@r", qitemIds: [], quarantine }))
-      .toMatchObject({ qitemId: first.qitemId, existing: true });
-    const unreleased = await effects.escalate({ jobId: "pool-1", seat: "dev-impl-s2@r", model: "dev-impl@r", qitemIds: [], quarantine: { why: "usage_limit", release: null } });
-    expect(repo.getById(unreleased.qitemId!)!.body).toContain("the pool has no release command to confirm its work is saved");
   });
 });

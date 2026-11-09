@@ -163,7 +163,7 @@ import { makeIdleGateQitemPolicy } from "./domain/policies/idle-gate-qitem.js";
 import { makeParkedOwnerConsumerPolicy, makeRigAnchor, PARKED_OWNER_POLICY_NAME } from "./domain/policies/parked-owner-consumer.js";
 import { makeSeatPoolPolicy, parseSeatPoolSpec, seatPoolOutOfUsage, type SeatPoolSpec } from "./domain/policies/seat-pool.js";
 import {
-  readSeatPoolState, runSeatPoolCommand, SEAT_POOL_QUARANTINE_TAG, SeatPoolExecutor, SeatPoolSlots, seatPoolQueueEffects, slotMemberFragment,
+  readSeatPoolState, runSeatPoolCommand, SeatPoolExecutor, SeatPoolSlots, seatPoolQueueEffects, slotMemberFragment,
 } from "./domain/seat-pool-executor.js";
 import { LaunchBudget, launchBudgetLimits } from "./domain/launch-budget.js";
 import { launchStatusIsRunning } from "./domain/restore-orchestrator.js";
@@ -2393,7 +2393,6 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
       seatStopped: (nodeId) => !["running", "idle", "unknown"].includes(latestSession(nodeId)?.status ?? "") || nodeExecutorConfirmedStopped(db, nodeId),
       seatState: (nodeId) => nodeExecutorConfirmedStopped(db, nodeId) ? null : seatActivityService.getSeatState(nodeId),
       usageLimited: usageLimited ? (sessionName) => usageLimited.has(sessionName) : undefined,
-      quarantined: (sessionName) => queueRepoInstance.list({ tag: `${SEAT_POOL_QUARANTINE_TAG}:${sessionName}`, activeOnly: true, limit: 1 }).length > 0,
       restoring: (rigId) => restoreOrchestrator.restoreInProgress(rigId),
       demand: (jobId) => seatPoolExecutor.demandSample(jobId),
     }, job);

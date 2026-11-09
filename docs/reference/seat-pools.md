@@ -26,7 +26,6 @@ context:
   cooldown_s: 60            # wait after an add or removal before the next one (default 60)
   idle_grace_s: 300         # how long a seat must sit idle before it is drained (default 300)
   dispatch_after_s: 60      # how long a row waits at its seat before the pool moves it or wakes the seat (default 60)
-  stuck_after_s: 14400      # how long a live seat may go without an activity change before it is reaped (default: never)
   drain: false              # true empties the pool (see below)
   adopt: [dev.impl2]        # existing seats the pool takes over
   cwd_template: /work/{rig}/{slot}   # required: absolute, with {slot}; {rig} is optional
@@ -37,9 +36,8 @@ context:
 ```
 
 Registration and `rig watchdog update --spec` refuse a spec with an unknown field, `max` below `min`, a relative
-`cwd_template` or one without `{slot}`, a `stuck_after_s` that isn't a positive whole number, or a command that isn't an
-argv. Commands run without a shell, with the
-daemon's environment plus:
+`cwd_template` or one without `{slot}`, or a command that isn't an argv. Commands run without a shell, with the daemon's
+environment plus:
 
 | Variable | Set for | Value |
 | --- | --- | --- |
@@ -141,23 +139,11 @@ reaping, moving rows and nudging take no room.
 
 ## Reaping a seat
 
-A seat of the pool that stops working is reaped: its rows go back to the model and its node is removed, so the pool can
-add a fresh seat in its place. The pool reaps a live seat (one it launched or adopted)
-
-- whose session is gone (it exited, crashed or was stopped), even while its account is out of usage, or
-- with `stuck_after_s` set, whose activity hasn't changed for that long while it is out of provider usage, waiting for
-  input or working. Set it above the longest turn a seat may take: a seat that works without an activity change counts.
-
-Everything happens under the seat's lifecycle lease, after the pool reads the seat again; a seat that recovered since
-the plan is left alone. A live seat goes first through the release command, as a drained seat does, and is stopped with
-a [checked stop](checked-seat-stop.md) only if `release_cmd` exits 0 and the seat is still stuck afterwards. Without a
-`release_cmd`, or when it refuses, the seat is **quarantined**: it is neither stopped nor removed, and one row tagged
-`seat-pool-quarantine:<seat>` goes to the model's escalation owner with the seat's open rows. While that row is open the
-pool leaves the seat as it is, even if its session ends or it becomes free: it neither reaps nor drains it, and gives it
-no row. Once the row is closed and the seat is still stuck, or its session is gone, the pool tries again.
-
-A seat whose session is gone, or that was just stopped, is then reaped in this order, and a failed step stops the reap
-there for the next plan to pick up:
+A seat of the pool whose session is gone (it exited, crashed or was stopped) is reaped: its rows go back to the model
+and its node is removed, so the pool can add a fresh seat in its place. This goes on even while its account is out of
+usage. Everything happens under the seat's lifecycle lease, after the pool reads the seat again; a seat that came back
+since the plan is left alone. The reap runs in this order, and a failed step stops it there for the next plan to pick
+up:
 
 1. `rig seat clean`, which checks in tmux that the session is really gone; a live session stops the reap before anything
    is moved.
@@ -172,8 +158,8 @@ Each move gives the reason `reap:<seat>`. A row that a reap already moved once (
 that reason) goes to the model's escalation owner instead of the model, so a row whose seats keep dying stops cycling
 through the pool. With no escalation owner it goes to the model, and `seat_pool_escalation_failed` is recorded.
 
-The history records `seat_pool_reaped` with the rows moved and where each went, `seat_pool_quarantined`, and
-`seat_pool_reap_failed` with the step that failed. Reaping goes on under `drain` and while a seat is out of usage: it
+The history records `seat_pool_reaped` with the rows moved and where each went, and `seat_pool_reap_failed` with the
+step that failed. Reaping goes on under `drain` and while a seat is out of usage: it
 adds and launches nothing.
 
 ## Stopping a pool: drain
