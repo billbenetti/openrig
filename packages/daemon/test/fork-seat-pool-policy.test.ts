@@ -48,8 +48,8 @@ function slot(overrides: Partial<SeatPoolSlotView> = {}): SeatPoolSlotView {
 
 let nextRow = 1;
 /** Pending rows to `destination` (the model by default), created `ageSeconds` ago: past the default dispatch_after_s. */
-function rows(count: number, destination = "dev-impl@r", ageSeconds = 120): SeatPoolPendingRow[] {
-  return Array.from({ length: count }, () => ({ qitemId: `q-${nextRow++}`, destination, waitingSince: ago(ageSeconds) }));
+function rows(count: number, destination = "dev-impl@r", ageSeconds = 120, tags: string[] = []): SeatPoolPendingRow[] {
+  return Array.from({ length: count }, () => ({ qitemId: `q-${nextRow++}`, destination, waitingSince: ago(ageSeconds), tags }));
 }
 
 function state(overrides: Partial<SeatPoolState> = {}): SeatPoolState {
@@ -65,7 +65,7 @@ describe("seat-pool spec", () => {
   it("fills the defaults and keeps commands as argv", () => {
     const parsed = parseSeatPoolSpec({ max: 2, cwd_template: "/w/{slot}", release_cmd: { argv: ["/bin/release", "--now"], timeout_s: 9 } });
     expect(parsed).toEqual({ spec: {
-      min: 0, max: 2, cooldownSeconds: 60, idleGraceSeconds: 300, dispatchAfterSeconds: 60, drain: false, adopt: [], cwdTemplate: "/w/{slot}",
+      min: 0, max: 2, cooldownSeconds: 60, idleGraceSeconds: 300, dispatchAfterSeconds: 60, dispatchTag: null, drain: false, adopt: [], cwdTemplate: "/w/{slot}",
       demandCmd: null, prepareCmd: null, releaseCmd: { argv: ["/bin/release", "--now"], timeoutSeconds: 9 }, reapCmd: null,
     } });
   });
@@ -83,6 +83,7 @@ describe("seat-pool spec", () => {
     [{ max: 1, cwd_template: "/w/{slot}", restart_cmd: { argv: ["x"] } }, "restart_cmd"],
     [{ max: 1, cwd_template: "/w/{slot}", reap_cmd: "pool-reap" }, "reap_cmd"],
     [{ max: 1, cwd_template: "/w/{slot}", drain: "yes" }, "drain"],
+    [{ max: 1, cwd_template: "/w/{slot}", dispatch_tag: " " }, "dispatch_tag"],
     [{ max: 1, cwd_template: "/w/{slot}", dispatch_after_s: -5 }, "dispatch_after_s"],
     [{ max: 1, cwd_template: "/w/{slot}", adopt: "dev.impl2" }, "adopt"],
   ])("refuses %j at %s", (context, field) => {
@@ -217,6 +218,20 @@ describe("planSeatPool: dispatch and wake", () => {
     const held = rows(1, busy.sessionName);
     const result = plan(spec(), state({ pending: [...orphan, ...held], slots: [busy, free] }));
     expect(result.intents).toEqual([{ kind: "dispatch", qitemId: orphan[0]!.qitemId, from: "dev-impl-s9@r", slotId: free.slotId }]);
+  });
+
+  it("with dispatch_tag, moves and counts only the model's rows carrying it, and still a row to a seat it removed", () => {
+    const free = [slot(), slot()];
+    const tagged = rows(1, "dev-impl@r", 900, ["role:impl"]);
+    const reply = rows(1, "dev-impl@r", 900, ["review"]);
+    const orphan = rows(1, "dev-impl-s9@r");
+    const result = plan(spec({ dispatch_tag: "role:impl", max: 9 }), state({ pending: [...tagged, ...reply, ...orphan, ...rows(2)], slots: free }));
+    // The reply and the untagged rows stay with the model, which is working on them: they are not demand.
+    expect(result.intents).toEqual<SeatPoolIntent[]>([
+      { kind: "dispatch", qitemId: tagged[0]!.qitemId, from: "dev-impl@r", slotId: free[0]!.slotId },
+      { kind: "dispatch", qitemId: orphan[0]!.qitemId, from: "dev-impl-s9@r", slotId: free[1]!.slotId },
+    ]);
+    expect(result.target).toBe(2);
   });
 
   it("only gives a row to a seat that is idle at its prompt with nothing open or held", () => {
