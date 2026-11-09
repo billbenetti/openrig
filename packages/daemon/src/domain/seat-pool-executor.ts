@@ -101,10 +101,6 @@ export class SeatPoolSlots {
       .all(poolJobId) as Array<{ logical_id: string }>).map((row) => row.logical_id);
   }
 
-  hasOpen(poolJobId: string): boolean {
-    return !!this.db.prepare("SELECT 1 FROM seat_pool_slots WHERE pool_job_id = ? AND retired_at IS NULL").get(poolJobId);
-  }
-
   /** The latest add or removal in the pool; adopting a seat is neither. */
   lastScaleAt(poolJobId: string): string | null {
     const row = this.db.prepare(
@@ -307,7 +303,6 @@ export type SeatPoolEffectResult = { ok: true } | { ok: false; code: string; err
 export interface SeatPoolCommandResult {
   exitCode: number | null;
   stdout: string;
-  timedOut: boolean;
   error?: string;
 }
 
@@ -418,13 +413,12 @@ export function runSeatPoolCommand(command: SeatPoolCommand, env: Record<string,
       env: { ...process.env, ...env }, signal, timeout: command.timeoutSeconds * 1000, killSignal: "SIGKILL",
       maxBuffer: 1024 * 1024, encoding: "utf8",
     }, (error, stdout) => {
-      if (!error) return resolve({ exitCode: 0, stdout, timedOut: false });
+      if (!error) return resolve({ exitCode: 0, stdout });
       const failure = error as NodeJS.ErrnoException & { code?: number | string; killed?: boolean; signal?: string };
       const timedOut = failure.killed === true && failure.signal === "SIGKILL" && !signal.aborted;
       resolve({
         exitCode: typeof failure.code === "number" ? failure.code : null,
         stdout: stdout ?? "",
-        timedOut,
         error: timedOut ? `timed out after ${command.timeoutSeconds}s` : failure.message,
       });
     });
@@ -492,8 +486,6 @@ const NO_ROOM = Symbol("no room");
 export class SeatPoolExecutor {
   private readonly runs = new Map<string, Run>();
   private readonly samples = new Map<string, { desired: number; sampledAt: string }>();
-  /** Slots whose intent this process wrote; any other intent was left by an interrupted run. */
-  private readonly touched = new Set<number>();
   private readonly now: () => Date;
   private readonly effectTimeoutMs: number;
   private stopping = false;
@@ -556,13 +548,7 @@ export class SeatPoolExecutor {
   }
 
   private setIntent(slotId: number, intent: string | null, phase?: Exclude<SeatPoolSlotPhase, "retired">): void {
-    this.touched.add(slotId);
     this.deps.slots.update(slotId, { intent, ...(phase ? { phase } : {}) });
-  }
-
-  /** Notes naming an intent an interrupted run left on the seat, the first time this process meets it. */
-  private interrupted(slot: SeatPoolSlot): Record<string, unknown> {
-    return slot.intent && !this.touched.has(slot.slotId) ? { interrupted: slot.intent } : {};
   }
 
   private async within<T>(run: Run, start: () => Promise<T>): Promise<T | typeof TIMED_OUT> {
@@ -649,16 +635,13 @@ export class SeatPoolExecutor {
     const ctx = this.fresh(jobId, run);
     if (!ctx || ctx.spec.drain || ctx.state.slots.length >= ctx.spec.max) return null;
     const logicalId = this.deps.slots.nextLogicalId(ctx.model);
-    const slot = this.deps.slots.insert({ poolJobId: jobId, logicalId, nodeId: null, phase: "adding", intent: "add", opId: randomUUID(), at: this.at() });
-    this.touched.add(slot.slotId);
-    return slot;
+    return this.deps.slots.insert({ poolJobId: jobId, logicalId, nodeId: null, phase: "adding", intent: "add", opId: randomUUID(), at: this.at() });
   }
 
   /** Adds (or resolves the add of), prepares and launches a seat. False stops the run. */
   private async bringUp(jobId: string, run: Run, slotId: number): Promise<boolean> {
     let slot = this.deps.slots.get(slotId);
     if (!slot || slot.retiredAt) return true;
-    const interrupted = this.interrupted(slot);
     let ctx = this.fresh(jobId, run);
     if (!ctx) return false;
     const memberId = slot.logicalId.slice(ctx.model.podNamespace.length + 1);
@@ -668,13 +651,13 @@ export class SeatPoolExecutor {
       this.setIntent(slotId, "add");
       const added = await this.within(run, () => this.deps.effects.addSlot({ model: ctx!.model, memberId, cwd, operationId: slot!.opId! }));
       if (added === TIMED_OUT) {
-        this.record(jobId, true, "seat_pool_add_failed", { slot: slot.logicalId, code: "effect_timeout", ...interrupted });
+        this.record(jobId, true, "seat_pool_add_failed", { slot: slot.logicalId, code: "effect_timeout" });
         return false;
       }
       if (!added.ok || !added.nodeId) {
         // The name is spent; the next add would most likely fail the same way, so the run stops here.
         this.deps.slots.retire(slotId, this.at());
-        this.record(jobId, true, "seat_pool_add_failed", { slot: slot.logicalId, ...(added.ok ? { code: "no_node" } : { code: added.code, error: added.error }), ...interrupted });
+        this.record(jobId, true, "seat_pool_add_failed", { slot: slot.logicalId, ...(added.ok ? { code: "no_node" } : { code: added.code, error: added.error }) });
         return false;
       }
       this.deps.slots.update(slotId, { nodeId: added.nodeId, phase: "added", intent: null });
@@ -691,40 +674,40 @@ export class SeatPoolExecutor {
     // A launch that ran but whose result was lost: the session is the evidence.
     if (!this.deps.effects.sessionRunning(nodeId)) {
       if (ctx.spec.prepareCmd) {
-        if (await this.outOfUsage(ctx)) return this.holdStart(jobId, slotId, slot.logicalId, interrupted);
+        if (await this.outOfUsage(ctx)) return this.holdStart(jobId, slotId, slot.logicalId);
         this.setIntent(slotId, "prepare");
         const prepared = await this.deps.effects.runCommand(ctx.spec.prepareCmd,
           this.commandEnv(ctx, { OPENRIG_SEAT_POOL_SLOT: sessionName, OPENRIG_SEAT_POOL_SLOT_CWD: cwd }), run.controller.signal);
         if (run.controller.signal.aborted) return false;
         if (prepared.exitCode !== 0) {
-          this.record(jobId, true, "seat_pool_prepare_failed", { slot: slot.logicalId, exitCode: prepared.exitCode, error: prepared.error ?? null, ...interrupted });
+          this.record(jobId, true, "seat_pool_prepare_failed", { slot: slot.logicalId, exitCode: prepared.exitCode, error: prepared.error ?? null });
           return this.removeUnstarted(jobId, run, slotId);
         }
       }
       ctx = this.fresh(jobId, run);
       if (!ctx) return false;
       if (ctx.spec.drain) return this.removeUnstarted(jobId, run, slotId);
-      if (await this.outOfUsage(ctx)) return this.holdStart(jobId, slotId, slot.logicalId, interrupted);
+      if (await this.outOfUsage(ctx)) return this.holdStart(jobId, slotId, slot.logicalId);
       this.setIntent(slotId, "launch");
       const launched = await this.within(run, () => this.deps.effects.launchSlot({ rigId: ctx!.model.rigId, nodeId }));
       if (launched === TIMED_OUT) {
-        this.record(jobId, true, "seat_pool_launch_failed", { slot: slot.logicalId, code: "effect_timeout", ...interrupted });
+        this.record(jobId, true, "seat_pool_launch_failed", { slot: slot.logicalId, code: "effect_timeout" });
         return false;
       }
       if (!launched.ok) {
-        this.record(jobId, true, "seat_pool_launch_failed", { slot: slot.logicalId, code: launched.code, error: launched.error, ...interrupted });
+        this.record(jobId, true, "seat_pool_launch_failed", { slot: slot.logicalId, code: launched.code, error: launched.error });
         return this.removeUnstarted(jobId, run, slotId);
       }
     }
     this.setIntent(slotId, null, "live");
-    this.record(jobId, false, "seat_pool_launched", { slot: slot.logicalId, nodeId, ...interrupted });
+    this.record(jobId, false, "seat_pool_launched", { slot: slot.logicalId, nodeId });
     return true;
   }
 
   /** Leaves a seat added but not launched as it is, while a seat of the pool is out of usage: a later plan launches it. */
-  private holdStart(jobId: string, slotId: number, logicalId: string, interrupted: Record<string, unknown>): boolean {
+  private holdStart(jobId: string, slotId: number, logicalId: string): boolean {
     this.setIntent(slotId, null);
-    this.record(jobId, false, "seat_pool_held", { reason: "usage_limit", slot: logicalId, ...interrupted });
+    this.record(jobId, false, "seat_pool_held", { reason: "usage_limit", slot: logicalId });
     return true;
   }
 
@@ -736,7 +719,6 @@ export class SeatPoolExecutor {
   private async drain(jobId: string, run: Run, slotId: number): Promise<boolean> {
     const slot = this.deps.slots.get(slotId);
     if (!slot?.nodeId || slot.retiredAt) return true;
-    const interrupted = this.interrupted(slot);
     const ctx = this.fresh(jobId, run);
     if (!ctx) return false;
     const view = ctx.state.slots.find((s) => s.slotId === slotId);
@@ -787,10 +769,10 @@ export class SeatPoolExecutor {
       return { stop: false, reason: "seat_pool_removed", notes: {} };
     }));
     if (outcome === TIMED_OUT) {
-      this.record(jobId, true, "seat_pool_drain_failed", { slot: slot.logicalId, code: "effect_timeout", ...interrupted });
+      this.record(jobId, true, "seat_pool_drain_failed", { slot: slot.logicalId, code: "effect_timeout" });
       return false;
     }
-    if (outcome.reason) this.record(jobId, outcome.failed === true, outcome.reason, { slot: slot.logicalId, ...outcome.notes, ...interrupted });
+    if (outcome.reason) this.record(jobId, outcome.failed === true, outcome.reason, { slot: slot.logicalId, ...outcome.notes });
     return !outcome.stop;
   }
 
@@ -798,14 +780,13 @@ export class SeatPoolExecutor {
   private async removeUnstarted(jobId: string, run: Run, slotId: number): Promise<boolean> {
     const slot = this.deps.slots.get(slotId);
     if (!slot || slot.retiredAt) return true;
-    const interrupted = this.interrupted(slot);
     const ctx = this.fresh(jobId, run);
     if (!ctx) return false;
     const nodeId = slot.nodeId ?? (slot.opId ? this.deps.effects.operationNodeId(slot.opId) : null);
     const view = ctx.state.slots.find((s) => s.slotId === slotId);
     if (!nodeId || (slot.nodeId && view && !view.nodeExists)) {
       this.deps.slots.retire(slotId, this.at());
-      this.record(jobId, false, "seat_pool_removed", { slot: slot.logicalId, why: nodeId ? "node_gone" : "never_created", ...interrupted });
+      this.record(jobId, false, "seat_pool_removed", { slot: slot.logicalId, why: nodeId ? "node_gone" : "never_created" });
       return true;
     }
     // An admitted seat may hold work: it leaves only by draining.
@@ -814,21 +795,21 @@ export class SeatPoolExecutor {
     if (this.deps.effects.sessionRunning(nodeId)) {
       // Launched after all: it is a live seat now, and leaves only by draining.
       this.setIntent(slotId, null, "live");
-      this.record(jobId, false, "seat_pool_launched", { slot: slot.logicalId, nodeId, ...interrupted });
+      this.record(jobId, false, "seat_pool_launched", { slot: slot.logicalId, nodeId });
       return true;
     }
     this.setIntent(slotId, "remove");
     const removed = await this.within(run, () => this.deps.effects.removeSlot({ rigId: ctx.model.rigId, nodeId, expected: this.deps.effects.stopPrecondition(nodeId) }));
     if (removed === TIMED_OUT) {
-      this.record(jobId, true, "seat_pool_remove_failed", { slot: slot.logicalId, code: "effect_timeout", ...interrupted });
+      this.record(jobId, true, "seat_pool_remove_failed", { slot: slot.logicalId, code: "effect_timeout" });
       return false;
     }
     if (!removed.ok && removed.code !== "node_not_found") {
-      this.record(jobId, true, "seat_pool_remove_failed", { slot: slot.logicalId, code: removed.code, error: removed.error, ...interrupted });
+      this.record(jobId, true, "seat_pool_remove_failed", { slot: slot.logicalId, code: removed.code, error: removed.error });
       return true;
     }
     this.deps.slots.retire(slotId, this.at());
-    this.record(jobId, false, "seat_pool_removed", { slot: slot.logicalId, ...interrupted });
+    this.record(jobId, false, "seat_pool_removed", { slot: slot.logicalId });
     return true;
   }
 
@@ -846,7 +827,6 @@ export class SeatPoolExecutor {
   private async reap(jobId: string, run: Run, slotId: number): Promise<boolean> {
     const slot = this.deps.slots.get(slotId);
     if (!slot?.nodeId || slot.retiredAt || slot.phase !== "live") return true;
-    const interrupted = this.interrupted(slot);
     const ctx = this.fresh(jobId, run);
     if (!ctx) return false;
     const nodeId = slot.nodeId;
@@ -895,10 +875,10 @@ export class SeatPoolExecutor {
       return { stop: false, reason: "seat_pool_reaped", notes: { rows } };
     }));
     if (outcome === TIMED_OUT) {
-      this.record(jobId, true, "seat_pool_reap_failed", { slot: slot.logicalId, code: "effect_timeout", ...interrupted });
+      this.record(jobId, true, "seat_pool_reap_failed", { slot: slot.logicalId, code: "effect_timeout" });
       return false;
     }
-    if (outcome.reason) this.record(jobId, outcome.failed === true, outcome.reason, { slot: slot.logicalId, ...outcome.notes, ...interrupted });
+    if (outcome.reason) this.record(jobId, outcome.failed === true, outcome.reason, { slot: slot.logicalId, ...outcome.notes });
     return !outcome.stop;
   }
 
