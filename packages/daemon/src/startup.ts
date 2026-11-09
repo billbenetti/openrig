@@ -146,7 +146,9 @@ import { WatchdogAutoRegistration } from "./domain/watchdog-auto-registration.js
 import { WatchdogHistoryLog } from "./domain/watchdog-history-log.js";
 import {
   formatWatchdogDeliveryMessage,
+  parseWatchdogSpec,
   WatchdogPolicyEngine,
+  watchdogJobTarget,
 } from "./domain/watchdog-policy-engine.js";
 import { WatchdogScheduler } from "./domain/watchdog-scheduler.js";
 import {
@@ -160,6 +162,12 @@ import { resolveWorkflowHumanDestination } from "./domain/workflow-human-destina
 import { makeWorkflowKeepalivePolicy } from "./domain/policies/workflow-keepalive.js";
 import { makeIdleGateQitemPolicy } from "./domain/policies/idle-gate-qitem.js";
 import { makeParkedOwnerConsumerPolicy, makeRigAnchor, PARKED_OWNER_POLICY_NAME } from "./domain/policies/parked-owner-consumer.js";
+import { makeSeatPoolPolicy, parseSeatPoolSpec, type SeatPoolSpec } from "./domain/policies/seat-pool.js";
+import { readSeatPoolState, runSeatPoolCommand, SeatPoolExecutor, SeatPoolSlots, slotMemberFragment } from "./domain/seat-pool-executor.js";
+import { SeatLifecycleService } from "./domain/seat-lifecycle-service.js";
+import { reserveOperation } from "./domain/operation-correlation.js";
+import { readClaudePermissionRules } from "./domain/claude-permission-rules.js";
+import { readCodexMemberPermissions } from "./domain/codex-member-permissions.js";
 import { diagnoseRigParked } from "./domain/parked-query.js";
 import { SpecReviewService } from "./domain/spec-review-service.js";
 import { SpecLibraryService } from "./domain/spec-library-service.js";
@@ -2362,6 +2370,90 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
       const since = deps.compactionEnforcer?.postCompactStageOwedSince(physicalSessionName(db, session));
       return since == null ? null : new Date(since).toISOString();
     });
+    // Seat pools: the seat-pool policy plans, and this executor adds, launches, drains and removes the seats outside
+    // the scheduler tick, through the same services the member, launch, stop and node routes use.
+    const seatPoolSlots = new SeatPoolSlots(db);
+    const seatPoolStops = new SeatLifecycleService({ db, rigRepo, sessionRegistry, eventBus, tmuxAdapter, nodeLauncher });
+    const latestSession = (nodeId: string) =>
+      db.prepare("SELECT id, status FROM sessions WHERE node_id = ? ORDER BY id DESC LIMIT 1").get(nodeId) as { id: string; status: string } | undefined;
+    const readPoolState = (job: { jobId: string; targetSession: string; spec: SeatPoolSpec }) => readSeatPoolState({
+      db,
+      slots: seatPoolSlots,
+      openRows: (sessionName) => queueRepoInstance.listOpenObligations(sessionName, 500),
+      heldMessages: (nodeId) => outboxHandlerInstance.heldCount(nodeId),
+      seatState: (nodeId) => nodeExecutorConfirmedStopped(db, nodeId) ? null : seatActivityService.getSeatState(nodeId),
+      restoring: (rigId) => restoreOrchestrator.restoreInProgress(rigId),
+      demand: (jobId) => seatPoolExecutor.demandSample(jobId),
+    }, job);
+    const seatPoolExecutor: SeatPoolExecutor = new SeatPoolExecutor({
+      slots: seatPoolSlots,
+      readJob: (jobId) => {
+        const job = watchdogJobsRepoInstance.getById(jobId);
+        if (!job) return null;
+        try {
+          const parsed = parseWatchdogSpec(job.specYaml);
+          const pool = parseSeatPoolSpec(parsed.context);
+          return { active: job.state === "active", targetSession: watchdogJobTarget(job, parsed.target).session, spec: "spec" in pool ? pool.spec : null };
+        } catch {
+          return { active: job.state === "active", targetSession: job.targetSession, spec: null };
+        }
+      },
+      readState: readPoolState,
+      record: (jobId, entry) => {
+        watchdogHistoryLogInstance.record({
+          jobId, evaluatedAt: new Date().toISOString(), outcome: entry.failed ? "failed" : "skipped",
+          skipReason: entry.reason, evaluationNotes: entry.notes,
+        });
+      },
+      effects: {
+        addSlot: async ({ model, memberId, cwd, operationId }) => {
+          const logicalId = `${model.podNamespace}.${memberId}`;
+          const operation = reserveOperation(db, operationId, "member.add", [model.rigId, model.podNamespace], logicalId);
+          if (operation.state === "replay") {
+            const created = operation.operation.current.nodes.find((node) => node.exists);
+            return created ? { ok: true, nodeId: created.id } : { ok: false, code: "add_not_completed", error: `the earlier add of ${logicalId} created no node` };
+          }
+          if (operation.state !== "fresh") return { ok: false, code: "operation_id_conflict", error: `operation ${operationId} was used for another request` };
+          const source = rigRepo.getRig(model.rigId)?.nodes.find((node) => node.id === model.nodeId);
+          if (!source) return { ok: false, code: "model_not_found", error: `model seat ${model.logicalId} no longer exists` };
+          const member = slotMemberFragment(source, memberId, cwd, {
+            claude: source.runtime === "claude-code" ? readClaudePermissionRules(db, source.id) : undefined,
+            codex: source.runtime === "codex" ? readCodexMemberPermissions(db, source.id) : undefined,
+          });
+          const rigRoot = rigRepo.getNodeLaunchRecipe(source.id)?.rigRoot ?? ".";
+          const outcome = await podInstantiator.addMemberToPod(model.rigId, model.podNamespace, member, rigRoot,
+            { recordCreated: operation.recordCreated, launch: false });
+          if (!outcome.ok) return { ok: false, code: outcome.code, error: "message" in outcome ? outcome.message : outcome.errors.join("; ") };
+          return { ok: true, nodeId: outcome.result.node.nodeId };
+        },
+        operationNodeId: (operationId) => {
+          const row = db.prepare("SELECT node_ids_json FROM operation_correlations WHERE operation_id = ?").get(operationId) as { node_ids_json: string } | undefined;
+          return row ? (JSON.parse(row.node_ids_json) as string[])[0] ?? null : null;
+        },
+        launchSlot: async ({ rigId, nodeId }) => {
+          const started = await podInstantiator.launchFirstMaterializedNode(rigId, nodeId);
+          if (!started) return { ok: false, code: "not_first_start", error: "the seat already had a session, or its member declaration is gone" };
+          if (!started.ok) return { ok: false, code: started.code ?? "launch_failed", error: started.error ?? "launch failed" };
+          // As the launch route does after a first start, so a later restore knows the seat.
+          snapshotCapture.captureSnapshot(rigId, "auto-rehydrate");
+          return { ok: true };
+        },
+        sessionRunning: (nodeId) => latestSession(nodeId)?.status === "running",
+        lifecycle: (nodeId, fn) => tmuxAdapter.deliveryGuard ? tmuxAdapter.deliveryGuard.lifecycle([nodeId], fn) : fn(),
+        stopPrecondition: (nodeId) => ({ nodeId, sessionId: latestSession(nodeId)?.id ?? null }),
+        stopSlot: async ({ sessionName, expected }) => {
+          const stopped = await seatPoolStops.stopSeat({ seatRef: sessionName, reason: "seat-pool drain", operator: null, expected });
+          return stopped.ok ? { ok: true } : { ok: false, code: stopped.code, error: stopped.message };
+        },
+        removeSlot: async ({ rigId, nodeId, expected }) => {
+          const removed = await rigLifecycleService.removeNode(rigId, nodeId, { expected });
+          return removed.ok ? { ok: true } : { ok: false, code: removed.code, error: removed.error };
+        },
+        runCommand: runSeatPoolCommand,
+      },
+    });
+    deps.seatPoolExecutor = seatPoolExecutor;
+
     const watchdogPolicyEngine = new WatchdogPolicyEngine({
       jobsRepo: watchdogJobsRepoInstance,
       historyLog: watchdogHistoryLogInstance,
@@ -2408,6 +2500,7 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
           reconcileStuckExceptions: (id) => workflowRuntime?.reconcileStuckExceptions(id) ?? 0,
         }),
         makeIdleGateQitemPolicy({ db, seatActivity: seatActivityService }),
+        makeSeatPoolPolicy({ readState: readPoolState, submit: (jobId, intents) => seatPoolExecutor.submit(jobId, intents) }),
         // OPR.0.5.6.24 F-14: the parked-owner consumer — the WHOLE shipped
         // parked diagnosis (diagnoseRigParked over the arbitrated oracle +
         // destination-scoped obligations + wake status; the same derivation

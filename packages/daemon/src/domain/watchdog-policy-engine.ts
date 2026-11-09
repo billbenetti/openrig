@@ -242,6 +242,10 @@ const QUIET_SKIP_REASONS = new Set<string>([
   // scan writes no history (the loud, audited signals are the SENT wake,
   // episode-ended, and all-parked-owners-deferred).
   "no-parked-owner",
+  // A seat pool with nothing to change, or whose previous plan is still being applied: the executor records every
+  // effect it applies, and a plan with work is loud (seat_pool_planned).
+  "seat_pool_steady",
+  "seat_pool_busy",
   // OPR.0.4.3.16 rev1-r1 fixback (advisor ruling 2026-07-03): seat_needs_input
   // and activity_stale_unknown are the COMMON recurring states for this
   // policy's own target scenario — a gate qitem pending on a seat that has
