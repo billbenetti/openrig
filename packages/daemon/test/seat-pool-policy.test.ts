@@ -21,6 +21,7 @@ import {
   planSeatPool,
   SEAT_POOL_POLICY_NAME,
   type SeatPoolIntent,
+  type SeatPoolPendingRow,
   type SeatPoolSlotView,
   type SeatPoolSpec,
   type SeatPoolState,
@@ -40,15 +41,21 @@ let nextSlot = 1;
 function slot(overrides: Partial<SeatPoolSlotView> = {}): SeatPoolSlotView {
   const slotId = overrides.slotId ?? nextSlot++;
   return {
-    slotId, logicalId: `dev.impl-s${slotId}`, nodeId: `node-${slotId}`, phase: "live", adopted: false, nodeExists: true,
-    openRows: 0, heldMessages: 0, idleSince: ago(600), ...overrides,
+    slotId, logicalId: `dev.impl-s${slotId}`, sessionName: `dev-impl-s${slotId}@r`, nodeId: `node-${slotId}`, phase: "live", adopted: false,
+    nodeExists: true, openRows: 0, heldMessages: 0, idleSince: ago(600), cause: "idle", ...overrides,
   };
+}
+
+let nextRow = 1;
+/** Pending rows to `destination` (the model by default), created `ageSeconds` ago: past the default dispatch_after_s. */
+function rows(count: number, destination = "dev-impl@r", ageSeconds = 120, nudged = false): SeatPoolPendingRow[] {
+  return Array.from({ length: count }, () => ({ qitemId: `q-${nextRow++}`, destination, waitingSince: ago(ageSeconds), nudged }));
 }
 
 function state(overrides: Partial<SeatPoolState> = {}): SeatPoolState {
   return {
     model: { rigId: "rig-1", rigName: "r", podNamespace: "dev", memberId: "impl", logicalId: "dev.impl", nodeId: "model", sessionName: "dev-impl@r" },
-    restoring: false, slots: [], adoptable: [], pendingForModel: 0, demand: null, lastScaleAt: null, ...overrides,
+    modelCause: "working", restoring: false, slots: [], adoptable: [], pending: [], demand: null, lastScaleAt: null, ...overrides,
   };
 }
 
@@ -58,7 +65,7 @@ describe("seat-pool spec", () => {
   it("fills the defaults and keeps commands as argv", () => {
     const parsed = parseSeatPoolSpec({ max: 2, cwd_template: "/w/{slot}", release_cmd: { argv: ["/bin/release", "--now"], timeout_s: 9 } });
     expect(parsed).toEqual({ spec: {
-      min: 0, max: 2, cooldownSeconds: 60, idleGraceSeconds: 300, drain: false, adopt: [], cwdTemplate: "/w/{slot}",
+      min: 0, max: 2, cooldownSeconds: 60, idleGraceSeconds: 300, dispatchAfterSeconds: 60, drain: false, adopt: [], cwdTemplate: "/w/{slot}",
       demandCmd: null, prepareCmd: null, releaseCmd: { argv: ["/bin/release", "--now"], timeoutSeconds: 9 },
     } });
   });
@@ -75,6 +82,7 @@ describe("seat-pool spec", () => {
     [{ max: 1, cwd_template: "/w/{slot}", release_cmd: { argv: ["x"], timeout_s: 0 } }, "release_cmd.timeout_s"],
     [{ max: 1, cwd_template: "/w/{slot}", reap_cmd: { argv: ["x"] } }, "reap_cmd"],
     [{ max: 1, cwd_template: "/w/{slot}", drain: "yes" }, "drain"],
+    [{ max: 1, cwd_template: "/w/{slot}", dispatch_after_s: -5 }, "dispatch_after_s"],
     [{ max: 1, cwd_template: "/w/{slot}", adopt: "dev.impl2" }, "adopt"],
   ])("refuses %j at %s", (context, field) => {
     const parsed = parseSeatPoolSpec(context);
@@ -83,23 +91,26 @@ describe("seat-pool spec", () => {
 });
 
 describe("planSeatPool", () => {
-  beforeEach(() => { nextSlot = 1; });
+  beforeEach(() => { nextSlot = 1; nextRow = 1; });
 
   it("holds while the model is missing or the rig is being restored", () => {
-    expect(plan(spec(), state({ model: null, pendingForModel: 5 }))).toMatchObject({ intents: [], reason: "model_not_found" });
-    const restoring = plan(spec(), state({ restoring: true, pendingForModel: 5, slots: [slot({ phase: "added" })] }));
+    expect(plan(spec(), state({ model: null, pending: rows(5) }))).toMatchObject({ intents: [], reason: "model_not_found" });
+    const restoring = plan(spec(), state({ restoring: true, pending: rows(5), modelCause: "stopped", slots: [slot({ phase: "added" }), slot()] }));
     expect(restoring).toMatchObject({ intents: [], reason: "restore_in_progress" });
   });
 
-  it("adds one seat per pending row to the model, up to max", () => {
-    expect(plan(spec(), state({ pendingForModel: 2 })).intents).toEqual([{ kind: "add", count: 2 }]);
-    expect(plan(spec(), state({ pendingForModel: 9 })).intents).toEqual([{ kind: "add", count: 3 }]);
+  it("adds one seat per row waiting past dispatch_after_s for the model, up to max", () => {
+    expect(plan(spec(), state({ pending: rows(2) })).intents).toEqual([{ kind: "add", count: 2 }]);
+    expect(plan(spec(), state({ pending: rows(9) })).intents).toEqual([{ kind: "add", count: 3 }]);
     expect(plan(spec({ min: 1 }), state()).intents).toEqual([{ kind: "add", count: 1 }]);
+    // A row younger than dispatch_after_s is still the model's to take: it is not demand.
+    expect(plan(spec(), state({ pending: rows(2, "dev-impl@r", 30) })).intents).toEqual([]);
+    expect(plan(spec({ dispatch_after_s: 10 }), state({ pending: rows(2, "dev-impl@r", 30) })).intents).toEqual([{ kind: "add", count: 2 }]);
   });
 
   it("uses the demand command's answer, and holds when that answer is stale", () => {
     const withCmd = spec({ demand_cmd: { argv: ["/bin/demand"] } });
-    expect(plan(withCmd, state({ demand: { desired: 2, sampledAt: ago(30) }, pendingForModel: 0 })).intents).toEqual([{ kind: "add", count: 2 }]);
+    expect(plan(withCmd, state({ demand: { desired: 2, sampledAt: ago(30) } })).intents).toEqual([{ kind: "add", count: 2 }]);
     const starting = slot({ phase: "added", idleSince: null });
     const free = slot();
     const stale = plan(withCmd, state({ demand: { desired: 0, sampledAt: ago(600) }, slots: [starting, free] }));
@@ -141,7 +152,7 @@ describe("planSeatPool", () => {
   it("waits for the cooldown before adding or starting a drain, but finishes what it started", () => {
     const starting = slot({ phase: "added", idleSince: null });
     const draining = slot({ phase: "draining" });
-    const cooling = plan(spec(), state({ pendingForModel: 3, lastScaleAt: ago(10), slots: [starting, draining] }));
+    const cooling = plan(spec(), state({ pending: rows(3), lastScaleAt: ago(10), slots: [starting, draining] }));
     expect(cooling.reason).toBe("cooldown");
     expect(cooling.intents).toEqual([{ kind: "drain", slotId: draining.slotId }, { kind: "launch", slotId: starting.slotId }]);
     expect(plan(spec(), state({ slots: [slot()], lastScaleAt: ago(10) })).intents).toEqual([]);
@@ -155,7 +166,7 @@ describe("planSeatPool", () => {
     const free = slot();
     const starting = slot({ phase: "added", idleSince: null });
     const result = plan(spec({ drain: true, min: 2 }), state({
-      pendingForModel: 4, lastScaleAt: ago(1), slots: [busy, free, starting], adoptable: [{ logicalId: "dev.impl2", nodeId: "n2" }],
+      pending: rows(4), modelCause: "stopped", lastScaleAt: ago(1), slots: [busy, free, starting], adoptable: [{ logicalId: "dev.impl2", nodeId: "n2" }],
     }));
     expect(result.target).toBe(0);
     expect(result.intents).toEqual<SeatPoolIntent[]>([
@@ -178,6 +189,122 @@ describe("planSeatPool", () => {
   });
 });
 
+describe("planSeatPool: dispatch and wake", () => {
+  beforeEach(() => { nextSlot = 1; nextRow = 1; });
+
+  it("moves waiting rows to free seats, oldest first, and counts the rest as demand", () => {
+    const older = rows(1, "dev-impl@r", 900);
+    const newer = rows(2);
+    const free = slot();
+    const result = plan(spec(), state({ pending: [...older, ...newer], slots: [free] }));
+    expect(result.intents).toEqual<SeatPoolIntent[]>([
+      { kind: "dispatch", qitemId: older[0]!.qitemId, from: "dev-impl@r", slotId: free.slotId },
+      { kind: "add", count: 2 },
+    ]);
+    // The seat that receives a row holds work: it counts toward the target and is not drained.
+    expect(result.target).toBe(3);
+  });
+
+  it("moves a row addressed to a seat the pool removed, and never a row addressed to one of its live seats", () => {
+    const busy = slot({ openRows: 1, idleSince: null, cause: "working" });
+    const free = slot();
+    const orphan = rows(1, "dev-impl-s9@r");
+    const held = rows(1, busy.sessionName);
+    const result = plan(spec(), state({ pending: [...orphan, ...held], slots: [busy, free] }));
+    expect(result.intents).toEqual([{ kind: "dispatch", qitemId: orphan[0]!.qitemId, from: "dev-impl-s9@r", slotId: free.slotId }]);
+  });
+
+  it("only gives a row to a seat that is idle at its prompt with nothing open or held", () => {
+    const seats = [
+      slot({ openRows: 1 }),
+      slot({ heldMessages: 1 }),
+      slot({ idleSince: null, cause: "needs_input" }),
+      slot({ idleSince: null, cause: "working" }),
+      slot({ idleSince: null, cause: "stopped" }),
+    ];
+    const result = plan(spec({ max: 9 }), state({ pending: rows(1), slots: seats }));
+    expect(result.intents.filter((i) => i.kind === "dispatch")).toEqual([]);
+    expect(result.intents).toContainEqual({ kind: "add", count: 1 });
+  });
+
+  it("wakes a seat of the pool holding a waiting row by its cause", () => {
+    const stopped = slot({ cause: "stopped", openRows: 2, idleSince: null });
+    const idle = slot({ openRows: 2 });
+    const asking = slot({ cause: "needs_input", openRows: 1, idleSince: null });
+    const nudged = rows(1, idle.sessionName, 120, true);
+    const fresh = rows(1, idle.sessionName);
+    const askingRows = rows(1, asking.sessionName);
+    const young = rows(1, stopped.sessionName, 10);
+    const result = plan(spec(), state({
+      pending: [...rows(1, stopped.sessionName), ...young, ...nudged, ...fresh, ...askingRows], slots: [stopped, idle, asking],
+    }));
+    expect(result.intents).toEqual<SeatPoolIntent[]>([
+      { kind: "relaunch", seat: stopped.sessionName, nodeId: stopped.nodeId! },
+      { kind: "nudge", seat: idle.sessionName, qitemId: fresh[0]!.qitemId },
+      { kind: "escalate", seat: asking.sessionName, qitemIds: [askingRows[0]!.qitemId] },
+    ]);
+  });
+
+  it("launches a stopped model, nudges an idle one once per row, escalates one that needs input, and leaves one working", () => {
+    const waiting = rows(2);
+    expect(plan(spec(), state({ modelCause: "stopped", pending: waiting })).intents).toEqual([
+      { kind: "relaunch", seat: "dev-impl@r", nodeId: "model" },
+      { kind: "add", count: 2 },
+    ]);
+    expect(plan(spec(), state({ modelCause: "idle", pending: [waiting[0]!, { ...waiting[1]!, nudged: true }] })).intents).toEqual([
+      { kind: "nudge", seat: "dev-impl@r", qitemId: waiting[0]!.qitemId },
+      { kind: "add", count: 2 },
+    ]);
+    expect(plan(spec(), state({ modelCause: "needs_input", pending: waiting })).intents).toEqual([
+      { kind: "escalate", seat: "dev-impl@r", qitemIds: waiting.map((r) => r.qitemId) },
+      { kind: "add", count: 2 },
+    ]);
+    expect(plan(spec(), state({ modelCause: "working", pending: waiting })).intents).toEqual([{ kind: "add", count: 2 }]);
+  });
+
+  it("adds no seat and launches no stopped seat while a seat of the pool is out of usage", async () => {
+    const waiting = rows(2);
+    expect(plan(spec(), state({ modelCause: "usage_limit", pending: waiting }))).toMatchObject({ intents: [], reason: "usage_limit", target: 0 });
+    const stopped = slot({ cause: "stopped", openRows: 1, idleSince: null });
+    const free = slot();
+    const result = plan(spec({ max: 5 }), state({ pending: [...rows(1, stopped.sessionName), ...waiting], slots: [stopped, free, slot({ cause: "usage_limit", idleSince: null })] }));
+    // The free seat still takes a row; nothing is launched or added.
+    expect(result.intents).toEqual([{ kind: "dispatch", qitemId: waiting[0]!.qitemId, from: "dev-impl@r", slotId: free.slotId }]);
+    expect(result.reason).toBe("usage_limit");
+    const evaluated = await makeSeatPoolPolicy({ readState: async () => state({ modelCause: "usage_limit", pending: waiting }), submit: () => true, now: () => NOW })
+      .evaluate({ jobId: "pool-1", policy: SEAT_POOL_POLICY_NAME, target: { session: "dev-impl@r" }, intervalSeconds: 60, context: { max: 2, cwd_template: "/w/{slot}" } } as PolicyJob);
+    expect(evaluated).toMatchObject({ reason: "seat_pool_held", notes: { reason: "usage_limit" } });
+  });
+
+  it("launches no seat it added and hasn't started while a seat is out of usage, and still removes an unwanted one", () => {
+    const added = slot({ phase: "added", cause: "stopped", idleSince: null });
+    const held = plan(spec(), state({ modelCause: "usage_limit", slots: [added] }));
+    expect(held).toMatchObject({ intents: [], reason: "usage_limit" });
+    // The same holds while the demand command's answer is stale.
+    expect(plan(spec({ demand_cmd: { argv: ["/bin/demand"] } }), state({ modelCause: "usage_limit", slots: [added] })).intents).toEqual([]);
+    expect(plan(spec({ max: 0 }), state({ modelCause: "usage_limit", slots: [added] })).intents).toEqual([{ kind: "remove", slotId: added.slotId }]);
+    expect(plan(spec(), state({ slots: [added] })).intents).toEqual([{ kind: "launch", slotId: added.slotId }]);
+  });
+
+  it("moves and wakes nothing under drain", () => {
+    const free = slot();
+    const result = plan(spec({ drain: true }), state({ modelCause: "stopped", pending: [...rows(2), ...rows(1, "dev-impl-s9@r")], slots: [free] }));
+    expect(result.intents).toEqual([{ kind: "drain", slotId: free.slotId }]);
+  });
+
+  it("still moves and wakes while the demand command's answer is stale", () => {
+    const free = slot();
+    const waiting = rows(2);
+    const result = plan(spec({ demand_cmd: { argv: ["/bin/demand"] } }), state({ modelCause: "idle", pending: waiting, slots: [free] }));
+    expect(result).toMatchObject({ reason: "demand_sample_stale", target: null });
+    expect(result.intents).toEqual([
+      { kind: "dispatch", qitemId: waiting[0]!.qitemId, from: "dev-impl@r", slotId: free.slotId },
+      { kind: "nudge", seat: "dev-impl@r", qitemId: waiting[1]!.qitemId },
+    ]);
+  });
+});
+
+
 describe("seat-pool policy evaluation", () => {
   const job = (context: Record<string, unknown>): PolicyJob => ({
     jobId: "pool-1", policy: SEAT_POOL_POLICY_NAME, target: { session: "dev-impl@r" }, intervalSeconds: 60, context,
@@ -186,7 +313,7 @@ describe("seat-pool policy evaluation", () => {
   it("hands the plan to the executor and reports it, quietly when nothing changes", async () => {
     const submitted: SeatPoolIntent[][] = [];
     const policy = makeSeatPoolPolicy({
-      readState: () => state({ pendingForModel: 1 }),
+      readState: () => state({ pending: rows(1) }),
       submit: (_jobId, intents) => { submitted.push(intents); return true; },
       now: () => NOW,
     });
@@ -203,7 +330,7 @@ describe("seat-pool policy evaluation", () => {
     const held = await makeSeatPoolPolicy({ readState: () => state({ restoring: true }), submit: () => true, now: () => NOW })
       .evaluate(job({ max: 2, cwd_template: "/w/{slot}" }));
     expect(held).toMatchObject({ reason: "seat_pool_held", notes: { reason: "restore_in_progress" } });
-    const busy = await makeSeatPoolPolicy({ readState: () => state({ pendingForModel: 1 }), submit: () => false, now: () => NOW })
+    const busy = await makeSeatPoolPolicy({ readState: () => state({ pending: rows(1) }), submit: () => false, now: () => NOW })
       .evaluate(job({ max: 2, cwd_template: "/w/{slot}" }));
     expect(busy).toEqual({ action: "skip", reason: "seat_pool_busy" });
   });
