@@ -12,7 +12,8 @@ rig watchdog register --policy seat-pool --target-session dev-impl@my-rig \
 The target is the model seat. Each new seat is a member of the model's pod named `<member>-s<n>` (`dev.impl-s1`,
 `dev.impl-s2`, ...), with the model's runtime, agent, profile, model, effort, permissions, environment and launch
 wrapper, its own working directory, and a fresh session. `n` only grows: a removed seat's name is never given to a new
-seat. The model seat itself is never added, stopped or removed.
+seat. The model seat itself is never added, stopped or removed; the pool only launches it when it stopped with work
+waiting (see [Waiting rows](#waiting-rows-dispatch-and-wake)).
 
 ## The spec
 
@@ -23,6 +24,7 @@ context:
   min: 0                    # the fewest extra seats (default 0)
   cooldown_s: 60            # wait after an add or removal before the next one (default 60)
   idle_grace_s: 300         # how long a seat must sit idle before it is drained (default 300)
+  dispatch_after_s: 60      # how long a row waits at its seat before the pool moves it or wakes the seat (default 60)
   drain: false              # true empties the pool (see below)
   adopt: [dev.impl2]        # existing seats the pool takes over
   cwd_template: /work/{rig}/{slot}   # required: absolute, with {slot}; {rig} is optional
@@ -48,8 +50,8 @@ A command that runs past `timeout_s` is killed and counts as failed.
 ## How many seats
 
 The pool wants as many extra seats as its demand, clamped to `min`..`max`, and never fewer than the seats holding work
-plus the seats still starting. Without `demand_cmd`, the demand is one seat per pending row addressed to the model,
-plus the seats holding work. With `demand_cmd`, it is the `desired` whole number the command prints as JSON
+plus the seats still starting. Without `demand_cmd`, the demand is one seat per waiting row that no free seat takes
+(see below), plus the seats holding work. With `demand_cmd`, it is the `desired` whole number the command prints as JSON
 (`{"desired": 3}`). The command runs after each evaluation, and its answer is used for the next one. When it fails or
 its last good answer is older than two evaluation intervals, the pool holds as it is: it finishes starting the seats
 it has begun, and adds or drains nothing.
@@ -57,6 +59,37 @@ it has begun, and adds or drains nothing.
 A seat holds work when it has a pending, in-progress or blocked row, a message the typing guard holds for it, or isn't
 idle at a prompt. Only a seat with no open row and no held message that has been idle at a prompt, with no pending input
 and no background shell, for `idle_grace_s` is drained; the pool's own seats go before adopted ones, newest first.
+
+## Waiting rows: dispatch and wake
+
+A pending row waits once it has been at its seat for `dispatch_after_s`, counted from its creation or its latest
+reroute. Only pending rows are read: a claimed or blocked row is never moved, woken for or counted, and the pool reads
+only rows addressed to the model, to its own seats and to the seats it removed, so a row to a person
+(`human@kernel`) or to any other seat is never touched.
+
+A waiting row addressed to the model, or to a seat the pool removed, goes to a free seat: one that is live, idle at
+its prompt with nothing in the background, and holds no open row and no held message. The longest waiting row goes
+first, one row per free seat. The move is `rig queue fallback` with `--expect-state pending`,
+`--expect-destination <the row's seat>` and `--wake`, so a row claimed or moved since the plan stays where it is, and
+the new seat is woken in the same transaction. A row no free seat takes counts as demand, so the pool adds a seat for
+it. A row addressed to one of the pool's own seats stays with that seat.
+
+A waiting row the pool doesn't move wakes the seat holding it (the model, or a seat of the pool), by why that seat
+isn't taking it:
+
+| The seat | The pool |
+| --- | --- |
+| has no live session | launches it, as `rig launch` does |
+| is idle at its prompt | nudges it about the row, once per row and seat; the row records the nudge (`seat-pool nudge: <seat>`) before it is sent, so a restart never sends a second |
+| needs input (a permission prompt or a question) | opens one row to the model's escalation owner, tagged `seat-pool-needs-input:<seat>`; no other is opened about that seat while it is open |
+| is out of provider usage | nothing: the row waits |
+| is working | nothing: the row waits, and counts as demand if it is the model's |
+
+While any seat of the pool is out of usage (its provider account reports the limit, as the wake ladder reads it), the
+pool adds no seat and launches none, neither a stopped seat nor one it added and hasn't started, and records
+`usage_limit`; a seat added but not launched waits until the limit lifts. A run reads usage again just before each add,
+launch and relaunch, so a limit that appears after the plan, or while `prepare_cmd` runs, holds the seat too. Under
+`drain`, nothing is moved or woken, even a move or a wake planned before `drain` was set.
 
 ## Adding and removing a seat
 
@@ -71,10 +104,11 @@ comes between the steps, checks that it still has no open row and no held messag
 exits non-zero, the seat goes back into the pool untouched. The removal never passes a fallback: a seat that still has
 rows is not removed.
 
-Every add, launch, removal, refusal and failure is written to the job's history (`rig watchdog status <jobId>`). An
-evaluation that plans changes records the plan (`seat_pool_planned`), and one that holds because the model seat is
-gone, the rig is being restored or the demand answer is stale records why (`seat_pool_held`). One with nothing to
-change records nothing.
+Every add, launch, removal, row moved (`seat_pool_dispatched`, or `seat_pool_dispatch_skipped` when the row was claimed
+or moved first), relaunch, nudge, escalation, refusal and failure is written to the job's history
+(`rig watchdog status <jobId>`). An evaluation that plans changes records the plan (`seat_pool_planned`), and one that
+holds because the model seat is gone, the rig is being restored, the demand answer is stale or a seat is out of usage
+records why (`seat_pool_held`). One with nothing to change records nothing.
 
 ## Stopping a pool: drain
 
@@ -90,4 +124,4 @@ launched is prepared and launched (or removed if it is no longer wanted), and a 
 completed but wasn't recorded is recognized by its running session. The pool acts only on seats it created or adopted
 (`adopt`); it never takes a node over because of its name. While the rig is being restored, the pool does nothing.
 
-A seat whose session died is left in place; the pool does not relaunch it.
+A seat whose session died is relaunched only when a row waits for it; otherwise it is left in place.
