@@ -129,7 +129,7 @@ describe("planSeatPool", () => {
     expect(result.intents).toEqual([{ kind: "launch", slotId: starting.slotId }]);
   });
 
-  it("drains only seats idle past the grace, the pool's own before adopted, newest first", () => {
+  it("drains only seats it added that are idle past the grace, newest first, and never an adopted one", () => {
     const adopted = slot({ adopted: true });
     const older = slot();
     const newer = slot();
@@ -138,7 +138,6 @@ describe("planSeatPool", () => {
     expect(result.intents).toEqual([
       { kind: "drain", slotId: newer.slotId, idleSince: newer.idleSince },
       { kind: "drain", slotId: older.slotId, idleSince: older.idleSince },
-      { kind: "drain", slotId: adopted.slotId, idleSince: adopted.idleSince },
     ]);
   });
 
@@ -162,15 +161,20 @@ describe("planSeatPool", () => {
     expect(waiting.intents).toEqual([{ kind: "launch", slotId: starting.slotId }]);
   });
 
-  it("drain empties the pool without touching work, adopts nothing and ignores the cooldown", () => {
+  it("drain empties the pool without touching work, gives adopted seats back, adopts nothing and ignores the cooldown", () => {
     const busy = slot({ openRows: 2 });
     const free = slot();
     const starting = slot({ phase: "added", idleSince: null });
+    const adoptedBusy = slot({ adopted: true, openRows: 1 });
+    const adoptedFree = slot({ adopted: true });
     const result = plan(spec({ drain: true, min: 2 }), state({
-      pending: rows(4), modelCause: "stopped", lastScaleAt: ago(1), slots: [busy, free, starting], adoptable: [{ logicalId: "dev.impl2", nodeId: "n2" }],
+      pending: rows(4), modelCause: "stopped", lastScaleAt: ago(1), slots: [busy, free, starting, adoptedBusy, adoptedFree],
+      adoptable: [{ logicalId: "dev.impl2", nodeId: "n2" }],
     }));
     expect(result.target).toBe(0);
     expect(result.intents).toEqual<SeatPoolIntent[]>([
+      { kind: "unlink", slotId: adoptedBusy.slotId },
+      { kind: "unlink", slotId: adoptedFree.slotId },
       { kind: "drain", slotId: free.slotId, idleSince: free.idleSince },
       { kind: "remove", slotId: starting.slotId },
     ]);

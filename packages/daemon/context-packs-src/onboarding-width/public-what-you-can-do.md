@@ -732,10 +732,10 @@ not have to tear one down to change it, and you rarely have to start from nothin
   left waiting at the model moves to a free seat, and a seat that isn't taking its rows is launched
   when it stopped and escalated when it needs input. A seat the pool added whose session is gone is reaped
   (its rows go back to the model and it is removed) once its release command agrees, and launched again
-  when it refuses; an adopted seat is never reaped. `drain: true` empties the pool without killing
-  work; `stop` is refused while it holds seats. Every pool of a daemon launches within one host
-  budget (`policies.seat_pool.*` in `rig config`: launches in flight and per watchdog tick, free memory,
-  load per CPU). `rig ps --nodes` and the TUI list a pool's seats under the model.
+  when it refuses; an adopted seat is never reaped, drained or removed. `drain: true` empties the pool
+  without killing work and gives adopted seats back as they are; `stop` is refused while it holds
+  seats. Every pool of a daemon launches within one host budget (`policies.seat_pool.*` in
+  `rig config`: launches in flight and per watchdog tick, free memory, load per CPU). `rig ps --nodes` and the TUI list a pool's seats under the model.
   Spec and behavior: the `seat-pools.md` reference.
 - **`rig remove`** / **`rig shrink`** — take a seat, or an entire pod, out of a running topology.
   If it holds active work, pass `--fallback <live-seat>` to reroute before mutation; without a
