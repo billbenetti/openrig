@@ -191,3 +191,23 @@ completed but wasn't recorded is recognized by its running session. The pool act
 (`adopt`); it never takes a node over because of its name. While the rig is being restored, the pool does nothing.
 
 A seat of the pool whose session died is reaped, never relaunched.
+
+## Seeing a pool
+
+`rig ps --nodes` lists each seat a pool holds right after its model seat, marked `└` in the SESSION column (MEMBER
+with `--full`). With `--json` the daemon's order is kept, and such a seat carries `seatPoolModel`, the model's logical
+id (also selectable with `--fields seatPoolModel`). The link is the pool's `seat_pool_slots` row, as it is for the pool
+itself: an adopted seat is listed under the model whatever its name, and a node named like a pool seat that no pool
+holds is not. A seat whose model isn't listed, because `--session`, `--filter` or `--limit` left the model out, keeps
+its place unmarked.
+
+The TUI draws the seats the same way under the model, in the topology tree and in the seat tables, within the model's
+pod: an adopted seat in another pod stays in its own pod, unmarked.
+
+## Limits
+
+- A pool works only on the daemon it's registered with: its model, its seats and the rows it reads all belong to that
+  daemon. To grow seats on two hosts, register a pool on each. The pools don't coordinate, so whatever hands out the
+  work decides which host's seat takes it.
+- A pool has one model, and a seat belongs to one pool at a time. The pool's own seats are members of the model's pod;
+  an adopted seat stays in the pod it is in.
