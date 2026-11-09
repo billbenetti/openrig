@@ -348,11 +348,6 @@ export interface SeatPoolPolicyDeps {
   now?: () => number;
 }
 
-/** A demand answer counts while it is no older than two evaluation intervals. */
-export function seatPoolSampleMaxAgeMs(intervalSeconds: number): number {
-  return 2 * intervalSeconds * 1000;
-}
-
 export function makeSeatPoolPolicy(deps: SeatPoolPolicyDeps): Policy {
   return {
     name: SEAT_POOL_POLICY_NAME,
@@ -361,7 +356,8 @@ export function makeSeatPoolPolicy(deps: SeatPoolPolicyDeps): Policy {
       // Registration and update refuse an invalid spec; one that is invalid here holds the pool rather than act on it.
       if ("problem" in parsed) return { action: "skip", reason: "seat_pool_spec_invalid", notes: { ...parsed.problem } };
       const state = await deps.readState({ jobId: job.jobId, targetSession: job.target.session, spec: parsed.spec });
-      const plan = planSeatPool(parsed.spec, state, deps.now?.() ?? Date.now(), seatPoolSampleMaxAgeMs(job.intervalSeconds));
+      // A demand answer counts while it is no older than two evaluation intervals.
+      const plan = planSeatPool(parsed.spec, state, deps.now?.() ?? Date.now(), 2 * job.intervalSeconds * 1000);
       // The executor also refreshes the demand sample, so a plan with nothing to do is still submitted.
       if (!deps.submit(job.jobId, plan.intents)) return { action: "skip", reason: "seat_pool_busy" };
       const notes = { target: plan.target, current: plan.current, reason: plan.reason, intents: plan.intents };

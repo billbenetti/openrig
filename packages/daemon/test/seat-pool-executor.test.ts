@@ -131,8 +131,8 @@ class World {
         this.calls.push(`run ${name}`);
         this.env.push(env);
         if (this.commandGate) await this.commandGate(signal);
-        if (signal.aborted) return { exitCode: null, stdout: "", timedOut: false, error: "aborted" };
-        return { exitCode: this.exit[name] ?? 0, stdout: name === "demand" ? this.demandStdout : "", timedOut: false };
+        if (signal.aborted) return { exitCode: null, stdout: "", error: "aborted" };
+        return { exitCode: this.exit[name] ?? 0, stdout: name === "demand" ? this.demandStdout : "" };
       },
       cleanSlot: async ({ sessionName }) => {
         this.calls.push(`clean ${sessionName}`);
@@ -295,7 +295,7 @@ describe("seat-pool executor", () => {
     await run(makeExecutor(), [{ kind: "launch", slotId: slot.slotId }]);
     expect(world.calls).toEqual([]);
     expect(slots.get(slot.slotId)).toMatchObject({ phase: "live", intent: null });
-    expect(history).toEqual([{ failed: false, reason: "seat_pool_launched", notes: { slot: "dev.impl-s1", nodeId: "node-9", interrupted: "launch" } }]);
+    expect(history).toEqual([{ failed: false, reason: "seat_pool_launched", notes: { slot: "dev.impl-s1", nodeId: "node-9" } }]);
   });
 
   it("after a restart, finishes an interrupted add through its Operation-Id instead of adding again", async () => {
@@ -308,7 +308,7 @@ describe("seat-pool executor", () => {
     expect(slots.get(created.slotId)).toMatchObject({ phase: "live", nodeId: "node-7" });
     expect(world.nodes.size).toBe(1);
     expect(slots.get(lost.slotId)).toMatchObject({ phase: "retired" });
-    expect(history.find((h) => h.reason === "seat_pool_add_failed")).toMatchObject({ notes: { slot: "dev.impl-s2", code: "add_not_completed", interrupted: "add" } });
+    expect(history.find((h) => h.reason === "seat_pool_add_failed")).toMatchObject({ notes: { slot: "dev.impl-s2", code: "add_not_completed" } });
   });
 
   it("removes an unwanted seat whose add was interrupted, resolving its node first", async () => {
@@ -807,7 +807,7 @@ describe("seat-pool executor", () => {
       expect(history).toEqual([
         { ...held, notes: { reason: "launch_budget", why: "launches_in_flight", inFlight: 1, maxInFlight: 1, slot: "dev.impl-s8" } },
         { ...held, notes: { reason: "launch_budget", why: "launches_in_flight", inFlight: 1, maxInFlight: 1, seat: "dev-impl@r" } },
-        { failed: false, reason: "seat_pool_launched", notes: { slot: "dev.impl-s9", nodeId: "node-9", interrupted: "launch" } },
+        { failed: false, reason: "seat_pool_launched", notes: { slot: "dev.impl-s9", nodeId: "node-9" } },
       ]);
       if (elsewhere.ok) elsewhere.release();
       world.calls = [];
@@ -904,14 +904,14 @@ describe("runSeatPoolCommand", () => {
   it("runs an argv without a shell and returns its output", async () => {
     const result = await runSeatPoolCommand({ argv: [node, "-e", "process.stdout.write(process.argv[1] + process.env.OPENRIG_SEAT_POOL_JOB)", "$HOME;"], timeoutSeconds: 10 },
       { OPENRIG_SEAT_POOL_JOB: "j1" }, new AbortController().signal);
-    expect(result).toEqual({ exitCode: 0, stdout: "$HOME;j1", timedOut: false });
+    expect(result).toEqual({ exitCode: 0, stdout: "$HOME;j1" });
   });
 
   it("reports the exit code, and kills a command at its timeout", async () => {
     const failed = await runSeatPoolCommand({ argv: [node, "-e", "process.exit(4)"], timeoutSeconds: 10 }, {}, new AbortController().signal);
     expect(failed.exitCode).toBe(4);
     const slow = await runSeatPoolCommand({ argv: [node, "-e", "setTimeout(() => {}, 60000)"], timeoutSeconds: 1 }, {}, new AbortController().signal);
-    expect(slow).toMatchObject({ exitCode: null, timedOut: true, error: "timed out after 1s" });
+    expect(slow).toMatchObject({ exitCode: null, error: "timed out after 1s" });
   });
 });
 
