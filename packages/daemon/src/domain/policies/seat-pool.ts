@@ -199,6 +199,8 @@ export type SeatPoolIntent =
   | { kind: "drain"; slotId: number; idleSince: string | null }
   /** Remove a seat that never took work, or forget one whose node is gone. */
   | { kind: "remove"; slotId: number }
+  /** Give back an adopted seat under drain: the pool's link ends, and the node and its session stay as they are. */
+  | { kind: "unlink"; slotId: number }
   /** Move a waiting row to a free seat, only while it is still pending and addressed to `from`, and wake that seat. */
   | { kind: "dispatch"; qitemId: string; from: string; slotId: number }
   /** Launch a stopped seat (the model or one of the pool's) that holds a waiting row. */
@@ -245,9 +247,9 @@ export function seatPoolOutOfUsage(state: Pick<SeatPoolState, "modelCause" | "sl
  * holding work), never below the seats holding work plus the seats still starting, clamped to min..max; with `drain`
  * it is 0, and nothing is moved or woken. A demand answer older than `sampleMaxAgeMs` holds the pool's size as it is.
  * While a seat of the pool is out of usage, the pool adds no seat and launches none: neither a stopped seat nor one it
- * added and has not started, which waits as it is (and may still be removed). Only a free seat idle
- * for `idle_grace_s` is drained, the pool's own before adopted ones and the newest first. Adds and new drains wait for
- * `cooldown_s` after the last add or removal, except under `drain`.
+ * added and has not started, which waits as it is (and may still be removed). Only a free seat the pool added, idle
+ * for `idle_grace_s`, is drained, the newest first; an adopted seat is never drained, and under `drain` it is unlinked.
+ * Adds and new drains wait for `cooldown_s` after the last add or removal, except under `drain`.
  */
 export function planSeatPool(spec: SeatPoolSpec, state: SeatPoolState, nowMs: number, sampleMaxAgeMs: number): SeatPoolPlan {
   const hold = (reason: string): SeatPoolPlan => ({ intents: [], reason, target: null, current: state.slots.length });
@@ -262,6 +264,7 @@ export function planSeatPool(spec: SeatPoolSpec, state: SeatPoolState, nowMs: nu
   for (const gone of state.slots.filter((slot) => !present.includes(slot))) intents.push({ kind: "remove", slotId: gone.slotId });
   for (const slot of present.filter((s) => s.phase === "draining")) intents.push({ kind: "drain", slotId: slot.slotId, idleSince: slot.idleSince });
   for (const slot of present.filter(seatPoolReapable)) intents.push({ kind: "reap", slotId: slot.slotId });
+  if (spec.drain) for (const slot of present.filter((s) => s.adopted)) intents.push({ kind: "unlink", slotId: slot.slotId });
 
   const starting = present.filter((slot) => slot.phase === "adding" || slot.phase === "added");
   // A stopped adopted seat takes no row and is not reaped: it isn't one of the pool's seats until it runs again.
@@ -329,7 +332,8 @@ export function planSeatPool(spec: SeatPoolSpec, state: SeatPoolState, nowMs: nu
   }
 
   const surplus = Math.max(0, current - target);
-  const drainOrder = [...free].sort((a, b) => Number(a.adopted) - Number(b.adopted) || b.slotId - a.slotId);
+  // An adopted seat was someone else's before the pool: the pool never stops or removes it.
+  const drainOrder = free.filter((slot) => !slot.adopted).sort((a, b) => b.slotId - a.slotId);
   if (!cooling) for (const slot of drainOrder.slice(0, surplus)) intents.push({ kind: "drain", slotId: slot.slotId, idleSince: slot.idleSince });
   // A seat that never started holds no work. It goes only for the surplus free seats can't cover (a lowered max, or drain).
   const removeStarting = [...starting].sort((a, b) => b.slotId - a.slotId).slice(0, Math.max(0, surplus - drainOrder.length));
