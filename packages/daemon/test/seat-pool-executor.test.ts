@@ -339,6 +339,41 @@ describe("seat-pool executor", () => {
     expect(reasons().at(-1)).toBe("seat_pool_removed");
   });
 
+  it("runs remove_cmd once a removed seat's node is gone, and keeps the seat on record until it agrees", async () => {
+    jobSpec = spec({ remove_cmd: { argv: ["remove"] } });
+    const executor = makeExecutor();
+    await run(executor, [{ kind: "add", count: 1 }]);
+    const [slot] = slots.listOpen(JOB);
+    world.calls = [];
+    world.env = [];
+    world.exit["remove"] = 1;
+    await run(executor, [drainOf(slot!.slotId)]);
+    expect(world.calls.slice(-2)).toEqual(["lease released", "run remove"]);
+    expect(world.env.at(-1)).toEqual({ OPENRIG_SEAT_POOL_JOB: JOB, OPENRIG_SEAT_POOL_MODEL: "dev-impl@r", OPENRIG_SEAT_POOL_SLOT: "dev-impl-s1@r" });
+    expect(world.nodes.size).toBe(0);
+    expect(slots.listOpen(JOB)).toHaveLength(1);
+    expect(history.slice(-2)).toEqual([
+      { failed: false, reason: "seat_pool_removed", notes: { slot: "dev.impl-s1" } },
+      { failed: true, reason: "seat_pool_remove_cmd_failed", notes: { slot: "dev.impl-s1", exitCode: 1, error: null } },
+    ]);
+
+    world.exit["remove"] = 0;
+    const plan = planSeatPool(jobSpec, world.state(slots, executor, jobSpec), T0, 120_000);
+    expect(plan.intents).toEqual([{ kind: "remove", slotId: slot!.slotId }]);
+    await run(executor, plan.intents);
+    expect(world.calls.at(-1)).toBe("run remove");
+    expect(slots.listOpen(JOB)).toEqual([]);
+    expect(history.at(-1)).toEqual({ failed: false, reason: "seat_pool_removed", notes: { slot: "dev.impl-s1", why: "node_gone" } });
+  });
+
+  it("never runs remove_cmd for an adopted seat whose node is gone", async () => {
+    jobSpec = spec({ remove_cmd: { argv: ["remove"] } });
+    const adopted = slots.adopt({ poolJobId: JOB, logicalId: "dev.impl2", nodeId: "node-9", at: new Date(T0).toISOString() });
+    await run(makeExecutor(), [{ kind: "remove", slotId: adopted.slotId }]);
+    expect(world.calls).toEqual([]);
+    expect(slots.listOpen(JOB)).toEqual([]);
+  });
+
   it("returns a seat to the pool, untouched, when its release command refuses or work arrives in the lease", async () => {
     jobSpec = spec({ release_cmd: { argv: ["release"] } });
     const executor = makeExecutor();
@@ -755,6 +790,16 @@ describe("seat-pool executor", () => {
         slot: "dev.impl-s1",
         rows: ["q-1", "q-2", "q-3"].map((qitemId) => ({ qitemId, to: "dev-impl@r" })),
       } }]);
+    });
+
+    it("runs remove_cmd after a reap removed the seat's node", async () => {
+      jobSpec = spec({ reap_cmd: { argv: ["reap"] }, remove_cmd: { argv: ["remove"] } });
+      const executor = makeExecutor();
+      const dead = await seat(executor, { session: "stopped", idle: false });
+      await run(executor, [{ kind: "reap", slotId: dead.slotId }]);
+      expect(world.calls.slice(-3)).toEqual([`remove dev.impl-s1 ${JSON.stringify({ nodeId: dead.nodeId, sessionId: "sess-2" })}`, "lease released", "run remove"]);
+      expect(world.env.at(-1)).toMatchObject({ OPENRIG_SEAT_POOL_SLOT: "dev-impl-s1@r" });
+      expect(slots.listOpen(JOB)).toEqual([]);
     });
 
     it("asks the release command first, and launches the seat again instead when it refuses, reaping it only if that fails", async () => {

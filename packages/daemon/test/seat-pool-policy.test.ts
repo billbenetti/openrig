@@ -66,7 +66,7 @@ describe("seat-pool spec", () => {
     const parsed = parseSeatPoolSpec({ max: 2, cwd_template: "/w/{slot}", release_cmd: { argv: ["/bin/release", "--now"], timeout_s: 9 } });
     expect(parsed).toEqual({ spec: {
       min: 0, max: 2, cooldownSeconds: 60, idleGraceSeconds: 300, dispatchAfterSeconds: 60, dispatchTag: null, drain: false, adopt: [], cwdTemplate: "/w/{slot}",
-      demandCmd: null, prepareCmd: null, releaseCmd: { argv: ["/bin/release", "--now"], timeoutSeconds: 9 }, reapCmd: null,
+      demandCmd: null, prepareCmd: null, releaseCmd: { argv: ["/bin/release", "--now"], timeoutSeconds: 9 }, reapCmd: null, removeCmd: null,
     } });
   });
 
