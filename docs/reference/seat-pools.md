@@ -48,7 +48,9 @@ environment plus:
 | `OPENRIG_SEAT_POOL_SLOT_CWD` | `prepare_cmd` | the seat's working directory |
 | `OPENRIG_SEAT_POOL_SLOTS` | `demand_cmd` | JSON list of `{session, phase}` for the pool's seats |
 
-A command that runs past `timeout_s` is killed and counts as failed.
+A command that runs past `timeout_s` is killed and counts as failed. Each command has its own `timeout_s` (default 60),
+so a slow `release_cmd` can be given longer than `demand_cmd`; `release_cmd` runs under the seat's lifecycle lease,
+which holds deliveries to that seat back for as long as it runs.
 
 ## How many seats
 
@@ -200,6 +202,11 @@ restart it resumes from those records: an add is resolved through its Operation-
 launched is prepared and launched (or removed if it is no longer wanted), and a drain finishes. A seat whose launch
 completed but wasn't recorded is recognized by its running session. The pool acts only on seats it created or adopted
 (`adopt`); it never takes a node over because of its name. While the rig is being restored, the pool does nothing.
+
+An add, a launch, a drain or a reap the pool waits on for more than 10 minutes is recorded as failed with
+`code: effect_timeout`, once, and the pool takes no new plan until that effect settles, so two runs never act on the
+same seat. A daemon that stops cancels the pool's runs without waiting for such an effect, or for one in flight; the
+step recorded on the seat is resumed at the next start.
 
 A seat the pool added whose session died is reaped, unless its release command refuses (see
 [Reaping a seat](#reaping-a-seat)); an adopted one is only launched again.
