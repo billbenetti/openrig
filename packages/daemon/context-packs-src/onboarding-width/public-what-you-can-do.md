@@ -51,7 +51,7 @@ one command away. Your memory of the fleet is a claim about the past.
   positions.
   Since 0.7.16 each human summary line ends with the daemon that answered (`· daemon <address>`),
   and `--nodes --json --fields activityState` returns each seat's whole activity object.
-  **`rig ps --resources`** shows this host's load and transcript capture cost.
+  **`rig ps --resources`** shows this host's load, memory and transcript capture cost.
 - **`rig ps --all-hosts --nodes -A`** — the same across every registered machine. Rollup-only
   unless you ask for nodes.
 - **`rig discover`** — what is running on this box that OpenRig is *not* managing.
