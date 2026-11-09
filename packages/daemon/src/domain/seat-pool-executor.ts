@@ -1,0 +1,637 @@
+import { execFile } from "node:child_process";
+import { randomUUID } from "node:crypto";
+import type Database from "better-sqlite3";
+import type { StopPrecondition } from "./seat-lifecycle-service.js";
+import type { ArbitratedSeatState } from "./activity-taxonomy.js";
+import { deriveCanonicalSessionName } from "./session-name.js";
+import { physicalSessionName } from "./session-registry.js";
+import type { Node } from "./types.js";
+import {
+  slotWorkingDirectory,
+  type SeatPoolCommand,
+  type SeatPoolIntent,
+  type SeatPoolModel,
+  type SeatPoolSlotPhase,
+  type SeatPoolSlotView,
+  type SeatPoolSpec,
+  type SeatPoolState,
+} from "./policies/seat-pool.js";
+
+/**
+ * The seat-pool executor: applies a pool's plan outside the scheduler tick.
+ *
+ * One run per pool at a time; a plan for a pool whose previous plan is still running is refused, so two runs never act
+ * on the same seats. Before every effect the run reads the job, its spec and the pool's state again, and stops when the
+ * job is no longer active, its model is gone or the rig is being restored. Each effect is recorded on the seat's row
+ * (`intent`) before it starts and cleared once its result is written, and each result goes to the job's history. A
+ * restart therefore resumes from the rows: a seat being added is resolved through its Operation-Id, a seat added but
+ * not launched is prepared and launched or removed, and a seat being drained finishes draining.
+ */
+
+export interface SeatPoolSlot {
+  slotId: number;
+  poolJobId: string;
+  nodeId: string | null;
+  logicalId: string;
+  phase: SeatPoolSlotPhase;
+  intent: string | null;
+  /** The add's Operation-Id; null for an adopted seat. */
+  opId: string | null;
+  createdAt: string;
+  retiredAt: string | null;
+}
+
+interface SlotRow {
+  id: number;
+  pool_job_id: string;
+  node_id: string | null;
+  logical_id: string;
+  phase: SeatPoolSlotPhase;
+  intent: string | null;
+  op_id: string | null;
+  created_at: string;
+  retired_at: string | null;
+}
+
+const toSlot = (row: SlotRow): SeatPoolSlot => ({
+  slotId: row.id, poolJobId: row.pool_job_id, nodeId: row.node_id, logicalId: row.logical_id, phase: row.phase,
+  intent: row.intent, opId: row.op_id, createdAt: row.created_at, retiredAt: row.retired_at,
+});
+
+/** The `seat_pool_slots` rows: the only link between a pool and its seats. */
+export class SeatPoolSlots {
+  constructor(private readonly db: Database.Database) {}
+
+  /** The pool's seats that are not retired, oldest first. */
+  listOpen(poolJobId: string): SeatPoolSlot[] {
+    return (this.db.prepare("SELECT * FROM seat_pool_slots WHERE pool_job_id = ? AND retired_at IS NULL ORDER BY id")
+      .all(poolJobId) as SlotRow[]).map(toSlot);
+  }
+
+  get(slotId: number): SeatPoolSlot | null {
+    const row = this.db.prepare("SELECT * FROM seat_pool_slots WHERE id = ?").get(slotId) as SlotRow | undefined;
+    return row ? toSlot(row) : null;
+  }
+
+  /** Whether any pool holds this node. */
+  isLinked(nodeId: string): boolean {
+    return !!this.db.prepare("SELECT 1 FROM seat_pool_slots WHERE node_id = ? AND retired_at IS NULL").get(nodeId);
+  }
+
+  hasOpen(poolJobId: string): boolean {
+    return !!this.db.prepare("SELECT 1 FROM seat_pool_slots WHERE pool_job_id = ? AND retired_at IS NULL").get(poolJobId);
+  }
+
+  /** The latest add or removal in the pool; adopting a seat is neither. */
+  lastScaleAt(poolJobId: string): string | null {
+    const row = this.db.prepare(
+      `SELECT MAX(CASE WHEN op_id IS NOT NULL THEN created_at END) AS added, MAX(retired_at) AS retired
+         FROM seat_pool_slots WHERE pool_job_id = ?`,
+    ).get(poolJobId) as { added: string | null; retired: string | null };
+    const times = [row.added, row.retired].filter((t): t is string => t !== null).sort();
+    return times.at(-1) ?? null;
+  }
+
+  /**
+   * The next `<member>-s<n>` for a model. `n` is one more than any this table ever recorded for the model, in any
+   * pool, and skips a logical id the rig already has, so a removed seat's name is never given to a new one.
+   */
+  nextLogicalId(model: Pick<SeatPoolModel, "rigId" | "logicalId">): string {
+    const prefix = `${model.logicalId}-s`;
+    let n = 0;
+    const rows = this.db.prepare("SELECT logical_id FROM seat_pool_slots WHERE substr(logical_id, 1, ?) = ?")
+      .all(prefix.length, prefix) as Array<{ logical_id: string }>;
+    for (const { logical_id } of rows) {
+      const suffix = logical_id.slice(prefix.length);
+      if (/^[1-9]\d*$/.test(suffix)) n = Math.max(n, Number(suffix));
+    }
+    const taken = this.db.prepare("SELECT 1 FROM nodes WHERE rig_id = ? AND logical_id = ?");
+    do n++; while (taken.get(model.rigId, `${prefix}${n}`));
+    return `${prefix}${n}`;
+  }
+
+  insert(input: { poolJobId: string; logicalId: string; nodeId: string | null; phase: SeatPoolSlotPhase; intent: string | null; opId: string | null; at: string }): SeatPoolSlot {
+    const id = this.db.prepare(
+      `INSERT INTO seat_pool_slots (pool_job_id, node_id, logical_id, phase, intent, op_id, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+    ).run(input.poolJobId, input.nodeId, input.logicalId, input.phase, input.intent, input.opId, input.at).lastInsertRowid;
+    return this.get(Number(id))!;
+  }
+
+  update(slotId: number, fields: { nodeId?: string; phase?: Exclude<SeatPoolSlotPhase, "retired">; intent?: string | null }): void {
+    const sets: string[] = [];
+    const values: unknown[] = [];
+    if (fields.nodeId !== undefined) { sets.push("node_id = ?"); values.push(fields.nodeId); }
+    if (fields.phase !== undefined) { sets.push("phase = ?"); values.push(fields.phase); }
+    if (fields.intent !== undefined) { sets.push("intent = ?"); values.push(fields.intent); }
+    if (sets.length > 0) this.db.prepare(`UPDATE seat_pool_slots SET ${sets.join(", ")} WHERE id = ?`).run(...values, slotId);
+  }
+
+  retire(slotId: number, at: string): void {
+    this.db.prepare("UPDATE seat_pool_slots SET phase = 'retired', intent = NULL, retired_at = ? WHERE id = ?").run(at, slotId);
+  }
+}
+
+/** The canonical session name of a seat, from its `<pod>.<member>` logical id. */
+export function seatSessionName(logicalId: string, rigName: string): string {
+  const dot = logicalId.indexOf(".");
+  return deriveCanonicalSessionName(logicalId.slice(0, dot), logicalId.slice(dot + 1), rigName);
+}
+
+/**
+ * The member fragment of a new seat: the model's launch shape (runtime, agent, profile, model, effort, permissions,
+ * environment, launch wrapper) with its own id and working directory. Its session starts fresh: the model's
+ * conversation is never carried over.
+ */
+export function slotMemberFragment(
+  model: Node,
+  memberId: string,
+  cwd: string,
+  permissions: { claude?: unknown; codex?: unknown } = {},
+): Record<string, unknown> {
+  return {
+    id: memberId,
+    runtime: model.runtime,
+    cwd,
+    ...(model.agentRef ? { agent_ref: model.agentRef } : {}),
+    ...(model.profile ? { profile: model.profile } : {}),
+    ...(model.codexConfigProfile ? { codex_config_profile: model.codexConfigProfile } : {}),
+    ...(model.permissionPolicy ? { permission_policy: model.permissionPolicy } : {}),
+    ...(permissions.claude === undefined ? {} : { claude_permissions: permissions.claude }),
+    ...(permissions.codex === undefined ? {} : { codex_permissions: permissions.codex }),
+    ...(model.model ? { model: model.model } : {}),
+    ...(model.effort ? { effort: model.effort } : {}),
+    ...(model.role ? { role: model.role } : {}),
+    ...(model.restorePolicy ? { restore_policy: model.restorePolicy } : {}),
+    ...(model.env ? { env: model.env } : {}),
+    ...(model.launchWrapper?.length ? { launch_wrapper: model.launchWrapper } : {}),
+  };
+}
+
+export interface SeatPoolStateReaderDeps {
+  db: Database.Database;
+  slots: SeatPoolSlots;
+  /** Pending, in-progress and blocked rows addressed to a session. */
+  openRows(sessionName: string): Array<{ state: string }>;
+  /** Messages the typing guard holds for a seat, not yet delivered. */
+  heldMessages(nodeId: string): number;
+  /** The arbitrated activity of a seat whose session is not confirmed stopped; null otherwise. */
+  seatState(nodeId: string): ArbitratedSeatState | null;
+  restoring(rigId: string): boolean;
+  demand(jobId: string): { desired: number; sampledAt: string } | null;
+}
+
+/** The pool's state as the planner sees it. */
+export function readSeatPoolState(deps: SeatPoolStateReaderDeps, job: { jobId: string; targetSession: string; spec: SeatPoolSpec }): SeatPoolState {
+  const { db } = deps;
+  const row = db.prepare(
+    `SELECT n.id AS node_id, n.logical_id, r.id AS rig_id, r.name AS rig_name, p.namespace
+       FROM sessions s JOIN nodes n ON n.id = s.node_id JOIN rigs r ON r.id = n.rig_id JOIN pods p ON p.id = n.pod_id
+      WHERE s.session_name = ? ORDER BY s.id DESC LIMIT 1`,
+  ).get(physicalSessionName(db, job.targetSession)) as
+    | { node_id: string; logical_id: string; rig_id: string; rig_name: string; namespace: string }
+    | undefined;
+  const model: SeatPoolModel | null = row && row.logical_id.startsWith(`${row.namespace}.`)
+    ? {
+        rigId: row.rig_id, rigName: row.rig_name, podNamespace: row.namespace, memberId: row.logical_id.slice(row.namespace.length + 1),
+        logicalId: row.logical_id, nodeId: row.node_id, sessionName: job.targetSession,
+      }
+    : null;
+  const empty = { model, restoring: false, slots: [], adoptable: [], pendingForModel: 0, demand: null, lastScaleAt: null };
+  if (!model) return empty;
+
+  const nodeExists = (nodeId: string) => !!db.prepare("SELECT 1 FROM nodes WHERE id = ? AND rig_id = ?").get(nodeId, model.rigId);
+  const slots = deps.slots.listOpen(job.jobId).map((slot) => {
+    const present = slot.nodeId !== null && nodeExists(slot.nodeId);
+    const state = present ? deps.seatState(slot.nodeId!) : null;
+    const idle = state?.activity === "idle-at-prompt" && state.needsInput.count === 0 && !state.backgroundWork;
+    return {
+      slotId: slot.slotId,
+      logicalId: slot.logicalId,
+      nodeId: slot.nodeId,
+      phase: slot.phase as Exclude<SeatPoolSlotPhase, "retired">,
+      adopted: slot.opId === null,
+      nodeExists: present,
+      openRows: present ? deps.openRows(seatSessionName(slot.logicalId, model.rigName)).length : 0,
+      heldMessages: present ? deps.heldMessages(slot.nodeId!) : 0,
+      idleSince: idle ? state!.changedAt : null,
+    };
+  });
+  const adoptable = job.spec.adopt.flatMap((logicalId) => {
+    const node = db.prepare("SELECT id FROM nodes WHERE rig_id = ? AND logical_id = ?").get(model.rigId, logicalId) as { id: string } | undefined;
+    return node && node.id !== model.nodeId && !deps.slots.isLinked(node.id) ? [{ logicalId, nodeId: node.id }] : [];
+  });
+  return {
+    model,
+    restoring: deps.restoring(model.rigId),
+    slots,
+    adoptable,
+    pendingForModel: deps.openRows(model.sessionName).filter((r) => r.state === "pending").length,
+    demand: job.spec.demandCmd ? deps.demand(job.jobId) : null,
+    lastScaleAt: deps.slots.lastScaleAt(job.jobId),
+  };
+}
+
+export type SeatPoolEffectResult = { ok: true } | { ok: false; code: string; error: string };
+
+export interface SeatPoolCommandResult {
+  exitCode: number | null;
+  stdout: string;
+  timedOut: boolean;
+  error?: string;
+}
+
+/** The daemon operations a run uses, injected so the executor holds no service of its own. */
+export interface SeatPoolEffects {
+  /** Adds the seat without a session, under the Operation-Id; the same id again returns the node it created. */
+  addSlot(input: { model: SeatPoolModel; memberId: string; cwd: string; operationId: string }): Promise<SeatPoolEffectResult & { nodeId?: string }>;
+  /** The node an earlier add with this Operation-Id created, without adding anything. */
+  operationNodeId(operationId: string): string | null;
+  /** The seat's first launch. */
+  launchSlot(input: { rigId: string; nodeId: string }): Promise<SeatPoolEffectResult>;
+  sessionRunning(nodeId: string): boolean;
+  /** Runs `fn` holding the seat's lifecycle lease, so no launch, stop or delivery of the seat comes between its steps. */
+  lifecycle<T>(nodeId: string, fn: () => Promise<T>): Promise<T>;
+  stopPrecondition(nodeId: string): StopPrecondition;
+  stopSlot(input: { sessionName: string; expected: StopPrecondition }): Promise<SeatPoolEffectResult>;
+  removeSlot(input: { rigId: string; nodeId: string; expected: StopPrecondition }): Promise<SeatPoolEffectResult>;
+  runCommand(command: SeatPoolCommand, env: Record<string, string>, signal: AbortSignal): Promise<SeatPoolCommandResult>;
+}
+
+/** Runs an argv without a shell, with the daemon's environment plus `env`, killed at its timeout or on abort. */
+export function runSeatPoolCommand(command: SeatPoolCommand, env: Record<string, string>, signal: AbortSignal): Promise<SeatPoolCommandResult> {
+  const [file, ...args] = command.argv;
+  return new Promise((resolve) => {
+    execFile(file!, args, {
+      env: { ...process.env, ...env }, signal, timeout: command.timeoutSeconds * 1000, killSignal: "SIGKILL",
+      maxBuffer: 1024 * 1024, encoding: "utf8",
+    }, (error, stdout) => {
+      if (!error) return resolve({ exitCode: 0, stdout, timedOut: false });
+      const failure = error as NodeJS.ErrnoException & { code?: number | string; killed?: boolean; signal?: string };
+      const timedOut = failure.killed === true && failure.signal === "SIGKILL" && !signal.aborted;
+      resolve({
+        exitCode: typeof failure.code === "number" ? failure.code : null,
+        stdout: stdout ?? "",
+        timedOut,
+        error: timedOut ? `timed out after ${command.timeoutSeconds}s` : failure.message,
+      });
+    });
+  });
+}
+
+/** The job as stored now, for the re-read before each effect. */
+export interface SeatPoolJobView {
+  active: boolean;
+  targetSession: string;
+  /** Null when the stored spec no longer parses: the run stops. */
+  spec: SeatPoolSpec | null;
+}
+
+export interface SeatPoolExecutorDeps {
+  slots: SeatPoolSlots;
+  readJob(jobId: string): SeatPoolJobView | null;
+  readState(job: { jobId: string; targetSession: string; spec: SeatPoolSpec }): SeatPoolState;
+  effects: SeatPoolEffects;
+  /** Writes one history entry for the job. */
+  record(jobId: string, entry: { failed: boolean; reason: string; notes: Record<string, unknown> }): void;
+  now?: () => Date;
+  /** How long one add, launch or drain may take before the run stops waiting for it. Default 10 minutes. */
+  effectTimeoutMs?: number;
+}
+
+interface Run {
+  controller: AbortController;
+  /** Effects the run stopped waiting for; the pool stays owned until they settle. */
+  lingering: Array<Promise<unknown>>;
+  done: Promise<void>;
+}
+
+interface DrainOutcome {
+  /** True stops the run. */
+  stop: boolean;
+  failed?: boolean;
+  /** The history entry's reason; null writes none. */
+  reason: string | null;
+  notes?: Record<string, unknown>;
+}
+
+interface Context {
+  jobId: string;
+  spec: SeatPoolSpec;
+  state: SeatPoolState;
+  model: SeatPoolModel;
+}
+
+const STOPPED_CODES = new Set(["session_not_live", "no_session"]);
+const holdsWork = (slot: SeatPoolSlotView) => slot.openRows > 0 || slot.heldMessages > 0;
+const TIMED_OUT = Symbol("timed out");
+
+export class SeatPoolExecutor {
+  private readonly runs = new Map<string, Run>();
+  private readonly samples = new Map<string, { desired: number; sampledAt: string }>();
+  /** Slots whose intent this process wrote; any other intent was left by an interrupted run. */
+  private readonly touched = new Set<number>();
+  private readonly now: () => Date;
+  private readonly effectTimeoutMs: number;
+  private stopping = false;
+
+  constructor(private readonly deps: SeatPoolExecutorDeps) {
+    this.now = deps.now ?? (() => new Date());
+    this.effectTimeoutMs = deps.effectTimeoutMs ?? 10 * 60_000;
+  }
+
+  /** The demand command's last good answer for the pool, or null. */
+  demandSample(jobId: string): { desired: number; sampledAt: string } | null {
+    return this.samples.get(jobId) ?? null;
+  }
+
+  /** Starts applying a plan; false when the pool already has a run, or the executor is stopping. */
+  submit(jobId: string, intents: SeatPoolIntent[]): boolean {
+    if (this.stopping || this.runs.has(jobId)) return false;
+    const run: Run = { controller: new AbortController(), lingering: [], done: Promise.resolve() };
+    run.done = this.apply(jobId, intents, run)
+      .catch((error) => this.deps.record(jobId, { failed: true, reason: "seat_pool_run_failed", notes: { error: (error as Error).message } }))
+      .then(() => Promise.allSettled(run.lingering))
+      .then(() => { this.runs.delete(jobId); });
+    this.runs.set(jobId, run);
+    return true;
+  }
+
+  /** Resolves when the pool's current run, if any, has finished. */
+  async settled(jobId: string): Promise<void> {
+    await this.runs.get(jobId)?.done;
+  }
+
+  /** Cancels every run (commands are killed, no further effect starts) and waits for them to finish. */
+  async stop(): Promise<void> {
+    this.stopping = true;
+    for (const run of this.runs.values()) run.controller.abort();
+    await Promise.all([...this.runs.values()].map((run) => run.done));
+  }
+
+  private at(): string {
+    return this.now().toISOString();
+  }
+
+  private record(jobId: string, failed: boolean, reason: string, notes: Record<string, unknown>): void {
+    this.deps.record(jobId, { failed, reason, notes });
+  }
+
+  /** The job, spec and pool state read now; null stops the run. */
+  private fresh(jobId: string, run: Run): Context | null {
+    if (run.controller.signal.aborted) return null;
+    const job = this.deps.readJob(jobId);
+    if (!job?.active || !job.spec) return null;
+    const state = this.deps.readState({ jobId, targetSession: job.targetSession, spec: job.spec });
+    if (!state.model || state.restoring) return null;
+    return { jobId, spec: job.spec, state, model: state.model };
+  }
+
+  private setIntent(slotId: number, intent: string | null, phase?: Exclude<SeatPoolSlotPhase, "retired">): void {
+    this.touched.add(slotId);
+    this.deps.slots.update(slotId, { intent, ...(phase ? { phase } : {}) });
+  }
+
+  /** Notes naming an intent an interrupted run left on the seat, the first time this process meets it. */
+  private interrupted(slot: SeatPoolSlot): Record<string, unknown> {
+    return slot.intent && !this.touched.has(slot.slotId) ? { interrupted: slot.intent } : {};
+  }
+
+  private async within<T>(run: Run, start: () => Promise<T>): Promise<T | typeof TIMED_OUT> {
+    const pending = start();
+    run.lingering.push(pending.catch(() => undefined));
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timeout = new Promise<typeof TIMED_OUT>((resolve) => { timer = setTimeout(() => resolve(TIMED_OUT), this.effectTimeoutMs); });
+    try {
+      return await Promise.race([pending, timeout]);
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  private commandEnv(ctx: Context, extra: Record<string, string>): Record<string, string> {
+    return { OPENRIG_SEAT_POOL_JOB: ctx.jobId, OPENRIG_SEAT_POOL_MODEL: ctx.model.sessionName, ...extra };
+  }
+
+  private async apply(jobId: string, intents: SeatPoolIntent[], run: Run): Promise<void> {
+    for (const intent of intents) {
+      if (!this.fresh(jobId, run)) return;
+      if (intent.kind === "adopt") this.adopt(jobId, run, intent);
+      else if (intent.kind === "add") {
+        for (let i = 0; i < intent.count; i++) {
+          const slot = this.allocate(jobId, run);
+          if (!slot || !(await this.bringUp(jobId, run, slot.slotId))) break;
+        }
+      } else if (intent.kind === "launch") {
+        if (!(await this.bringUp(jobId, run, intent.slotId))) return;
+      } else if (intent.kind === "drain") {
+        if (!(await this.drain(jobId, run, intent.slotId))) return;
+      } else if (!(await this.removeUnstarted(jobId, run, intent.slotId))) return;
+    }
+    await this.refreshDemand(jobId, run);
+  }
+
+  private adopt(jobId: string, run: Run, intent: Extract<SeatPoolIntent, { kind: "adopt" }>): void {
+    const ctx = this.fresh(jobId, run);
+    if (!ctx || ctx.spec.drain || !ctx.state.adoptable.some((seat) => seat.nodeId === intent.nodeId)) return;
+    const slot = this.deps.slots.insert({ poolJobId: jobId, logicalId: intent.logicalId, nodeId: intent.nodeId, phase: "live", intent: null, opId: null, at: this.at() });
+    this.record(jobId, false, "seat_pool_adopted", { slot: slot.logicalId, nodeId: intent.nodeId });
+  }
+
+  /** Records a new seat (phase `adding`) if the pool, read again, still has room for it. */
+  private allocate(jobId: string, run: Run): SeatPoolSlot | null {
+    const ctx = this.fresh(jobId, run);
+    if (!ctx || ctx.spec.drain || ctx.state.slots.length >= ctx.spec.max) return null;
+    const logicalId = this.deps.slots.nextLogicalId(ctx.model);
+    const slot = this.deps.slots.insert({ poolJobId: jobId, logicalId, nodeId: null, phase: "adding", intent: "add", opId: randomUUID(), at: this.at() });
+    this.touched.add(slot.slotId);
+    return slot;
+  }
+
+  /** Adds (or resolves the add of), prepares and launches a seat. False stops the run. */
+  private async bringUp(jobId: string, run: Run, slotId: number): Promise<boolean> {
+    let slot = this.deps.slots.get(slotId);
+    if (!slot || slot.retiredAt) return true;
+    const interrupted = this.interrupted(slot);
+    let ctx = this.fresh(jobId, run);
+    if (!ctx) return false;
+    const memberId = slot.logicalId.slice(ctx.model.podNamespace.length + 1);
+    const cwd = slotWorkingDirectory(ctx.spec.cwdTemplate, ctx.model.rigName, memberId);
+
+    if (slot.phase === "adding") {
+      this.setIntent(slotId, "add");
+      const added = await this.within(run, () => this.deps.effects.addSlot({ model: ctx!.model, memberId, cwd, operationId: slot!.opId! }));
+      if (added === TIMED_OUT) {
+        this.record(jobId, true, "seat_pool_add_failed", { slot: slot.logicalId, code: "effect_timeout", ...interrupted });
+        return false;
+      }
+      if (!added.ok || !added.nodeId) {
+        // The name is spent; the next add would most likely fail the same way, so the run stops here.
+        this.deps.slots.retire(slotId, this.at());
+        this.record(jobId, true, "seat_pool_add_failed", { slot: slot.logicalId, ...(added.ok ? { code: "no_node" } : { code: added.code, error: added.error }), ...interrupted });
+        return false;
+      }
+      this.deps.slots.update(slotId, { nodeId: added.nodeId, phase: "added", intent: null });
+      slot = this.deps.slots.get(slotId)!;
+    }
+    if (slot.phase !== "added") return true;
+
+    ctx = this.fresh(jobId, run);
+    if (!ctx) return false;
+    // Drain turned on since the plan: a seat that hasn't started is removed instead.
+    if (ctx.spec.drain) return this.removeUnstarted(jobId, run, slotId);
+    const nodeId = slot.nodeId!;
+    const sessionName = seatSessionName(slot.logicalId, ctx.model.rigName);
+    // A launch that ran but whose result was lost: the session is the evidence.
+    if (!this.deps.effects.sessionRunning(nodeId)) {
+      if (ctx.spec.prepareCmd) {
+        this.setIntent(slotId, "prepare");
+        const prepared = await this.deps.effects.runCommand(ctx.spec.prepareCmd,
+          this.commandEnv(ctx, { OPENRIG_SEAT_POOL_SLOT: sessionName, OPENRIG_SEAT_POOL_SLOT_CWD: cwd }), run.controller.signal);
+        if (run.controller.signal.aborted) return false;
+        if (prepared.exitCode !== 0) {
+          this.record(jobId, true, "seat_pool_prepare_failed", { slot: slot.logicalId, exitCode: prepared.exitCode, error: prepared.error ?? null, ...interrupted });
+          return this.removeUnstarted(jobId, run, slotId);
+        }
+      }
+      ctx = this.fresh(jobId, run);
+      if (!ctx) return false;
+      if (ctx.spec.drain) return this.removeUnstarted(jobId, run, slotId);
+      this.setIntent(slotId, "launch");
+      const launched = await this.within(run, () => this.deps.effects.launchSlot({ rigId: ctx!.model.rigId, nodeId }));
+      if (launched === TIMED_OUT) {
+        this.record(jobId, true, "seat_pool_launch_failed", { slot: slot.logicalId, code: "effect_timeout", ...interrupted });
+        return false;
+      }
+      if (!launched.ok) {
+        this.record(jobId, true, "seat_pool_launch_failed", { slot: slot.logicalId, code: launched.code, error: launched.error, ...interrupted });
+        return this.removeUnstarted(jobId, run, slotId);
+      }
+    }
+    this.setIntent(slotId, null, "live");
+    this.record(jobId, false, "seat_pool_launched", { slot: slot.logicalId, nodeId, ...interrupted });
+    return true;
+  }
+
+  /**
+   * Takes a free seat out of admission and removes it: the release command, a checked stop and a checked removal, all
+   * under one lifecycle lease. A seat that gets work (an open row or a held message) before the stop, or whose release
+   * command refuses, returns to admission.
+   */
+  private async drain(jobId: string, run: Run, slotId: number): Promise<boolean> {
+    const slot = this.deps.slots.get(slotId);
+    if (!slot?.nodeId || slot.retiredAt) return true;
+    const interrupted = this.interrupted(slot);
+    const ctx = this.fresh(jobId, run);
+    if (!ctx) return false;
+    const view = ctx.state.slots.find((s) => s.slotId === slotId);
+    if (!view?.nodeExists) return this.removeUnstarted(jobId, run, slotId);
+    if (slot.phase === "live") {
+      if (holdsWork(view) || view.idleSince === null) return true;
+      this.setIntent(slotId, null, "draining");
+    } else if (slot.phase !== "draining") return true;
+
+    const nodeId = slot.nodeId;
+    const sessionName = seatSessionName(slot.logicalId, ctx.model.rigName);
+    const tookWork = (read: Context) => read.state.slots.some((s) => s.slotId === slotId && holdsWork(s));
+    const returned = (): DrainOutcome => {
+      this.setIntent(slotId, null, "live");
+      return { stop: false, reason: "seat_pool_returned", notes: { why: "work_arrived" } };
+    };
+    const outcome = await this.within(run, () => this.deps.effects.lifecycle(nodeId, async (): Promise<DrainOutcome> => {
+      const inLease = this.fresh(jobId, run);
+      if (!inLease) return { stop: true, reason: null };
+      if (tookWork(inLease)) return returned();
+      const expected = this.deps.effects.stopPrecondition(nodeId);
+      if (inLease.spec.releaseCmd) {
+        this.setIntent(slotId, "release");
+        const released = await this.deps.effects.runCommand(inLease.spec.releaseCmd, this.commandEnv(inLease, { OPENRIG_SEAT_POOL_SLOT: sessionName }), run.controller.signal);
+        if (run.controller.signal.aborted) return { stop: true, reason: null };
+        if (released.exitCode !== 0) {
+          this.setIntent(slotId, null, "live");
+          return { stop: false, reason: "seat_pool_returned", notes: { why: "release_refused", exitCode: released.exitCode, error: released.error ?? null } };
+        }
+        // The lease holds deliveries back, not queue writes: a row may have arrived while the command ran.
+        const afterRelease = this.fresh(jobId, run);
+        if (!afterRelease) return { stop: true, reason: null };
+        if (tookWork(afterRelease)) return returned();
+      }
+      this.setIntent(slotId, "stop");
+      const stopped = await this.deps.effects.stopSlot({ sessionName, expected });
+      if (!stopped.ok && !STOPPED_CODES.has(stopped.code)) {
+        // A seat relaunched since the read is someone's seat now: it goes back to admission, untouched.
+        if (stopped.code === "selection_changed") this.setIntent(slotId, null, "live");
+        return { stop: false, failed: true, reason: "seat_pool_stop_failed", notes: { code: stopped.code, error: stopped.error } };
+      }
+      this.setIntent(slotId, "remove");
+      const removed = await this.deps.effects.removeSlot({ rigId: inLease.model.rigId, nodeId, expected });
+      if (!removed.ok && removed.code !== "node_not_found") {
+        return { stop: false, failed: true, reason: "seat_pool_remove_failed", notes: { code: removed.code, error: removed.error } };
+      }
+      this.deps.slots.retire(slotId, this.at());
+      return { stop: false, reason: "seat_pool_removed", notes: {} };
+    }));
+    if (outcome === TIMED_OUT) {
+      this.record(jobId, true, "seat_pool_drain_failed", { slot: slot.logicalId, code: "effect_timeout", ...interrupted });
+      return false;
+    }
+    if (outcome.reason) this.record(jobId, outcome.failed === true, outcome.reason, { slot: slot.logicalId, ...outcome.notes, ...interrupted });
+    return !outcome.stop;
+  }
+
+  /** Removes a seat that never took work, or forgets one whose node is gone. */
+  private async removeUnstarted(jobId: string, run: Run, slotId: number): Promise<boolean> {
+    const slot = this.deps.slots.get(slotId);
+    if (!slot || slot.retiredAt) return true;
+    const interrupted = this.interrupted(slot);
+    const ctx = this.fresh(jobId, run);
+    if (!ctx) return false;
+    const nodeId = slot.nodeId ?? (slot.opId ? this.deps.effects.operationNodeId(slot.opId) : null);
+    const view = ctx.state.slots.find((s) => s.slotId === slotId);
+    if (!nodeId || (slot.nodeId && view && !view.nodeExists)) {
+      this.deps.slots.retire(slotId, this.at());
+      this.record(jobId, false, "seat_pool_removed", { slot: slot.logicalId, why: nodeId ? "node_gone" : "never_created", ...interrupted });
+      return true;
+    }
+    // An admitted seat may hold work: it leaves only by draining.
+    if (slot.phase === "live" || slot.phase === "draining") return true;
+    if (!slot.nodeId) this.deps.slots.update(slotId, { nodeId });
+    if (this.deps.effects.sessionRunning(nodeId)) {
+      // Launched after all: it is a live seat now, and leaves only by draining.
+      this.setIntent(slotId, null, "live");
+      this.record(jobId, false, "seat_pool_launched", { slot: slot.logicalId, nodeId, ...interrupted });
+      return true;
+    }
+    this.setIntent(slotId, "remove");
+    const removed = await this.within(run, () => this.deps.effects.removeSlot({ rigId: ctx.model.rigId, nodeId, expected: this.deps.effects.stopPrecondition(nodeId) }));
+    if (removed === TIMED_OUT) {
+      this.record(jobId, true, "seat_pool_remove_failed", { slot: slot.logicalId, code: "effect_timeout", ...interrupted });
+      return false;
+    }
+    if (!removed.ok && removed.code !== "node_not_found") {
+      this.record(jobId, true, "seat_pool_remove_failed", { slot: slot.logicalId, code: removed.code, error: removed.error, ...interrupted });
+      return true;
+    }
+    this.deps.slots.retire(slotId, this.at());
+    this.record(jobId, false, "seat_pool_removed", { slot: slot.logicalId, ...interrupted });
+    return true;
+  }
+
+  /** Asks the demand command for the next plan. A failure keeps the previous answer, which ages until it holds the pool. */
+  private async refreshDemand(jobId: string, run: Run): Promise<void> {
+    const ctx = this.fresh(jobId, run);
+    if (!ctx?.spec.demandCmd) return;
+    const slots = ctx.state.slots.map((slot) => ({ session: seatSessionName(slot.logicalId, ctx.model.rigName), phase: slot.phase }));
+    const result = await this.deps.effects.runCommand(ctx.spec.demandCmd, this.commandEnv(ctx, { OPENRIG_SEAT_POOL_SLOTS: JSON.stringify(slots) }), run.controller.signal);
+    if (run.controller.signal.aborted) return;
+    let desired: unknown;
+    try { desired = result.exitCode === 0 ? (JSON.parse(result.stdout) as { desired?: unknown }).desired : undefined; } catch { desired = undefined; }
+    if (Number.isInteger(desired) && (desired as number) >= 0) {
+      this.samples.set(jobId, { desired: desired as number, sampledAt: this.at() });
+      return;
+    }
+    this.record(jobId, true, "seat_pool_demand_failed", {
+      exitCode: result.exitCode, error: result.error ?? (result.exitCode === 0 ? "stdout is not {\"desired\": <whole number>}" : null),
+    });
+  }
+}

@@ -8,7 +8,8 @@ import {
   WatchdogJobsError,
 } from "../domain/watchdog-jobs-repository.js";
 import { parseWatchdogSpec } from "../domain/watchdog-policy-engine.js";
-import { updateWatchdogJob } from "../domain/watchdog-job-update.js";
+import { specProblem, updateWatchdogJob } from "../domain/watchdog-job-update.js";
+import { SEAT_POOL_POLICY_NAME } from "../domain/policies/seat-pool.js";
 
 /**
  * Watchdog HTTP routes (PL-004 Phase C). Backs `rig watchdog` CLI verb.
@@ -63,6 +64,7 @@ export function watchdogRoutes(): Hono {
         : err.code === "policy_not_updatable" ? 409
         : err.code === "spec_not_updatable" ? 409
         : err.code === "target_not_updatable" ? 409
+        : err.code === "pool_has_slots" ? 409
         : 500;
       return c.json(
         { error: err.code, message: err.message, ...(err.details ?? {}) },
@@ -99,7 +101,13 @@ export function watchdogRoutes(): Hono {
     if (!body.registeredBySession) return c.json({ error: "registeredBySession is required" }, 400);
     try {
       const jobsRepo = getJobsRepo(c);
-      const context = parseWatchdogSpec(body.specYaml).context;
+      const parsedSpec = parseWatchdogSpec(body.specYaml);
+      const context = parsedSpec.context;
+      // A pool acts on seats, so its spec is checked before it can run, as an update checks it.
+      const poolProblem = body.policy === SEAT_POOL_POLICY_NAME ? specProblem(body.policy, parsedSpec) : null;
+      if (poolProblem) {
+        throw new WatchdogJobsError("spec_invalid", `watchdog spec is not valid for ${body.policy}: ${poolProblem}`, { policy: body.policy });
+      }
       const isContextUsageThreshold = body.policy === "context-usage-threshold";
       const specWatchedFile = typeof context.watched_file === "string"
         ? context.watched_file

@@ -451,7 +451,10 @@ export async function startServer(port?: number) {
       ["runtime-probes", () => stopRuntimeProbes()],
       ["proof-source-watch", () => deps.proofSourceWatch?.close()],
       ["health-diagnosis", () => deps.healthDiagnosis?.stop()],
-      ["watchdog", () => deps.watchdogScheduler?.stop()],
+      ["watchdog", async () => {
+        await deps.watchdogScheduler?.stop();
+        await deps.seatPoolExecutor?.stop();
+      }],
       ["stream-intake", () => deps.streamIntakeCoordinator?.stop()],
       ["draft-delivery", () => deps.sessionTransport?.guardedDelivery?.stop()],
       ["seat-activity", () => deps.seatActivityService?.stop()],
