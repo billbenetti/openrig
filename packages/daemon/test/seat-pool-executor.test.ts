@@ -699,6 +699,46 @@ describe("seat-pool executor", () => {
       } }]);
     });
 
+    it("asks the release command first, and launches the seat again instead when it refuses, reaping it only if that fails", async () => {
+      jobSpec = spec({ release_cmd: { argv: ["release"] }, reap_cmd: { argv: ["reap"] } });
+      const executor = makeExecutor();
+      const saved = await seat(executor, { session: "stopped", idle: false, openRows: 1 });
+      row("q-1", "dev-impl-s1@r", "in-progress");
+      await run(executor, [{ kind: "reap", slotId: saved.slotId }]);
+      expect(world.calls.slice(0, 4)).toEqual(["lease dev.impl-s1", "run release", "clean dev-impl-s1@r", "run reap"]);
+      expect(reasons()).toEqual(["seat_pool_reaped"]);
+
+      // Its work isn't saved: the seat comes back to finish it, and nothing of it is moved or removed.
+      const unsaved = await seat(executor, { session: "stopped", idle: false, openRows: 1 });
+      row("q-2", "dev-impl-s2@r", "in-progress");
+      world.exit["release"] = 1;
+      await run(executor, [{ kind: "reap", slotId: unsaved.slotId }]);
+      expect(world.calls).toEqual(["lease dev.impl-s2", "run release", "lease released", "relaunch dev.impl-s2"]);
+      expect(history).toEqual([{ failed: false, reason: "seat_pool_relaunched", notes: { seat: "dev-impl-s2@r", why: "release_refused", exitCode: 1, error: null } }]);
+      expect(world.rows.get("q-2")).toMatchObject({ destination: "dev-impl-s2@r", state: "in-progress" });
+      expect(slots.get(unsaved.slotId)).toMatchObject({ phase: "live", intent: null });
+
+      // A seat that can't come back is reaped, without asking the release command again.
+      world.calls = [];
+      history = [];
+      world.relaunchResult = { ok: false, code: "resume_failed", error: "no resumable session" };
+      await run(executor, [{ kind: "reap", slotId: unsaved.slotId }]);
+      expect(world.calls).toEqual([
+        "lease dev.impl-s2", "run release", "lease released", "relaunch dev.impl-s2",
+        "lease dev.impl-s2", "clean dev-impl-s2@r", "run reap", "unclaim q-2 reap:dev-impl-s2@r", "move q-2 dev-impl-s2@r -> dev-impl@r",
+        `remove dev.impl-s2 ${JSON.stringify({ nodeId: unsaved.nodeId, sessionId: "sess-4" })}`, "lease released",
+      ]);
+      expect(reasons()).toEqual(["seat_pool_relaunch_failed", "seat_pool_reaped"]);
+    });
+
+    it("never reaps an adopted seat whose session is gone", async () => {
+      world.nodes.set("node-9", { logicalId: "dev.impl2", session: "stopped", sessionId: "sess-9", openRows: 1, idle: false });
+      const adopted = slots.adopt({ poolJobId: JOB, logicalId: "dev.impl2", nodeId: "node-9", at: new Date(T0).toISOString() });
+      await run(makeExecutor(), [{ kind: "reap", slotId: adopted.slotId }]);
+      expect(world.calls).toEqual(["lease dev.impl2", "lease released"]);
+      expect(slots.get(adopted.slotId)).toMatchObject({ phase: "live", retiredAt: null });
+    });
+
     it("sends a row a reap already moved to the escalation owner, and to the model when there is none", async () => {
       const executor = makeExecutor();
       const first = await seat(executor, { session: "stopped", idle: false });
