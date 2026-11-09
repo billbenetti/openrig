@@ -611,7 +611,7 @@ export class SeatPoolExecutor {
           : await this.bringUp(jobId, run, intent.slotId);
         if (started === false) return;
       } else if (intent.kind === "drain") {
-        if (!(await this.drain(jobId, run, intent.slotId))) return;
+        if (!(await this.drain(jobId, run, intent))) return;
       } else if (intent.kind === "remove") {
         if (!(await this.removeUnstarted(jobId, run, intent.slotId))) return;
       } else if (intent.kind === "dispatch") {
@@ -715,24 +715,27 @@ export class SeatPoolExecutor {
 
   /**
    * Takes a free seat out of admission and removes it: the release command, a checked stop and a checked removal, all
-   * under one lifecycle lease. A seat that gets work (an open row or a held message) before the stop, or whose release
+   * under one lifecycle lease. A seat that gets work (an open row or a held message) before the stop, that isn't idle
+   * since the moment the plan read (a message or a nudge woke it, even one that left nothing behind), or whose release
    * command refuses, returns to admission.
    */
-  private async drain(jobId: string, run: Run, slotId: number): Promise<boolean> {
+  private async drain(jobId: string, run: Run, intent: Extract<SeatPoolIntent, { kind: "drain" }>): Promise<boolean> {
+    const { slotId } = intent;
     const slot = this.deps.slots.get(slotId);
     if (!slot?.nodeId || slot.retiredAt) return true;
     const ctx = this.fresh(jobId, run);
     if (!ctx) return false;
     const view = ctx.state.slots.find((s) => s.slotId === slotId);
     if (!view?.nodeExists) return this.removeUnstarted(jobId, run, slotId);
+    const stillFree = (s: SeatPoolSlotView) => !holdsWork(s) && s.cause === "idle" && s.idleSince === intent.idleSince;
     if (slot.phase === "live") {
-      if (holdsWork(view) || view.idleSince === null) return true;
+      if (!stillFree(view)) return true;
       this.setIntent(slotId, null, "draining");
     } else if (slot.phase !== "draining") return true;
 
     const nodeId = slot.nodeId;
     const sessionName = seatSessionName(slot.logicalId, ctx.model.rigName);
-    const tookWork = (read: Context) => read.state.slots.some((s) => s.slotId === slotId && holdsWork(s));
+    const tookWork = (read: Context) => !read.state.slots.some((s) => s.slotId === slotId && stillFree(s));
     const returned = (): DrainOutcome => {
       this.setIntent(slotId, null, "live");
       return { stop: false, reason: "seat_pool_returned", notes: { why: "work_arrived" } };
