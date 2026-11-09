@@ -327,6 +327,42 @@ describe("Rig lifecycle routes", () => {
     });
   });
 
+  it("DELETE /api/rigs/:rigId/nodes/:nodeRef with expected removes only the node and session the caller read", async () => {
+    const rig = setup.rigRepo.createRig("checked-remove-rig");
+    const expanded = await setup.rigExpansionService.expand({ rigId: rig.id, pod: { id: "infra", label: "Infrastructure",
+      members: [{ id: "server", runtime: "terminal", agentRef: "builtin:terminal", profile: "none", cwd: "/tmp" }], edges: [] } });
+    expect(expanded.ok).toBe(true);
+    if (!expanded.ok) return;
+    const nodeId = expanded.nodes[0]!.nodeId;
+    const sessionId = (db.prepare("SELECT id FROM sessions WHERE node_id = ?").get(nodeId) as { id: string }).id;
+    const removeRaw = (body: string) => setup.app.request(`/api/rigs/${rig.id}/nodes/infra.server`, {
+      method: "DELETE", headers: { "Content-Type": "application/json" }, body,
+    });
+    const remove = (expected: unknown) => removeRaw(JSON.stringify({ expected }));
+    const removeNode = vi.spyOn(setup.rigLifecycleService, "removeNode");
+
+    for (const [body, status, code] of [
+      [JSON.stringify({ expected: { nodeId } }), 400, "invalid_stop_precondition"],
+      [JSON.stringify({ expected: { nodeId, sessionId: "01STALESESSION" } }), 409, "selection_changed"],
+      [JSON.stringify({ expected: { nodeId: "01OTHERNODE", sessionId } }), 409, "selection_changed"],
+      // A truncated or non-object body must not read as "no expected" and remove unchecked.
+      [JSON.stringify({ expected: { nodeId, sessionId } }).slice(0, -2), 400, "invalid_json"],
+      [JSON.stringify([{ expected: { nodeId, sessionId } }]), 400, "invalid_json"],
+    ] as const) {
+      const res = await removeRaw(body);
+      expect({ status: res.status, body: await res.json() }).toMatchObject({ status, body: { ok: false, code } });
+    }
+    // Only the two well-formed stale selections reach removal, which refuses them before any reroute.
+    expect(removeNode).toHaveBeenCalledTimes(2);
+    expect(setup.tmuxAdapter.killSession).not.toHaveBeenCalled();
+    expect(setup.rigRepo.getRig(rig.id)!.nodes.map((node) => node.id)).toEqual([nodeId]);
+
+    const res = await remove({ nodeId, sessionId });
+    expect(res.status).toBe(200);
+    expect(await res.json()).toMatchObject({ ok: true, nodeId });
+    expect(setup.rigRepo.getRig(rig.id)!.nodes).toEqual([]);
+  });
+
   it("DELETE /api/rigs/:rigId/nodes/:nodeRef refuses removal while active qitems target the session", async () => {
     const rig = setup.rigRepo.createRig("remove-active-qitem-rig");
     const expanded = await setup.rigExpansionService.expand({
