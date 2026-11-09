@@ -42,7 +42,7 @@ function slot(overrides: Partial<SeatPoolSlotView> = {}): SeatPoolSlotView {
   const slotId = overrides.slotId ?? nextSlot++;
   return {
     slotId, logicalId: `dev.impl-s${slotId}`, sessionName: `dev-impl-s${slotId}@r`, nodeId: `node-${slotId}`, phase: "live", adopted: false,
-    nodeExists: true, openRows: 0, heldMessages: 0, idleSince: ago(600), stateSince: ago(600), cause: "idle", quarantined: false, ...overrides,
+    nodeExists: true, openRows: 0, heldMessages: 0, idleSince: ago(600), cause: "idle", ...overrides,
   };
 }
 
@@ -66,7 +66,7 @@ describe("seat-pool spec", () => {
     const parsed = parseSeatPoolSpec({ max: 2, cwd_template: "/w/{slot}", release_cmd: { argv: ["/bin/release", "--now"], timeout_s: 9 } });
     expect(parsed).toEqual({ spec: {
       min: 0, max: 2, cooldownSeconds: 60, idleGraceSeconds: 300, dispatchAfterSeconds: 60, drain: false, adopt: [], cwdTemplate: "/w/{slot}",
-      demandCmd: null, prepareCmd: null, releaseCmd: { argv: ["/bin/release", "--now"], timeoutSeconds: 9 }, reapCmd: null, stuckAfterSeconds: null,
+      demandCmd: null, prepareCmd: null, releaseCmd: { argv: ["/bin/release", "--now"], timeoutSeconds: 9 }, reapCmd: null,
     } });
   });
 
@@ -82,7 +82,6 @@ describe("seat-pool spec", () => {
     [{ max: 1, cwd_template: "/w/{slot}", release_cmd: { argv: ["x"], timeout_s: 0 } }, "release_cmd.timeout_s"],
     [{ max: 1, cwd_template: "/w/{slot}", restart_cmd: { argv: ["x"] } }, "restart_cmd"],
     [{ max: 1, cwd_template: "/w/{slot}", reap_cmd: "pool-reap" }, "reap_cmd"],
-    [{ max: 1, cwd_template: "/w/{slot}", stuck_after_s: 0 }, "stuck_after_s"],
     [{ max: 1, cwd_template: "/w/{slot}", drain: "yes" }, "drain"],
     [{ max: 1, cwd_template: "/w/{slot}", dispatch_after_s: -5 }, "dispatch_after_s"],
     [{ max: 1, cwd_template: "/w/{slot}", adopt: "dev.impl2" }, "adopt"],
@@ -241,7 +240,7 @@ describe("planSeatPool: dispatch and wake", () => {
       pending: [...rows(1, stopped.sessionName), ...young, ...nudged, ...fresh, ...askingRows], slots: [stopped, idle, asking],
     }));
     expect(result.intents).toEqual<SeatPoolIntent[]>([
-      { kind: "reap", slotId: stopped.slotId, why: "no_session" },
+      { kind: "reap", slotId: stopped.slotId },
       { kind: "nudge", seat: idle.sessionName, qitemId: fresh[0]!.qitemId },
       { kind: "escalate", seat: asking.sessionName, qitemIds: [askingRows[0]!.qitemId] },
     ]);
@@ -272,7 +271,7 @@ describe("planSeatPool: dispatch and wake", () => {
     const result = plan(spec({ max: 5 }), state({ pending: [...rows(1, stopped.sessionName), ...waiting], slots: [stopped, free, slot({ cause: "usage_limit", idleSince: null })] }));
     // The free seat still takes a row, and the stopped seat is reaped; nothing is launched or added.
     expect(result.intents).toEqual([
-      { kind: "reap", slotId: stopped.slotId, why: "no_session" },
+      { kind: "reap", slotId: stopped.slotId },
       { kind: "dispatch", qitemId: waiting[0]!.qitemId, from: "dev-impl@r", slotId: free.slotId },
     ]);
     expect(result.reason).toBe("usage_limit");
@@ -291,47 +290,14 @@ describe("planSeatPool: dispatch and wake", () => {
     expect(plan(spec(), state({ slots: [added] })).intents).toEqual([{ kind: "launch", slotId: added.slotId }]);
   });
 
-  it("reaps a live seat out of usage, waiting for input or working with no activity change past stuck_after_s", () => {
-    const limited = slot({ cause: "usage_limit", idleSince: null, stateSince: ago(4000), openRows: 1 });
-    const working = slot({ cause: "working", idleSince: null, stateSince: ago(4000), openRows: 1 });
-    const asking = slot({ cause: "needs_input", idleSince: null, stateSince: ago(4000) });
-    const recent = slot({ cause: "working", idleSince: null, stateSince: ago(100) });
-    const unknown = slot({ cause: "working", idleSince: null, stateSince: null });
-    const quarantined = slot({ cause: "working", idleSince: null, stateSince: ago(4000), quarantined: true });
-    const idle = slot({ stateSince: ago(4000), openRows: 1 });
-    const seats = [limited, working, asking, recent, unknown, quarantined, idle];
-    const reaps = (s: SeatPoolSpec) => plan(s, state({ slots: seats })).intents.filter((i) => i.kind === "reap");
-    expect(reaps(spec({ max: 9, stuck_after_s: 3600 }))).toEqual<SeatPoolIntent[]>([
-      { kind: "reap", slotId: limited.slotId, why: "usage_limit" },
-      { kind: "reap", slotId: working.slotId, why: "stuck" },
-      { kind: "reap", slotId: asking.slotId, why: "stuck" },
-    ]);
-    // Without stuck_after_s, a live seat is never reaped.
-    expect(reaps(spec({ max: 9 }))).toEqual([]);
-  });
-
-  it("leaves a quarantined seat as it is: no reap when its session ends, no row and no drain when it is free", () => {
-    const dead = slot({ cause: "stopped", idleSince: null, stateSince: null, openRows: 1, quarantined: true });
-    const free = slot({ quarantined: true });
-    const waiting = rows(1);
-    // The free one holds no work, yet counts as taken: the row goes to a new seat.
-    expect(plan(spec({ max: 9 }), state({ pending: waiting, slots: [dead, free] })).intents).toEqual([{ kind: "add", count: 1 }]);
-    expect(plan(spec({ drain: true }), state({ slots: [dead, free] })).intents).toEqual([]);
-    // Once the quarantine row closes, the same seats are reaped and drained.
-    expect(plan(spec({ drain: true }), state({ slots: [{ ...dead, quarantined: false }, { ...free, quarantined: false }] })).intents).toEqual<SeatPoolIntent[]>([
-      { kind: "reap", slotId: dead.slotId, why: "no_session" },
-      { kind: "drain", slotId: free.slotId },
-    ]);
-  });
-
   it("reaps a seat whose session is gone under drain too, and never a seat still starting or whose node is gone", () => {
-    const stopped = slot({ cause: "stopped", idleSince: null, stateSince: null, openRows: 1 });
+    const stopped = slot({ cause: "stopped", idleSince: null, openRows: 1 });
     const starting = slot({ phase: "added", cause: "stopped", idleSince: null });
     const gone = slot({ cause: "stopped", idleSince: null, nodeExists: false });
     const result = plan(spec({ drain: true }), state({ slots: [stopped, starting, gone] }));
     expect(result.intents).toEqual<SeatPoolIntent[]>([
       { kind: "remove", slotId: gone.slotId },
-      { kind: "reap", slotId: stopped.slotId, why: "no_session" },
+      { kind: "reap", slotId: stopped.slotId },
       { kind: "remove", slotId: starting.slotId },
     ]);
   });
