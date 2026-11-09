@@ -26,6 +26,7 @@ import {
 } from "../domain/node-inventory.js";
 import type { ContextUsageStore } from "../domain/context-usage-store.js";
 import type { RigLifecycleService } from "../domain/rig-lifecycle-service.js";
+import { validStopPrecondition } from "../domain/seat-lifecycle-service.js";
 import type { SessionTransport } from "../domain/session-transport.js";
 import type { PreviewRateLimiter } from "../domain/preview/preview-rate-limiter.js";
 import type { ClaimService } from "../domain/claim-service.js";
@@ -492,11 +493,32 @@ nodesRoutes.delete("/:logicalId", async (c) => {
   if (!rigLifecycleService) {
     return c.json({ error: "Lifecycle service not available" }, 500);
   }
+  // An optional body carries the seat-stop.v1 `expected` tuple, as for a checked stop.
+  // A body that is present but unreadable is refused: reading it as absent would drop the check.
+  const raw = await c.req.text();
+  let body: Record<string, unknown> = {};
+  if (raw.trim() !== "") {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      return c.json({ ok: false, code: "invalid_json", error: "Request body must be JSON." }, 400);
+    }
+    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+      return c.json({ ok: false, code: "invalid_json", error: "Request body must be a JSON object." }, 400);
+    }
+    body = parsed as Record<string, unknown>;
+  }
+  const expected = Object.prototype.hasOwnProperty.call(body, "expected") ? body["expected"] : undefined;
+  if (expected !== undefined && !validStopPrecondition(expected)) {
+    return c.json({ ok: false, code: "invalid_stop_precondition", error: "expected must contain a nonempty nodeId and a nonempty sessionId or null." }, 400);
+  }
 
-  const result = await rigLifecycleService.removeNode(rigId, nodeRef, { fallbackDestination });
+  const result = await rigLifecycleService.removeNode(rigId, nodeRef, { fallbackDestination, expected });
   if (!result.ok) {
     const status = result.code === "rig_not_found" ? 404
       : result.code === "node_not_found" ? 404
+      : result.code === "selection_changed" ? 409
       : result.code === "active_qitems" ? 409
       : result.code === "fallback_not_running" ? 409
       : result.code === "fallback_in_target" ? 409

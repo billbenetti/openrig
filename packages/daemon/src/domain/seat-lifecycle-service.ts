@@ -277,7 +277,7 @@ export type StopSeatResult =
 export interface StopPrecondition { nodeId: string; sessionId: string | null }
 
 /** Reject malformed explicit values so they never fall through to an unchecked stop. */
-function validStopPrecondition(value: unknown): value is StopPrecondition {
+export function validStopPrecondition(value: unknown): value is StopPrecondition {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false;
   const record = value as Record<string, unknown>;
   return Object.keys(record).sort().join(",") === "nodeId,sessionId"
