@@ -5,12 +5,16 @@ import type { StopPrecondition } from "./seat-lifecycle-service.js";
 import type { ArbitratedSeatState } from "./activity-taxonomy.js";
 import { deriveCanonicalSessionName } from "./session-name.js";
 import { physicalSessionName } from "./session-registry.js";
+import { FALLBACK_ACTOR, type QueueRepository } from "./queue-repository.js";
+import { OPENRIG_SENDER } from "../lib/pane-envelope.js";
 import type { Node } from "./types.js";
 import {
   slotWorkingDirectory,
   type SeatPoolCommand,
   type SeatPoolIntent,
   type SeatPoolModel,
+  type SeatPoolPendingRow,
+  type SeatPoolSeatCause,
   type SeatPoolSlotPhase,
   type SeatPoolSlotView,
   type SeatPoolSpec,
@@ -25,7 +29,10 @@ import {
  * job is no longer active, its model is gone or the rig is being restored. Each effect is recorded on the seat's row
  * (`intent`) before it starts and cleared once its result is written, and each result goes to the job's history. A
  * restart therefore resumes from the rows: a seat being added is resolved through its Operation-Id, a seat added but
- * not launched is prepared and launched or removed, and a seat being drained finishes draining.
+ * not launched is prepared and launched or removed, and a seat being drained finishes draining. Moving a row and waking
+ * a seat check the row and the seat again just before, and change nothing when either changed since the plan or the
+ * pool was set to drain. An add, a launch and a relaunch check provider usage again just before, and start nothing
+ * while a seat of the pool is out of usage.
  */
 
 export interface SeatPoolSlot {
@@ -76,6 +83,12 @@ export class SeatPoolSlots {
   /** Whether any pool holds this node. */
   isLinked(nodeId: string): boolean {
     return !!this.db.prepare("SELECT 1 FROM seat_pool_slots WHERE node_id = ? AND retired_at IS NULL").get(nodeId);
+  }
+
+  /** The logical ids of the seats the pool removed. */
+  listRetired(poolJobId: string): string[] {
+    return (this.db.prepare("SELECT logical_id FROM seat_pool_slots WHERE pool_job_id = ? AND retired_at IS NOT NULL ORDER BY id")
+      .all(poolJobId) as Array<{ logical_id: string }>).map((row) => row.logical_id);
   }
 
   hasOpen(poolJobId: string): boolean {
@@ -168,17 +181,57 @@ export function slotMemberFragment(
   };
 }
 
+/** The note a nudge from the pool leaves on the row, followed by the seat it went to. */
+export const SEAT_POOL_NUDGE_NOTE = "seat-pool nudge:";
+
 export interface SeatPoolStateReaderDeps {
   db: Database.Database;
   slots: SeatPoolSlots;
   /** Pending, in-progress and blocked rows addressed to a session. */
   openRows(sessionName: string): Array<{ state: string }>;
+  /** Every destination a row addressed to this session may carry (the queue's own address resolution). */
+  sessionAddresses(sessionName: string): string[];
   /** Messages the typing guard holds for a seat, not yet delivered. */
   heldMessages(nodeId: string): number;
+  /** Whether the seat has no live session. */
+  seatStopped(nodeId: string): boolean;
   /** The arbitrated activity of a seat whose session is not confirmed stopped; null otherwise. */
   seatState(nodeId: string): ArbitratedSeatState | null;
+  /** Whether the provider account the session runs on is out of usage. Absent: never. */
+  usageLimited?(sessionName: string): boolean;
   restoring(rigId: string): boolean;
   demand(jobId: string): { desired: number; sampledAt: string } | null;
+}
+
+/** Pending rows addressed to any of `sessions` (in any of their addresses), longest waiting first, with whether the pool
+ *  nudged that session about the row. A row waits from its latest reroute, or from its creation. Only pending rows: a
+ *  claimed, blocked or closed row is never the pool's to move. */
+function readPendingRows(deps: SeatPoolStateReaderDeps, sessions: string[]): SeatPoolPendingRow[] {
+  const sessionOf = new Map<string, string>();
+  for (const session of sessions) {
+    for (const address of deps.sessionAddresses(session)) if (!sessionOf.has(address)) sessionOf.set(address, session);
+  }
+  if (sessionOf.size === 0) return [];
+  const rows = deps.db.prepare(
+    `SELECT q.qitem_id, q.destination_session,
+            COALESCE((SELECT MAX(t.ts) FROM queue_transitions t WHERE t.qitem_id = q.qitem_id AND t.actor_session = ?), q.ts_created) AS since
+       FROM queue_items q
+      WHERE q.state = 'pending' AND q.destination_session IN (${[...sessionOf.keys()].map(() => "?").join(",")})
+      ORDER BY since, q.qitem_id`,
+  ).all(FALLBACK_ACTOR, ...sessionOf.keys()) as Array<{ qitem_id: string; destination_session: string; since: string }>;
+  if (rows.length === 0) return [];
+  const nudges = new Set((deps.db.prepare(
+    `SELECT qitem_id, transition_note FROM queue_transitions
+      WHERE qitem_id IN (${rows.map(() => "?").join(",")}) AND transition_note LIKE ?`,
+  ).all(...rows.map((row) => row.qitem_id), `${SEAT_POOL_NUDGE_NOTE} %`) as Array<{ qitem_id: string; transition_note: string }>)
+    .map((t) => `${t.qitem_id} ${t.transition_note}`));
+  return rows.map((row) => {
+    const destination = sessionOf.get(row.destination_session)!;
+    return {
+      qitemId: row.qitem_id, destination, waitingSince: row.since,
+      nudged: nudges.has(`${row.qitem_id} ${SEAT_POOL_NUDGE_NOTE} ${destination}`),
+    };
+  });
 }
 
 /** The pool's state as the planner sees it. */
@@ -197,36 +250,47 @@ export function readSeatPoolState(deps: SeatPoolStateReaderDeps, job: { jobId: s
         logicalId: row.logical_id, nodeId: row.node_id, sessionName: job.targetSession,
       }
     : null;
-  const empty = { model, restoring: false, slots: [], adoptable: [], pendingForModel: 0, demand: null, lastScaleAt: null };
+  const empty: SeatPoolState = { model, modelCause: "working", restoring: false, slots: [], adoptable: [], pending: [], demand: null, lastScaleAt: null };
   if (!model) return empty;
 
+  const causeOf = (nodeId: string, sessionName: string, state: ArbitratedSeatState | null): SeatPoolSeatCause => {
+    if (deps.usageLimited?.(sessionName)) return "usage_limit";
+    if (deps.seatStopped(nodeId)) return "stopped";
+    if (state && state.needsInput.count > 0) return "needs_input";
+    return state?.activity === "idle-at-prompt" && !state.backgroundWork ? "idle" : "working";
+  };
   const nodeExists = (nodeId: string) => !!db.prepare("SELECT 1 FROM nodes WHERE id = ? AND rig_id = ?").get(nodeId, model.rigId);
-  const slots = deps.slots.listOpen(job.jobId).map((slot) => {
+  const slots = deps.slots.listOpen(job.jobId).map((slot): SeatPoolSlotView => {
     const present = slot.nodeId !== null && nodeExists(slot.nodeId);
     const state = present ? deps.seatState(slot.nodeId!) : null;
     const idle = state?.activity === "idle-at-prompt" && state.needsInput.count === 0 && !state.backgroundWork;
+    const sessionName = seatSessionName(slot.logicalId, model.rigName);
     return {
       slotId: slot.slotId,
       logicalId: slot.logicalId,
+      sessionName,
       nodeId: slot.nodeId,
       phase: slot.phase as Exclude<SeatPoolSlotPhase, "retired">,
       adopted: slot.opId === null,
       nodeExists: present,
-      openRows: present ? deps.openRows(seatSessionName(slot.logicalId, model.rigName)).length : 0,
+      openRows: present ? deps.openRows(sessionName).length : 0,
       heldMessages: present ? deps.heldMessages(slot.nodeId!) : 0,
       idleSince: idle ? state!.changedAt : null,
+      cause: present ? causeOf(slot.nodeId!, sessionName, state) : "stopped",
     };
   });
   const adoptable = job.spec.adopt.flatMap((logicalId) => {
     const node = db.prepare("SELECT id FROM nodes WHERE rig_id = ? AND logical_id = ?").get(model.rigId, logicalId) as { id: string } | undefined;
     return node && node.id !== model.nodeId && !deps.slots.isLinked(node.id) ? [{ logicalId, nodeId: node.id }] : [];
   });
+  const retired = deps.slots.listRetired(job.jobId).map((logicalId) => seatSessionName(logicalId, model.rigName));
   return {
     model,
+    modelCause: causeOf(model.nodeId, model.sessionName, deps.seatState(model.nodeId)),
     restoring: deps.restoring(model.rigId),
     slots,
     adoptable,
-    pendingForModel: deps.openRows(model.sessionName).filter((r) => r.state === "pending").length,
+    pending: readPendingRows(deps, [model.sessionName, ...slots.map((slot) => slot.sessionName), ...retired]),
     demand: job.spec.demandCmd ? deps.demand(job.jobId) : null,
     lastScaleAt: deps.slots.lastScaleAt(job.jobId),
   };
@@ -256,6 +320,70 @@ export interface SeatPoolEffects {
   stopSlot(input: { sessionName: string; expected: StopPrecondition }): Promise<SeatPoolEffectResult>;
   removeSlot(input: { rigId: string; nodeId: string; expected: StopPrecondition }): Promise<SeatPoolEffectResult>;
   runCommand(command: SeatPoolCommand, env: Record<string, string>, signal: AbortSignal): Promise<SeatPoolCommandResult>;
+  /** Moves a row to `to` only if it is still pending and addressed to `from`, and wakes `to`, in one transaction. */
+  moveRow(input: { qitemId: string; from: string; to: string; reason: string }): SeatPoolEffectResult;
+  /** Launches a seat whose session stopped, as `rig launch` does for it. */
+  relaunchSeat(input: { rigId: string; logicalId: string }): Promise<SeatPoolEffectResult>;
+  /** Wakes `seat` about the row, after recording on the row that the pool did, so it never does it twice. */
+  nudgeRow(input: { qitemId: string; seat: string }): Promise<SeatPoolEffectResult & { result?: string | null }>;
+  /** Opens a row to the model's escalation owner about a seat that needs input, unless one about that seat is open. */
+  escalate(input: { jobId: string; seat: string; model: string; qitemIds: string[] }): Promise<SeatPoolEffectResult & { qitemId?: string; destination?: string; existing?: boolean }>;
+}
+
+/** The tag on the open escalation about a seat that needs input, followed by that seat: one at a time per seat. */
+export const SEAT_POOL_NEEDS_INPUT_TAG = "seat-pool-needs-input";
+const SEAT_POOL_ACTOR = "seat-pool@system";
+
+const errorCode = (error: unknown, fallback: string) => {
+  const code = (error as { code?: unknown }).code;
+  return typeof code === "string" ? code : fallback;
+};
+
+/** The executor's row moves, nudges and escalations, through the queue repository. */
+export function seatPoolQueueEffects(deps: {
+  queueRepo: QueueRepository;
+  /** Where an escalation about a seat of the pool goes: the model's escalation owner, or why it has none. */
+  escalationOwner(modelSession: string): { owner: string | null; reason: string };
+}): Pick<SeatPoolEffects, "moveRow" | "nudgeRow" | "escalate"> {
+  const { queueRepo } = deps;
+  return {
+    moveRow: ({ qitemId, from, to, reason }) => {
+      try {
+        queueRepo.routeToFallback(qitemId, to, reason, { expectState: "pending", expectDestination: from, wake: true });
+        return { ok: true };
+      } catch (error) {
+        return { ok: false, code: errorCode(error, "fallback_failed"), error: (error as Error).message };
+      }
+    },
+    nudgeRow: async ({ qitemId, seat }) => {
+      try {
+        // Recorded before the send: a restart between the two loses a nudge rather than sending a second one.
+        queueRepo.update({ qitemId, actorSession: SEAT_POOL_ACTOR, transitionNote: `${SEAT_POOL_NUDGE_NOTE} ${seat}` });
+      } catch (error) {
+        return { ok: false, code: errorCode(error, "note_failed"), error: (error as Error).message };
+      }
+      await queueRepo.maybeNudge(qitemId, seat, true, OPENRIG_SENDER, undefined, "openrig");
+      return { ok: true, result: queueRepo.getById(qitemId)?.lastNudgeWireResult ?? null };
+    },
+    escalate: async ({ jobId, seat, model, qitemIds }) => {
+      const tag = `${SEAT_POOL_NEEDS_INPUT_TAG}:${seat}`;
+      const open = queueRepo.list({ tag, activeOnly: true, limit: 1 })[0];
+      if (open) return { ok: true, qitemId: open.qitemId, destination: open.destinationSession, existing: true };
+      const route = deps.escalationOwner(model);
+      if (!route.owner) return { ok: false, code: "no_escalation_owner", error: route.reason };
+      const created = await queueRepo.create({
+        sourceSession: OPENRIG_SENDER,
+        destinationSession: route.owner,
+        summary: `${seat} needs input and holds ${qitemIds.length} waiting row(s)`,
+        body: `${seat} is waiting for input (a permission prompt or a question), so it isn't taking the pending row(s) `
+          + `addressed to it: ${qitemIds.join(", ")}. Answer its prompt; rig capture ${seat} shows it. `
+          + `Raised by seat pool ${jobId}, which raises no other until this row is closed.`,
+        tags: [tag],
+        wakeTrigger: "openrig",
+      });
+      return { ok: true, qitemId: created.qitemId, destination: route.owner, existing: false };
+    },
+  };
 }
 
 /** Runs an argv without a shell, with the daemon's environment plus `env`, killed at its timeout or on abort. */
@@ -291,6 +419,8 @@ export interface SeatPoolExecutorDeps {
   slots: SeatPoolSlots;
   readJob(jobId: string): SeatPoolJobView | null;
   readState(job: { jobId: string; targetSession: string; spec: SeatPoolSpec }): SeatPoolState;
+  /** Whether the model or a seat of the pool is out of provider usage, read now. Absent: never. */
+  outOfUsage?(job: { jobId: string; targetSession: string; spec: SeatPoolSpec }): Promise<boolean>;
   effects: SeatPoolEffects;
   /** Writes one history entry for the job. */
   record(jobId: string, entry: { failed: boolean; reason: string; notes: Record<string, unknown> }): void;
@@ -323,6 +453,8 @@ interface Context {
 }
 
 const STOPPED_CODES = new Set(["session_not_live", "no_session"]);
+/** A reroute refused because the row was claimed, closed or moved since the plan: nothing failed. */
+const ROW_MOVED_ON = new Set(["fallback_state_mismatch", "fallback_destination_mismatch", "qitem_not_found"]);
 const holdsWork = (slot: SeatPoolSlotView) => slot.openRows > 0 || slot.heldMessages > 0;
 const TIMED_OUT = Symbol("timed out");
 
@@ -387,6 +519,11 @@ export class SeatPoolExecutor {
     return { jobId, spec: job.spec, state, model: state.model };
   }
 
+  /** Read just before an add, a launch or a relaunch: the limit can appear after the plan, or while a command runs. */
+  private async outOfUsage(ctx: Context): Promise<boolean> {
+    return (await this.deps.outOfUsage?.({ jobId: ctx.jobId, targetSession: ctx.model.sessionName, spec: ctx.spec })) ?? false;
+  }
+
   private setIntent(slotId: number, intent: string | null, phase?: Exclude<SeatPoolSlotPhase, "retired">): void {
     this.touched.add(slotId);
     this.deps.slots.update(slotId, { intent, ...(phase ? { phase } : {}) });
@@ -419,14 +556,18 @@ export class SeatPoolExecutor {
       if (intent.kind === "adopt") this.adopt(jobId, run, intent);
       else if (intent.kind === "add") {
         for (let i = 0; i < intent.count; i++) {
-          const slot = this.allocate(jobId, run);
+          const slot = await this.allocate(jobId, run);
           if (!slot || !(await this.bringUp(jobId, run, slot.slotId))) break;
         }
       } else if (intent.kind === "launch") {
         if (!(await this.bringUp(jobId, run, intent.slotId))) return;
       } else if (intent.kind === "drain") {
         if (!(await this.drain(jobId, run, intent.slotId))) return;
-      } else if (!(await this.removeUnstarted(jobId, run, intent.slotId))) return;
+      } else if (intent.kind === "remove") {
+        if (!(await this.removeUnstarted(jobId, run, intent.slotId))) return;
+      } else if (intent.kind === "dispatch") {
+        if (!this.dispatch(jobId, run, intent)) return;
+      } else if (!(await this.wake(jobId, run, intent))) return;
     }
     await this.refreshDemand(jobId, run);
   }
@@ -438,8 +579,10 @@ export class SeatPoolExecutor {
     this.record(jobId, false, "seat_pool_adopted", { slot: slot.logicalId, nodeId: intent.nodeId });
   }
 
-  /** Records a new seat (phase `adding`) if the pool, read again, still has room for it. */
-  private allocate(jobId: string, run: Run): SeatPoolSlot | null {
+  /** Records a new seat (phase `adding`) if the pool, read again, still has room for it and no seat out of usage. */
+  private async allocate(jobId: string, run: Run): Promise<SeatPoolSlot | null> {
+    const before = this.fresh(jobId, run);
+    if (!before || await this.outOfUsage(before)) return null;
     const ctx = this.fresh(jobId, run);
     if (!ctx || ctx.spec.drain || ctx.state.slots.length >= ctx.spec.max) return null;
     const logicalId = this.deps.slots.nextLogicalId(ctx.model);
@@ -485,6 +628,7 @@ export class SeatPoolExecutor {
     // A launch that ran but whose result was lost: the session is the evidence.
     if (!this.deps.effects.sessionRunning(nodeId)) {
       if (ctx.spec.prepareCmd) {
+        if (await this.outOfUsage(ctx)) return this.holdStart(jobId, slotId, slot.logicalId, interrupted);
         this.setIntent(slotId, "prepare");
         const prepared = await this.deps.effects.runCommand(ctx.spec.prepareCmd,
           this.commandEnv(ctx, { OPENRIG_SEAT_POOL_SLOT: sessionName, OPENRIG_SEAT_POOL_SLOT_CWD: cwd }), run.controller.signal);
@@ -497,6 +641,7 @@ export class SeatPoolExecutor {
       ctx = this.fresh(jobId, run);
       if (!ctx) return false;
       if (ctx.spec.drain) return this.removeUnstarted(jobId, run, slotId);
+      if (await this.outOfUsage(ctx)) return this.holdStart(jobId, slotId, slot.logicalId, interrupted);
       this.setIntent(slotId, "launch");
       const launched = await this.within(run, () => this.deps.effects.launchSlot({ rigId: ctx!.model.rigId, nodeId }));
       if (launched === TIMED_OUT) {
@@ -510,6 +655,13 @@ export class SeatPoolExecutor {
     }
     this.setIntent(slotId, null, "live");
     this.record(jobId, false, "seat_pool_launched", { slot: slot.logicalId, nodeId, ...interrupted });
+    return true;
+  }
+
+  /** Leaves a seat added but not launched as it is, while a seat of the pool is out of usage: a later plan launches it. */
+  private holdStart(jobId: string, slotId: number, logicalId: string, interrupted: Record<string, unknown>): boolean {
+    this.setIntent(slotId, null);
+    this.record(jobId, false, "seat_pool_held", { reason: "usage_limit", slot: logicalId, ...interrupted });
     return true;
   }
 
@@ -614,6 +766,82 @@ export class SeatPoolExecutor {
     }
     this.deps.slots.retire(slotId, this.at());
     this.record(jobId, false, "seat_pool_removed", { slot: slot.logicalId, ...interrupted });
+    return true;
+  }
+
+  /**
+   * Moves a waiting row to a seat that is still free. A seat that took work since the plan is left to the next plan, and
+   * a pool set to drain since the plan moves nothing.
+   */
+  private dispatch(jobId: string, run: Run, intent: Extract<SeatPoolIntent, { kind: "dispatch" }>): boolean {
+    const ctx = this.fresh(jobId, run);
+    if (!ctx) return false;
+    if (ctx.spec.drain) return true;
+    const slot = ctx.state.slots.find((s) => s.slotId === intent.slotId);
+    if (!slot || slot.phase !== "live" || !slot.nodeExists || slot.cause !== "idle" || holdsWork(slot)) return true;
+    const notes = { qitemId: intent.qitemId, from: intent.from, to: slot.sessionName };
+    const moved = this.deps.effects.moveRow({ ...notes, reason: `seat pool ${jobId}: ${intent.from} had not taken it; ${slot.sessionName} was free` });
+    if (moved.ok) this.record(jobId, false, "seat_pool_dispatched", notes);
+    else if (ROW_MOVED_ON.has(moved.code)) this.record(jobId, false, "seat_pool_dispatch_skipped", { ...notes, code: moved.code });
+    else this.record(jobId, true, "seat_pool_dispatch_failed", { ...notes, code: moved.code, error: moved.error });
+    return true;
+  }
+
+  /**
+   * Wakes a seat holding a waiting row, by why it isn't taking it: launches it when it stopped, nudges it about the row
+   * when it is idle, escalates when it needs input. Nothing happens when the seat's cause or the row changed since the
+   * plan, or the pool was set to drain. False stops the run.
+   */
+  private async wake(jobId: string, run: Run, intent: Extract<SeatPoolIntent, { kind: "relaunch" | "nudge" | "escalate" }>): Promise<boolean> {
+    const ctx = this.fresh(jobId, run);
+    if (!ctx) return false;
+    if (ctx.spec.drain) return true;
+    const slot = ctx.state.slots.find((s) => s.sessionName === intent.seat && s.phase === "live" && s.nodeExists);
+    const seat = intent.seat === ctx.model.sessionName
+      ? { logicalId: ctx.model.logicalId, nodeId: ctx.model.nodeId, cause: ctx.state.modelCause }
+      : slot ? { logicalId: slot.logicalId, nodeId: slot.nodeId!, cause: slot.cause } : null;
+    if (!seat) return true;
+
+    if (intent.kind === "relaunch") {
+      if (seat.cause !== "stopped" || seat.nodeId !== intent.nodeId) return true;
+      if (await this.outOfUsage(ctx)) {
+        this.record(jobId, false, "seat_pool_held", { reason: "usage_limit", seat: intent.seat });
+        return true;
+      }
+      const launched = await this.within(run, () => this.deps.effects.relaunchSeat({ rigId: ctx.model.rigId, logicalId: seat.logicalId }));
+      if (launched === TIMED_OUT) {
+        this.record(jobId, true, "seat_pool_relaunch_failed", { seat: intent.seat, code: "effect_timeout" });
+        return false;
+      }
+      if (launched.ok) this.record(jobId, false, "seat_pool_relaunched", { seat: intent.seat });
+      else this.record(jobId, true, "seat_pool_relaunch_failed", { seat: intent.seat, code: launched.code, error: launched.error });
+      return true;
+    }
+
+    if (intent.kind === "nudge") {
+      const row = ctx.state.pending.find((r) => r.qitemId === intent.qitemId && r.destination === intent.seat);
+      if (seat.cause !== "idle" || !row || row.nudged) return true;
+      const nudged = await this.within(run, () => this.deps.effects.nudgeRow({ qitemId: intent.qitemId, seat: intent.seat }));
+      if (nudged === TIMED_OUT) {
+        this.record(jobId, true, "seat_pool_nudge_failed", { seat: intent.seat, qitemId: intent.qitemId, code: "effect_timeout" });
+        return false;
+      }
+      if (nudged.ok) this.record(jobId, false, "seat_pool_nudged", { seat: intent.seat, qitemId: intent.qitemId, result: nudged.result ?? null });
+      else this.record(jobId, true, "seat_pool_nudge_failed", { seat: intent.seat, qitemId: intent.qitemId, code: nudged.code, error: nudged.error });
+      return true;
+    }
+
+    if (seat.cause !== "needs_input") return true;
+    const escalated = await this.within(run, () => this.deps.effects.escalate({ jobId, seat: intent.seat, model: ctx.model.sessionName, qitemIds: intent.qitemIds }));
+    if (escalated === TIMED_OUT) {
+      this.record(jobId, true, "seat_pool_escalation_failed", { seat: intent.seat, code: "effect_timeout" });
+      return false;
+    }
+    if (!escalated.ok) this.record(jobId, true, "seat_pool_escalation_failed", { seat: intent.seat, code: escalated.code, error: escalated.error });
+    // An escalation about the seat is already open: it is the one, and nothing new is recorded.
+    else if (!escalated.existing) {
+      this.record(jobId, false, "seat_pool_escalated", { seat: intent.seat, to: escalated.destination, qitemId: escalated.qitemId, rows: intent.qitemIds });
+    }
     return true;
   }
 
