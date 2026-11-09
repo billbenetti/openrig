@@ -714,7 +714,7 @@ not have to tear one down to change it, and you rarely have to start from nothin
   release command agrees, and is quarantined otherwise. `drain: true` empties the pool without killing
   work; `stop` is refused while it holds seats. Every pool of a daemon launches within one host
   budget (`policies.seat_pool.*` in `rig config`: launches in flight and per watchdog tick, free memory,
-  load per CPU).
+  load per CPU). `rig ps --nodes` and the TUI list a pool's seats under the model.
   Spec and behavior: the `seat-pools.md` reference.
 - **`rig remove`** / **`rig shrink`** — take a seat, or an entire pod, out of a running topology.
   If it holds active work, pass `--fallback <live-seat>` to reroute before mutation; without a

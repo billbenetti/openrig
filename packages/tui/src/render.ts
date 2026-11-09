@@ -840,7 +840,7 @@ function instanceContentLines(
         text: tableRow(columns, {
           rig: rig.name,
           pod: firstInPod ? pod : "",
-          seat: `${stateCell.mark} ${seatName(pod, agent.name)}`,
+          seat: `${stateCell.mark} ${agent.seatPoolModel ? "└" : ""}${seatName(pod, agent.name)}`,
           runtime: runtimeShort(agent.runtime),
           context: contextCompact(agent.context, contentWidth < 110),
           status: stateCell.word,
@@ -1078,7 +1078,7 @@ function contentLines(state: ViewState, snap: FleetSnapshot, contentWidth: numbe
         // any visible cell opens the agent; the ACTIONS zones override.
         text: tableRow(agentCols, {
           pod: firstInPod ? a.pod : "",
-          seat: `${stateCell.mark} ${seatName(a.pod, a.name)}`,
+          seat: `${stateCell.mark} ${a.seatPoolModel ? "└" : ""}${seatName(a.pod, a.name)}`,
           runtime: runtimeShort(a.runtime),
           model: tableModel(a.model),
           effort: tableEffort(a.effort, a.effortSource, effortCol?.[2] ?? 0),

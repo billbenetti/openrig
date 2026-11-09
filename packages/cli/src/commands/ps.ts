@@ -103,6 +103,8 @@ interface NodeEntry {
   heldReason?: string | null;
   /** #2456: the required startup files this occupant's handover started it without. */
   startedWithoutRequired?: string[];
+  /** The logical id of the model seat whose seat pool holds this seat. Missing for other seats and on an older daemon. */
+  seatPoolModel?: string;
   agentActivity?: {
     state: "running" | "needs_input" | "idle" | "unknown";
     reason: string;
@@ -244,6 +246,7 @@ const ALLOWED_NODE_FIELDS = new Set([
   "contextUsage",
   "heldReason",
   "startedWithoutRequired",
+  "seatPoolModel",
   "storedSessionStatus",
   "identityVerdict",
 ]);
@@ -781,11 +784,43 @@ export function compactNodeProjection(nodes: NodeEntry[]): Array<Record<string, 
     // held/attention reason (short) when present.
     if (n.heldReason) compact.heldReason = n.heldReason;
     if (n.startedWithoutRequired?.length) compact.startedWithoutRequired = n.startedWithoutRequired;
+    if (n.seatPoolModel) compact.seatPoolModel = n.seatPoolModel;
     if (keepDiagnostics && n.latestError) {
       compact.latestError = n.latestError;
     }
     return compact;
   });
+}
+
+const seatKey = (rigId: string, logicalId: string) => `${rigId}\0${logicalId}`;
+
+/** Whether a seat is shown under its seat pool's model: the model is listed too. */
+function inSeatPoolGroup(node: NodeEntry, listed: ReadonlySet<string>): boolean {
+  return !!node.seatPoolModel && node.seatPoolModel !== node.logicalId && listed.has(seatKey(node.rigId, node.seatPoolModel));
+}
+
+/** The nodes in their order, except that each seat a seat pool holds follows its model, after any earlier such seat.
+ *  A seat whose model isn't listed (filtered out, or past a limit) keeps its place. */
+export function groupSeatPoolSeats(nodes: NodeEntry[]): NodeEntry[] {
+  const listed = new Set(nodes.map((n) => seatKey(n.rigId, n.logicalId)));
+  const seatsOf = new Map<string, NodeEntry[]>();
+  for (const n of nodes) {
+    if (!inSeatPoolGroup(n, listed)) continue;
+    const model = seatKey(n.rigId, n.seatPoolModel!);
+    seatsOf.set(model, [...(seatsOf.get(model) ?? []), n]);
+  }
+  const out: NodeEntry[] = [];
+  const placed = new Set<NodeEntry>();
+  const place = (n: NodeEntry) => {
+    if (placed.has(n)) return;
+    placed.add(n);
+    out.push(n);
+    for (const seat of seatsOf.get(seatKey(n.rigId, n.logicalId)) ?? []) place(seat);
+  };
+  for (const n of nodes) if (!inSeatPoolGroup(n, listed)) place(n);
+  // Pools that hold each other's models have no seat to start from; they keep their order.
+  for (const n of nodes) place(n);
+  return out;
 }
 
 function summarizeRigs(entries: PsEntry[]): {
@@ -1364,7 +1399,11 @@ async function handleNodes(
     return;
   }
 
-  const humanList = (opts.full || limit !== null) ? limited : limited.slice(0, HUMAN_NODE_BUDGET);
+  const grouped = groupSeatPoolSeats(limited);
+  const humanList = (opts.full || limit !== null) ? grouped : grouped.slice(0, HUMAN_NODE_BUDGET);
+  const listed = new Set(limited.map((n) => seatKey(n.rigId, n.logicalId)));
+  // A seat a seat pool holds is shown under its model.
+  const underModel = (n: NodeEntry, name: string) => inSeatPoolGroup(n, listed) ? `└ ${name}` : name;
   const humanTruncated = !opts.full && limit === null && filtered.length > HUMAN_NODE_BUDGET;
 
   if (useCompact) {
@@ -1376,7 +1415,7 @@ async function handleNodes(
         : livenessUnconfirmed(n) ? "liveness unconfirmed" : "—");
       console.log(padCompactNodeRow(
         n.rigName,
-        n.canonicalSessionName ?? "—",
+        underModel(n, n.canonicalSessionName ?? "—"),
         abbrevNodeLifecycle(n.lifecycleState),
         formatActivity(n),
         formatHasWork(n.hasAssignedWork, n.assignedWorkCount ?? n.pendingWorkCount),
@@ -1395,7 +1434,7 @@ async function handleNodes(
       console.log(padNodeRow(
         rig,
         pod,
-        member,
+        underModel(n, member),
         n.canonicalSessionName ?? "—",
         n.runtime ?? "—",
         formatDeclaredModel(n.model),

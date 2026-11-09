@@ -697,7 +697,7 @@ export function computeExplorerRows(state: ViewState, snap: FleetSnapshot): Expl
             // an offline seat is never dressed as a live ●
             for (const agent of pod.agents)
               rows.push({
-                label: `        ${rowStatusGlyph(agent).glyph} ${agent.name}`,
+                label: `        ${rowStatusGlyph(agent).glyph} ${agent.seatPoolModel ? "└ " : ""}${agent.name}`,
                 action: { type: "drill", resource: "agent", name: agent.name, target: { host: host.name, rig: rig.name, pod: pod.name } },
                 key: `agent:${host.name}/${rig.name}/${pod.name}/${agent.name}`,
               });

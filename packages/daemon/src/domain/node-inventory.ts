@@ -612,11 +612,12 @@ export function getNodeInventory(db: Database.Database, rigId: string): NodeInve
   const restoreOutcomes = buildRestoreOutcomeMap(db, rigId);
   const orienteds = buildOrientedMap(db, rigId);
   const codexDaemonOptOuts = new AppliedLaunchObservationStore(db).readCurrentDaemonOptOuts();
+  const seatPoolModels = readSeatPoolModels(db);
 
   const rows = queryInventoryRows(db, rigId);
 
   return rows.map((row) =>
-    buildInventoryEntry(db, row, { usableSnapshot, workspaceSpec, identityVerdicts, restoreOutcomes, orienteds, codexDaemonOptOuts }),
+    buildInventoryEntry(db, row, { usableSnapshot, workspaceSpec, identityVerdicts, restoreOutcomes, orienteds, codexDaemonOptOuts, seatPoolModels }),
   );
 }
 
@@ -731,6 +732,8 @@ interface InventoryBuildContext {
   orienteds: Map<string, NodeOriented>;
   /** Each node's current recorded Codex daemon choice (one read per projection); absent = not recorded. */
   codexDaemonOptOuts: Map<string, boolean>;
+  /** The model seat of each node a seat pool holds (one read per projection). */
+  seatPoolModels: Map<string, string>;
 }
 
 /**
@@ -743,7 +746,7 @@ function buildInventoryEntry(
   row: InventoryRow,
   ctx: InventoryBuildContext,
 ): NodeInventoryEntry {
-  const { usableSnapshot, workspaceSpec, identityVerdicts, restoreOutcomes, orienteds, codexDaemonOptOuts } = ctx;
+  const { usableSnapshot, workspaceSpec, identityVerdicts, restoreOutcomes, orienteds, codexDaemonOptOuts, seatPoolModels } = ctx;
   const launchWrapper = parseStoredLaunchWrapper(row.launch_wrapper, `Seat ${row.node_id} launch_wrapper`);
   if (launchWrapper && !isLaunchWrapperRuntime(row.runtime)) {
     throw new Error(`Seat ${row.node_id} launch_wrapper: only valid when runtime is "pi", "codex", "claude-code" or a supported community harness`);
@@ -857,7 +860,38 @@ function buildInventoryEntry(
     identityVerdict,
     heldReason: deriveHeldReason(db, row.rig_id, row.node_id, sessionStatus),
     ...(row.handover_at ? startedWithoutRequired(db, row.node_id, row.session_id) : {}),
+    ...(seatPoolModels.has(row.node_id) ? { seatPoolModel: seatPoolModels.get(row.node_id)! } : {}),
   };
+}
+
+/**
+ * The model seat's logical id for each node a seat pool holds, keyed by node id. The pool's `seat_pool_slots` row is
+ * the only link, as it is for the pool itself: a seat is never matched to a model by its name. The model is the seat
+ * the pool's watchdog job targets, and only in the seat's own rig. Empty on a database without seat pools.
+ */
+function readSeatPoolModels(db: Database.Database): Map<string, string> {
+  const out = new Map<string, string>();
+  if (!db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'seat_pool_slots'").get()) return out;
+  const slots = db.prepare(
+    `SELECT sl.node_id, n.rig_id, j.target_session
+       FROM seat_pool_slots sl
+       JOIN nodes n ON n.id = sl.node_id
+       JOIN watchdog_jobs j ON j.job_id = sl.pool_job_id
+      WHERE sl.retired_at IS NULL`,
+  ).all() as Array<{ node_id: string; rig_id: string; target_session: string }>;
+  const modelOf = db.prepare(
+    `SELECT n.logical_id, n.rig_id FROM sessions s JOIN nodes n ON n.id = s.node_id
+      WHERE s.session_name = ? ORDER BY s.id DESC LIMIT 1`,
+  );
+  const models = new Map<string, { logical_id: string; rig_id: string } | undefined>();
+  for (const slot of slots) {
+    if (!models.has(slot.target_session)) {
+      models.set(slot.target_session, modelOf.get(physicalSessionName(db, slot.target_session)) as { logical_id: string; rig_id: string } | undefined);
+    }
+    const model = models.get(slot.target_session);
+    if (model && model.rig_id === slot.rig_id) out.set(slot.node_id, model.logical_id);
+  }
+  return out;
 }
 
 /** #2456: the required startup files the seat's current occupant started without, as its handover recorded them. Only
@@ -921,6 +955,7 @@ function buildInventoryMapFromRows(db: Database.Database, rows: InventoryRow[]):
   const restoreOutcomes = buildRestoreOutcomeMap(db); // one fleet restore-outcome scan
   const orienteds = buildOrientedMap(db);             // one fleet startup-orientation scan
   const codexDaemonOptOuts = new AppliedLaunchObservationStore(db).readCurrentDaemonOptOuts(); // one launch-fact read
+  const seatPoolModels = readSeatPoolModels(db);                                                 // one seat-pool read
   const out = new Map<string, NodeInventoryEntry[]>();
   for (const row of rows) {
     const entry = buildInventoryEntry(db, row, {
@@ -930,6 +965,7 @@ function buildInventoryMapFromRows(db: Database.Database, rows: InventoryRow[]):
       restoreOutcomes,
       orienteds,
       codexDaemonOptOuts,
+      seatPoolModels,
     });
     let list = out.get(row.rig_id);
     if (!list) { list = []; out.set(row.rig_id, list); }
