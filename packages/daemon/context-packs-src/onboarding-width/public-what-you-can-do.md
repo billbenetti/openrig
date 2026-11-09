@@ -707,9 +707,10 @@ not have to tear one down to change it, and you rarely have to start from nothin
   `rig_bind`. A name two rigs share returns `rig_ambiguous` with the candidates. Don't look the id
   up first.
 - **`rig watchdog register --policy seat-pool`** — keep extra seats cloned from one model seat
-  (`<member>-s<n>`) and add or drain them with demand, within the spec's `min` and `max`. `drain: true`
-  empties the pool without killing work; `stop` is refused while it holds seats. Spec and behavior:
-  the `seat-pools.md` reference.
+  (`<member>-s<n>`) and add or drain them with demand, within the spec's `min` and `max`. A pending row
+  left waiting at the model moves to a free seat, and a seat that isn't taking its rows is launched,
+  nudged or escalated by the reason. `drain: true` empties the pool without killing work; `stop` is
+  refused while it holds seats. Spec and behavior: the `seat-pools.md` reference.
 - **`rig remove`** / **`rig shrink`** — take a seat, or an entire pod, out of a running topology.
   If it holds active work, pass `--fallback <live-seat>` to reroute before mutation; without a
   valid fallback the command refuses rather than strand the rows.
