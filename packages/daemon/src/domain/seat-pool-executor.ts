@@ -95,16 +95,16 @@ export class SeatPoolSlots {
     return !!this.db.prepare(`SELECT 1 FROM seat_pool_slots WHERE node_id = ? AND retired_at IS NULL AND NOT ${POOL_ENDED}`).get(nodeId);
   }
 
-  /** The logical ids of the seats the pool removed. */
+  /** The logical ids of the seats the pool added and removed; an adopted seat it gave back is still there. */
   listRetired(poolJobId: string): string[] {
-    return (this.db.prepare("SELECT logical_id FROM seat_pool_slots WHERE pool_job_id = ? AND retired_at IS NOT NULL ORDER BY id")
+    return (this.db.prepare("SELECT logical_id FROM seat_pool_slots WHERE pool_job_id = ? AND retired_at IS NOT NULL AND op_id IS NOT NULL ORDER BY id")
       .all(poolJobId) as Array<{ logical_id: string }>).map((row) => row.logical_id);
   }
 
-  /** The latest add or removal in the pool; adopting a seat is neither. */
+  /** The latest add or removal in the pool; adopting or unlinking a seat is neither. */
   lastScaleAt(poolJobId: string): string | null {
     const row = this.db.prepare(
-      `SELECT MAX(CASE WHEN op_id IS NOT NULL THEN created_at END) AS added, MAX(retired_at) AS retired
+      `SELECT MAX(CASE WHEN op_id IS NOT NULL THEN created_at END) AS added, MAX(CASE WHEN op_id IS NOT NULL THEN retired_at END) AS retired
          FROM seat_pool_slots WHERE pool_job_id = ?`,
     ).get(poolJobId) as { added: string | null; retired: string | null };
     const times = [row.added, row.retired].filter((t): t is string => t !== null).sort();
@@ -614,6 +614,8 @@ export class SeatPoolExecutor {
         if (!(await this.drain(jobId, run, intent))) return;
       } else if (intent.kind === "remove") {
         if (!(await this.removeUnstarted(jobId, run, intent.slotId))) return;
+      } else if (intent.kind === "unlink") {
+        this.unlink(jobId, run, intent.slotId);
       } else if (intent.kind === "dispatch") {
         if (!this.dispatch(jobId, run, intent)) return;
       } else if (intent.kind === "reap") {
@@ -628,6 +630,14 @@ export class SeatPoolExecutor {
     if (!ctx || ctx.spec.drain || !ctx.state.adoptable.some((seat) => seat.nodeId === intent.nodeId)) return;
     const slot = this.deps.slots.adopt({ poolJobId: jobId, logicalId: intent.logicalId, nodeId: intent.nodeId, at: this.at() });
     this.record(jobId, false, "seat_pool_adopted", { slot: slot.logicalId, nodeId: intent.nodeId });
+  }
+
+  /** Gives back an adopted seat while the pool drains: its link is retired, and its node and session are left alone. */
+  private unlink(jobId: string, run: Run, slotId: number): void {
+    const slot = this.deps.slots.get(slotId);
+    if (!slot || slot.retiredAt || slot.opId !== null || !this.fresh(jobId, run)?.spec.drain) return;
+    this.deps.slots.retire(slotId, this.at());
+    this.record(jobId, false, "seat_pool_unlinked", { slot: slot.logicalId });
   }
 
   /** Records a new seat (phase `adding`) if the pool, read again, still has room for it and no seat out of usage. */
@@ -722,7 +732,8 @@ export class SeatPoolExecutor {
   private async drain(jobId: string, run: Run, intent: Extract<SeatPoolIntent, { kind: "drain" }>): Promise<boolean> {
     const { slotId } = intent;
     const slot = this.deps.slots.get(slotId);
-    if (!slot?.nodeId || slot.retiredAt) return true;
+    // An adopted seat is never stopped or removed by the pool.
+    if (!slot?.nodeId || slot.retiredAt || slot.opId === null) return true;
     const ctx = this.fresh(jobId, run);
     if (!ctx) return false;
     const view = ctx.state.slots.find((s) => s.slotId === slotId);
