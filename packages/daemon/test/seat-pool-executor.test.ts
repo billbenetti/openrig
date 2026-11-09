@@ -49,6 +49,9 @@ const MODEL: SeatPoolModel = {
   rigId: "rig-1", rigName: "r", podNamespace: "dev", memberId: "impl", logicalId: "dev.impl", nodeId: "model-node", sessionName: "dev-impl@r",
 };
 const T0 = Date.parse("2026-11-09T12:00:00.000Z");
+/** When an idle seat in the World became idle. */
+const IDLE_SINCE = new Date(T0 - 3_600_000).toISOString();
+const drainOf = (slotId: number) => ({ kind: "drain" as const, slotId, idleSince: IDLE_SINCE });
 
 function spec(overrides: Record<string, unknown> = {}): SeatPoolSpec {
   const parsed = parseSeatPoolSpec({ max: 3, cwd_template: "/work/{rig}/{slot}", idle_grace_s: 0, cooldown_s: 0, ...overrides });
@@ -58,7 +61,7 @@ function spec(overrides: Record<string, unknown> = {}): SeatPoolSpec {
 
 interface FakeNode {
   logicalId: string; session: "none" | "running" | "stopped"; sessionId: string | null; openRows: number; idle: boolean; held?: number;
-  cause?: SeatPoolSeatCause;
+  cause?: SeatPoolSeatCause; idleSince?: string;
 }
 interface FakeRow { destination: string; waitingSince: string; state?: "pending" | "in-progress" | "blocked"; reaps?: number }
 
@@ -186,7 +189,7 @@ class World {
         return {
           slotId: s.slotId, logicalId: s.logicalId, sessionName: seatSessionName(s.logicalId, "r"), nodeId: s.nodeId, phase: s.phase as "live",
           adopted: s.opId === null, nodeExists: !!node, openRows: node?.openRows ?? 0, heldMessages: node?.held ?? 0,
-          idleSince: idle ? new Date(T0 - 3_600_000).toISOString() : null,
+          idleSince: idle ? node.idleSince ?? IDLE_SINCE : null,
           cause: node?.cause ?? (node?.session !== "running" ? "stopped" : idle ? "idle" : "working"),
         };
       }),
@@ -256,7 +259,7 @@ describe("seat-pool executor", () => {
     const executor = makeExecutor();
     await run(executor, [{ kind: "add", count: 2 }]);
     const second = slots.listOpen(JOB)[1]!;
-    await run(executor, [{ kind: "drain", slotId: second.slotId }]);
+    await run(executor, [drainOf(second.slotId)]);
     await run(executor, [{ kind: "add", count: 1 }]);
     expect(live()).toEqual(["dev.impl-s1", "dev.impl-s3"]);
   });
@@ -326,7 +329,7 @@ describe("seat-pool executor", () => {
     await run(executor, [{ kind: "add", count: 1 }]);
     world.calls = [];
     const [slot] = slots.listOpen(JOB);
-    await run(executor, [{ kind: "drain", slotId: slot!.slotId }]);
+    await run(executor, [drainOf(slot!.slotId)]);
     const expected: StopPrecondition = { nodeId: "node-1", sessionId: "sess-2" };
     expect(world.calls).toEqual([
       "lease dev.impl-s1", "run release", `stop dev-impl-s1@r ${JSON.stringify(expected)}`, `remove dev.impl-s1 ${JSON.stringify(expected)}`, "lease released",
@@ -343,10 +346,10 @@ describe("seat-pool executor", () => {
     const [first, second] = slots.listOpen(JOB);
     world.calls = [];
     world.exit["release"] = 1;
-    await run(executor, [{ kind: "drain", slotId: first!.slotId }]);
+    await run(executor, [drainOf(first!.slotId)]);
     world.exit["release"] = 0;
     world.onLease = () => { world.nodes.get(second!.nodeId!)!.openRows = 1; };
-    await run(executor, [{ kind: "drain", slotId: second!.slotId }]);
+    await run(executor, [drainOf(second!.slotId)]);
     expect(world.calls.filter((c) => c.startsWith("stop") || c.startsWith("remove"))).toEqual([]);
     expect(live()).toEqual(["dev.impl-s1", "dev.impl-s2"]);
     expect(history.slice(-2)).toEqual([
@@ -360,7 +363,7 @@ describe("seat-pool executor", () => {
     await run(executor, [{ kind: "add", count: 1 }]);
     world.stopResult = { ok: false, code: "selection_changed", error: "the seat changed" };
     world.calls = [];
-    await run(executor, [{ kind: "drain", slotId: slots.listOpen(JOB)[0]!.slotId }]);
+    await run(executor, [drainOf(slots.listOpen(JOB)[0]!.slotId)]);
     expect(world.calls.some((c) => c.startsWith("remove"))).toBe(false);
     expect(live()).toEqual(["dev.impl-s1"]);
     expect(history.at(-1)).toMatchObject({ failed: true, reason: "seat_pool_stop_failed", notes: { code: "selection_changed" } });
@@ -372,7 +375,7 @@ describe("seat-pool executor", () => {
     const [slot] = slots.listOpen(JOB);
     world.nodes.get(slot!.nodeId!)!.openRows = 1;
     world.calls = [];
-    await run(executor, [{ kind: "drain", slotId: slot!.slotId }]);
+    await run(executor, [drainOf(slot!.slotId)]);
     expect(world.calls).toEqual([]);
     expect(slots.get(slot!.slotId)).toMatchObject({ phase: "live" });
   });
@@ -384,7 +387,7 @@ describe("seat-pool executor", () => {
     world.nodes.get(first!.nodeId!)!.held = 1;
     world.onLease = () => { world.nodes.get(second!.nodeId!)!.held = 1; };
     world.calls = [];
-    await run(executor, [{ kind: "drain", slotId: first!.slotId }, { kind: "drain", slotId: second!.slotId }]);
+    await run(executor, [drainOf(first!.slotId), drainOf(second!.slotId)]);
     expect(world.calls).toEqual(["lease dev.impl-s2", "lease released"]);
     expect(live()).toEqual(["dev.impl-s1", "dev.impl-s2"]);
     expect(history.at(-1)).toEqual({ failed: false, reason: "seat_pool_returned", notes: { slot: "dev.impl-s2", why: "work_arrived" } });
@@ -398,10 +401,28 @@ describe("seat-pool executor", () => {
     // The lease holds deliveries back, not queue writes: a row is created while the command runs.
     world.commandGate = async () => { world.nodes.get(slot!.nodeId!)!.openRows = 1; };
     world.calls = [];
-    await run(executor, [{ kind: "drain", slotId: slot!.slotId }]);
+    await run(executor, [drainOf(slot!.slotId)]);
     expect(world.calls).toEqual(["lease dev.impl-s1", "run release", "lease released"]);
     expect(slots.get(slot!.slotId)).toMatchObject({ phase: "live", intent: null });
     expect(history.at(-1)).toEqual({ failed: false, reason: "seat_pool_returned", notes: { slot: "dev.impl-s1", why: "work_arrived" } });
+  });
+
+  it("does not stop a seat woken since the plan, even one idle again with nothing left open", async () => {
+    jobSpec = spec({ release_cmd: { argv: ["release"] } });
+    const executor = makeExecutor();
+    await run(executor, [{ kind: "add", count: 2 }]);
+    const [first, second] = slots.listOpen(JOB);
+    // A message woke the first between the plan and the lease; it took its turn and is back at its prompt.
+    world.onLease = () => { world.nodes.get(first!.nodeId!)!.idleSince = new Date(T0 - 5_000).toISOString(); };
+    await run(executor, [drainOf(first!.slotId)]);
+    // The second is woken while its release command runs.
+    world.onLease = () => {};
+    world.commandGate = async () => { Object.assign(world.nodes.get(second!.nodeId!)!, { idle: false }); };
+    world.calls = [];
+    await run(executor, [drainOf(second!.slotId)]);
+    expect(world.calls).toEqual(["lease dev.impl-s2", "run release", "lease released"]);
+    expect(live()).toEqual(["dev.impl-s1", "dev.impl-s2"]);
+    expect(reasons().slice(-2)).toEqual(["seat_pool_returned", "seat_pool_returned"]);
   });
 
   it("removes instead of launching a seat whose pool was set to drain while its prepare command ran", async () => {
