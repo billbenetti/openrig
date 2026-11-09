@@ -162,8 +162,12 @@ import { resolveWorkflowHumanDestination } from "./domain/workflow-human-destina
 import { makeWorkflowKeepalivePolicy } from "./domain/policies/workflow-keepalive.js";
 import { makeIdleGateQitemPolicy } from "./domain/policies/idle-gate-qitem.js";
 import { makeParkedOwnerConsumerPolicy, makeRigAnchor, PARKED_OWNER_POLICY_NAME } from "./domain/policies/parked-owner-consumer.js";
-import { makeSeatPoolPolicy, parseSeatPoolSpec, type SeatPoolSpec } from "./domain/policies/seat-pool.js";
-import { readSeatPoolState, runSeatPoolCommand, SeatPoolExecutor, SeatPoolSlots, slotMemberFragment } from "./domain/seat-pool-executor.js";
+import { makeSeatPoolPolicy, parseSeatPoolSpec, seatPoolOutOfUsage, type SeatPoolSpec } from "./domain/policies/seat-pool.js";
+import { readSeatPoolState, runSeatPoolCommand, SeatPoolExecutor, SeatPoolSlots, seatPoolQueueEffects, slotMemberFragment } from "./domain/seat-pool-executor.js";
+import { launchStatusIsRunning } from "./domain/restore-orchestrator.js";
+import { resolveEscalationOwner } from "./domain/escalation-owner.js";
+import { deriveUsageLimitPools } from "./domain/provider/provider-signals.js";
+import { resolveWakeRetryIntervalSeconds } from "./domain/queue-wake-ladder.js";
 import { SeatLifecycleService } from "./domain/seat-lifecycle-service.js";
 import { reserveOperation } from "./domain/operation-correlation.js";
 import { readClaudePermissionRules } from "./domain/claude-permission-rules.js";
@@ -2370,21 +2374,42 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
       const since = deps.compactionEnforcer?.postCompactStageOwedSince(physicalSessionName(db, session));
       return since == null ? null : new Date(since).toISOString();
     });
-    // Seat pools: the seat-pool policy plans, and this executor adds, launches, drains and removes the seats outside
-    // the scheduler tick, through the same services the member, launch, stop and node routes use.
+    // Seat pools: the seat-pool policy plans, and this executor adds, launches, drains and removes the seats, moves
+    // waiting rows and wakes the seats holding them outside the scheduler tick, through the same services the member,
+    // launch, stop, node and queue routes use.
     const seatPoolSlots = new SeatPoolSlots(db);
     const seatPoolStops = new SeatLifecycleService({ db, rigRepo, sessionRegistry, eventBus, tmuxAdapter, nodeLauncher });
     const latestSession = (nodeId: string) =>
       db.prepare("SELECT id, status FROM sessions WHERE node_id = ? ORDER BY id DESC LIMIT 1").get(nodeId) as { id: string; status: string } | undefined;
-    const readPoolState = (job: { jobId: string; targetSession: string; spec: SeatPoolSpec }) => readSeatPoolState({
+    const readPoolState = (job: { jobId: string; targetSession: string; spec: SeatPoolSpec }, usageLimited?: ReadonlySet<string>) => readSeatPoolState({
       db,
       slots: seatPoolSlots,
       openRows: (sessionName) => queueRepoInstance.listOpenObligations(sessionName, 500),
+      sessionAddresses: (sessionName) => sessionRegistry.sessionAddresses(sessionName),
       heldMessages: (nodeId) => outboxHandlerInstance.heldCount(nodeId),
+      // The live statuses getLatestLiveSessions reads, and the identity verdict that a "running" session is gone.
+      seatStopped: (nodeId) => !["running", "idle", "unknown"].includes(latestSession(nodeId)?.status ?? "") || nodeExecutorConfirmedStopped(db, nodeId),
       seatState: (nodeId) => nodeExecutorConfirmedStopped(db, nodeId) ? null : seatActivityService.getSeatState(nodeId),
+      usageLimited: usageLimited ? (sessionName) => usageLimited.has(sessionName) : undefined,
       restoring: (rigId) => restoreOrchestrator.restoreInProgress(rigId),
       demand: (jobId) => seatPoolExecutor.demandSample(jobId),
     }, job);
+    // The seats whose provider account is out of usage, as the wake ladder reads them: the plan reads them, and the run
+    // again just before each add, launch and relaunch.
+    const usageLimitedSessions = async (): Promise<ReadonlySet<string>> => {
+      if (!deps.providerService) return new Set();
+      try {
+        const pools = deriveUsageLimitPools({
+          ...(await deps.providerService.getReadModel()),
+          now: new Date(),
+          fallbackSeconds: resolveWakeRetryIntervalSeconds(),
+          claudeHomeOf: (seatSession) => seatRuntimeHomeBySession(db, seatSession, "claude-code"),
+        });
+        return new Set(pools.flatMap((pool) => pool.seatSessions));
+      } catch {
+        return new Set();
+      }
+    };
     const seatPoolExecutor: SeatPoolExecutor = new SeatPoolExecutor({
       slots: seatPoolSlots,
       readJob: (jobId) => {
@@ -2399,6 +2424,7 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
         }
       },
       readState: readPoolState,
+      outOfUsage: async (job) => seatPoolOutOfUsage(readPoolState(job, await usageLimitedSessions())),
       record: (jobId, entry) => {
         watchdogHistoryLogInstance.record({
           jobId, evaluatedAt: new Date().toISOString(), outcome: entry.failed ? "failed" : "skipped",
@@ -2450,6 +2476,21 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
           return removed.ok ? { ok: true } : { ok: false, code: removed.code, error: removed.error };
         },
         runCommand: runSeatPoolCommand,
+        relaunchSeat: async ({ rigId, logicalId }) => {
+          // As the node launch route does for a seat that already had a session.
+          const result = await restoreOrchestrator.launchSingleNode(rigId, logicalId, { adapters: runtimeAdaptersMap, fsOps: { exists: (p) => fs.existsSync(p) } });
+          if (!result.ok) return { ok: false, code: result.code ?? "launch_failed", error: result.message ?? "launch failed" };
+          const launched = result.launched?.find((node) => node.logicalId === logicalId);
+          if (launched && !launchStatusIsRunning(launched.status)) return { ok: false, code: launched.status, error: launched.error ?? `the seat came up ${launched.status}` };
+          if (!launched && !result.alreadyRunning?.some((node) => node.logicalId === logicalId)) {
+            return { ok: false, code: "not_launched", error: result.failedTargets?.find((node) => node.logicalId === logicalId)?.reason ?? "the seat was not launched" };
+          }
+          return { ok: true };
+        },
+        ...seatPoolQueueEffects({
+          queueRepo: queueRepoInstance,
+          escalationOwner: (modelSession) => resolveEscalationOwner(db, modelSession, (target) => queueRepoInstance.acceptsDestination(target)),
+        }),
       },
     });
     deps.seatPoolExecutor = seatPoolExecutor;
@@ -2500,7 +2541,10 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
           reconcileStuckExceptions: (id) => workflowRuntime?.reconcileStuckExceptions(id) ?? 0,
         }),
         makeIdleGateQitemPolicy({ db, seatActivity: seatActivityService }),
-        makeSeatPoolPolicy({ readState: readPoolState, submit: (jobId, intents) => seatPoolExecutor.submit(jobId, intents) }),
+        makeSeatPoolPolicy({
+          readState: async (job) => readPoolState(job, await usageLimitedSessions()),
+          submit: (jobId, intents) => seatPoolExecutor.submit(jobId, intents),
+        }),
         // OPR.0.5.6.24 F-14: the parked-owner consumer — the WHOLE shipped
         // parked diagnosis (diagnoseRigParked over the arbitrated oracle +
         // destination-scoped obligations + wake status; the same derivation
