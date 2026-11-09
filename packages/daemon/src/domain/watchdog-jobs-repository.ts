@@ -47,6 +47,7 @@ export const PHASE_D_POLICIES = [
   "mode-scheduled-end",
   // Seat pool (#3395): one job per model member with a `pool` block, ensured by the daemon. Accepted here so the
   // ensure can register it; the watchdog engine does not run it until the activation change arms it.
+  // Fork: elastic seats cloned from one model member; its executor adds and removes them outside the tick.
   "seat-pool",
 ] as const;
 
@@ -209,6 +210,7 @@ export class WatchdogJobsRepository {
   private readonly hasContextUsageColumns: boolean;
   private readonly hasWatchedFileGenerationColumn: boolean;
   private readonly hasThresholdUnitsColumns: boolean;
+  private readonly hasSeatPoolSlotsTable: boolean;
   /** Per job, the spec and interval a caller's update replaced, for a delivery still in flight (see updateInPlace). */
   private readonly updatedFrom = new Map<string, Array<{ specYaml: string; intervalSeconds: number }>>();
   /** Per job, the schedule its delivery in flight started under (see deliverySchedule). */
@@ -226,6 +228,7 @@ export class WatchdogJobsRepository {
     this.hasContextUsageColumns = detectWatchdogColumn(db, "last_fired_generation_uuid");
     this.hasWatchedFileGenerationColumn = detectWatchdogColumn(db, "watched_file_generation_uuid");
     this.hasThresholdUnitsColumns = detectWatchdogColumn(db, "threshold_tokens");
+    this.hasSeatPoolSlotsTable = !!db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'seat_pool_slots'").get();
   }
 
   /**
@@ -933,6 +936,15 @@ export class WatchdogJobsRepository {
       );
     }
     if (existing.state === "stopped") return existing;
+    // A stopped pool could no longer drain its seats; they would be left running with nothing to remove them.
+    if (existing.policy === "seat-pool" && this.hasSeatPoolSlotsTable
+      && this.db.prepare("SELECT 1 FROM seat_pool_slots WHERE pool_job_id = ? AND retired_at IS NULL").get(jobId)) {
+      throw new WatchdogJobsError(
+        "pool_has_slots",
+        `cannot stop seat pool ${jobId}: it still holds seats; set drain: true with rig watchdog update, and stop it once they are gone`,
+        { jobId },
+      );
+    }
     this.db
       .prepare(`UPDATE watchdog_jobs SET state = 'stopped', terminal_reason = ? WHERE job_id = ?`)
       .run(reason, jobId);
