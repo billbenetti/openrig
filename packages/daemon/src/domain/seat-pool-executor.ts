@@ -225,13 +225,16 @@ function readPendingRows(deps: SeatPoolStateReaderDeps, sessions: string[]): Sea
   }
   if (sessionOf.size === 0) return [];
   const rows = deps.db.prepare(
-    `SELECT q.qitem_id, q.destination_session,
+    `SELECT q.qitem_id, q.destination_session, q.tags,
             COALESCE((SELECT MAX(t.ts) FROM queue_transitions t WHERE t.qitem_id = q.qitem_id AND t.actor_session = ?), q.ts_created) AS since
        FROM queue_items q
       WHERE q.state = 'pending' AND q.destination_session IN (${[...sessionOf.keys()].map(() => "?").join(",")})
       ORDER BY since, q.qitem_id`,
-  ).all(FALLBACK_ACTOR, ...sessionOf.keys()) as Array<{ qitem_id: string; destination_session: string; since: string }>;
-  return rows.map((row) => ({ qitemId: row.qitem_id, destination: sessionOf.get(row.destination_session)!, waitingSince: row.since }));
+  ).all(FALLBACK_ACTOR, ...sessionOf.keys()) as Array<{ qitem_id: string; destination_session: string; tags: string | null; since: string }>;
+  return rows.map((row) => ({
+    qitemId: row.qitem_id, destination: sessionOf.get(row.destination_session)!, waitingSince: row.since,
+    tags: row.tags ? JSON.parse(row.tags) as string[] : [],
+  }));
 }
 
 /** The pool's state as the planner sees it. */
