@@ -244,6 +244,19 @@ describe("planSeatPool: dispatch and wake", () => {
     ]);
   });
 
+  it("launches an adopted seat whose session is gone when it holds a waiting row, never reaps it, and doesn't count it", () => {
+    const asleep = slot({ adopted: true, cause: "stopped", idleSince: null });
+    const holding = slot({ adopted: true, cause: "stopped", idleSince: null, openRows: 1 });
+    const waiting = rows(1, holding.sessionName);
+    const result = plan(spec(), state({ pending: [...waiting, ...rows(1)], slots: [asleep, holding] }));
+    // Neither takes the model's row, so it is demand for a seat of the pool's own.
+    expect(result.intents).toEqual<SeatPoolIntent[]>([
+      { kind: "relaunch", seat: holding.sessionName, nodeId: holding.nodeId! },
+      { kind: "add", count: 1 },
+    ]);
+    expect(result).toMatchObject({ current: 0, target: 1 });
+  });
+
   it("launches a stopped model, escalates one that needs input, and leaves one idle or working", () => {
     const waiting = rows(2);
     expect(plan(spec(), state({ modelCause: "stopped", pending: waiting })).intents).toEqual([

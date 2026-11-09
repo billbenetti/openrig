@@ -465,6 +465,8 @@ interface DrainOutcome {
   /** The history entry's reason; null writes none. */
   reason: string | null;
   notes?: Record<string, unknown>;
+  /** A reap the release command refused: its result. */
+  refused?: { exitCode: number | null; error: string | null };
 }
 
 interface Context {
@@ -817,14 +819,16 @@ export class SeatPoolExecutor {
    * Reaps a seat whose session is gone, under its lifecycle lease, after checking again that it is gone: a seat that
    * came back since the plan is left alone.
    *
-   * The seat is cleaned, which checks in tmux that the session is gone before anything else changes; then `reap_cmd`
-   * runs; then each in-progress row is unclaimed and every open row is moved back to the model (a pending one with a
-   * wake), each only if it is still addressed to the seat, with the reason `reap:<seat>`. A row that a reap already
-   * moved once goes to the model's escalation owner instead, so a row that keeps losing its seat stops cycling through
-   * the pool. Last, the node is removed with the `expected` read at the start. A failed step stops the reap there; the
-   * next plan picks it up again.
+   * The release command runs first, as for a drained seat: the session is gone, but its work may not be saved. When it
+   * refuses, the seat is launched again instead (its session resumes where it can), and reaped without asking again
+   * only if that launch fails. Then the seat is cleaned, which checks in tmux that the session is gone before anything
+   * else changes; then `reap_cmd` runs; then each in-progress row is unclaimed and every open row is moved back to the
+   * model (a pending one with a wake), each only if it is still addressed to the seat, with the reason `reap:<seat>`. A
+   * row that a reap already moved once goes to the model's escalation owner instead, so a row that keeps losing its
+   * seat stops cycling through the pool. Last, the node is removed with the `expected` read at the start. A failed step
+   * stops the reap there; the next plan picks it up again.
    */
-  private async reap(jobId: string, run: Run, slotId: number): Promise<boolean> {
+  private async reap(jobId: string, run: Run, slotId: number, released = false): Promise<boolean> {
     const slot = this.deps.slots.get(slotId);
     if (!slot?.nodeId || slot.retiredAt || slot.phase !== "live") return true;
     const ctx = this.fresh(jobId, run);
@@ -842,6 +846,15 @@ export class SeatPoolExecutor {
         return { stop: false, failed: true, reason: "seat_pool_reap_failed", notes: { step, ...notes } };
       };
 
+      if (!released && inLease.spec.releaseCmd) {
+        this.setIntent(slotId, "release");
+        const release = await this.deps.effects.runCommand(inLease.spec.releaseCmd, this.commandEnv(inLease, { OPENRIG_SEAT_POOL_SLOT: sessionName }), run.controller.signal);
+        if (run.controller.signal.aborted) return { stop: true, reason: null };
+        if (release.exitCode !== 0) {
+          this.setIntent(slotId, null);
+          return { stop: false, reason: null, refused: { exitCode: release.exitCode, error: release.error ?? null } };
+        }
+      }
       this.setIntent(slotId, "reap");
       const cleaned = await this.deps.effects.cleanSlot({ sessionName });
       if (!cleaned.ok && cleaned.code !== "nothing_to_clean") return failed("clean", { code: cleaned.code, error: cleaned.error });
@@ -877,6 +890,13 @@ export class SeatPoolExecutor {
     if (outcome === TIMED_OUT) {
       this.record(jobId, true, "seat_pool_reap_failed", { slot: slot.logicalId, code: "effect_timeout" });
       return false;
+    }
+    if (outcome.refused) {
+      const inRun = this.fresh(jobId, run);
+      if (!inRun) return false;
+      const launched = await this.relaunch(jobId, run, inRun, sessionName, slot.logicalId, { why: "release_refused", ...outcome.refused });
+      if (launched === "failed") return this.reap(jobId, run, slotId, true);
+      return launched !== "timed_out";
     }
     if (outcome.reason) this.record(jobId, outcome.failed === true, outcome.reason, { slot: slot.logicalId, ...outcome.notes });
     return !outcome.stop;
@@ -917,20 +937,7 @@ export class SeatPoolExecutor {
 
     if (intent.kind === "relaunch") {
       if (seat.cause !== "stopped" || seat.nodeId !== intent.nodeId) return true;
-      if (await this.outOfUsage(ctx)) {
-        this.record(jobId, false, "seat_pool_held", { reason: "usage_limit", seat: intent.seat });
-        return true;
-      }
-      const launched = await this.withLaunchRoom(jobId, run, { seat: intent.seat },
-        () => this.within(run, () => this.deps.effects.relaunchSeat({ rigId: ctx.model.rigId, logicalId: seat.logicalId })));
-      if (launched === NO_ROOM) return true;
-      if (launched === TIMED_OUT) {
-        this.record(jobId, true, "seat_pool_relaunch_failed", { seat: intent.seat, code: "effect_timeout" });
-        return false;
-      }
-      if (launched.ok) this.record(jobId, false, "seat_pool_relaunched", { seat: intent.seat });
-      else this.record(jobId, true, "seat_pool_relaunch_failed", { seat: intent.seat, code: launched.code, error: launched.error });
-      return true;
+      return await this.relaunch(jobId, run, ctx, intent.seat, seat.logicalId) !== "timed_out";
     }
 
     if (seat.cause !== "needs_input") return true;
@@ -945,6 +952,31 @@ export class SeatPoolExecutor {
       this.record(jobId, false, "seat_pool_escalated", { seat: intent.seat, to: escalated.destination, qitemId: escalated.qitemId, rows: intent.qitemIds });
     }
     return true;
+  }
+
+  /**
+   * Launches a stopped seat again, as `rig launch` does, within the launch budget and only while no seat of the pool is
+   * out of usage. `held` started nothing; the next plan tries again.
+   */
+  private async relaunch(jobId: string, run: Run, ctx: Context, seat: string, logicalId: string, notes: Record<string, unknown> = {}):
+    Promise<"launched" | "failed" | "held" | "timed_out"> {
+    if (await this.outOfUsage(ctx)) {
+      this.record(jobId, false, "seat_pool_held", { reason: "usage_limit", seat, ...notes });
+      return "held";
+    }
+    const launched = await this.withLaunchRoom(jobId, run, { seat, ...notes },
+      () => this.within(run, () => this.deps.effects.relaunchSeat({ rigId: ctx.model.rigId, logicalId })));
+    if (launched === NO_ROOM) return "held";
+    if (launched === TIMED_OUT) {
+      this.record(jobId, true, "seat_pool_relaunch_failed", { seat, code: "effect_timeout", ...notes });
+      return "timed_out";
+    }
+    if (!launched.ok) {
+      this.record(jobId, true, "seat_pool_relaunch_failed", { seat, code: launched.code, error: launched.error, ...notes });
+      return "failed";
+    }
+    this.record(jobId, false, "seat_pool_relaunched", { seat, ...notes });
+    return "launched";
   }
 
   /** Asks the demand command for the next plan. A failure keeps the previous answer, which ages until it holds the pool. */
