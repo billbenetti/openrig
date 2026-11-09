@@ -82,7 +82,7 @@ isn't taking it:
 | The seat | The pool |
 | --- | --- |
 | has no live session | launches the model, as `rig launch` does; reaps a seat of the pool (see [Reaping a seat](#reaping-a-seat)) |
-| is idle at its prompt | nudges it about the row, once per row and seat; the row records the nudge (`seat-pool nudge: <seat>`) before it is sent, so a restart never sends a second |
+| is idle at its prompt | nothing: the queue's own wakes cover it (the nudge when the row was created or moved, the wake ladder and the stuck sweep) |
 | needs input (a permission prompt or a question) | opens one row to the model's escalation owner, tagged `seat-pool-needs-input:<seat>`; no other is opened about that seat while it is open |
 | is out of provider usage | nothing: the row waits |
 | is working | nothing: the row waits, and counts as demand if it is the model's |
@@ -107,7 +107,7 @@ exits non-zero, the seat goes back into the pool untouched. The removal never pa
 rows is not removed.
 
 Every add, launch, removal, row moved (`seat_pool_dispatched`, or `seat_pool_dispatch_skipped` when the row was claimed
-or moved first), relaunch, nudge, escalation, refusal and failure is written to the job's history
+or moved first), relaunch, escalation, refusal and failure is written to the job's history
 (`rig watchdog status <jobId>`). An evaluation that plans changes records the plan (`seat_pool_planned`), and one that
 holds because the model seat is gone, the rig is being restored, the demand answer is stale or a seat is out of usage
 records why (`seat_pool_held`). One with nothing to change records nothing.

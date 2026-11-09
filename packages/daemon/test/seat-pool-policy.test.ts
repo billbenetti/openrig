@@ -48,8 +48,8 @@ function slot(overrides: Partial<SeatPoolSlotView> = {}): SeatPoolSlotView {
 
 let nextRow = 1;
 /** Pending rows to `destination` (the model by default), created `ageSeconds` ago: past the default dispatch_after_s. */
-function rows(count: number, destination = "dev-impl@r", ageSeconds = 120, nudged = false): SeatPoolPendingRow[] {
-  return Array.from({ length: count }, () => ({ qitemId: `q-${nextRow++}`, destination, waitingSince: ago(ageSeconds), nudged }));
+function rows(count: number, destination = "dev-impl@r", ageSeconds = 120): SeatPoolPendingRow[] {
+  return Array.from({ length: count }, () => ({ qitemId: `q-${nextRow++}`, destination, waitingSince: ago(ageSeconds) }));
 }
 
 function state(overrides: Partial<SeatPoolState> = {}): SeatPoolState {
@@ -232,30 +232,25 @@ describe("planSeatPool: dispatch and wake", () => {
     const stopped = slot({ cause: "stopped", openRows: 2, idleSince: null });
     const idle = slot({ openRows: 2 });
     const asking = slot({ cause: "needs_input", openRows: 1, idleSince: null });
-    const nudged = rows(1, idle.sessionName, 120, true);
-    const fresh = rows(1, idle.sessionName);
     const askingRows = rows(1, asking.sessionName);
     const young = rows(1, stopped.sessionName, 10);
     const result = plan(spec(), state({
-      pending: [...rows(1, stopped.sessionName), ...young, ...nudged, ...fresh, ...askingRows], slots: [stopped, idle, asking],
+      pending: [...rows(1, stopped.sessionName), ...young, ...rows(1, idle.sessionName), ...askingRows], slots: [stopped, idle, asking],
     }));
+    // The idle one is left to the queue's own wakes.
     expect(result.intents).toEqual<SeatPoolIntent[]>([
       { kind: "reap", slotId: stopped.slotId },
-      { kind: "nudge", seat: idle.sessionName, qitemId: fresh[0]!.qitemId },
       { kind: "escalate", seat: asking.sessionName, qitemIds: [askingRows[0]!.qitemId] },
     ]);
   });
 
-  it("launches a stopped model, nudges an idle one once per row, escalates one that needs input, and leaves one working", () => {
+  it("launches a stopped model, escalates one that needs input, and leaves one idle or working", () => {
     const waiting = rows(2);
     expect(plan(spec(), state({ modelCause: "stopped", pending: waiting })).intents).toEqual([
       { kind: "relaunch", seat: "dev-impl@r", nodeId: "model" },
       { kind: "add", count: 2 },
     ]);
-    expect(plan(spec(), state({ modelCause: "idle", pending: [waiting[0]!, { ...waiting[1]!, nudged: true }] })).intents).toEqual([
-      { kind: "nudge", seat: "dev-impl@r", qitemId: waiting[0]!.qitemId },
-      { kind: "add", count: 2 },
-    ]);
+    expect(plan(spec(), state({ modelCause: "idle", pending: waiting })).intents).toEqual([{ kind: "add", count: 2 }]);
     expect(plan(spec(), state({ modelCause: "needs_input", pending: waiting })).intents).toEqual([
       { kind: "escalate", seat: "dev-impl@r", qitemIds: waiting.map((r) => r.qitemId) },
       { kind: "add", count: 2 },
@@ -315,7 +310,6 @@ describe("planSeatPool: dispatch and wake", () => {
     expect(result).toMatchObject({ reason: "demand_sample_stale", target: null });
     expect(result.intents).toEqual([
       { kind: "dispatch", qitemId: waiting[0]!.qitemId, from: "dev-impl@r", slotId: free.slotId },
-      { kind: "nudge", seat: "dev-impl@r", qitemId: waiting[1]!.qitemId },
     ]);
   });
 });
