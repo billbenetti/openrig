@@ -493,6 +493,25 @@ describe("seat-pool executor", () => {
     expect(slots.listOpen(JOB).map((s) => s.logicalId)).toEqual(["dev.impl-s1"]);
   });
 
+  it("gives an adopted seat back under drain without touching it, and never stops or removes it", async () => {
+    world.nodes.set("node-9", { logicalId: "dev.impl2", session: "running", sessionId: "sess-9", openRows: 0, idle: true });
+    const adopted = slots.adopt({ poolJobId: JOB, logicalId: "dev.impl2", nodeId: "node-9", at: new Date(T0).toISOString() });
+    const executor = makeExecutor();
+    await run(executor, [drainOf(adopted.slotId), { kind: "unlink", slotId: adopted.slotId }]);
+    // Without drain, neither the drain nor the unlink does anything.
+    expect(world.calls).toEqual([]);
+    expect(slots.get(adopted.slotId)).toMatchObject({ phase: "live", retiredAt: null });
+    jobSpec = spec({ drain: true });
+    await run(executor, planSeatPool(jobSpec, world.state(slots, executor, jobSpec), T0, 120_000).intents);
+    expect(world.calls).toEqual([]);
+    expect(world.nodes.get("node-9")).toMatchObject({ session: "running" });
+    expect(slots.listOpen(JOB)).toEqual([]);
+    expect(history).toEqual([{ failed: false, reason: "seat_pool_unlinked", notes: { slot: "dev.impl2" } }]);
+    // A seat given back is not one the pool removed: rows to it are not the pool's, and it starts no cooldown.
+    expect(slots.listRetired(JOB)).toEqual([]);
+    expect(slots.lastScaleAt(JOB)).toBeNull();
+  });
+
   it("does nothing while the rig is restored, or once the job is no longer active", async () => {
     world.restoring = true;
     await run(makeExecutor(), [{ kind: "add", count: 1 }]);

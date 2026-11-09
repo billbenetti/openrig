@@ -27,7 +27,7 @@ context:
   idle_grace_s: 300         # how long a seat must sit idle before it is drained (default 300)
   dispatch_after_s: 60      # how long a row waits at its seat before the pool moves it or wakes the seat (default 60)
   drain: false              # true empties the pool (see below)
-  adopt: [dev.impl2]        # existing seats the pool takes over
+  adopt: [dev.impl2]        # existing seats the pool counts and gives rows to, but never stops or removes
   cwd_template: /work/{rig}/{slot}   # required: absolute, with {slot}; {rig} is optional
   demand_cmd:  { argv: [/usr/local/bin/pool-demand], timeout_s: 30 }
   prepare_cmd: { argv: [/usr/local/bin/pool-prepare], timeout_s: 120 }
@@ -59,8 +59,9 @@ its last good answer is older than two evaluation intervals, the pool holds as i
 it has begun, and adds or drains nothing.
 
 A seat holds work when it has a pending, in-progress or blocked row, a message the typing guard holds for it, or isn't
-idle at a prompt. Only a seat with no open row and no held message that has been idle at a prompt, with no pending input
-and no background shell, for `idle_grace_s` is drained; the pool's own seats go before adopted ones, newest first.
+idle at a prompt. Only a seat the pool added, with no open row and no held message, that has been idle at a prompt, with
+no pending input and no background shell, for `idle_grace_s` is drained, the newest first. An adopted seat counts and
+takes rows like the pool's own, but the pool never stops or removes it: it was there before the pool and stays after.
 
 ## Waiting rows: dispatch and wake
 
@@ -175,7 +176,9 @@ waits out a usage limit like any other launch.
 ## Stopping a pool: drain
 
 `drain: true` is the kill switch. Set it with `rig watchdog update <jobId> --spec <file>`: the pool adds nothing,
-removes the seats that haven't started, and drains the rest as each becomes free, so no work is killed. `rig watchdog
+removes the seats that haven't started, and drains the rest of its own seats as each becomes free, so no work is
+killed. It gives the adopted seats back at once (`seat_pool_unlinked`): their link ends, and their nodes, sessions and
+rows stay as they are. `rig watchdog
 stop` refuses a pool that still holds seats (`pool_has_slots`); stop it once its seats are gone.
 
 A pool can still end with seats in it: a daemon that doesn't know the `seat-pool` policy, such as an earlier version
