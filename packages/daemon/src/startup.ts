@@ -162,7 +162,9 @@ import { makeWorkflowKeepalivePolicy } from "./domain/policies/workflow-keepaliv
 import { makeIdleGateQitemPolicy } from "./domain/policies/idle-gate-qitem.js";
 import { makeParkedOwnerConsumerPolicy, makeRigAnchor, PARKED_OWNER_POLICY_NAME } from "./domain/policies/parked-owner-consumer.js";
 import { makeSeatPoolPolicy, parseSeatPoolSpec, seatPoolOutOfUsage, type SeatPoolSpec } from "./domain/policies/seat-pool.js";
-import { readSeatPoolState, runSeatPoolCommand, SeatPoolExecutor, SeatPoolSlots, seatPoolQueueEffects, slotMemberFragment } from "./domain/seat-pool-executor.js";
+import {
+  readSeatPoolState, runSeatPoolCommand, SEAT_POOL_QUARANTINE_TAG, SeatPoolExecutor, SeatPoolSlots, seatPoolQueueEffects, slotMemberFragment,
+} from "./domain/seat-pool-executor.js";
 import { launchStatusIsRunning } from "./domain/restore-orchestrator.js";
 import { resolveEscalationOwner } from "./domain/escalation-owner.js";
 import { deriveUsageLimitPools } from "./domain/provider/provider-signals.js";
@@ -2373,9 +2375,9 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
       const since = deps.compactionEnforcer?.postCompactStageOwedSince(physicalSessionName(db, session));
       return since == null ? null : new Date(since).toISOString();
     });
-    // Seat pools: the seat-pool policy plans, and this executor adds, launches, drains and removes the seats, moves
-    // waiting rows and wakes the seats holding them outside the scheduler tick, through the same services the member,
-    // launch, stop, node and queue routes use.
+    // Seat pools: the seat-pool policy plans, and this executor adds, launches, drains, reaps and removes the seats,
+    // moves waiting rows and wakes the seats holding them outside the scheduler tick, through the same services the
+    // member, launch, stop, clean, node and queue routes use.
     const seatPoolSlots = new SeatPoolSlots(db);
     const seatPoolStops = new SeatLifecycleService({ db, rigRepo, sessionRegistry, eventBus, tmuxAdapter, nodeLauncher });
     const latestSession = (nodeId: string) =>
@@ -2390,6 +2392,7 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
       seatStopped: (nodeId) => !["running", "idle", "unknown"].includes(latestSession(nodeId)?.status ?? "") || nodeExecutorConfirmedStopped(db, nodeId),
       seatState: (nodeId) => nodeExecutorConfirmedStopped(db, nodeId) ? null : seatActivityService.getSeatState(nodeId),
       usageLimited: usageLimited ? (sessionName) => usageLimited.has(sessionName) : undefined,
+      quarantined: (sessionName) => queueRepoInstance.list({ tag: `${SEAT_POOL_QUARANTINE_TAG}:${sessionName}`, activeOnly: true, limit: 1 }).length > 0,
       restoring: (rigId) => restoreOrchestrator.restoreInProgress(rigId),
       demand: (jobId) => seatPoolExecutor.demandSample(jobId),
     }, job);
@@ -2475,6 +2478,10 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
           return removed.ok ? { ok: true } : { ok: false, code: removed.code, error: removed.error };
         },
         runCommand: runSeatPoolCommand,
+        cleanSlot: async ({ sessionName }) => {
+          const cleaned = await seatPoolStops.cleanSeat({ seatRef: sessionName, reason: "seat-pool reap", operator: null });
+          return cleaned.ok ? { ok: true } : { ok: false, code: cleaned.code, error: cleaned.message };
+        },
         relaunchSeat: async ({ rigId, logicalId }) => {
           // As the node launch route does for a seat that already had a session.
           const result = await restoreOrchestrator.launchSingleNode(rigId, logicalId, { adapters: runtimeAdaptersMap, fsOps: { exists: (p) => fs.existsSync(p) } });

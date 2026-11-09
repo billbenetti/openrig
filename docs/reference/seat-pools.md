@@ -13,7 +13,8 @@ The target is the model seat. Each new seat is a member of the model's pod named
 `dev.impl-s2`, ...), with the model's runtime, agent, profile, model, effort, permissions, environment and launch
 wrapper, its own working directory, and a fresh session. `n` only grows: a removed seat's name is never given to a new
 seat. The model seat itself is never added, stopped or removed; the pool only launches it when it stopped with work
-waiting (see [Waiting rows](#waiting-rows-dispatch-and-wake)).
+waiting (see [Waiting rows](#waiting-rows-dispatch-and-wake)). A seat of the pool that stops working is reaped instead
+(see [Reaping a seat](#reaping-a-seat)).
 
 ## The spec
 
@@ -25,23 +26,26 @@ context:
   cooldown_s: 60            # wait after an add or removal before the next one (default 60)
   idle_grace_s: 300         # how long a seat must sit idle before it is drained (default 300)
   dispatch_after_s: 60      # how long a row waits at its seat before the pool moves it or wakes the seat (default 60)
+  stuck_after_s: 14400      # how long a live seat may go without an activity change before it is reaped (default: never)
   drain: false              # true empties the pool (see below)
   adopt: [dev.impl2]        # existing seats the pool takes over
   cwd_template: /work/{rig}/{slot}   # required: absolute, with {slot}; {rig} is optional
   demand_cmd:  { argv: [/usr/local/bin/pool-demand], timeout_s: 30 }
   prepare_cmd: { argv: [/usr/local/bin/pool-prepare], timeout_s: 120 }
   release_cmd: { argv: [/usr/local/bin/pool-release], timeout_s: 60 }
+  reap_cmd:    { argv: [/usr/local/bin/pool-reap], timeout_s: 60 }
 ```
 
 Registration and `rig watchdog update --spec` refuse a spec with an unknown field, `max` below `min`, a relative
-`cwd_template` or one without `{slot}`, or a command that isn't an argv. Commands run without a shell, with the
+`cwd_template` or one without `{slot}`, a `stuck_after_s` that isn't a positive whole number, or a command that isn't an
+argv. Commands run without a shell, with the
 daemon's environment plus:
 
 | Variable | Set for | Value |
 | --- | --- | --- |
 | `OPENRIG_SEAT_POOL_JOB` | every command | the job id |
 | `OPENRIG_SEAT_POOL_MODEL` | every command | the model's session name |
-| `OPENRIG_SEAT_POOL_SLOT` | `prepare_cmd`, `release_cmd` | the seat's session name |
+| `OPENRIG_SEAT_POOL_SLOT` | `prepare_cmd`, `release_cmd`, `reap_cmd` | the seat's session name |
 | `OPENRIG_SEAT_POOL_SLOT_CWD` | `prepare_cmd` | the seat's working directory |
 | `OPENRIG_SEAT_POOL_SLOTS` | `demand_cmd` | JSON list of `{session, phase}` for the pool's seats |
 
@@ -79,7 +83,7 @@ isn't taking it:
 
 | The seat | The pool |
 | --- | --- |
-| has no live session | launches it, as `rig launch` does |
+| has no live session | launches the model, as `rig launch` does; reaps a seat of the pool (see [Reaping a seat](#reaping-a-seat)) |
 | is idle at its prompt | nudges it about the row, once per row and seat; the row records the nudge (`seat-pool nudge: <seat>`) before it is sent, so a restart never sends a second |
 | needs input (a permission prompt or a question) | opens one row to the model's escalation owner, tagged `seat-pool-needs-input:<seat>`; no other is opened about that seat while it is open |
 | is out of provider usage | nothing: the row waits |
@@ -110,6 +114,43 @@ or moved first), relaunch, nudge, escalation, refusal and failure is written to 
 holds because the model seat is gone, the rig is being restored, the demand answer is stale or a seat is out of usage
 records why (`seat_pool_held`). One with nothing to change records nothing.
 
+## Reaping a seat
+
+A seat of the pool that stops working is reaped: its rows go back to the model and its node is removed, so the pool can
+add a fresh seat in its place. The pool reaps a live seat (one it launched or adopted)
+
+- whose session is gone (it exited, crashed or was stopped), even while its account is out of usage, or
+- with `stuck_after_s` set, whose activity hasn't changed for that long while it is out of provider usage, waiting for
+  input or working. Set it above the longest turn a seat may take: a seat that works without an activity change counts.
+
+Everything happens under the seat's lifecycle lease, after the pool reads the seat again; a seat that recovered since
+the plan is left alone. A live seat goes first through the release command, as a drained seat does, and is stopped with
+a [checked stop](checked-seat-stop.md) only if `release_cmd` exits 0 and the seat is still stuck afterwards. Without a
+`release_cmd`, or when it refuses, the seat is **quarantined**: it is neither stopped nor removed, and one row tagged
+`seat-pool-quarantine:<seat>` goes to the model's escalation owner with the seat's open rows. While that row is open the
+pool leaves the seat as it is, even if its session ends or it becomes free: it neither reaps nor drains it, and gives it
+no row. Once the row is closed and the seat is still stuck, or its session is gone, the pool tries again.
+
+A seat whose session is gone, or that was just stopped, is then reaped in this order, and a failed step stops the reap
+there for the next plan to pick up:
+
+1. `rig seat clean`, which checks in tmux that the session is really gone; a live session stops the reap before anything
+   is moved.
+2. `reap_cmd`, if set, so whatever tracks the seat's work (an executor lease, a task claim) can release it. A non-zero
+   exit stops the reap.
+3. Each in-progress row addressed to the seat is unclaimed, and every open row is moved with `rig queue fallback`,
+   `--expect-destination <the seat>` and the row's state expected, to the model, with a wake when the row is pending.
+   A blocked row keeps its blocker; a one-shot `--wake-after` timer ends with the move, as with any reroute.
+4. The node is removed with the `expected` read at the start of the reap, as a drain removes it.
+
+Each move gives the reason `reap:<seat>`. A row that a reap already moved once (the pool counts the row's reroutes with
+that reason) goes to the model's escalation owner instead of the model, so a row whose seats keep dying stops cycling
+through the pool. With no escalation owner it goes to the model, and `seat_pool_escalation_failed` is recorded.
+
+The history records `seat_pool_reaped` with the rows moved and where each went, `seat_pool_quarantined`, and
+`seat_pool_reap_failed` with the step that failed. Reaping goes on under `drain` and while a seat is out of usage: it
+adds and launches nothing.
+
 ## Stopping a pool: drain
 
 `drain: true` is the kill switch. Set it with `rig watchdog update <jobId> --spec <file>`: the pool adds nothing,
@@ -124,4 +165,4 @@ launched is prepared and launched (or removed if it is no longer wanted), and a 
 completed but wasn't recorded is recognized by its running session. The pool acts only on seats it created or adopted
 (`adopt`); it never takes a node over because of its name. While the rig is being restored, the pool does nothing.
 
-A seat whose session died is relaunched only when a row waits for it; otherwise it is left in place.
+A seat of the pool whose session died is reaped, never relaunched.
