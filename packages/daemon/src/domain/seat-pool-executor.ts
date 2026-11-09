@@ -456,6 +456,10 @@ interface Run {
   controller: AbortController;
   /** Effects the run stopped waiting for; the pool stays owned until they settle. */
   lingering: Array<Promise<unknown>>;
+  /** Resolves when the run is cancelled. */
+  cancelled: Promise<void>;
+  /** The plan's own steps, without the effects the run stopped waiting for. */
+  applied: Promise<void>;
   done: Promise<void>;
   /** The launch budget's tick the plan was submitted in: every launch of the run counts against it. */
   tick?: LaunchTick;
@@ -508,11 +512,14 @@ export class SeatPoolExecutor {
   /** Starts applying a plan; false when the pool already has a run, or the executor is stopping. */
   submit(jobId: string, intents: SeatPoolIntent[]): boolean {
     if (this.stopping || this.runs.has(jobId)) return false;
-    const run: Run = { controller: new AbortController(), lingering: [], done: Promise.resolve(), tick: this.deps.launchBudget?.currentTick() };
-    run.done = this.apply(jobId, intents, run)
-      .catch((error) => this.deps.record(jobId, { failed: true, reason: "seat_pool_run_failed", notes: { error: (error as Error).message } }))
-      .then(() => Promise.allSettled(run.lingering))
-      .then(() => { this.runs.delete(jobId); });
+    const controller = new AbortController();
+    const run: Run = {
+      controller, lingering: [], applied: Promise.resolve(), done: Promise.resolve(), tick: this.deps.launchBudget?.currentTick(),
+      cancelled: new Promise((resolve) => controller.signal.addEventListener("abort", () => resolve(), { once: true })),
+    };
+    run.applied = this.apply(jobId, intents, run)
+      .catch((error) => this.deps.record(jobId, { failed: true, reason: "seat_pool_run_failed", notes: { error: (error as Error).message } }));
+    run.done = run.applied.then(() => Promise.allSettled(run.lingering)).then(() => { this.runs.delete(jobId); });
     this.runs.set(jobId, run);
     return true;
   }
@@ -522,11 +529,15 @@ export class SeatPoolExecutor {
     await this.runs.get(jobId)?.done;
   }
 
-  /** Cancels every run (commands are killed, no further effect starts) and waits for them to finish. */
+  /**
+   * Cancels every run (commands are killed, no further effect starts) and waits for their steps to end, not for an
+   * effect a run stopped waiting for or was waiting for when cancelled: one that never settles can't hold a shutdown.
+   * The intent recorded on its seat lets the next start resume it.
+   */
   async stop(): Promise<void> {
     this.stopping = true;
     for (const run of this.runs.values()) run.controller.abort();
-    await Promise.all([...this.runs.values()].map((run) => run.done));
+    await Promise.all([...this.runs.values()].map((run) => run.applied));
   }
 
   private at(): string {
@@ -556,16 +567,23 @@ export class SeatPoolExecutor {
     this.deps.slots.update(slotId, { intent, ...(phase ? { phase } : {}) });
   }
 
+  /** Waits for an effect until it settles, its timeout passes or the run is cancelled; TIMED_OUT for the last two. */
   private async within<T>(run: Run, start: () => Promise<T>): Promise<T | typeof TIMED_OUT> {
     const pending = start();
     run.lingering.push(pending.catch(() => undefined));
     let timer: ReturnType<typeof setTimeout> | undefined;
     const timeout = new Promise<typeof TIMED_OUT>((resolve) => { timer = setTimeout(() => resolve(TIMED_OUT), this.effectTimeoutMs); });
     try {
-      return await Promise.race([pending, timeout]);
+      return await Promise.race([pending, timeout, run.cancelled.then((): typeof TIMED_OUT => TIMED_OUT)]);
     } finally {
       clearTimeout(timer);
     }
+  }
+
+  /** Records an effect the run stopped waiting for, unless a cancel cut it short, and stops the run. */
+  private gaveUp(jobId: string, run: Run, reason: string, notes: Record<string, unknown>): false {
+    if (!run.controller.signal.aborted) this.record(jobId, true, reason, { ...notes, code: "effect_timeout" });
+    return false;
   }
 
   /**
@@ -584,8 +602,8 @@ export class SeatPoolExecutor {
     try {
       return await start();
     } finally {
-      await Promise.allSettled(run.lingering.slice(started));
-      room.release();
+      // A cancelled run stops waiting; the room is kept until those effects settle all the same.
+      await Promise.race([Promise.allSettled(run.lingering.slice(started)).then(() => room.release()), run.cancelled]);
     }
   }
 
@@ -665,10 +683,7 @@ export class SeatPoolExecutor {
     if (slot.phase === "adding") {
       this.setIntent(slotId, "add");
       const added = await this.within(run, () => this.deps.effects.addSlot({ model: ctx!.model, memberId, cwd, operationId: slot!.opId! }));
-      if (added === TIMED_OUT) {
-        this.record(jobId, true, "seat_pool_add_failed", { slot: slot.logicalId, code: "effect_timeout" });
-        return false;
-      }
+      if (added === TIMED_OUT) return this.gaveUp(jobId, run, "seat_pool_add_failed", { slot: slot.logicalId });
       if (!added.ok || !added.nodeId) {
         // The name is spent; the next add would most likely fail the same way, so the run stops here.
         this.deps.slots.retire(slotId, this.at());
@@ -705,10 +720,7 @@ export class SeatPoolExecutor {
       if (await this.outOfUsage(ctx)) return this.holdStart(jobId, slotId, slot.logicalId);
       this.setIntent(slotId, "launch");
       const launched = await this.within(run, () => this.deps.effects.launchSlot({ rigId: ctx!.model.rigId, nodeId }));
-      if (launched === TIMED_OUT) {
-        this.record(jobId, true, "seat_pool_launch_failed", { slot: slot.logicalId, code: "effect_timeout" });
-        return false;
-      }
+      if (launched === TIMED_OUT) return this.gaveUp(jobId, run, "seat_pool_launch_failed", { slot: slot.logicalId });
       if (!launched.ok) {
         this.record(jobId, true, "seat_pool_launch_failed", { slot: slot.logicalId, code: launched.code, error: launched.error });
         return this.removeUnstarted(jobId, run, slotId);
@@ -787,10 +799,7 @@ export class SeatPoolExecutor {
       this.deps.slots.retire(slotId, this.at());
       return { stop: false, reason: "seat_pool_removed", notes: {} };
     }));
-    if (outcome === TIMED_OUT) {
-      this.record(jobId, true, "seat_pool_drain_failed", { slot: slot.logicalId, code: "effect_timeout" });
-      return false;
-    }
+    if (outcome === TIMED_OUT) return this.gaveUp(jobId, run, "seat_pool_drain_failed", { slot: slot.logicalId });
     if (outcome.reason) this.record(jobId, outcome.failed === true, outcome.reason, { slot: slot.logicalId, ...outcome.notes });
     return !outcome.stop;
   }
@@ -819,10 +828,7 @@ export class SeatPoolExecutor {
     }
     this.setIntent(slotId, "remove");
     const removed = await this.within(run, () => this.deps.effects.removeSlot({ rigId: ctx.model.rigId, nodeId, expected: this.deps.effects.stopPrecondition(nodeId) }));
-    if (removed === TIMED_OUT) {
-      this.record(jobId, true, "seat_pool_remove_failed", { slot: slot.logicalId, code: "effect_timeout" });
-      return false;
-    }
+    if (removed === TIMED_OUT) return this.gaveUp(jobId, run, "seat_pool_remove_failed", { slot: slot.logicalId });
     if (!removed.ok && removed.code !== "node_not_found") {
       this.record(jobId, true, "seat_pool_remove_failed", { slot: slot.logicalId, code: removed.code, error: removed.error });
       return true;
@@ -904,10 +910,7 @@ export class SeatPoolExecutor {
       this.deps.slots.retire(slotId, this.at());
       return { stop: false, reason: "seat_pool_reaped", notes: { rows } };
     }));
-    if (outcome === TIMED_OUT) {
-      this.record(jobId, true, "seat_pool_reap_failed", { slot: slot.logicalId, code: "effect_timeout" });
-      return false;
-    }
+    if (outcome === TIMED_OUT) return this.gaveUp(jobId, run, "seat_pool_reap_failed", { slot: slot.logicalId });
     if (outcome.refused) {
       const inRun = this.fresh(jobId, run);
       if (!inRun) return false;
@@ -959,10 +962,7 @@ export class SeatPoolExecutor {
 
     if (seat.cause !== "needs_input") return true;
     const escalated = await this.within(run, () => this.deps.effects.escalate({ jobId, seat: intent.seat, model: ctx.model.sessionName, qitemIds: intent.qitemIds }));
-    if (escalated === TIMED_OUT) {
-      this.record(jobId, true, "seat_pool_escalation_failed", { seat: intent.seat, code: "effect_timeout" });
-      return false;
-    }
+    if (escalated === TIMED_OUT) return this.gaveUp(jobId, run, "seat_pool_escalation_failed", { seat: intent.seat });
     if (!escalated.ok) this.record(jobId, true, "seat_pool_escalation_failed", { seat: intent.seat, code: escalated.code, error: escalated.error });
     // An escalation about the seat is already open: it is the one, and nothing new is recorded.
     else if (!escalated.existing) {
@@ -985,7 +985,7 @@ export class SeatPoolExecutor {
       () => this.within(run, () => this.deps.effects.relaunchSeat({ rigId: ctx.model.rigId, logicalId })));
     if (launched === NO_ROOM) return "held";
     if (launched === TIMED_OUT) {
-      this.record(jobId, true, "seat_pool_relaunch_failed", { seat, code: "effect_timeout", ...notes });
+      this.gaveUp(jobId, run, "seat_pool_relaunch_failed", { seat, ...notes });
       return "timed_out";
     }
     if (!launched.ok) {
