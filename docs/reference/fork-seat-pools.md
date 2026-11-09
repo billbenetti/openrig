@@ -182,6 +182,11 @@ adds and launches nothing.
 removes the seats that haven't started, and drains the rest as each becomes free, so no work is killed. `rig watchdog
 stop` refuses a pool that still holds seats (`pool_has_slots`); stop it once its seats are gone.
 
+A pool can still end with seats in it: a daemon that doesn't know the `seat-pool` policy, such as an earlier version
+started on the same `OPENRIG_HOME`, marks the job terminal (`unknown_policy:seat-pool`), and the job can't be updated
+or restarted. Its seats keep running and holding their rows, and no pool holds them any more. Register a new pool with
+those seats in `adopt` to take them over; drain the pool before going back to such a version to avoid this.
+
 ## Restarts and restores
 
 The pool records each seat in `seat_pool_slots`, and records each step on the seat before it runs. After a daemon
