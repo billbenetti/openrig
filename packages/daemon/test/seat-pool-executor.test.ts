@@ -60,7 +60,7 @@ interface FakeNode {
   logicalId: string; session: "none" | "running" | "stopped"; sessionId: string | null; openRows: number; idle: boolean; held?: number;
   cause?: SeatPoolSeatCause;
 }
-interface FakeRow { destination: string; waitingSince: string; nudged: string[]; state?: "pending" | "in-progress" | "blocked"; reaps?: number }
+interface FakeRow { destination: string; waitingSince: string; state?: "pending" | "in-progress" | "blocked"; reaps?: number }
 
 /** The daemon as the executor sees it: nodes, sessions and rows, changed only through the effects. */
 class World {
@@ -164,11 +164,6 @@ class World {
         if (logicalId === MODEL.logicalId) this.modelCause = "working";
         return { ok: true };
       },
-      nudgeRow: async ({ qitemId, seat }) => {
-        this.calls.push(`nudge ${qitemId} ${seat}`);
-        this.rows.get(qitemId)!.nudged.push(seat);
-        return { ok: true, result: "verified" };
-      },
       escalationOwner: () => ({ owner: this.escalationOwner, reason: "no escalation destination declared" }),
       escalate: async ({ seat, qitemIds }) => {
         this.calls.push(`escalate ${seat} ${qitemIds.join(",")}`);
@@ -196,7 +191,7 @@ class World {
         };
       }),
       adoptable: [],
-      pending: [...this.rows].map(([qitemId, row]) => ({ qitemId, destination: row.destination, waitingSince: row.waitingSince, nudged: row.nudged.includes(row.destination) })),
+      pending: [...this.rows].map(([qitemId, row]) => ({ qitemId, destination: row.destination, waitingSince: row.waitingSince })),
       demand: jobSpec.demandCmd ? executor.demandSample(JOB) : null,
       lastScaleAt: slots.lastScaleAt(JOB),
     };
@@ -530,7 +525,7 @@ describe("seat-pool executor", () => {
 
   describe("dispatch and wake", () => {
     const waitingRow = (qitemId: string, destination = MODEL.sessionName) =>
-      world.rows.set(qitemId, { destination, waitingSince: new Date(T0 - 600_000).toISOString(), nudged: [] });
+      world.rows.set(qitemId, { destination, waitingSince: new Date(T0 - 600_000).toISOString() });
 
     it("moves a waiting row to a seat that is still free, and leaves it when the seat took work since the plan", async () => {
       const executor = makeExecutor();
@@ -591,19 +586,6 @@ describe("seat-pool executor", () => {
       ]);
     });
 
-    it("nudges an idle seat about a waiting row once, and not a seat that is no longer idle", async () => {
-      const executor = makeExecutor();
-      waitingRow("q-1");
-      waitingRow("q-2");
-      world.modelCause = "idle";
-      await run(executor, [{ kind: "nudge", seat: MODEL.sessionName, qitemId: "q-1" }]);
-      await run(executor, [{ kind: "nudge", seat: MODEL.sessionName, qitemId: "q-1" }]);
-      world.modelCause = "working";
-      await run(executor, [{ kind: "nudge", seat: MODEL.sessionName, qitemId: "q-2" }]);
-      expect(world.calls).toEqual(["nudge q-1 dev-impl@r"]);
-      expect(history).toEqual([{ failed: false, reason: "seat_pool_nudged", notes: { seat: "dev-impl@r", qitemId: "q-1", result: "verified" } }]);
-    });
-
     it("escalates a seat that needs input once while the escalation is open, and records a seat with nowhere to escalate", async () => {
       const executor = makeExecutor();
       waitingRow("q-1");
@@ -650,16 +632,15 @@ describe("seat-pool executor", () => {
       await run(executor, [
         { kind: "relaunch", seat: MODEL.sessionName, nodeId: MODEL.nodeId },
         { kind: "dispatch", qitemId: "q-1", from: MODEL.sessionName, slotId: free!.slotId },
-        { kind: "nudge", seat: "dev-impl-s1@r", qitemId: "q-2" },
         { kind: "escalate", seat: MODEL.sessionName, qitemIds: ["q-1"] },
       ]);
       expect(world.calls).toEqual(["relaunch dev.impl"]);
       // A plan made before drain was set changes nothing either.
-      expect(planned.map((intent) => intent.kind)).toEqual(["dispatch", "nudge"]);
+      expect(planned.map((intent) => intent.kind)).toEqual(["dispatch"]);
       await run(executor, planned);
       expect(world.calls).toEqual(["relaunch dev.impl"]);
-      expect(world.rows.get("q-1")).toMatchObject({ destination: MODEL.sessionName, nudged: [] });
-      expect(world.rows.get("q-2")).toMatchObject({ destination: "dev-impl-s1@r", nudged: [] });
+      expect(world.rows.get("q-1")).toMatchObject({ destination: MODEL.sessionName });
+      expect(world.rows.get("q-2")).toMatchObject({ destination: "dev-impl-s1@r" });
       expect(world.escalations).toEqual([]);
       expect(history).toEqual([{ failed: false, reason: "seat_pool_relaunched", notes: { seat: "dev-impl@r" } }]);
     });
@@ -681,7 +662,7 @@ describe("seat-pool executor", () => {
 
   describe("reap", () => {
     const row = (qitemId: string, destination: string, state: FakeRow["state"] = "pending", reaps = 0) =>
-      world.rows.set(qitemId, { destination, waitingSince: new Date(T0 - 600_000).toISOString(), nudged: [], state, reaps });
+      world.rows.set(qitemId, { destination, waitingSince: new Date(T0 - 600_000).toISOString(), state, reaps });
     /** One seat of the pool, live, with its node set as given. */
     const seat = async (executor: SeatPoolExecutor, node: Partial<FakeNode>) => {
       await run(executor, [{ kind: "add", count: 1 }]);
@@ -1046,10 +1027,6 @@ describe("readSeatPoolState", () => {
     insert("q-blocked", "dev-impl@r", "blocked", "2026-11-09T11:00:00.000Z");
     insert("q-claimed", "dev-impl@r", "in-progress", "2026-11-09T11:00:00.000Z");
     insert("q-human", "human@kernel", "pending", "2026-11-09T11:00:00.000Z");
-    db.prepare("INSERT INTO queue_transitions (qitem_id, ts, state, actor_session, transition_note) VALUES ('q-old', ?, 'pending', 'seat-pool@system', 'seat-pool nudge: dev-impl@r')")
-      .run("2026-11-09T11:06:00.000Z");
-    db.prepare("INSERT INTO queue_transitions (qitem_id, ts, state, actor_session, transition_note) VALUES ('q-slot', ?, 'pending', 'seat-pool@system', 'seat-pool nudge: dev-impl@r')")
-      .run("2026-11-09T11:31:00.000Z");
 
     const state = readSeatPoolState({
       db, slots,
@@ -1068,12 +1045,11 @@ describe("readSeatPoolState", () => {
 
     // Only pending rows, under the name the pool knows each seat by; a blocked, claimed or human row is never read.
     expect(state.pending).toEqual([
-      { qitemId: "q-old", destination: "dev-impl@r", waitingSince: "2026-11-09T11:05:00.000Z", nudged: true },
-      { qitemId: "q-model", destination: "dev-impl@r", waitingSince: "2026-11-09T11:20:00.000Z", nudged: false },
-      // A nudge to another seat is not a nudge to this one.
-      { qitemId: "q-slot", destination: "dev-impl-s1@r", waitingSince: "2026-11-09T11:30:00.000Z", nudged: false },
-      { qitemId: "q-removed", destination: "dev-impl-s3@r", waitingSince: "2026-11-09T11:40:00.000Z", nudged: false },
-      { qitemId: "q-moved", destination: "dev-impl@r", waitingSince: "2026-11-09T11:50:00.000Z", nudged: false },
+      { qitemId: "q-old", destination: "dev-impl@r", waitingSince: "2026-11-09T11:05:00.000Z" },
+      { qitemId: "q-model", destination: "dev-impl@r", waitingSince: "2026-11-09T11:20:00.000Z" },
+      { qitemId: "q-slot", destination: "dev-impl-s1@r", waitingSince: "2026-11-09T11:30:00.000Z" },
+      { qitemId: "q-removed", destination: "dev-impl-s3@r", waitingSince: "2026-11-09T11:40:00.000Z" },
+      { qitemId: "q-moved", destination: "dev-impl@r", waitingSince: "2026-11-09T11:50:00.000Z" },
     ]);
     // The model, which the pool can only launch, waits out the limit; a seat whose session is gone is reaped.
     expect(state.modelCause).toBe("usage_limit");
@@ -1165,22 +1141,6 @@ describe("seatPoolQueueEffects", () => {
     expect(repo.getById(blocked.qitemId)).toMatchObject({ destinationSession: "dev-impl@r", state: "blocked" });
     expect(fallbackWakes(blocked.qitemId)).toEqual([]);
     expect(effects.reapCount(blocked.qitemId)).toBe(1);
-  });
-
-  it("records the nudge on the row before sending it", async () => {
-    const sends: string[] = [];
-    repo.attachTransport({
-      send: async (session: string) => {
-        sends.push(session);
-        // The note is already on the row when the send happens.
-        expect(repo.listTransitions(row.qitemId).some((t) => t.transitionNote === "seat-pool nudge: dev-impl@r")).toBe(true);
-        return { ok: true, verified: true };
-      },
-    } as never);
-    const row = await repo.create({ sourceSession: "lead@r", destinationSession: "dev-impl@r", body: "work", nudge: false });
-    expect(await effects.nudgeRow({ qitemId: row.qitemId, seat: "dev-impl@r" })).toMatchObject({ ok: true });
-    expect(sends).toEqual(["dev-impl@r"]);
-    expect(repo.getById(row.qitemId)!.state).toBe("pending");
   });
 
   it("opens one escalation per seat while it is open, and none without an escalation owner", async () => {
