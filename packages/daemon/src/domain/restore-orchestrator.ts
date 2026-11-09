@@ -346,6 +346,11 @@ export class RestoreOrchestrator {
     return false;
   }
 
+  /** Whether a rig restore is running now; a controller that adds or removes seats waits for it. */
+  restoreInProgress(rigId: string): boolean {
+    return this.activeRestores.has(rigId);
+  }
+
   async restore(snapshotId: string, opts?: {
     adapters?: Record<string, import("./runtime-adapter.js").RuntimeAdapter>;
     fsOps?: { exists(path: string): boolean };

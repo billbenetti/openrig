@@ -245,6 +245,8 @@ export interface AppDeps {
   watchdogScheduler?: WatchdogScheduler;
   /** The outbound network connector (`rig network`); started after the listener binds. */
   networkConnector?: import("./domain/network/network-connector.js").NetworkConnectorService;
+  /** Applies seat-pool plans outside the watchdog tick; stopped with the scheduler. */
+  seatPoolExecutor?: import("./domain/seat-pool-executor.js").SeatPoolExecutor;
   /** B8 / slice-07 A3 — the model-divergence monitor (effective-vs-pinned, four-channel proclaim). */
   modelDivergenceMonitor?: import("./domain/model-divergence/model-divergence-monitor.js").ModelDivergenceMonitor;
   /** S10 — the in-daemon gateway subsystem (amended M1 §3: in-process, no second deployable).
