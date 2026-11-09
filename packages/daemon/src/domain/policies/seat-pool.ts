@@ -41,11 +41,14 @@ export interface SeatPoolSpec {
   prepareCmd: SeatPoolCommand | null;
   /** Runs before the rows of a seat whose session is gone are moved, so the work they track can be released. */
   reapCmd: SeatPoolCommand | null;
+  /** Runs once the node of a seat the pool added is gone, so what `prepareCmd` set up can be undone; the seat stays on
+   *  record until it exits 0. */
+  removeCmd: SeatPoolCommand | null;
 }
 
 const SPEC_KEYS = new Set([
   "min", "max", "cooldown_s", "idle_grace_s", "dispatch_after_s", "dispatch_tag", "drain", "adopt", "cwd_template",
-  "demand_cmd", "release_cmd", "prepare_cmd", "reap_cmd",
+  "demand_cmd", "release_cmd", "prepare_cmd", "reap_cmd", "remove_cmd",
 ]);
 const DEFAULT_COOLDOWN_SECONDS = 60;
 const DEFAULT_IDLE_GRACE_SECONDS = 300;
@@ -109,7 +112,7 @@ export function parseSeatPoolSpec(context: Record<string, unknown>): { spec: Sea
   const placeholder = cwdTemplate.match(/\{(?!slot\}|rig\})[^}]*\}/);
   if (placeholder) return { problem: { field: "cwd_template", message: `seat-pool: cwd_template may use only {slot} and {rig} (found ${placeholder[0]})` } };
   const commands: Record<string, SeatPoolCommand | null> = {};
-  for (const field of ["demand_cmd", "release_cmd", "prepare_cmd", "reap_cmd"]) {
+  for (const field of ["demand_cmd", "release_cmd", "prepare_cmd", "reap_cmd", "remove_cmd"]) {
     const parsed = command(context[field], field);
     if (isProblem(parsed)) return { problem: parsed };
     commands[field] = parsed;
@@ -119,7 +122,7 @@ export function parseSeatPoolSpec(context: Record<string, unknown>): { spec: Sea
       min: min as number, max: max as number, cooldownSeconds: cooldownSeconds as number, idleGraceSeconds: idleGraceSeconds as number,
       dispatchAfterSeconds: dispatchAfterSeconds as number, dispatchTag: dispatchTag as string | null, drain, adopt: [...new Set(adopt as string[])], cwdTemplate,
       demandCmd: commands["demand_cmd"]!, releaseCmd: commands["release_cmd"]!, prepareCmd: commands["prepare_cmd"]!,
-      reapCmd: commands["reap_cmd"]!,
+      reapCmd: commands["reap_cmd"]!, removeCmd: commands["remove_cmd"]!,
     },
   };
 }

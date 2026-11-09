@@ -479,6 +479,8 @@ interface DrainOutcome {
   notes?: Record<string, unknown>;
   /** A reap the release command refused: its result. */
   refused?: { exitCode: number | null; error: string | null };
+  /** The seat's node was removed: the seat is forgotten next (forget). */
+  removed?: true;
 }
 
 interface Context {
@@ -801,12 +803,11 @@ export class SeatPoolExecutor {
       if (!removed.ok && removed.code !== "node_not_found") {
         return { stop: false, failed: true, reason: "seat_pool_remove_failed", notes: { code: removed.code, error: removed.error } };
       }
-      this.deps.slots.retire(slotId, this.at());
-      return { stop: false, reason: "seat_pool_removed", notes: {} };
+      return { stop: false, reason: "seat_pool_removed", notes: {}, removed: true };
     }));
     if (outcome === TIMED_OUT) return this.gaveUp(jobId, run, "seat_pool_drain_failed", { slot: slot.logicalId });
     if (outcome.reason) this.record(jobId, outcome.failed === true, outcome.reason, { slot: slot.logicalId, ...outcome.notes });
-    return !outcome.stop;
+    return outcome.removed ? this.forget(jobId, run, slotId) : !outcome.stop;
   }
 
   /** Removes a seat that never took work, or forgets one whose node is gone. */
@@ -817,9 +818,14 @@ export class SeatPoolExecutor {
     if (!ctx) return false;
     const nodeId = slot.nodeId ?? (slot.opId ? this.deps.effects.operationNodeId(slot.opId) : null);
     const view = ctx.state.slots.find((s) => s.slotId === slotId);
-    if (!nodeId || (slot.nodeId && view && !view.nodeExists)) {
+    if (!nodeId) {
       this.deps.slots.retire(slotId, this.at());
-      this.record(jobId, false, "seat_pool_removed", { slot: slot.logicalId, why: nodeId ? "node_gone" : "never_created" });
+      this.record(jobId, false, "seat_pool_removed", { slot: slot.logicalId, why: "never_created" });
+      return true;
+    }
+    if (slot.nodeId && view && !view.nodeExists) {
+      if (!(await this.forget(jobId, run, slotId))) return false;
+      if (this.deps.slots.get(slotId)?.retiredAt) this.record(jobId, false, "seat_pool_removed", { slot: slot.logicalId, why: "node_gone" });
       return true;
     }
     // An admitted seat may hold work: it leaves only by draining.
@@ -838,8 +844,30 @@ export class SeatPoolExecutor {
       this.record(jobId, true, "seat_pool_remove_failed", { slot: slot.logicalId, code: removed.code, error: removed.error });
       return true;
     }
-    this.deps.slots.retire(slotId, this.at());
     this.record(jobId, false, "seat_pool_removed", { slot: slot.logicalId });
+    return this.forget(jobId, run, slotId);
+  }
+
+  /**
+   * Forgets a seat whose node is gone. For a seat the pool added, `remove_cmd` runs first, so what `prepare_cmd` set up
+   * can be undone; while it refuses, the seat stays on record, counted against `max` but taking no row, and the next
+   * plan, or the next start, runs it again. False stops the run.
+   */
+  private async forget(jobId: string, run: Run, slotId: number): Promise<boolean> {
+    const slot = this.deps.slots.get(slotId);
+    if (!slot || slot.retiredAt) return true;
+    const ctx = this.fresh(jobId, run);
+    if (!ctx) return false;
+    if (slot.opId !== null && ctx.spec.removeCmd) {
+      const sessionName = seatSessionName(slot.logicalId, ctx.model.rigName);
+      const result = await this.deps.effects.runCommand(ctx.spec.removeCmd, this.commandEnv(ctx, { OPENRIG_SEAT_POOL_SLOT: sessionName }), run.controller.signal);
+      if (run.controller.signal.aborted) return false;
+      if (result.exitCode !== 0) {
+        this.record(jobId, true, "seat_pool_remove_cmd_failed", { slot: slot.logicalId, exitCode: result.exitCode, error: result.error ?? null });
+        return true;
+      }
+    }
+    this.deps.slots.retire(slotId, this.at());
     return true;
   }
 
@@ -853,8 +881,8 @@ export class SeatPoolExecutor {
    * else changes; then `reap_cmd` runs; then each in-progress row is unclaimed and every open row is moved back to the
    * model (a pending one with a wake), each only if it is still addressed to the seat, with the reason `reap:<seat>`. A
    * row that a reap already moved once goes to the model's escalation owner instead, so a row that keeps losing its
-   * seat stops cycling through the pool. Last, the node is removed with the `expected` read at the start. A failed step
-   * stops the reap there; the next plan picks it up again.
+   * seat stops cycling through the pool. Then the node is removed with the `expected` read at the start, and last the
+   * seat is forgotten (forget). A failed step stops the reap there; the next plan picks it up again.
    */
   private async reap(jobId: string, run: Run, slotId: number, released = false): Promise<boolean> {
     const slot = this.deps.slots.get(slotId);
@@ -912,8 +940,7 @@ export class SeatPoolExecutor {
       this.setIntent(slotId, "remove");
       const removed = await this.deps.effects.removeSlot({ rigId: inLease.model.rigId, nodeId, expected });
       if (!removed.ok && removed.code !== "node_not_found") return failed("remove", { code: removed.code, error: removed.error, rows });
-      this.deps.slots.retire(slotId, this.at());
-      return { stop: false, reason: "seat_pool_reaped", notes: { rows } };
+      return { stop: false, reason: "seat_pool_reaped", notes: { rows }, removed: true };
     }));
     if (outcome === TIMED_OUT) return this.gaveUp(jobId, run, "seat_pool_reap_failed", { slot: slot.logicalId });
     if (outcome.refused) {
@@ -924,7 +951,7 @@ export class SeatPoolExecutor {
       return launched !== "timed_out";
     }
     if (outcome.reason) this.record(jobId, outcome.failed === true, outcome.reason, { slot: slot.logicalId, ...outcome.notes });
-    return !outcome.stop;
+    return outcome.removed ? this.forget(jobId, run, slotId) : !outcome.stop;
   }
 
   /**
