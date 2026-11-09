@@ -180,6 +180,7 @@ import { escalateUnclaimedReminder } from "./domain/parked-owner-escalation.js";
 import {
   readSeatPoolState, runSeatPoolCommand, SEAT_POOL_QUARANTINE_TAG, SeatPoolExecutor, SeatPoolSlots, seatPoolQueueEffects, slotMemberFragment,
 } from "./domain/seat-pool-executor.js";
+import { LaunchBudget, launchBudgetLimits } from "./domain/launch-budget.js";
 import { launchStatusIsRunning } from "./domain/restore-orchestrator.js";
 import { resolveEscalationOwner } from "./domain/escalation-owner.js";
 import { deriveUsageLimitPools } from "./domain/provider/provider-signals.js";
@@ -2632,8 +2633,17 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
         return new Set();
       }
     };
+    // One budget for every pool of this daemon; its limits are the daemon's settings, read at each launch. The
+    // watchdog scheduler starts its next tick at each pass.
+    const seatPoolLaunchBudget = new LaunchBudget({
+      limits: () => {
+        const settings = new ContextPackSettingsStore();
+        return launchBudgetLimits((key) => settings.resolveOne(key).value as number);
+      },
+    });
     const seatPoolExecutor: SeatPoolExecutor = new SeatPoolExecutor({
       slots: seatPoolSlots,
+      launchBudget: seatPoolLaunchBudget,
       readJob: (jobId) => {
         const job = watchdogJobsRepoInstance.getById(jobId);
         if (!job) return null;
@@ -2913,7 +2923,10 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
     const watchdogScheduler = new WatchdogScheduler({
       jobsRepo: watchdogJobsRepoInstance,
       policyEngine: watchdogPolicyEngine,
-      beforeTick: () => queueRepoInstance.reconcileWaitReminders(),
+      beforeTick: () => {
+        seatPoolLaunchBudget.nextTick();
+        queueRepoInstance.reconcileWaitReminders();
+      },
     });
     deps.watchdogPolicyEngine = watchdogPolicyEngine;
     deps.watchdogScheduler = watchdogScheduler;
