@@ -143,7 +143,8 @@ describe("config routes (User Settings v0)", () => {
     // + 2 retention.closed_content_days, retention.closed_metadata_days (closed-work erasure; default 0 = keep).
     // + 1 retention.erasure_ledger (queue erasure's replay ledger; default empty = none).
     // + 1 output.rebuild_recaps (optional rebuild briefing preview; default 3).
-    expect(Object.keys(body.settings).length).toBe(105);
+    // + 4 policies.seat_pool.* (the seat pools' launch budget; default 1 in flight, 1 per tick, 1024 MB free, 100% load per CPU).
+    expect(Object.keys(body.settings).length).toBe(109);
     expect(body.settings["output.rebuild_recaps"]).toMatchObject({ value: 3, source: "default", defaultValue: 3 });
     expect(body.settings["launch.codex_login_shell"]).toMatchObject({ value: false, source: "default", defaultValue: false });
     expect(body.settings["transport.draft_delivery"]).toMatchObject({ value: "deliver", source: "default", defaultValue: "deliver" });

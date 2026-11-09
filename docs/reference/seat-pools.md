@@ -114,6 +114,31 @@ or moved first), relaunch, nudge, escalation, refusal and failure is written to 
 holds because the model seat is gone, the rig is being restored, the demand answer is stale or a seat is out of usage
 records why (`seat_pool_held`). One with nothing to change records nothing.
 
+## Host budget
+
+All the pools of one daemon share one budget for starting seats, so pools evaluated at the same moment don't all read
+the same load and memory and launch together. Each add (with its `prepare_cmd`), each first launch and each relaunch
+reserves room before it starts and keeps it until it settles, even past the run's effect timeout. It also counts
+against the watchdog tick in which its pool's plan was evaluated, however long the run applying that plan takes, and
+settling does not give that back: load and free memory lag a seat that has just started, so launches one after another
+are bounded as well as launches at once. With the default of 1, a pool starts at most one seat per evaluation, and
+pools evaluated in the same tick share that one. The limits are the daemon's settings, not a pool's spec, and each
+reservation reads them again, so `rig config set` takes effect on the next launch:
+
+| Setting | Default | A launch starts only when |
+| --- | --- | --- |
+| `policies.seat_pool.max_launches_in_flight` | 1 | fewer launches than this are in flight, across every pool |
+| `policies.seat_pool.max_launches_per_tick` | 1 | fewer launches than this were admitted for the plans of its watchdog tick, across every pool (0: none starts) |
+| `policies.seat_pool.min_free_memory_mb` | 1024 | free memory, as `rig ps --resources` reports it, is at least this (0: no floor) |
+| `policies.seat_pool.max_load_per_cpu_percent` | 100 | the 1-minute load, plus one for each launch in flight and one for this launch, divided by the CPU count, stays at or below this percentage |
+
+A launch in flight does not show in free memory yet: with more than one launch in flight, raise the floor by what that
+many new seats use. Where the platform has no load average (Windows), load is not checked. When there is no room,
+nothing starts and the run records `seat_pool_held` with `reason: launch_budget`, which limit refused (`why`:
+`launches_per_tick`, `launches_in_flight`, `low_memory` or `high_load`) and the figures; an add records it once and
+adds nothing more in that run. A seat added but not launched stays as it is, and the next plan tries again. Draining,
+reaping, moving rows and nudging take no room.
+
 ## Reaping a seat
 
 A seat of the pool that stops working is reaped: its rows go back to the model and its node is removed, so the pool can
