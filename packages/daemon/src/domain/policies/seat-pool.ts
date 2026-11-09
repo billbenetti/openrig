@@ -2,9 +2,10 @@
 //
 // A pool job targets its model seat (`<pod>-<member>@<rig>`) and keeps between `min` and `max` extra seats beside it,
 // named `<member>-s<n>`. Evaluation is pure planning: it reads the pool's state through an injected reader, decides
-// what should change (add N seats, finish starting a seat, drain a free seat, remove a seat) and hands those intents
-// to the executor, which applies them outside the scheduler tick (seat-pool-executor.ts). The policy itself never
-// creates, launches, stops or removes anything, so one slow launch can't hold every other job's evaluation.
+// what should change (add N seats, finish starting a seat, drain a free seat, remove a seat, move a waiting row to a
+// free seat, wake a seat holding a waiting row) and hands those intents to the executor, which applies them outside
+// the scheduler tick (seat-pool-executor.ts). The policy itself never creates, launches, stops, removes, moves or
+// sends anything, so one slow launch can't hold every other job's evaluation.
 
 import type { Policy, PolicyEvaluation, PolicyJob } from "./types.js";
 
@@ -21,13 +22,15 @@ export interface SeatPoolSpec {
   max: number;
   cooldownSeconds: number;
   idleGraceSeconds: number;
+  /** How long a pending row waits for the seat it is addressed to before the pool moves it or wakes that seat. */
+  dispatchAfterSeconds: number;
   /** True empties the pool as its seats become free, and adds none: the kill switch. */
   drain: boolean;
   /** Existing seats (logical ids) this pool takes over, so they are counted and drained like its own. */
   adopt: string[];
   /** Absolute working directory for a new seat; `{slot}` (required) and `{rig}` are replaced. */
   cwdTemplate: string;
-  /** Prints `{"desired": N}`: how many extra seats the pool should have. Absent: the pending rows to the model. */
+  /** Prints `{"desired": N}`: how many extra seats the pool should have. Absent: the rows waiting for a seat. */
   demandCmd: SeatPoolCommand | null;
   /** Must exit 0 before a free seat is stopped and removed. */
   releaseCmd: SeatPoolCommand | null;
@@ -35,9 +38,10 @@ export interface SeatPoolSpec {
   prepareCmd: SeatPoolCommand | null;
 }
 
-const SPEC_KEYS = new Set(["min", "max", "cooldown_s", "idle_grace_s", "drain", "adopt", "cwd_template", "demand_cmd", "release_cmd", "prepare_cmd"]);
+const SPEC_KEYS = new Set(["min", "max", "cooldown_s", "idle_grace_s", "dispatch_after_s", "drain", "adopt", "cwd_template", "demand_cmd", "release_cmd", "prepare_cmd"]);
 const DEFAULT_COOLDOWN_SECONDS = 60;
 const DEFAULT_IDLE_GRACE_SECONDS = 300;
+const DEFAULT_DISPATCH_AFTER_SECONDS = 60;
 const DEFAULT_COMMAND_TIMEOUT_SECONDS = 60;
 
 type SpecProblem = { field: string; message: string };
@@ -77,7 +81,8 @@ export function parseSeatPoolSpec(context: Record<string, unknown>): { spec: Sea
   const max = wholeNumber(context["max"], "max");
   const cooldownSeconds = wholeNumber(context["cooldown_s"], "cooldown_s", DEFAULT_COOLDOWN_SECONDS);
   const idleGraceSeconds = wholeNumber(context["idle_grace_s"], "idle_grace_s", DEFAULT_IDLE_GRACE_SECONDS);
-  for (const value of [min, max, cooldownSeconds, idleGraceSeconds]) if (isProblem(value)) return { problem: value };
+  const dispatchAfterSeconds = wholeNumber(context["dispatch_after_s"], "dispatch_after_s", DEFAULT_DISPATCH_AFTER_SECONDS);
+  for (const value of [min, max, cooldownSeconds, idleGraceSeconds, dispatchAfterSeconds]) if (isProblem(value)) return { problem: value };
   if ((max as number) < (min as number)) return { problem: { field: "max", message: "seat-pool: max must be at least min" } };
   const drain = context["drain"] ?? false;
   if (typeof drain !== "boolean") return { problem: { field: "drain", message: "seat-pool: drain must be true or false" } };
@@ -100,7 +105,7 @@ export function parseSeatPoolSpec(context: Record<string, unknown>): { spec: Sea
   return {
     spec: {
       min: min as number, max: max as number, cooldownSeconds: cooldownSeconds as number, idleGraceSeconds: idleGraceSeconds as number,
-      drain, adopt: [...new Set(adopt as string[])], cwdTemplate,
+      dispatchAfterSeconds: dispatchAfterSeconds as number, drain, adopt: [...new Set(adopt as string[])], cwdTemplate,
       demandCmd: commands["demand_cmd"]!, releaseCmd: commands["release_cmd"]!, prepareCmd: commands["prepare_cmd"]!,
     },
   };
@@ -130,9 +135,15 @@ export interface SeatPoolModel {
   sessionName: string;
 }
 
+/** Why a seat isn't taking a row, read before the pool moves the row or wakes the seat. `stopped`: no live session.
+ *  `usage_limit`: its provider account is out of usage. `needs_input`: a prompt waits for an answer. `idle`: at its
+ *  prompt with nothing running in the background. `working`: anything else, including not known. */
+export type SeatPoolSeatCause = "stopped" | "usage_limit" | "needs_input" | "idle" | "working";
+
 export interface SeatPoolSlotView {
   slotId: number;
   logicalId: string;
+  sessionName: string;
   nodeId: string | null;
   phase: Exclude<SeatPoolSlotPhase, "retired">;
   adopted: boolean;
@@ -144,16 +155,31 @@ export interface SeatPoolSlotView {
   heldMessages: number;
   /** When the seat last became idle at a prompt, with no needs-input and no background shell; null when it isn't. */
   idleSince: string | null;
+  /** Meaningful for a live seat whose node exists. */
+  cause: SeatPoolSeatCause;
+}
+
+/** A pending row addressed to the model, to one of the pool's seats or to a seat the pool removed. */
+export interface SeatPoolPendingRow {
+  qitemId: string;
+  /** The session name it is addressed to, as the pool names that seat. */
+  destination: string;
+  /** When it reached `destination`: its latest reroute, or its creation. */
+  waitingSince: string;
+  /** Whether the pool already nudged `destination` about this row. */
+  nudged: boolean;
 }
 
 export interface SeatPoolState {
   model: SeatPoolModel | null;
+  /** Why the model isn't taking a row. */
+  modelCause: SeatPoolSeatCause;
   restoring: boolean;
   slots: SeatPoolSlotView[];
   /** The spec's adopt entries that exist in the rig and no pool has linked yet. */
   adoptable: Array<{ logicalId: string; nodeId: string }>;
-  /** Pending rows addressed to the model seat. */
-  pendingForModel: number;
+  /** Pending rows addressed to the model, to the pool's seats and to the seats it removed, longest waiting first. */
+  pending: SeatPoolPendingRow[];
   /** The demand command's last good answer, when the spec has one. */
   demand: { desired: number; sampledAt: string } | null;
   /** The latest add or removal in this pool. */
@@ -167,7 +193,15 @@ export type SeatPoolIntent =
   | { kind: "launch"; slotId: number }
   | { kind: "drain"; slotId: number }
   /** Remove a seat that never took work, or forget one whose node is gone. */
-  | { kind: "remove"; slotId: number };
+  | { kind: "remove"; slotId: number }
+  /** Move a waiting row to a free seat, only while it is still pending and addressed to `from`, and wake that seat. */
+  | { kind: "dispatch"; qitemId: string; from: string; slotId: number }
+  /** Launch a stopped seat (the model or one of the pool's) that holds a waiting row. */
+  | { kind: "relaunch"; seat: string; nodeId: string }
+  /** Remind an idle seat of a waiting row: once per row and seat. */
+  | { kind: "nudge"; seat: string; qitemId: string }
+  /** Tell the model's escalation owner that a seat holding waiting rows needs input. */
+  | { kind: "escalate"; seat: string; qitemIds: string[] };
 
 export interface SeatPoolPlan {
   intents: SeatPoolIntent[];
@@ -178,19 +212,34 @@ export interface SeatPoolPlan {
   current: number;
 }
 
+/** Whether the model or a seat of the pool is out of provider usage: the pool then adds and launches nothing. */
+export function seatPoolOutOfUsage(state: Pick<SeatPoolState, "modelCause" | "slots">): boolean {
+  return state.modelCause === "usage_limit" || state.slots.some((slot) => slot.nodeExists && slot.cause === "usage_limit");
+}
+
 /**
  * Pure: the same state and clock always give the same plan.
  *
- * The target is the demand (the demand command's last answer, or the pending rows to the model plus the seats holding
- * work), never below the seats holding work plus the seats still starting, clamped to min..max; with `drain` it is 0.
- * A demand answer older than `sampleMaxAgeMs` holds the pool as it is. Only a free seat (no open rows, no held messages,
- * idle at a prompt for `idle_grace_s`) is drained, the pool's own before adopted ones and the newest first. Adds and new
- * drains wait for `cooldown_s` after the last add or removal, except under `drain`.
+ * A pending row waits once it has been at its seat for `dispatch_after_s` (since its creation or its latest reroute).
+ * A waiting row addressed to the model or to a seat the pool removed goes to a free seat (live, idle at a prompt, no
+ * open row, no held message), the longest waiting first; one that finds no free seat is demand. A waiting row the pool
+ * doesn't move wakes the seat holding it by why that seat isn't taking it: a stopped seat is launched, an idle one is
+ * nudged once for the row, one that needs input is escalated, and one out of usage waits. Only pending rows are read,
+ * so a blocked or claimed row is never moved or counted.
+ *
+ * The target is the demand (the demand command's last answer, or the waiting rows no free seat takes plus the seats
+ * holding work), never below the seats holding work plus the seats still starting, clamped to min..max; with `drain`
+ * it is 0, and nothing is moved or woken. A demand answer older than `sampleMaxAgeMs` holds the pool's size as it is.
+ * While a seat of the pool is out of usage, the pool adds no seat and launches none: neither a stopped seat nor one it
+ * added and has not started, which waits as it is (and may still be removed). Only a free seat idle
+ * for `idle_grace_s` is drained, the pool's own before adopted ones and the newest first. Adds and new drains wait for
+ * `cooldown_s` after the last add or removal, except under `drain`.
  */
 export function planSeatPool(spec: SeatPoolSpec, state: SeatPoolState, nowMs: number, sampleMaxAgeMs: number): SeatPoolPlan {
   const hold = (reason: string): SeatPoolPlan => ({ intents: [], reason, target: null, current: state.slots.length });
   if (!state.model) return hold("model_not_found");
   if (state.restoring) return hold("restore_in_progress");
+  const model = state.model;
 
   const intents: SeatPoolIntent[] = [];
   if (!spec.drain) for (const seat of state.adoptable) intents.push({ kind: "adopt", ...seat });
@@ -202,8 +251,39 @@ export function planSeatPool(spec: SeatPoolSpec, state: SeatPoolState, nowMs: nu
   const starting = present.filter((slot) => slot.phase === "adding" || slot.phase === "added");
   const live = present.filter((slot) => slot.phase === "live");
   const idle = (slot: SeatPoolSlotView) => slot.openRows === 0 && slot.heldMessages === 0 && slot.idleSince !== null;
-  const occupied = live.filter((slot) => !idle(slot));
-  const free = live.filter((slot) => idle(slot) && nowMs - Date.parse(slot.idleSince!) >= spec.idleGraceSeconds * 1000);
+  const usageLimited = seatPoolOutOfUsage(state);
+
+  const waiting = state.pending.filter((row) => nowMs - Date.parse(row.waitingSince) >= spec.dispatchAfterSeconds * 1000);
+  const seatOf = new Map(present.map((slot) => [slot.sessionName, slot]));
+  const movable = waiting.filter((row) => !seatOf.has(row.destination));
+  const receivers = spec.drain ? [] : live.filter((slot) => idle(slot) && slot.cause === "idle");
+  const dispatched = movable.slice(0, receivers.length);
+  dispatched.forEach((row, i) => intents.push({ kind: "dispatch", qitemId: row.qitemId, from: row.destination, slotId: receivers[i]!.slotId }));
+  const receiving = new Set(receivers.slice(0, dispatched.length));
+
+  if (!spec.drain) {
+    const holders = new Map<string, { nodeId: string; cause: SeatPoolSeatCause; rows: SeatPoolPendingRow[] }>();
+    for (const row of waiting) {
+      if (dispatched.includes(row)) continue;
+      const slot = seatOf.get(row.destination);
+      const holder = slot
+        ? (slot.phase === "live" && slot.nodeId ? { nodeId: slot.nodeId, cause: slot.cause } : null)
+        : row.destination === model.sessionName ? { nodeId: model.nodeId, cause: state.modelCause } : null;
+      if (!holder) continue; // a seat the pool removed: the row waits for a free seat
+      const entry = holders.get(row.destination) ?? { ...holder, rows: [] };
+      entry.rows.push(row);
+      holders.set(row.destination, entry);
+    }
+    for (const [seat, holder] of holders) {
+      if (holder.cause === "stopped" && !usageLimited) intents.push({ kind: "relaunch", seat, nodeId: holder.nodeId });
+      else if (holder.cause === "idle") {
+        for (const row of holder.rows.filter((r) => !r.nudged)) intents.push({ kind: "nudge", seat, qitemId: row.qitemId });
+      } else if (holder.cause === "needs_input") intents.push({ kind: "escalate", seat, qitemIds: holder.rows.map((r) => r.qitemId) });
+    }
+  }
+
+  const occupied = live.filter((slot) => !idle(slot) || receiving.has(slot));
+  const free = live.filter((slot) => idle(slot) && !receiving.has(slot) && nowMs - Date.parse(slot.idleSince!) >= spec.idleGraceSeconds * 1000);
   const current = live.length + starting.length;
   const cooling = !spec.drain && state.lastScaleAt !== null && nowMs - Date.parse(state.lastScaleAt) < spec.cooldownSeconds * 1000;
 
@@ -218,15 +298,19 @@ export function planSeatPool(spec: SeatPoolSpec, state: SeatPoolState, nowMs: nu
       const fresh = state.demand !== null && nowMs - Date.parse(state.demand.sampledAt) <= sampleMaxAgeMs;
       desired = fresh ? state.demand!.desired : null;
     } else {
-      desired = state.pendingForModel + occupied.length;
+      desired = movable.length - dispatched.length + occupied.length;
     }
     if (desired === null) {
       // No current answer from the demand command: keep what exists and finish what was started.
-      for (const slot of starting) intents.push({ kind: "launch", slotId: slot.slotId });
+      if (!usageLimited) for (const slot of starting) intents.push({ kind: "launch", slotId: slot.slotId });
       return { intents, reason: "demand_sample_stale", target: null, current };
     }
     target = Math.min(spec.max, Math.max(spec.min, desired, occupied.length + starting.length));
     reason = target > current ? "scale_up" : target < current ? "scale_down" : "steady";
+    if (usageLimited && target > current) {
+      target = current;
+      reason = "usage_limit";
+    }
   }
 
   const surplus = Math.max(0, current - target);
@@ -235,17 +319,19 @@ export function planSeatPool(spec: SeatPoolSpec, state: SeatPoolState, nowMs: nu
   // A seat that never started holds no work. It goes only for the surplus free seats can't cover (a lowered max, or drain).
   const removeStarting = [...starting].sort((a, b) => b.slotId - a.slotId).slice(0, Math.max(0, surplus - drainOrder.length));
   for (const slot of starting) {
-    intents.push(removeStarting.includes(slot) ? { kind: "remove", slotId: slot.slotId } : { kind: "launch", slotId: slot.slotId });
+    if (removeStarting.includes(slot)) intents.push({ kind: "remove", slotId: slot.slotId });
+    else if (!usageLimited) intents.push({ kind: "launch", slotId: slot.slotId });
   }
+  if (usageLimited && starting.length > removeStarting.length) reason = "usage_limit";
   if (target > current && !cooling) intents.push({ kind: "add", count: target - current });
   if (cooling && target !== current) reason = "cooldown";
   return { intents, reason, target, current };
 }
 
-const HELD_REASONS = new Set(["model_not_found", "restore_in_progress", "demand_sample_stale"]);
+const HELD_REASONS = new Set(["model_not_found", "restore_in_progress", "demand_sample_stale", "usage_limit"]);
 
 export interface SeatPoolPolicyDeps {
-  readState(job: { jobId: string; targetSession: string; spec: SeatPoolSpec }): SeatPoolState;
+  readState(job: { jobId: string; targetSession: string; spec: SeatPoolSpec }): SeatPoolState | Promise<SeatPoolState>;
   /** Hands the plan to the executor; false when the pool's previous plan is still being applied. */
   submit(jobId: string, intents: SeatPoolIntent[]): boolean;
   now?: () => number;
@@ -263,7 +349,7 @@ export function makeSeatPoolPolicy(deps: SeatPoolPolicyDeps): Policy {
       const parsed = parseSeatPoolSpec(job.context);
       // Registration and update refuse an invalid spec; one that is invalid here holds the pool rather than act on it.
       if ("problem" in parsed) return { action: "skip", reason: "seat_pool_spec_invalid", notes: { ...parsed.problem } };
-      const state = deps.readState({ jobId: job.jobId, targetSession: job.target.session, spec: parsed.spec });
+      const state = await deps.readState({ jobId: job.jobId, targetSession: job.target.session, spec: parsed.spec });
       const plan = planSeatPool(parsed.spec, state, deps.now?.() ?? Date.now(), seatPoolSampleMaxAgeMs(job.intervalSeconds));
       // The executor also refreshes the demand sample, so a plan with nothing to do is still submitted.
       if (!deps.submit(job.jobId, plan.intents)) return { action: "skip", reason: "seat_pool_busy" };
