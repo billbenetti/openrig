@@ -16,6 +16,7 @@ import { PodRepository } from "../src/domain/pod-repository.js";
 import { EventBus } from "../src/domain/event-bus.js";
 import { OutboxHandler } from "../src/domain/outbox-handler.js";
 import { QueueRepository } from "../src/domain/queue-repository.js";
+import { WatchdogJobsRepository } from "../src/domain/watchdog-jobs-repository.js";
 import type { StopPrecondition } from "../src/domain/seat-lifecycle-service.js";
 import {
   readSeatPoolState,
@@ -1063,6 +1064,45 @@ describe("readSeatPoolState", () => {
     expect(state.modelCause).toBe("idle");
     expect(state.lastScaleAt).toBe("2026-11-09T11:00:00.000Z");
     expect(slots.nextLogicalId(state.model!)).toBe("dev.impl-s3");
+  });
+
+  it("frees the seats of a pool that has ended, so another pool adopts them, and keeps a live pool's", () => {
+    db = createFullTestDb();
+    const rigRepo = new RigRepository(db);
+    const rig = rigRepo.createRig("r");
+    const pod = new PodRepository(db).createPod(rig.id, "dev", "Dev");
+    const add = (logicalId: string) => {
+      const node = rigRepo.addNode(rig.id, logicalId, { runtime: "claude-code", cwd: "/tmp", podId: pod.id });
+      db.prepare("INSERT INTO sessions (id, node_id, session_name, status) VALUES (?, ?, ?, 'running')").run(`s-${logicalId}`, node.id, `${logicalId.replace(".", "-")}@r`);
+      return node;
+    };
+    add("dev.impl");
+    const left = add("dev.impl-s1");
+    const held = add("dev.impl-s2");
+    const jobs = new WatchdogJobsRepository(db);
+    const register = () => jobs.register({ policy: "seat-pool", specYaml: "policy: seat-pool", targetSession: "dev-impl@r", intervalSeconds: 60, registeredBySession: "test@r" }).jobId;
+    const ended = register();
+    const other = register();
+    const slots = new SeatPoolSlots(db);
+    const at = "2026-11-09T11:00:00.000Z";
+    const old = slots.insert({ poolJobId: ended, logicalId: "dev.impl-s1", nodeId: left.id, phase: "live", intent: null, opId: "op-1", at });
+    slots.insert({ poolJobId: other, logicalId: "dev.impl-s2", nodeId: held.id, phase: "live", intent: null, opId: "op-2", at });
+    // A daemon without the seat-pool policy ends the job and leaves its seat running.
+    jobs.markTerminal(ended, "unknown_policy:seat-pool");
+    const state = readSeatPoolState({
+      db, slots,
+      openRows: () => [], sessionAddresses: (session) => [session], heldMessages: () => 0, seatStopped: () => false,
+      seatState: () => null, quarantined: () => false, restoring: () => false, demand: () => null,
+    }, { jobId: JOB, targetSession: "dev-impl@r", spec: spec({ adopt: ["dev.impl-s1", "dev.impl-s2"] }) });
+    expect(state.adoptable).toEqual([{ logicalId: "dev.impl-s1", nodeId: left.id }]);
+
+    const adopted = slots.adopt({ poolJobId: JOB, logicalId: "dev.impl-s1", nodeId: left.id, at });
+    expect(adopted).toMatchObject({ poolJobId: JOB, nodeId: left.id, phase: "live", opId: null });
+    expect(slots.get(old.slotId)).toMatchObject({ phase: "retired", retiredAt: at });
+    expect(slots.isLinked(left.id)).toBe(true);
+    // A seat a live pool holds is never taken over: its link stays and the insert is refused.
+    expect(() => slots.adopt({ poolJobId: JOB, logicalId: "dev.impl-s2", nodeId: held.id, at })).toThrow(/UNIQUE/);
+    expect(slots.listOpen(other).map((s) => s.logicalId)).toEqual(["dev.impl-s2"]);
   });
 
   it("reads the pending rows to the model, its seats and the seats it removed, and each seat's cause", () => {
