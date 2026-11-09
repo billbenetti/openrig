@@ -9,6 +9,7 @@ import { FALLBACK_ACTOR, type QueueRepository } from "./queue-repository.js";
 import { OPENRIG_SENDER } from "../lib/pane-envelope.js";
 import type { Node } from "./types.js";
 import {
+  seatPoolReapCause,
   slotWorkingDirectory,
   type SeatPoolCommand,
   type SeatPoolIntent,
@@ -32,7 +33,8 @@ import {
  * not launched is prepared and launched or removed, and a seat being drained finishes draining. Moving a row and waking
  * a seat check the row and the seat again just before, and change nothing when either changed since the plan or the
  * pool was set to drain. An add, a launch and a relaunch check provider usage again just before, and start nothing
- * while a seat of the pool is out of usage.
+ * while a seat of the pool is out of usage. A reap, under the seat's lifecycle lease, checks again why the seat is
+ * reaped, and leaves a seat that recovered since the plan.
  */
 
 export interface SeatPoolSlot {
@@ -199,6 +201,8 @@ export interface SeatPoolStateReaderDeps {
   seatState(nodeId: string): ArbitratedSeatState | null;
   /** Whether the provider account the session runs on is out of usage. Absent: never. */
   usageLimited?(sessionName: string): boolean;
+  /** Whether a row about the seat's refused release is open. */
+  quarantined(sessionName: string): boolean;
   restoring(rigId: string): boolean;
   demand(jobId: string): { desired: number; sampledAt: string } | null;
 }
@@ -276,7 +280,11 @@ export function readSeatPoolState(deps: SeatPoolStateReaderDeps, job: { jobId: s
       openRows: present ? deps.openRows(sessionName).length : 0,
       heldMessages: present ? deps.heldMessages(slot.nodeId!) : 0,
       idleSince: idle ? state!.changedAt : null,
-      cause: present ? causeOf(slot.nodeId!, sessionName, state) : "stopped",
+      stateSince: state?.changedAt ?? null,
+      // A seat of the pool whose session is gone is reaped, which a usage limit doesn't hold, so for it a stopped session
+      // comes before its account's usage; for the model, which the pool can only launch, the usage limit comes first.
+      cause: !present || deps.seatStopped(slot.nodeId!) ? "stopped" : causeOf(slot.nodeId!, sessionName, state),
+      quarantined: present && deps.quarantined(sessionName),
     };
   });
   const adoptable = job.spec.adopt.flatMap((logicalId) => {
@@ -320,18 +328,43 @@ export interface SeatPoolEffects {
   stopSlot(input: { sessionName: string; expected: StopPrecondition }): Promise<SeatPoolEffectResult>;
   removeSlot(input: { rigId: string; nodeId: string; expected: StopPrecondition }): Promise<SeatPoolEffectResult>;
   runCommand(command: SeatPoolCommand, env: Record<string, string>, signal: AbortSignal): Promise<SeatPoolCommandResult>;
-  /** Moves a row to `to` only if it is still pending and addressed to `from`, and wakes `to`, in one transaction. */
-  moveRow(input: { qitemId: string; from: string; to: string; reason: string }): SeatPoolEffectResult;
+  /** Returns a seat whose session is gone to launchable, after checking in tmux that it is gone. */
+  cleanSlot(input: { sessionName: string }): Promise<SeatPoolEffectResult>;
+  /** The pending, in-progress and blocked rows addressed to a seat. */
+  openRows(sessionName: string): Array<{ qitemId: string; state: "pending" | "in-progress" | "blocked" }>;
+  /** Returns an in-progress row to pending, releasing its claim. */
+  unclaimRow(input: { qitemId: string; seat: string; reason: string }): SeatPoolEffectResult;
+  /** How many reaps moved the row before: its reroutes whose reason is `reap:<seat>`. */
+  reapCount(qitemId: string): number;
+  /**
+   * Moves a row to `to` only if it is still in `state` (pending by default) and addressed to `from`, in one transaction,
+   * and wakes `to` when the row is pending.
+   */
+  moveRow(input: { qitemId: string; from: string; to: string; reason: string; state?: "pending" | "blocked" }): SeatPoolEffectResult;
   /** Launches a seat whose session stopped, as `rig launch` does for it. */
   relaunchSeat(input: { rigId: string; logicalId: string }): Promise<SeatPoolEffectResult>;
   /** Wakes `seat` about the row, after recording on the row that the pool did, so it never does it twice. */
   nudgeRow(input: { qitemId: string; seat: string }): Promise<SeatPoolEffectResult & { result?: string | null }>;
-  /** Opens a row to the model's escalation owner about a seat that needs input, unless one about that seat is open. */
-  escalate(input: { jobId: string; seat: string; model: string; qitemIds: string[] }): Promise<SeatPoolEffectResult & { qitemId?: string; destination?: string; existing?: boolean }>;
+  /** Where the model's escalations go, or why there is nowhere. */
+  escalationOwner(modelSession: string): { owner: string | null; reason: string };
+  /**
+   * Opens a row to the model's escalation owner about a seat that needs input, or, with `quarantine`, about a seat
+   * whose release command refused, unless one of the same kind about that seat is open.
+   */
+  escalate(input: {
+    jobId: string; seat: string; model: string; qitemIds: string[];
+    /** `release` is the release command's result, or null when the pool has none. */
+    quarantine?: { why: "usage_limit" | "stuck"; release: { exitCode: number | null; error: string | null } | null };
+  }): Promise<SeatPoolEffectResult & { qitemId?: string; destination?: string; existing?: boolean }>;
 }
 
 /** The tag on the open escalation about a seat that needs input, followed by that seat: one at a time per seat. */
 export const SEAT_POOL_NEEDS_INPUT_TAG = "seat-pool-needs-input";
+/** The tag on the open row about a seat whose release refused, followed by that seat: while it is open, the seat is
+ *  quarantined. */
+export const SEAT_POOL_QUARANTINE_TAG = "seat-pool-quarantine";
+/** The reason a reap gives each row it moves, followed by the seat; counting these reroutes counts the row's reaps. */
+export const SEAT_POOL_REAP_REASON = "reap:";
 const SEAT_POOL_ACTOR = "seat-pool@system";
 
 const errorCode = (error: unknown, fallback: string) => {
@@ -339,17 +372,38 @@ const errorCode = (error: unknown, fallback: string) => {
   return typeof code === "string" ? code : fallback;
 };
 
+function releaseOutcome(release: { exitCode: number | null; error: string | null } | null): string {
+  if (!release) return "the pool has no release command to confirm its work is saved";
+  return release.exitCode !== null
+    ? `its release command exited ${release.exitCode}`
+    : `its release command failed (${release.error ?? "no exit code"})`;
+}
+
 /** The executor's row moves, nudges and escalations, through the queue repository. */
 export function seatPoolQueueEffects(deps: {
   queueRepo: QueueRepository;
   /** Where an escalation about a seat of the pool goes: the model's escalation owner, or why it has none. */
   escalationOwner(modelSession: string): { owner: string | null; reason: string };
-}): Pick<SeatPoolEffects, "moveRow" | "nudgeRow" | "escalate"> {
+}): Pick<SeatPoolEffects, "openRows" | "unclaimRow" | "reapCount" | "moveRow" | "nudgeRow" | "escalationOwner" | "escalate"> {
   const { queueRepo } = deps;
   return {
-    moveRow: ({ qitemId, from, to, reason }) => {
+    openRows: (sessionName) => queueRepo.listOpenObligations(sessionName, 500),
+    unclaimRow: ({ qitemId, seat, reason }) => {
       try {
-        queueRepo.routeToFallback(qitemId, to, reason, { expectState: "pending", expectDestination: from, wake: true });
+        queueRepo.unclaim(qitemId, seat, reason);
+        return { ok: true };
+      } catch (error) {
+        return { ok: false, code: errorCode(error, "unclaim_failed"), error: (error as Error).message };
+      }
+    },
+    // The reroute's own transitions, as fallbackLineStart trusts them: written in-process (no identity provenance) by
+    // the fallback actor. A transition the update route wrote can carry the same actor and note, and doesn't count.
+    reapCount: (qitemId) => queueRepo.listTransitions(qitemId).filter((t) =>
+      t.actorSession === FALLBACK_ACTOR && t.identityProvenance === null
+      && /^fallback-routed: .* \(reap:[^\s()]+\)$/.test(t.transitionNote ?? "")).length,
+    moveRow: ({ qitemId, from, to, reason, state = "pending" }) => {
+      try {
+        queueRepo.routeToFallback(qitemId, to, reason, { expectState: state, expectDestination: from, wake: state === "pending" });
         return { ok: true };
       } catch (error) {
         return { ok: false, code: errorCode(error, "fallback_failed"), error: (error as Error).message };
@@ -365,8 +419,9 @@ export function seatPoolQueueEffects(deps: {
       await queueRepo.maybeNudge(qitemId, seat, true, OPENRIG_SENDER, undefined, "openrig");
       return { ok: true, result: queueRepo.getById(qitemId)?.lastNudgeWireResult ?? null };
     },
-    escalate: async ({ jobId, seat, model, qitemIds }) => {
-      const tag = `${SEAT_POOL_NEEDS_INPUT_TAG}:${seat}`;
+    escalationOwner: deps.escalationOwner,
+    escalate: async ({ jobId, seat, model, qitemIds, quarantine }) => {
+      const tag = `${quarantine ? SEAT_POOL_QUARANTINE_TAG : SEAT_POOL_NEEDS_INPUT_TAG}:${seat}`;
       const open = queueRepo.list({ tag, activeOnly: true, limit: 1 })[0];
       if (open) return { ok: true, qitemId: open.qitemId, destination: open.destinationSession, existing: true };
       const route = deps.escalationOwner(model);
@@ -374,10 +429,20 @@ export function seatPoolQueueEffects(deps: {
       const created = await queueRepo.create({
         sourceSession: OPENRIG_SENDER,
         destinationSession: route.owner,
-        summary: `${seat} needs input and holds ${qitemIds.length} waiting row(s)`,
-        body: `${seat} is waiting for input (a permission prompt or a question), so it isn't taking the pending row(s) `
-          + `addressed to it: ${qitemIds.join(", ")}. Answer its prompt; rig capture ${seat} shows it. `
-          + `Raised by seat pool ${jobId}, which raises no other until this row is closed.`,
+        ...(quarantine
+          ? {
+              summary: `${seat} is ${quarantine.why === "usage_limit" ? "out of usage" : "stuck"} and was not released: quarantined`,
+              body: `${seat} has been ${quarantine.why === "usage_limit" ? "out of provider usage" : "without an activity change"} `
+                + `for longer than stuck_after_s, and ${releaseOutcome(quarantine.release)}, so its work may not be saved. `
+                + `Seat pool ${jobId} will not stop or remove it while this row is open. Its open rows: ${qitemIds.join(", ") || "none"}. `
+                + `Check it (rig capture ${seat}), save or hand off its work, and close this row; if it is still stuck then, the pool asks again.`,
+            }
+          : {
+              summary: `${seat} needs input and holds ${qitemIds.length} waiting row(s)`,
+              body: `${seat} is waiting for input (a permission prompt or a question), so it isn't taking the pending row(s) `
+                + `addressed to it: ${qitemIds.join(", ")}. Answer its prompt; rig capture ${seat} shows it. `
+                + `Raised by seat pool ${jobId}, which raises no other until this row is closed.`,
+            }),
         tags: [tag],
         wakeTrigger: "openrig",
       });
@@ -455,6 +520,8 @@ interface Context {
 const STOPPED_CODES = new Set(["session_not_live", "no_session"]);
 /** A reroute refused because the row was claimed, closed or moved since the plan: nothing failed. */
 const ROW_MOVED_ON = new Set(["fallback_state_mismatch", "fallback_destination_mismatch", "qitem_not_found"]);
+/** An unclaim refused because the row was closed or released since it was read: the move that follows decides. */
+const UNCLAIM_MOVED_ON = new Set(["qitem_not_in_progress", "qitem_not_found"]);
 const holdsWork = (slot: SeatPoolSlotView) => slot.openRows > 0 || slot.heldMessages > 0;
 const TIMED_OUT = Symbol("timed out");
 
@@ -567,6 +634,8 @@ export class SeatPoolExecutor {
         if (!(await this.removeUnstarted(jobId, run, intent.slotId))) return;
       } else if (intent.kind === "dispatch") {
         if (!this.dispatch(jobId, run, intent)) return;
+      } else if (intent.kind === "reap") {
+        if (!(await this.reap(jobId, run, intent.slotId))) return;
       } else if (!(await this.wake(jobId, run, intent))) return;
     }
     await this.refreshDemand(jobId, run);
@@ -679,7 +748,7 @@ export class SeatPoolExecutor {
     const view = ctx.state.slots.find((s) => s.slotId === slotId);
     if (!view?.nodeExists) return this.removeUnstarted(jobId, run, slotId);
     if (slot.phase === "live") {
-      if (holdsWork(view) || view.idleSince === null) return true;
+      if (holdsWork(view) || view.idleSince === null || view.quarantined) return true;
       this.setIntent(slotId, null, "draining");
     } else if (slot.phase !== "draining") return true;
 
@@ -770,6 +839,111 @@ export class SeatPoolExecutor {
   }
 
   /**
+   * Reaps a seat that stopped working, under its lifecycle lease, after checking again why (seatPoolReapCause): a seat
+   * that recovered since the plan is left alone.
+   *
+   * A live seat (out of usage or stuck) leaves only with its release command's consent: the command runs, then a
+   * checked stop. Without a release command, or when it refuses, the seat is quarantined instead: it is not stopped or
+   * removed, and one row about it goes to the model's escalation owner; while that row is open the pool leaves the seat.
+   *
+   * A seat whose session is gone (or was just stopped) is cleaned, which checks in tmux that the session is gone before
+   * anything else changes; then `reap_cmd` runs; then each in-progress row is unclaimed and every open row is moved
+   * back to the model (a pending one with a wake), each only if it is still addressed to the seat, with the reason
+   * `reap:<seat>`. A row that a reap already moved once goes to the model's escalation owner instead, so a row that
+   * keeps losing its seat stops cycling through the pool. Last, the node is removed with the `expected` read at the
+   * start. A failed step stops the reap there; the next plan picks it up again.
+   */
+  private async reap(jobId: string, run: Run, slotId: number): Promise<boolean> {
+    const slot = this.deps.slots.get(slotId);
+    if (!slot?.nodeId || slot.retiredAt || slot.phase !== "live") return true;
+    const interrupted = this.interrupted(slot);
+    const ctx = this.fresh(jobId, run);
+    if (!ctx) return false;
+    const nodeId = slot.nodeId;
+    const sessionName = seatSessionName(slot.logicalId, ctx.model.rigName);
+    const outcome = await this.within(run, () => this.deps.effects.lifecycle(nodeId, async (): Promise<DrainOutcome> => {
+      const inLease = this.fresh(jobId, run);
+      if (!inLease) return { stop: true, reason: null };
+      const view = inLease.state.slots.find((s) => s.slotId === slotId);
+      const why = view ? seatPoolReapCause(inLease.spec, view, this.now().getTime()) : null;
+      if (!why) return { stop: false, reason: null };
+      const expected = this.deps.effects.stopPrecondition(nodeId);
+      const failed = (step: string, notes: Record<string, unknown>): DrainOutcome => {
+        this.setIntent(slotId, null);
+        return { stop: false, failed: true, reason: "seat_pool_reap_failed", notes: { why, step, ...notes } };
+      };
+
+      if (why !== "no_session") {
+        let release: { exitCode: number | null; error: string | null } | null = null;
+        if (inLease.spec.releaseCmd) {
+          this.setIntent(slotId, "release");
+          const released = await this.deps.effects.runCommand(inLease.spec.releaseCmd, this.commandEnv(inLease, { OPENRIG_SEAT_POOL_SLOT: sessionName }), run.controller.signal);
+          if (run.controller.signal.aborted) return { stop: true, reason: null };
+          release = { exitCode: released.exitCode, error: released.error ?? null };
+        }
+        if (!release || release.exitCode !== 0) {
+          this.setIntent(slotId, null);
+          const qitemIds = this.deps.effects.openRows(sessionName).map((row) => row.qitemId);
+          const escalated = await this.deps.effects.escalate({ jobId, seat: sessionName, model: inLease.model.sessionName, qitemIds, quarantine: { why, release } });
+          return {
+            stop: false, failed: !escalated.ok, reason: "seat_pool_quarantined",
+            notes: { why, release, ...(escalated.ok ? { to: escalated.destination, qitemId: escalated.qitemId } : { code: escalated.code, error: escalated.error }) },
+          };
+        }
+        // A seat that recovered while the command ran keeps working.
+        const afterRelease = this.fresh(jobId, run);
+        if (!afterRelease) return { stop: true, reason: null };
+        const recovered = afterRelease.state.slots.find((s) => s.slotId === slotId);
+        if (!recovered || !seatPoolReapCause(afterRelease.spec, recovered, this.now().getTime())) {
+          this.setIntent(slotId, null);
+          return { stop: false, reason: null };
+        }
+        this.setIntent(slotId, "stop");
+        const stopped = await this.deps.effects.stopSlot({ sessionName, expected });
+        if (!stopped.ok && !STOPPED_CODES.has(stopped.code)) return failed("stop", { code: stopped.code, error: stopped.error });
+      }
+
+      this.setIntent(slotId, "reap");
+      const cleaned = await this.deps.effects.cleanSlot({ sessionName });
+      if (!cleaned.ok && cleaned.code !== "nothing_to_clean") return failed("clean", { code: cleaned.code, error: cleaned.error });
+      if (inLease.spec.reapCmd) {
+        const reaped = await this.deps.effects.runCommand(inLease.spec.reapCmd, this.commandEnv(inLease, { OPENRIG_SEAT_POOL_SLOT: sessionName }), run.controller.signal);
+        if (run.controller.signal.aborted) return { stop: true, reason: null };
+        if (reaped.exitCode !== 0) return failed("reap_cmd", { exitCode: reaped.exitCode, error: reaped.error ?? null });
+      }
+      const reason = `${SEAT_POOL_REAP_REASON}${sessionName}`;
+      const rows: Array<{ qitemId: string; to: string; escalated?: true }> = [];
+      for (const row of this.deps.effects.openRows(sessionName)) {
+        if (row.state === "in-progress") {
+          const unclaimed = this.deps.effects.unclaimRow({ qitemId: row.qitemId, seat: sessionName, reason });
+          if (!unclaimed.ok && !UNCLAIM_MOVED_ON.has(unclaimed.code)) return failed("unclaim", { qitemId: row.qitemId, code: unclaimed.code, error: unclaimed.error });
+        }
+        let to = inLease.model.sessionName;
+        let escalated = false;
+        if (this.deps.effects.reapCount(row.qitemId) > 0) {
+          const route = this.deps.effects.escalationOwner(inLease.model.sessionName);
+          if (route.owner) [to, escalated] = [route.owner, true];
+          else this.record(jobId, true, "seat_pool_escalation_failed", { seat: sessionName, qitemId: row.qitemId, code: "no_escalation_owner", error: route.reason });
+        }
+        const moved = this.deps.effects.moveRow({ qitemId: row.qitemId, from: sessionName, to, reason, state: row.state === "blocked" ? "blocked" : "pending" });
+        if (moved.ok) rows.push({ qitemId: row.qitemId, to, ...(escalated ? { escalated: true as const } : {}) });
+        else if (!ROW_MOVED_ON.has(moved.code)) return failed("move", { qitemId: row.qitemId, code: moved.code, error: moved.error });
+      }
+      this.setIntent(slotId, "remove");
+      const removed = await this.deps.effects.removeSlot({ rigId: inLease.model.rigId, nodeId, expected });
+      if (!removed.ok && removed.code !== "node_not_found") return failed("remove", { code: removed.code, error: removed.error, rows });
+      this.deps.slots.retire(slotId, this.at());
+      return { stop: false, reason: "seat_pool_reaped", notes: { why, rows } };
+    }));
+    if (outcome === TIMED_OUT) {
+      this.record(jobId, true, "seat_pool_reap_failed", { slot: slot.logicalId, code: "effect_timeout", ...interrupted });
+      return false;
+    }
+    if (outcome.reason) this.record(jobId, outcome.failed === true, outcome.reason, { slot: slot.logicalId, ...outcome.notes, ...interrupted });
+    return !outcome.stop;
+  }
+
+  /**
    * Moves a waiting row to a seat that is still free. A seat that took work since the plan is left to the next plan, and
    * a pool set to drain since the plan moves nothing.
    */
@@ -778,7 +952,7 @@ export class SeatPoolExecutor {
     if (!ctx) return false;
     if (ctx.spec.drain) return true;
     const slot = ctx.state.slots.find((s) => s.slotId === intent.slotId);
-    if (!slot || slot.phase !== "live" || !slot.nodeExists || slot.cause !== "idle" || holdsWork(slot)) return true;
+    if (!slot || slot.phase !== "live" || !slot.nodeExists || slot.cause !== "idle" || slot.quarantined || holdsWork(slot)) return true;
     const notes = { qitemId: intent.qitemId, from: intent.from, to: slot.sessionName };
     const moved = this.deps.effects.moveRow({ ...notes, reason: `seat pool ${jobId}: ${intent.from} had not taken it; ${slot.sessionName} was free` });
     if (moved.ok) this.record(jobId, false, "seat_pool_dispatched", notes);
