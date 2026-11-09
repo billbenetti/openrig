@@ -26,6 +26,7 @@ context:
   cooldown_s: 60            # wait after an add or removal before the next one (default 60)
   idle_grace_s: 300         # how long a seat must sit idle before it is drained (default 300)
   dispatch_after_s: 60      # how long a row waits at its seat before the pool moves it or wakes the seat (default 60)
+  dispatch_tag: role:impl   # move only the model's rows with this tag (default: every row to the model)
   drain: false              # true empties the pool (see below)
   adopt: [dev.impl2]        # existing seats the pool counts and gives rows to, but never stops or removes
   cwd_template: /work/{rig}/{slot}   # required: absolute, with {slot}; {rig} is optional
@@ -76,6 +77,12 @@ first, one row per free seat. The move is `rig queue fallback` with `--expect-st
 `--expect-destination <the row's seat>` and `--wake`, so a row claimed or moved since the plan stays where it is, and
 the new seat is woken in the same transaction. A row no free seat takes counts as demand, so the pool adds a seat for
 it. A row addressed to one of the pool's own seats stays with that seat.
+
+When the model is itself a seat that works, a row to it may be about the work it already holds: a review coming back,
+an answer to its question. Set `dispatch_tag` and tag the rows that are new work for the role when you create them
+(`rig queue create --tags <tag>`): only a row to the model carrying that tag is moved or counted as demand, and any other
+row to the model stays with it. A row to a seat the pool removed is moved whatever its tags, since nothing else will
+take it.
 
 A waiting row the pool doesn't move wakes the seat holding it (the model, or a seat of the pool), by why that seat
 isn't taking it:
