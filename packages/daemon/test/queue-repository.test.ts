@@ -545,6 +545,103 @@ describe("QueueRepository", () => {
     expect(captured.some((e) => e.type === "qitem.fallback_routed")).toBe(true);
   });
 
+  describe("routeToFallback with a guard and a wake", () => {
+    const fallbackTransitions = (qitemId: string) =>
+      repo.transitionLog.listForQitem(qitemId).filter((t) => t.transitionNote?.startsWith("fallback-routed: "));
+    const fallbackWakes = (qitemId: string) =>
+      db.prepare("SELECT outbox_id, sender_session, destination_session, delivery_state FROM outbox_entries WHERE audit_pointer = ? AND outbox_id LIKE 'wake-intent-fallback-%'")
+        .all(qitemId) as Array<{ outbox_id: string; sender_session: string; destination_session: string; delivery_state: string }>;
+
+    it("moves the row when its state and destination are still the expected ones", async () => {
+      const item = await repo.create({ sourceSession: "alice@rig", destinationSession: "bob@rig", body: "x", nudge: false });
+      const rerouted = repo.routeToFallback(item.qitemId, "carol@rig", "slot free", { expectState: "pending", expectDestination: "bob@rig" });
+      expect(rerouted.destinationSession).toBe("carol@rig");
+      expect(fallbackTransitions(item.qitemId)).toHaveLength(1);
+    });
+
+    it("refuses a row claimed since it was read, and leaves it as it was", async () => {
+      const item = await repo.create({ sourceSession: "alice@rig", destinationSession: "bob@rig", body: "x", nudge: false });
+      repo.claim({ qitemId: item.qitemId, destinationSession: "bob@rig" });
+      captured.length = 0;
+      expect(() => repo.routeToFallback(item.qitemId, "carol@rig", "slot free", { expectState: "pending" })).toThrow(expect.objectContaining({ code: "fallback_state_mismatch" }));
+      const after = repo.getById(item.qitemId)!;
+      expect(after.state).toBe("in-progress");
+      expect(after.destinationSession).toBe("bob@rig");
+      expect(after.chainOfRecord ?? []).toEqual([]);
+      expect(fallbackTransitions(item.qitemId)).toHaveLength(0);
+      expect(captured.some((e) => e.type === "qitem.fallback_routed")).toBe(false);
+    });
+
+    it("refuses a row rerouted elsewhere since it was read", async () => {
+      const item = await repo.create({ sourceSession: "alice@rig", destinationSession: "bob@rig", body: "x", nudge: false });
+      repo.routeToFallback(item.qitemId, "dave@rig", "someone else moved it");
+      expect(() => repo.routeToFallback(item.qitemId, "carol@rig", "slot free", { expectDestination: "bob@rig" })).toThrow(expect.objectContaining({ code: "fallback_destination_mismatch" }));
+      expect(repo.getById(item.qitemId)!.destinationSession).toBe("dave@rig");
+      expect(fallbackTransitions(item.qitemId)).toHaveLength(1);
+    });
+
+    it("matches the expected destination by any of its session addresses, as a claim does", async () => {
+      const aliasing = new QueueRepository(db, bus, { resolveSessionAddresses: (name) => name === "bob" ? ["bob", "bob@rig"] : [name] });
+      const item = await aliasing.create({ sourceSession: "alice@rig", destinationSession: "bob@rig", body: "x", nudge: false });
+      expect(aliasing.routeToFallback(item.qitemId, "carol@rig", "slot free", { expectDestination: "bob" }).destinationSession).toBe("carol@rig");
+    });
+
+    it("refuses an unknown expected state instead of treating it as a mismatch", async () => {
+      const item = await repo.create({ sourceSession: "alice@rig", destinationSession: "bob@rig", body: "x", nudge: false });
+      expect(() => repo.routeToFallback(item.qitemId, "carol@rig", "slot free", { expectState: "in_progress" })).toThrow(expect.objectContaining({ code: "invalid_state" }));
+      expect(repo.getById(item.qitemId)!.destinationSession).toBe("bob@rig");
+    });
+
+    it("wakes the new destination from OpenRig, and the old destination's wake is not delivered", async () => {
+      const sends: Array<{ session: string; text: string }> = [];
+      repo.attachTransport({ send: async (session: string, text: string) => { sends.push({ session, text }); return { ok: true, verified: true }; } });
+      // Staged before the transport existed, so the create's wake to bob is still pending.
+      repo.attachTransport({ send: async () => ({ ok: true, verified: true }) });
+      const item = await new QueueRepository(db, bus).create({ sourceSession: "alice@rig", destinationSession: "bob@rig", body: "x", summary: "review the thing" });
+      repo.attachTransport({ send: async (session: string, text: string) => { sends.push({ session, text }); return { ok: true, verified: true }; } });
+
+      repo.routeToFallback(item.qitemId, "carol@rig", "slot free", { expectState: "pending", expectDestination: "bob@rig", wake: true });
+
+      const [wake] = fallbackWakes(item.qitemId);
+      expect(wake).toMatchObject({ sender_session: "daemon@kernel", destination_session: "carol@rig" });
+      await vi.waitFor(() => expect(fallbackWakes(item.qitemId)[0]!.delivery_state).toBe("delivered"));
+      expect(sends).toHaveLength(1);
+      expect(sends[0]!.session).toBe("carol@rig");
+      expect(sends[0]!.text).toContain(`Queue handoff: ${item.qitemId}`);
+
+      await repo.deliverWakeForSuccessor(item.qitemId, "bob@rig", true);
+      expect(sends.map((s) => s.session)).toEqual(["carol@rig"]);
+    });
+
+    it("refuses a wake for a row that is not pending, and moves nothing", async () => {
+      const item = await repo.create({ sourceSession: "alice@rig", destinationSession: "bob@rig", body: "x", nudge: false });
+      repo.claim({ qitemId: item.qitemId, destinationSession: "bob@rig" });
+      expect(() => repo.routeToFallback(item.qitemId, "carol@rig", "slot free", { wake: true })).toThrow(expect.objectContaining({ code: "wake_not_admitted" }));
+      expect(repo.getById(item.qitemId)!.destinationSession).toBe("bob@rig");
+      expect(fallbackWakes(item.qitemId)).toHaveLength(0);
+    });
+
+    it("refuses a wake with no wake-intent store, before moving anything", async () => {
+      const noOutbox = new QueueRepository(db, bus);
+      const item = await noOutbox.create({ sourceSession: "alice@rig", destinationSession: "bob@rig", body: "x", nudge: false });
+      expect(() => noOutbox.routeToFallback(item.qitemId, "carol@rig", "slot free", { wake: true })).toThrow(expect.objectContaining({ code: "wake_intent_store_unavailable" }));
+      expect(noOutbox.getById(item.qitemId)!.destinationSession).toBe("bob@rig");
+    });
+
+    it("rolls the move back when the wake cannot be staged", async () => {
+      const outbox = new OutboxHandler(db);
+      const failing = new QueueRepository(db, bus);
+      failing.attachOutbox(outbox);
+      const item = await failing.create({ sourceSession: "alice@rig", destinationSession: "bob@rig", body: "x", nudge: false });
+      vi.spyOn(outbox, "record").mockImplementation(() => { throw new Error("disk full"); });
+      expect(() => failing.routeToFallback(item.qitemId, "carol@rig", "slot free", { wake: true })).toThrow("disk full");
+      const after = failing.getById(item.qitemId)!;
+      expect(after.destinationSession).toBe("bob@rig");
+      expect(after.resolution).toBeNull();
+      expect(failing.transitionLog.listForQitem(item.qitemId).filter((t) => t.transitionNote?.startsWith("fallback-routed: "))).toHaveLength(0);
+    });
+  });
+
   it("list filters by destination + state", async () => {
     const a = await repo.create({ sourceSession: "x@r", destinationSession: "bob@r", body: "1" });
     await repo.create({ sourceSession: "x@r", destinationSession: "carol@r", body: "2" });

@@ -294,6 +294,9 @@ export function queueRoutes(): Hono {
         : err.code === "qitem_not_claimable" ? 409
         : err.code === "qitem_not_in_progress" ? 409
         : err.code === "qitem_already_terminal" ? 409
+        // A conditional fallback whose row changed since the caller read it: the move was not made.
+        : err.code === "fallback_state_mismatch" ? 409
+        : err.code === "fallback_destination_mismatch" ? 409
         // OPR.0.4.6.MH3 Q-a: same minted id, different destination/source =
         // caller id-reuse (a bug, not an idempotent retry) — surface as a
         // conflict, never overwrite.
@@ -1140,10 +1143,32 @@ export function queueRoutes(): Hono {
   // POST /:qitemId/fallback
   app.post("/:qitemId/fallback", async (c) => {
     const qitemId = c.req.param("qitemId");
-    const body = await c.req.json<{ fallbackDestination?: string; reason?: string }>().catch(() => ({} as never));
+    const body = await c.req.json<{
+      fallbackDestination?: string;
+      reason?: string;
+      /** Move the row only if it is in this state, checked in the same transaction as the move. */
+      expectState?: unknown;
+      /** Move the row only if it is addressed to this seat, checked in the same transaction as the move. */
+      expectDestination?: unknown;
+      /** Stage a wake for the new destination, as a handoff does for its successor. */
+      wake?: unknown;
+    }>().catch(() => ({} as never));
     if (!body.fallbackDestination) return c.json({ error: "fallbackDestination is required" }, 400);
+    if (body.expectState !== undefined && typeof body.expectState !== "string") {
+      return c.json({ error: "invalid_state", message: "expectState must be a queue state name" }, 400);
+    }
+    if (body.expectDestination !== undefined && (typeof body.expectDestination !== "string" || !body.expectDestination.trim())) {
+      return c.json({ error: "expectDestination must be a non-empty session name" }, 400);
+    }
+    if (body.wake !== undefined && typeof body.wake !== "boolean") {
+      return c.json({ error: "wake must be a boolean" }, 400);
+    }
     try {
-      const item = getRepo(c).routeToFallback(qitemId, body.fallbackDestination, body.reason ?? "manual");
+      const item = getRepo(c).routeToFallback(qitemId, body.fallbackDestination, body.reason ?? "manual", {
+        expectState: body.expectState,
+        expectDestination: body.expectDestination,
+        wake: body.wake,
+      });
       return c.json(item);
     } catch (err) {
       return errorResponse(c, err);
