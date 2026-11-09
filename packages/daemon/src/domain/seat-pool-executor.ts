@@ -150,12 +150,17 @@ export class SeatPoolSlots {
     this.db.prepare("UPDATE seat_pool_slots SET phase = 'retired', intent = NULL, retired_at = ? WHERE id = ?").run(at, slotId);
   }
 
-  /** Links a seat the pool adopts, retiring first the link a pool that has ended left on it. */
+  /**
+   * Links a seat the pool adopts, retiring first the link a pool that has ended left on it. A seat that pool added
+   * keeps its add (Operation-Id and time), so it stays a seat a pool added, drained and reaped, not an adopted one.
+   */
   adopt(input: { poolJobId: string; logicalId: string; nodeId: string; at: string }): SeatPoolSlot {
     return this.db.transaction(() => {
-      this.db.prepare(`UPDATE seat_pool_slots SET phase = 'retired', intent = NULL, retired_at = ?
-        WHERE node_id = ? AND retired_at IS NULL AND ${POOL_ENDED}`).run(input.at, input.nodeId);
-      return this.insert({ ...input, phase: "live", intent: null, opId: null });
+      const ended = this.db.prepare(`SELECT id, op_id, created_at FROM seat_pool_slots WHERE node_id = ? AND retired_at IS NULL AND ${POOL_ENDED}`)
+        .get(input.nodeId) as { id: number; op_id: string | null; created_at: string } | undefined;
+      if (ended) this.retire(ended.id, input.at);
+      const added = ended?.op_id ? { opId: ended.op_id, at: ended.created_at } : { opId: null, at: input.at };
+      return this.insert({ ...input, ...added, phase: "live", intent: null });
     })();
   }
 }
