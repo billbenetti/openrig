@@ -172,8 +172,6 @@ export interface SeatPoolPendingRow {
   destination: string;
   /** When it reached `destination`: its latest reroute, or its creation. */
   waitingSince: string;
-  /** Whether the pool already nudged `destination` about this row. */
-  nudged: boolean;
 }
 
 export interface SeatPoolState {
@@ -204,8 +202,6 @@ export type SeatPoolIntent =
   | { kind: "dispatch"; qitemId: string; from: string; slotId: number }
   /** Launch a stopped seat (the model or one of the pool's) that holds a waiting row. */
   | { kind: "relaunch"; seat: string; nodeId: string }
-  /** Remind an idle seat of a waiting row: once per row and seat. */
-  | { kind: "nudge"; seat: string; qitemId: string }
   /** Tell the model's escalation owner that a seat holding waiting rows needs input. */
   | { kind: "escalate"; seat: string; qitemIds: string[] }
   /** Take out a seat whose session is gone (see seatPoolReapable). */
@@ -237,8 +233,8 @@ export function seatPoolOutOfUsage(state: Pick<SeatPoolState, "modelCause" | "sl
  * A pending row waits once it has been at its seat for `dispatch_after_s` (since its creation or its latest reroute).
  * A waiting row addressed to the model or to a seat the pool removed goes to a free seat (live, idle at a prompt, no
  * open row, no held message), the longest waiting first; one that finds no free seat is demand. A waiting row the pool
- * doesn't move wakes the seat holding it by why that seat isn't taking it: a stopped seat is launched, an idle one is
- * nudged once for the row, one that needs input is escalated, and one out of usage waits. Only pending rows are read,
+ * doesn't move wakes the seat holding it by why that seat isn't taking it: a stopped seat is launched and one that needs
+ * input is escalated; an idle one is left to the queue's own wakes, and one out of usage waits. Only pending rows are read,
  * so a blocked or claimed row is never moved or counted. A seat of the pool whose session is gone is reaped rather
  * than launched, even under drain or a usage limit.
  *
@@ -293,9 +289,7 @@ export function planSeatPool(spec: SeatPoolSpec, state: SeatPoolState, nowMs: nu
     }
     for (const [seat, holder] of holders) {
       if (holder.cause === "stopped" && !usageLimited) intents.push({ kind: "relaunch", seat, nodeId: holder.nodeId });
-      else if (holder.cause === "idle") {
-        for (const row of holder.rows.filter((r) => !r.nudged)) intents.push({ kind: "nudge", seat, qitemId: row.qitemId });
-      } else if (holder.cause === "needs_input") intents.push({ kind: "escalate", seat, qitemIds: holder.rows.map((r) => r.qitemId) });
+      else if (holder.cause === "needs_input") intents.push({ kind: "escalate", seat, qitemIds: holder.rows.map((r) => r.qitemId) });
     }
   }
 

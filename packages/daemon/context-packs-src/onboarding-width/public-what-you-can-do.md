@@ -741,8 +741,8 @@ not have to tear one down to change it, and you rarely have to start from nothin
   up first.
 - **`rig watchdog register --policy seat-pool`** — keep extra seats cloned from one model seat
   (`<member>-s<n>`) and add or drain them with demand, within the spec's `min` and `max`. A pending row
-  left waiting at the model moves to a free seat, and a seat that isn't taking its rows is launched,
-  nudged or escalated by the reason. A pool seat whose session is gone is reaped: its rows go back to
+  left waiting at the model moves to a free seat, and a seat that isn't taking its rows is launched
+  when it stopped and escalated when it needs input. A pool seat whose session is gone is reaped: its rows go back to
   the model and it is removed. `drain: true` empties the pool without killing
   work; `stop` is refused while it holds seats. Every pool of a daemon launches within one host
   budget (`policies.seat_pool.*` in `rig config`: launches in flight and per watchdog tick, free memory,
