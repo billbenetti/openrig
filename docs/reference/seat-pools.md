@@ -13,8 +13,8 @@ The target is the model seat. Each new seat is a member of the model's pod named
 `dev.impl-s2`, ...), with the model's runtime, agent, profile, model, effort, permissions, environment and launch
 wrapper, its own working directory, and a fresh session. `n` only grows: a removed seat's name is never given to a new
 seat. The model seat itself is never added, stopped or removed; the pool only launches it when it stopped with work
-waiting (see [Waiting rows](#waiting-rows-dispatch-and-wake)). A seat of the pool that stops working is reaped instead
-(see [Reaping a seat](#reaping-a-seat)).
+waiting (see [Waiting rows](#waiting-rows-dispatch-and-wake)). A seat the pool added whose session is gone is reaped
+instead (see [Reaping a seat](#reaping-a-seat)).
 
 ## The spec
 
@@ -81,7 +81,7 @@ isn't taking it:
 
 | The seat | The pool |
 | --- | --- |
-| has no live session | launches the model, as `rig launch` does; reaps a seat of the pool (see [Reaping a seat](#reaping-a-seat)) |
+| has no live session | launches the model or an adopted seat, as `rig launch` does; reaps a seat the pool added (see [Reaping a seat](#reaping-a-seat)) |
 | is idle at its prompt | nothing: the queue's own wakes cover it (the nudge when the row was created or moved, the wake ladder and the stuck sweep) |
 | needs input (a permission prompt or a question) | opens one row to the model's escalation owner, tagged `seat-pool-needs-input:<seat>`; no other is opened about that seat while it is open |
 | is out of provider usage | nothing: the row waits |
@@ -135,32 +135,40 @@ many new seats use. Where the platform has no load average (Windows), load is no
 nothing starts and the run records `seat_pool_held` with `reason: launch_budget`, which limit refused (`why`:
 `launches_per_tick`, `launches_in_flight`, `low_memory` or `high_load`) and the figures; an add records it once and
 adds nothing more in that run. A seat added but not launched stays as it is, and the next plan tries again. Draining,
-reaping, moving rows and nudging take no room.
+reaping and moving rows take no room; the launch a reap makes when the release command refuses does.
 
 ## Reaping a seat
 
-A seat of the pool whose session is gone (it exited, crashed or was stopped) is reaped: its rows go back to the model
-and its node is removed, so the pool can add a fresh seat in its place. This goes on even while its account is out of
-usage. Everything happens under the seat's lifecycle lease, after the pool reads the seat again; a seat that came back
-since the plan is left alone. The reap runs in this order, and a failed step stops it there for the next plan to pick
-up:
+A seat the pool added whose session is gone (it exited, crashed or was stopped) is reaped: its rows go back to the
+model and its node is removed, so the pool can add a fresh seat in its place. This goes on even while its account is
+out of usage. Everything happens under the seat's lifecycle lease, after the pool reads the seat again; a seat that came
+back since the plan is left alone. The reap runs in this order, and a failed step stops it there for the next plan to
+pick up:
 
-1. `rig seat clean`, which checks in tmux that the session is really gone; a live session stops the reap before anything
+1. `release_cmd`, if set, as for a drained seat: the session is gone, but its work may not be saved. When it exits
+   non-zero, nothing is reaped: the lease is let go and the seat is launched again, as `rig launch` does
+   (`seat_pool_relaunched` with `why: release_refused`), so its session resumes where it can and finishes its work.
+   Only when that launch fails is the seat reaped, from the next step, without asking `release_cmd` again.
+2. `rig seat clean`, which checks in tmux that the session is really gone; a live session stops the reap before anything
    is moved.
-2. `reap_cmd`, if set, so whatever tracks the seat's work (an executor lease, a task claim) can release it. A non-zero
+3. `reap_cmd`, if set, so whatever tracks the seat's work (an executor lease, a task claim) can release it. A non-zero
    exit stops the reap.
-3. Each in-progress row addressed to the seat is unclaimed, and every open row is moved with `rig queue fallback`,
+4. Each in-progress row addressed to the seat is unclaimed, and every open row is moved with `rig queue fallback`,
    `--expect-destination <the seat>` and the row's state expected, to the model, with a wake when the row is pending.
    A blocked row keeps its blocker; a one-shot `--wake-after` timer ends with the move, as with any reroute.
-4. The node is removed with the `expected` read at the start of the reap, as a drain removes it.
+5. The node is removed with the `expected` read at the start of the reap, as a drain removes it.
 
 Each move gives the reason `reap:<seat>`. A row that a reap already moved once (the pool counts the row's reroutes with
 that reason) goes to the model's escalation owner instead of the model, so a row whose seats keep dying stops cycling
 through the pool. With no escalation owner it goes to the model, and `seat_pool_escalation_failed` is recorded.
 
+An adopted seat is never reaped: it existed before the pool, so its node and its conversation stay. While its session is
+gone it is not counted among the pool's seats and takes no row, and it is launched again when a row waiting at it
+needs it.
+
 The history records `seat_pool_reaped` with the rows moved and where each went, and `seat_pool_reap_failed` with the
-step that failed. Reaping goes on under `drain` and while a seat is out of usage: it
-adds and launches nothing.
+step that failed. Reaping goes on under `drain` and while a seat is out of usage; the launch after a refused release
+waits out a usage limit like any other launch.
 
 ## Stopping a pool: drain
 
@@ -181,7 +189,8 @@ launched is prepared and launched (or removed if it is no longer wanted), and a 
 completed but wasn't recorded is recognized by its running session. The pool acts only on seats it created or adopted
 (`adopt`); it never takes a node over because of its name. While the rig is being restored, the pool does nothing.
 
-A seat of the pool whose session died is reaped, never relaunched.
+A seat the pool added whose session died is reaped, unless its release command refuses (see
+[Reaping a seat](#reaping-a-seat)); an adopted one is only launched again.
 
 ## Seeing a pool
 
