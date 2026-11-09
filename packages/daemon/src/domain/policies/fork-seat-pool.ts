@@ -24,6 +24,8 @@ export interface SeatPoolSpec {
   idleGraceSeconds: number;
   /** How long a pending row waits for the seat it is addressed to before the pool moves it or wakes that seat. */
   dispatchAfterSeconds: number;
+  /** Only a row to the model carrying this tag is moved to a seat of the pool; null: every row to the model. */
+  dispatchTag: string | null;
   /** True empties the pool as its seats become free, and adds none: the kill switch. */
   drain: boolean;
   /** Existing seats (logical ids) this pool takes over, so they are counted and drained like its own. */
@@ -41,7 +43,7 @@ export interface SeatPoolSpec {
 }
 
 const SPEC_KEYS = new Set([
-  "min", "max", "cooldown_s", "idle_grace_s", "dispatch_after_s", "drain", "adopt", "cwd_template",
+  "min", "max", "cooldown_s", "idle_grace_s", "dispatch_after_s", "dispatch_tag", "drain", "adopt", "cwd_template",
   "demand_cmd", "release_cmd", "prepare_cmd", "reap_cmd",
 ]);
 const DEFAULT_COOLDOWN_SECONDS = 60;
@@ -89,6 +91,10 @@ export function parseSeatPoolSpec(context: Record<string, unknown>): { spec: Sea
   const dispatchAfterSeconds = wholeNumber(context["dispatch_after_s"], "dispatch_after_s", DEFAULT_DISPATCH_AFTER_SECONDS);
   for (const value of [min, max, cooldownSeconds, idleGraceSeconds, dispatchAfterSeconds]) if (isProblem(value)) return { problem: value };
   if ((max as number) < (min as number)) return { problem: { field: "max", message: "seat-pool: max must be at least min" } };
+  const dispatchTag = context["dispatch_tag"] ?? null;
+  if (dispatchTag !== null && (typeof dispatchTag !== "string" || !dispatchTag.trim())) {
+    return { problem: { field: "dispatch_tag", message: "seat-pool: dispatch_tag must be a tag" } };
+  }
   const drain = context["drain"] ?? false;
   if (typeof drain !== "boolean") return { problem: { field: "drain", message: "seat-pool: drain must be true or false" } };
   const adopt = context["adopt"] ?? [];
@@ -110,7 +116,7 @@ export function parseSeatPoolSpec(context: Record<string, unknown>): { spec: Sea
   return {
     spec: {
       min: min as number, max: max as number, cooldownSeconds: cooldownSeconds as number, idleGraceSeconds: idleGraceSeconds as number,
-      dispatchAfterSeconds: dispatchAfterSeconds as number, drain, adopt: [...new Set(adopt as string[])], cwdTemplate,
+      dispatchAfterSeconds: dispatchAfterSeconds as number, dispatchTag: dispatchTag as string | null, drain, adopt: [...new Set(adopt as string[])], cwdTemplate,
       demandCmd: commands["demand_cmd"]!, releaseCmd: commands["release_cmd"]!, prepareCmd: commands["prepare_cmd"]!,
       reapCmd: commands["reap_cmd"]!,
     },
@@ -172,6 +178,7 @@ export interface SeatPoolPendingRow {
   destination: string;
   /** When it reached `destination`: its latest reroute, or its creation. */
   waitingSince: string;
+  tags: string[];
 }
 
 export interface SeatPoolState {
@@ -235,8 +242,9 @@ export function seatPoolOutOfUsage(state: Pick<SeatPoolState, "modelCause" | "sl
  * Pure: the same state and clock always give the same plan.
  *
  * A pending row waits once it has been at its seat for `dispatch_after_s` (since its creation or its latest reroute).
- * A waiting row addressed to the model or to a seat the pool removed goes to a free seat (live, idle at a prompt, no
- * open row, no held message), the longest waiting first; one that finds no free seat is demand. A waiting row the pool
+ * A waiting row addressed to the model (with `dispatch_tag`, only one carrying that tag) or to a seat the pool removed
+ * goes to a free seat (live, idle at a prompt, no open row, no held message), the longest waiting first; one that finds
+ * no free seat is demand. A waiting row the pool
  * doesn't move wakes the seat holding it by why that seat isn't taking it: a stopped seat is launched and one that needs
  * input is escalated; an idle one is left to the queue's own wakes, and one out of usage waits. Only pending rows are read,
  * so a blocked or claimed row is never moved or counted. A seat the pool added whose session is gone is reaped rather
@@ -274,7 +282,9 @@ export function planSeatPool(spec: SeatPoolSpec, state: SeatPoolState, nowMs: nu
 
   const waiting = state.pending.filter((row) => nowMs - Date.parse(row.waitingSince) >= spec.dispatchAfterSeconds * 1000);
   const seatOf = new Map(present.map((slot) => [slot.sessionName, slot]));
-  const movable = waiting.filter((row) => !seatOf.has(row.destination));
+  // A row to the model is the model's own unless the spec's dispatch tag marks it as the pool's to hand out.
+  const movable = waiting.filter((row) => !seatOf.has(row.destination)
+    && (row.destination !== model.sessionName || spec.dispatchTag === null || row.tags.includes(spec.dispatchTag)));
   const receivers = spec.drain ? [] : live.filter((slot) => idle(slot) && slot.cause === "idle");
   const dispatched = movable.slice(0, receivers.length);
   dispatched.forEach((row, i) => intents.push({ kind: "dispatch", qitemId: row.qitemId, from: row.destination, slotId: receivers[i]!.slotId }));
