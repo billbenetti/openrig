@@ -127,6 +127,9 @@ Keys:
                          message_inline, message_file_path
   policies.idle_gate_qitem.scan_interval_seconds
   policies.idle_gate_qitem.active_wake_interval_seconds
+  policies.seat_pool.*   max_launches_in_flight, max_launches_per_tick, min_free_memory_mb,
+                         max_load_per_cpu_percent (the host's room for seat-pool launches;
+                         defaults 1, 1, 1024, 100)
   snapshots.periodic.*   enabled, interval_seconds, retention_keep
   queue.*                pickup_stall_threshold_minutes (S04 pickup-receipt stall threshold),
                          stuck_sweep_interval_seconds, stuck_sweep_unclaimed_age_minutes (S02 standing stuck sweep),

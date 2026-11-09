@@ -184,6 +184,11 @@ describe("ConfigStore — extended namespaces (User Settings v0)", () => {
       // B6 founder ruling — auto-registration is not default-on.
       "policies.idle_gate_qitem.auto_register",
       "policies.idle_gate_qitem.opt_in_sessions",
+      // Seat pools' launch budget.
+      "policies.seat_pool.max_launches_in_flight",
+      "policies.seat_pool.max_launches_per_tick",
+      "policies.seat_pool.min_free_memory_mb",
+      "policies.seat_pool.max_load_per_cpu_percent",
       "snapshots.periodic.enabled",
       "snapshots.periodic.interval_seconds",
       "snapshots.periodic.retention_keep",
@@ -522,6 +527,28 @@ describe("ConfigStore — extended namespaces (User Settings v0)", () => {
       .toMatchObject({ value: 30, source: "env" });
     expect(store.resolveWithSource("policies.idle_gate_qitem.active_wake_interval_seconds"))
       .toMatchObject({ value: 450, source: "env" });
+  });
+
+  it("seat-pool launch budget defaults to 1 in flight, 1 per tick, 1024 MB free and 100% load per CPU; 0 per tick and a 0 memory floor are allowed", () => {
+    const store = new ConfigStore(configPath);
+    expect(store.resolveWithSource("policies.seat_pool.max_launches_in_flight")).toMatchObject({ value: 1, source: "default" });
+    expect(store.resolveWithSource("policies.seat_pool.max_launches_per_tick")).toMatchObject({ value: 1, source: "default" });
+    expect(store.resolveWithSource("policies.seat_pool.min_free_memory_mb")).toMatchObject({ value: 1024, source: "default" });
+    expect(store.resolveWithSource("policies.seat_pool.max_load_per_cpu_percent")).toMatchObject({ value: 100, source: "default" });
+    store.set("policies.seat_pool.min_free_memory_mb", "0");
+    expect(store.resolveWithSource("policies.seat_pool.min_free_memory_mb")).toMatchObject({ value: 0, source: "file" });
+    store.set("policies.seat_pool.max_launches_per_tick", "0");
+    expect(store.resolveWithSource("policies.seat_pool.max_launches_per_tick")).toMatchObject({ value: 0, source: "file" });
+    for (const key of ["policies.seat_pool.min_free_memory_mb", "policies.seat_pool.max_launches_per_tick"] as const) {
+      for (const raw of ["-1", "1.5", "512MB"]) {
+        expect(() => store.set(key, raw), `${key} must reject ${raw}`).toThrow(/integer >= 0/);
+      }
+    }
+    for (const key of ["policies.seat_pool.max_launches_in_flight", "policies.seat_pool.max_load_per_cpu_percent"] as const) {
+      for (const raw of ["0", "-1", "1.5"]) {
+        expect(() => store.set(key, raw), `${key} must reject ${raw}`).toThrow(/positive integer/i);
+      }
+    }
   });
 
   it("W2c idle-gate-qitem cadence rejects zero, negative, fractional, and partial numbers", () => {
