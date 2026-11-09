@@ -139,7 +139,7 @@ export async function convergeOp(
   rigId: string,
   op: TopologyOp,
   rigRoot: string,
-  opts?: { cwdOverride?: string; launchAdditionsFrom?: SeatSkillPaths; recordCreated?: RecordCreated },
+  opts?: { cwdOverride?: string; launchAdditionsFrom?: SeatSkillPaths; recordCreated?: RecordCreated; launch?: boolean },
 ): Promise<ConvergeResult> {
   switch (op.kind) {
     case "add_member": {
@@ -148,6 +148,7 @@ export async function convergeOp(
         ...(opts?.launchAdditionsFrom ? { launchAdditionsFrom: opts.launchAdditionsFrom } : {}),
         edges: op.edges,
         recordCreated: opts?.recordCreated,
+        launch: opts?.launch,
       });
       return { kind: "add_member", supported: true, outcome };
     }

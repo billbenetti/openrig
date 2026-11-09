@@ -7,6 +7,7 @@ import type { TmuxAdapter } from "../adapters/tmux.js";
 import type { QueueRepository } from "./queue-repository.js";
 import { findOtherSessionOwner } from "./session-owner.js";
 import { DeliveryGuardError } from "./seat-delivery-guard.js";
+import type { StopPrecondition } from "./seat-lifecycle-service.js";
 
 type ClaimedSessionRow = {
   session_id: string;
@@ -84,6 +85,9 @@ export type RemoveNodeResult =
       retained?: true;
       sessionStopped?: boolean;
     };
+
+/** A checked removal whose node or latest session is no longer the one the caller read; nothing was changed. */
+export type RemoveNodeSelectionChanged = { ok: false; code: "selection_changed"; error: string };
 
 type ShrinkNodeOutcome = {
   nodeId: string;
@@ -466,12 +470,36 @@ export class RigLifecycleService {
       opts?.delete ? undefined : (nodeId, error) => { changed.set(nodeId, error.message); }) : release();
   }
 
+  /**
+   * `expected` is the seat-stop.v1 tuple: when given, the removal is refused before any effect unless the node and
+   * its latest session are still the ones the caller read. The check runs under the node's lifecycle lease, so a
+   * launch or stop of the node can't come between it and the removal.
+   */
   async removeNode(
     rigId: string,
     nodeRef: string,
-    opts?: { fallbackDestination?: string },
-  ): Promise<RemoveNodeResult> {
-    return this.removeNodeWithin(rigId, nodeRef, opts?.fallbackDestination, null);
+    opts?: { fallbackDestination?: string; expected?: StopPrecondition },
+  ): Promise<RemoveNodeResult | RemoveNodeSelectionChanged> {
+    const expected = opts?.expected;
+    if (!expected) return this.removeNodeWithin(rigId, nodeRef, opts?.fallbackDestination, null);
+    const changed = (error: string): RemoveNodeSelectionChanged => ({ ok: false, code: "selection_changed", error });
+    const checked = async () => {
+      const node = this.resolveNodeRef(rigId, nodeRef);
+      if (node && (node.node_id !== expected.nodeId || node.latest_session_id !== expected.sessionId)) {
+        return changed("The selected node or its latest session changed; read the stop precondition again.");
+      }
+      return this.removeNodeWithin(rigId, nodeRef, opts.fallbackDestination, null);
+    };
+    const guard = this.tmuxAdapter?.deliveryGuard;
+    try {
+      return guard ? await guard.lifecycle([expected.nodeId], checked) : await checked();
+    } catch (error) {
+      // The lease refuses a seat whose target changed while it waited; a checked stop reports that the same way.
+      if (error instanceof DeliveryGuardError && (error.code === "guard_target_changed" || error.code === "guard_target_unknown")) {
+        return changed(error.message);
+      }
+      throw error;
+    }
   }
 
   /**
