@@ -1,4 +1,5 @@
 import { afterEach, expect, it, vi } from "vitest";
+import { totalmem } from "node:os";
 import { serve } from "@hono/node-server";
 import { Hono } from "hono";
 import { Command } from "commander";
@@ -43,10 +44,13 @@ it("serves running-seat/load measurements without changing the ordinary bare-arr
   const normal = await client.get<unknown>("/api/ps");
   expect(Array.isArray(normal.data)).toBe(true);
   expect(normal.data).toHaveLength(1);
-  const response = await client.get<{ cpuCount: number; runningSeats: number; capture: { rotatingSeats: number; maxIdleIntervalMs: number | null } }>("/api/ps/resources");
+  const response = await client.get<{ cpuCount: number; runningSeats: number; memory: { totalBytes: number; freeBytes: number }; capture: { rotatingSeats: number; maxIdleIntervalMs: number | null } }>("/api/ps/resources");
   expect(response.status).toBe(200);
   expect(response.data.runningSeats).toBe(2);
   expect(response.data.cpuCount).toBeGreaterThan(0);
+  expect(response.data.memory.totalBytes).toBe(totalmem());
+  expect(response.data.memory.freeBytes).toBeGreaterThan(0);
+  expect(response.data.memory.freeBytes).toBeLessThanOrEqual(response.data.memory.totalBytes);
   expect(response.data.capture.rotatingSeats).toBe(0);
   expect(response.data.capture.maxIdleIntervalMs).toBeNull();
 });
@@ -60,17 +64,18 @@ it("renders both native HTTP JSON and explicit human resource semantics", async 
   await command.parseAsync(["node", "rig", "ps", "--resources"]);
   expect(log.mock.calls.flat().join("\n")).toContain(process.platform === "win32" ? "unavailable on this platform" : "not CPU utilization");
   expect(log.mock.calls.flat().join("\n")).toContain("not daemon CPU time");
+  expect(log.mock.calls.flat().join("\n")).toMatch(/Memory: \d+\.\d GiB free of \d+\.\d GiB/);
   expect(log.mock.calls.flat().join("\n")).toContain("unavailable ms idle ceiling");
   expect(log.mock.calls.flat().join("\n")).not.toContain("0 ms idle ceiling");
 });
 
-async function remoteFixture(status: 200 | 401 | 403 | 404 | 429 | 500) {
+async function remoteFixture(status: 200 | 401 | 403 | 404 | 429 | 500, memory?: { totalBytes: number; freeBytes: number }) {
   vi.stubEnv("OPENRIG_RESOURCE_TEST_BEARER", "public-fixture-token");
   let authorization: string | undefined;
   const app = new Hono();
   app.get("/api/ps/resources", (c) => {
     authorization = c.req.header("authorization");
-    if (status === 200) return c.json({ cpuCount: 4, runningSeats: 2, loadAverage: null, loadPerCpu: null,
+    if (status === 200) return c.json({ cpuCount: 4, runningSeats: 2, loadAverage: null, loadPerCpu: null, memory,
       capture: { rotatingSeats: 2, idleSeats: 1, captures: 4, failures: 0, capturedBytes: 100,
         captureDurationMs: 10, activeIntervalMs: 2000, maxIdleIntervalMs: 6000, lines: 1000 } });
     return c.json({ error: "fixture failure" }, status);
@@ -88,11 +93,23 @@ async function remoteFixture(status: 200 | 401 | 403 | 404 | 429 | 500) {
 }
 
 it("names the registered remote host in successful human resource output", async () => {
-  const { command } = await remoteFixture(200);
+  const { command } = await remoteFixture(200, { totalBytes: 16 * 2 ** 30, freeBytes: 3.5 * 2 ** 30 });
   const log = vi.spyOn(console, "log").mockImplementation(() => {});
   await command.parseAsync(["node", "rig", "ps", "--host", "fixture-host", "--resources"]);
   expect(log.mock.calls[0]![0]).toBe("Host: fixture-host · 4 available CPUs · 2 running seats");
+  expect(log.mock.calls.flat()).toContain("Memory: 3.5 GiB free of 16.0 GiB");
   expect(log.mock.calls.flat().join("\n")).toContain("6000 ms idle ceiling");
+});
+
+it("says an older remote daemon does not report memory rather than showing zero", async () => {
+  const { command } = await remoteFixture(200);
+  const log = vi.spyOn(console, "log").mockImplementation(() => {});
+  await command.parseAsync(["node", "rig", "ps", "--host", "fixture-host", "--resources"]);
+  expect(log.mock.calls.flat()).toContain("Memory: not reported by this daemon");
+  expect(log.mock.calls.flat().join("\n")).not.toContain("0.0 GiB");
+  log.mockClear();
+  await command.parseAsync(["node", "rig", "ps", "--host", "fixture-host", "--resources", "--json"]);
+  expect(JSON.parse(String(log.mock.calls[0]![0]))).not.toHaveProperty("memory");
 });
 
 it.each([401, 403, 429, 500] as const)("preserves remote resource HTTP %s JSON classification and exit status through actual bearer transport", async (status) => {

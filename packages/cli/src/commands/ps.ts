@@ -954,7 +954,7 @@ Exit codes:
   cmd
     .option("--json", "JSON output for agents")
     .option("--no-cleanup", "Preserve stale daemon state files during observation")
-    .option("--resources", "Show this host’s load and transcript capture cost (also supports --host)")
+    .option("--resources", "Show this host’s load, memory and transcript capture cost (also supports --host)")
     .option("--nodes", "Show per-node detail (current rig; -A for all rigs)")
     .option("--full", "Show all rig rows without cell truncation, or all node-list fields with --nodes (recoveryGuidance/currentUsage live on node detail)")
     .option("--verbose", "Alias for --full")
@@ -1898,6 +1898,8 @@ async function runFanOutPs(
 interface HostResources {
   sampledAt: string; cpuCount: number; runningSeats: number;
   loadAverage: number[] | null; loadPerCpu: number[] | null;
+  /** Absent from daemons that predate memory reporting. */
+  memory?: { totalBytes: number; freeBytes: number };
   capture: {
     rotatingSeats: number; idleSeats: number; captures: number; failures: number;
     capturedBytes: number; captureDurationMs: number;
@@ -1923,6 +1925,10 @@ async function handleResources(client: DaemonClient, json?: boolean, headers?: R
   console.log(data.loadAverage && data.loadPerCpu
     ? `Load (1/5/15m): ${data.loadAverage.map((n) => n.toFixed(2)).join(" / ")} · per CPU: ${data.loadPerCpu.map((n) => n.toFixed(2)).join(" / ")} (not CPU utilization)`
     : "Load average: unavailable on this platform");
+  const gib = (bytes: number) => `${(bytes / 2 ** 30).toFixed(1)} GiB`;
+  console.log(data.memory
+    ? `Memory: ${gib(data.memory.freeBytes)} free of ${gib(data.memory.totalBytes)}`
+    : "Memory: not reported by this daemon");
   const capture = data.capture;
   console.log(`Transcript capture: ${capture.rotatingSeats} rotating · ${capture.idleSeats} backed off · ${capture.captures} attempts · ${capture.failures} failures`);
   console.log(`Capture cost for currently rotating seats: ${capture.capturedBytes} bytes · ${capture.captureDurationMs.toFixed(1)} ms elapsed across captures (not daemon CPU time)`);
