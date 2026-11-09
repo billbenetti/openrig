@@ -2,7 +2,7 @@ import { Hono } from "hono";
 import type { PsProjectionService } from "../domain/ps-projection.js";
 import { projectionLane } from "../domain/projection-lane.js";
 
-import { availableParallelism, loadavg, platform } from "node:os";
+import { availableParallelism, freemem, loadavg, platform, totalmem } from "node:os";
 import { getTranscriptCaptureStats } from "../domain/transcript-rotation.js";
 
 export const psRoutes = new Hono();
@@ -16,6 +16,9 @@ psRoutes.get("/resources", (c) => {
     return c.json({
       sampledAt: new Date().toISOString(), cpuCount,
       loadAverage: load, loadPerCpu: load ? load.map((value) => value / cpuCount) : null,
+      // On Linux, libuv reports MemAvailable (reclaimable cache counts as free)
+      // and falls back to MemFree only on kernels without it.
+      memory: { totalBytes: totalmem(), freeBytes: freemem() },
       // Forced archival can hide a rig without stopping its seats. Host load
       // measurements must count those running processes as well.
       runningSeats: psService.getEntries({ includeArchived: true, archivedOnly: false }).reduce((n, entry) => n + entry.runningCount, 0),
