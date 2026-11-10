@@ -1308,6 +1308,212 @@ describe("seat-pool executor", () => {
     });
   });
 
+  // T-004870 F3, volta 3 (REVISAO-f3 "Volta 2"): the forced pass at a drain's deadline.
+  describe("F3 v3: the forced pass reads the seat again after its release, and a seat stopped stays out of admission", () => {
+    let clock: number;
+    let repo: QueueRepository;
+    const SEAT = "dev-impl-s1@r";
+    const DEADLINE_MS = 900_000;
+    const executorWith = (effects: SeatPoolEffects): SeatPoolExecutor => {
+      const executor: SeatPoolExecutor = new SeatPoolExecutor({
+        slots,
+        readJob: () => ({ active, targetSession: MODEL.sessionName, spec: jobSpec }),
+        readState: () => world.state(slots, executor, jobSpec),
+        effects,
+        record: (_jobId, entry) => { history.push(entry); },
+        now: () => new Date(clock),
+      });
+      return executor;
+    };
+    const withQueue = (): SeatPoolEffects => ({ ...world.effects(), ...seatPoolQueueEffects({ queueRepo: repo, escalationOwner: () => ({ owner: "lead@r", reason: "routed" }) }) });
+    const liveSeat = (session: FakeNode["session"] = "running", phase: "live" | "draining" = "live", intent: string | null = null) => {
+      world.nodes.set("node-1", { logicalId: "dev.impl-s1", session, sessionId: "sess-1", openRows: 1, idle: false });
+      return slots.insert({ poolJobId: JOB, logicalId: "dev.impl-s1", nodeId: "node-1", phase, intent, opId: "op-1", at: new Date(T0).toISOString() });
+    };
+    /** The drain starts at T0 (one run), and the next run is past its deadline (the forced pass). */
+    const toDeadline = async (executor: SeatPoolExecutor) => {
+      await run(executor, []);
+      expect(history.at(-1)).toMatchObject({ reason: "seat_pool_drain_started" });
+      clock = T0 + DEADLINE_MS + 1_000;
+      await run(executor, []);
+    };
+    const expired = () => history.filter((h) => h.reason === "seat_pool_drain_expired");
+    beforeEach(() => {
+      clock = T0;
+      migrate(db, [inboxEntriesSchema, outboxEntriesSchema, i3IdentityProvenanceSchema]);
+      repo = new QueueRepository(db, new EventBus(db));
+      repo.attachOutbox(new OutboxHandler(db));
+      jobSpec = spec({ drain: true, release_cmd: { argv: ["release"] } });
+    });
+
+    // B1: the lifecycle lease holds deliveries back, not the claim. A turn already under way when the lease began claims
+    // a pending row of the seat while the release command (drain-deadline) runs: the seat is working again.
+    it("B1: a row the seat claims while the release command runs keeps the seat running: no stop, no unclaim, the row stays", async () => {
+      const row = await repo.create({ sourceSession: "lead@r", destinationSession: SEAT, body: "work", nudge: false });
+      const slot = liveSeat();
+      world.commandGate = async () => {
+        if (world.calls.at(-1) === "run release") repo.claim({ qitemId: row.qitemId, destinationSession: SEAT });
+      };
+      await toDeadline(executorWith(withQueue()));
+      expect(world.env.at(-1)).toMatchObject({ OPENRIG_SEAT_POOL_RELEASE_REASON: "drain-deadline", OPENRIG_SEAT_POOL_SLOT: SEAT });
+      expect(world.calls.filter((c) => c.startsWith("stop") || c.startsWith("remove") || c.startsWith("unclaim"))).toEqual([]);
+      expect(repo.getById(row.qitemId)).toMatchObject({ destinationSession: SEAT, state: "in-progress" });
+      expect(world.nodes.get("node-1")?.session).toBe("running");
+      expect(slots.get(slot.slotId)).toMatchObject({ phase: "live", intent: null, retiredAt: null });
+      expect(expired()).toEqual([expect.objectContaining({
+        failed: true, notes: expect.objectContaining({ left: [{ slot: "dev.impl-s1", why: "work_arrived", exitCode: 0 }], moved: [] }),
+      })]);
+    });
+
+    it("B1: a row claimed before the release, that the release command lets go, is still unclaimed and moved (the claim is not new)", async () => {
+      const row = await repo.create({ sourceSession: "lead@r", destinationSession: SEAT, body: "work", nudge: false });
+      repo.claim({ qitemId: row.qitemId, destinationSession: SEAT });
+      const slot = liveSeat();
+      await toDeadline(executorWith(withQueue()));
+      expect(world.calls.filter((c) => c.startsWith("stop"))).toHaveLength(1);
+      expect(repo.getById(row.qitemId)).toMatchObject({ destinationSession: MODEL.sessionName, state: "pending" });
+      expect(slots.get(slot.slotId)?.retiredAt).not.toBeNull();
+      expect(expired()).toEqual([expect.objectContaining({ failed: false, notes: expect.objectContaining({ left: [], moved: [{ qitemId: row.qitemId, to: MODEL.sessionName }] }) })]);
+    });
+
+    it("B1: a row that only arrives (pending, unclaimed) while the release command runs goes to the model with the others", async () => {
+      const first = await repo.create({ sourceSession: "lead@r", destinationSession: SEAT, body: "work", nudge: false });
+      const slot = liveSeat();
+      let arrived: string | null = null;
+      world.commandGate = async () => {
+        if (world.calls.at(-1) === "run release") arrived = (await repo.create({ sourceSession: "lead@r", destinationSession: SEAT, body: "more", nudge: false })).qitemId;
+      };
+      await toDeadline(executorWith(withQueue()));
+      expect(world.calls.filter((c) => c.startsWith("stop"))).toHaveLength(1);
+      expect(repo.getById(first.qitemId)).toMatchObject({ destinationSession: MODEL.sessionName, state: "pending" });
+      expect(repo.getById(arrived!)).toMatchObject({ destinationSession: MODEL.sessionName, state: "pending" });
+      expect(slots.get(slot.slotId)?.retiredAt).not.toBeNull();
+    });
+
+    // S1: a seat the pass already stopped (intent stop, its session gone) whose stop fails again is not put back in
+    // admission (phase live), where the reap would launch it: it stays draining with its intent, listed.
+    it("S1: a resumed seat (stopped, intent stop) whose stop fails stays draining with its intent, never live", async () => {
+      const slot = liveSeat("stopped", "draining", "stop");
+      world.stopResult = { ok: false, code: "stop_uncertain", error: "Checked stop did not complete" };
+      await toDeadline(executorWith(world.effects()));
+      expect(world.calls.filter((c) => c.startsWith("run release"))).toEqual([]);
+      expect(slots.get(slot.slotId)).toMatchObject({ phase: "draining", intent: "stop", retiredAt: null });
+      expect(expired()).toEqual([expect.objectContaining({ notes: expect.objectContaining({ left: [{ slot: "dev.impl-s1", why: "stop_failed", exitCode: null, stopped: true }] }) })]);
+    });
+
+    it("S1: a stop that fails after the kill (the session gone) leaves the seat draining with its intent, never live", async () => {
+      const slot = liveSeat();
+      await toDeadline(executorWith({
+        ...world.effects(),
+        stopSlot: async (input) => {
+          world.calls.push(`stop ${input.sessionName}`);
+          world.nodes.get(input.expected.nodeId)!.session = "stopped";
+          return { ok: false, code: "stop_uncertain", error: "Session kill completed, but stop finalization failed" };
+        },
+      }));
+      expect(slots.get(slot.slotId)).toMatchObject({ phase: "draining", intent: "stop", retiredAt: null });
+      expect(expired()).toEqual([expect.objectContaining({ notes: expect.objectContaining({ left: [{ slot: "dev.impl-s1", why: "stop_failed", exitCode: 0, stopped: true }] }) })]);
+    });
+
+    it("S1: a stop that tried the kill and failed to record it (stopPhase kill_attempted, the record still running) leaves the seat draining", async () => {
+      const slot = liveSeat();
+      const executor = executorWith({
+        ...world.effects(),
+        // As the daemon's stopSeat answers when the kill ran but the stop could not be persisted: the session's record
+        // (what sessionRunning reads) still says running.
+        stopSlot: async (input) => {
+          world.calls.push(`stop ${input.sessionName}`);
+          return { ok: false, code: "stop_uncertain", error: "Session kill completed, but stop state could not be persisted", killAttempted: true };
+        },
+      });
+      await toDeadline(executor);
+      expect(world.nodes.get("node-1")?.session).toBe("running");
+      expect(slots.get(slot.slotId)).toMatchObject({ phase: "draining", intent: "stop", retiredAt: null });
+      expect(expired()).toEqual([expect.objectContaining({ notes: expect.objectContaining({ left: [{ slot: "dev.impl-s1", why: "stop_failed", exitCode: 0, stopped: true }] }) })]);
+      // The next plain drain, its record still reading running: the seat stays held, never back in admission.
+      world.calls = [];
+      await run(executor, [drainOf(slot.slotId)]);
+      expect(world.calls).toEqual([]);
+      expect(slots.get(slot.slotId)).toMatchObject({ phase: "draining", intent: "stop", retiredAt: null });
+    });
+
+    it("S1: a stop refused with the session still running leaves the seat untouched, back in admission (as before)", async () => {
+      const slot = liveSeat();
+      world.stopResult = { ok: false, code: "selection_changed", error: "the seat was relaunched" };
+      await toDeadline(executorWith(world.effects()));
+      expect(world.nodes.get("node-1")?.session).toBe("running");
+      expect(slots.get(slot.slotId)).toMatchObject({ phase: "live", intent: null, retiredAt: null });
+      expect(expired()).toEqual([expect.objectContaining({ notes: expect.objectContaining({ left: [{ slot: "dev.impl-s1", why: "stop_failed", exitCode: 0 }] }) })]);
+    });
+
+    // S2: the guard that keeps a seat stopped on its way out for the forced pass holds only while that pass is still to
+    // run: once the drain expired, the pass never runs again, and the guard would hold the seat draining for ever.
+    it("S2: after the drain expired, a seat stopped on its way out is no longer held for the forced pass", async () => {
+      jobSpec = spec({ drain: true });
+      const holder = liveSeat("running");
+      world.exit["release"] = 0;
+      const executor = executorWith(world.effects());
+      // A seat the drain keeps (it holds a row) starts the clock; at the deadline, the pass takes it out (no release_cmd).
+      await toDeadline(executor);
+      expect(expired()).toHaveLength(1);
+      expect(slots.get(holder.slotId)?.retiredAt).not.toBeNull();
+      // Since: a seat the plain drain stopped and a restart cut short before its removal (intent stop, session gone).
+      world.nodes.set("node-2", { logicalId: "dev.impl-s2", session: "stopped", sessionId: "sess-2", openRows: 0, idle: false });
+      const cut = slots.insert({ poolJobId: JOB, logicalId: "dev.impl-s2", nodeId: "node-2", phase: "draining", intent: "stop", opId: "op-2", at: new Date(T0).toISOString() });
+      world.calls = [];
+      await run(executor, [drainOf(cut.slotId)]);
+      expect(world.calls).toContain("lease dev.impl-s2");
+      expect(slots.get(cut.slotId)?.phase).not.toBe("draining");
+    });
+
+    it("S2: after the drain expired, a seat the pass left stopped (listed) is still held: never back in admission", async () => {
+      const slot = liveSeat();
+      const executor = executorWith({
+        ...world.effects(),
+        stopSlot: async (input) => {
+          world.calls.push(`stop ${input.sessionName}`);
+          world.nodes.get(input.expected.nodeId)!.session = "stopped";
+          return { ok: false, code: "stop_uncertain", error: "Session kill completed, but stop finalization failed" };
+        },
+      });
+      await toDeadline(executor);
+      expect(expired()).toHaveLength(1);
+      world.calls = [];
+      await run(executor, [drainOf(slot.slotId)]);
+      expect(world.calls).toEqual([]);
+      expect(slots.get(slot.slotId)).toMatchObject({ phase: "draining", intent: "stop", retiredAt: null });
+    });
+
+    it("S2: after the drain expired, a seat the pass left running (release_refused), stopped since by the plain drain and cut short, is not held", async () => {
+      const slot = liveSeat();
+      world.exit["release"] = 1;
+      const executor = executorWith(world.effects());
+      await toDeadline(executor);
+      expect(expired()).toEqual([expect.objectContaining({ notes: expect.objectContaining({ left: [{ slot: "dev.impl-s1", why: "release_refused", exitCode: 1 }] }) })]);
+      // Since: the seat got free, the plain drain stopped it, and a restart cut it short before its removal.
+      slots.update(slot.slotId, { phase: "draining", intent: "stop" });
+      world.nodes.get("node-1")!.session = "stopped";
+      world.calls = [];
+      await run(executor, [drainOf(slot.slotId)]);
+      expect(world.calls).toContain("lease dev.impl-s1");
+      expect(slots.get(slot.slotId)?.phase).not.toBe("draining");
+    });
+
+    it("S2: before the deadline, the guard still holds a seat stopped on its way out for the forced pass", async () => {
+      jobSpec = spec({ drain: true });
+      liveSeat("running");
+      const executor = executorWith(world.effects());
+      await run(executor, []);
+      expect(history.at(-1)).toMatchObject({ reason: "seat_pool_drain_started" });
+      world.nodes.set("node-2", { logicalId: "dev.impl-s2", session: "stopped", sessionId: "sess-2", openRows: 0, idle: false });
+      const cut = slots.insert({ poolJobId: JOB, logicalId: "dev.impl-s2", nodeId: "node-2", phase: "draining", intent: "stop", opId: "op-2", at: new Date(T0).toISOString() });
+      world.calls = [];
+      await run(executor, [drainOf(cut.slotId)]);
+      expect(world.calls).toEqual([]);
+      expect(slots.get(cut.slotId)).toMatchObject({ phase: "draining", intent: "stop" });
+    });
+  });
+
   it("keeps the demand command's last good answer, and records a bad one", async () => {
     jobSpec = spec({ demand_cmd: { argv: ["demand"] } });
     const executor = makeExecutor();
