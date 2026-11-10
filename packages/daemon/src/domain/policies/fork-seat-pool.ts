@@ -29,6 +29,9 @@ export interface SeatPoolSpec {
   dispatchTag: string | null;
   /** True empties the pool as its seats become free, and adds none: the kill switch. */
   drain: boolean;
+  /** How long a drain waits for the pool's seats to become free before the executor takes the rest out (the forced
+   *  pass): their open rows go back to the model, their sessions stop and their nodes are removed. 0: no deadline. */
+  drainDeadlineSeconds: number;
   /** Existing seats (logical ids) this pool counts and gives rows to like its own, but never stops or removes. */
   adopt: string[];
   /** Absolute working directory for a new seat; `{slot}` (required) and `{rig}` are replaced. */
@@ -47,13 +50,23 @@ export interface SeatPoolSpec {
 }
 
 const SPEC_KEYS = new Set([
-  "min", "max", "cooldown_s", "idle_grace_s", "dispatch_after_s", "dispatch_tag", "drain", "adopt", "cwd_template",
+  "min", "max", "cooldown_s", "idle_grace_s", "dispatch_after_s", "dispatch_tag", "drain", "drain_deadline_s", "adopt", "cwd_template",
   "demand_cmd", "release_cmd", "prepare_cmd", "reap_cmd", "remove_cmd",
 ]);
 const DEFAULT_COOLDOWN_SECONDS = 60;
 const DEFAULT_IDLE_GRACE_SECONDS = 300;
 const DEFAULT_DISPATCH_AFTER_SECONDS = 60;
 const DEFAULT_COMMAND_TIMEOUT_SECONDS = 60;
+/** 15 minutes: the window a working seat has to finish on its own once the pool is set to drain. */
+export const DEFAULT_DRAIN_DEADLINE_SECONDS = 900;
+/**
+ * 1 day: the shortest history retention the settings allow. The drain's clock lives in the job's watchdog history,
+ * which is pruned (queue-retention.ts, pruneWatchdogHistory): a deadline no longer than the shortest retention keeps
+ * `seat_pool_drain_started` until the deadline passes, in any configuration. A drain left open for longer than the
+ * retention window can still lose its entries; it then starts a new deadline (a new `started`), and a stop refuses
+ * again until the new forced pass is recorded: the safe side, never a stop without the proof of the pass.
+ */
+export const MAX_DRAIN_DEADLINE_SECONDS = 86_400;
 
 type SpecProblem = { field: string; message: string };
 
@@ -93,7 +106,11 @@ export function parseSeatPoolSpec(context: Record<string, unknown>): { spec: Sea
   const cooldownSeconds = wholeNumber(context["cooldown_s"], "cooldown_s", DEFAULT_COOLDOWN_SECONDS);
   const idleGraceSeconds = wholeNumber(context["idle_grace_s"], "idle_grace_s", DEFAULT_IDLE_GRACE_SECONDS);
   const dispatchAfterSeconds = wholeNumber(context["dispatch_after_s"], "dispatch_after_s", DEFAULT_DISPATCH_AFTER_SECONDS);
-  for (const value of [min, max, cooldownSeconds, idleGraceSeconds, dispatchAfterSeconds]) if (isProblem(value)) return { problem: value };
+  const drainDeadlineSeconds = wholeNumber(context["drain_deadline_s"], "drain_deadline_s", DEFAULT_DRAIN_DEADLINE_SECONDS);
+  for (const value of [min, max, cooldownSeconds, idleGraceSeconds, dispatchAfterSeconds, drainDeadlineSeconds]) if (isProblem(value)) return { problem: value };
+  if ((drainDeadlineSeconds as number) > MAX_DRAIN_DEADLINE_SECONDS) {
+    return { problem: { field: "drain_deadline_s", message: `seat-pool: drain_deadline_s must be at most ${MAX_DRAIN_DEADLINE_SECONDS} (1 day, the shortest history retention); 0 means no deadline` } };
+  }
   if ((max as number) < (min as number)) return { problem: { field: "max", message: "seat-pool: max must be at least min" } };
   const dispatchTag = context["dispatch_tag"] ?? null;
   if (dispatchTag !== null && (typeof dispatchTag !== "string" || !dispatchTag.trim())) {
@@ -120,7 +137,8 @@ export function parseSeatPoolSpec(context: Record<string, unknown>): { spec: Sea
   return {
     spec: {
       min: min as number, max: max as number, cooldownSeconds: cooldownSeconds as number, idleGraceSeconds: idleGraceSeconds as number,
-      dispatchAfterSeconds: dispatchAfterSeconds as number, dispatchTag: dispatchTag as string | null, drain, adopt: [...new Set(adopt as string[])], cwdTemplate,
+      dispatchAfterSeconds: dispatchAfterSeconds as number, dispatchTag: dispatchTag as string | null, drain,
+      drainDeadlineSeconds: drainDeadlineSeconds as number, adopt: [...new Set(adopt as string[])], cwdTemplate,
       demandCmd: commands["demand_cmd"]!, releaseCmd: commands["release_cmd"]!, prepareCmd: commands["prepare_cmd"]!,
       reapCmd: commands["reap_cmd"]!, removeCmd: commands["remove_cmd"]!,
     },
@@ -135,6 +153,55 @@ export function seatPoolSpecProblem(spec: Pick<PolicyJob, "context">): SpecProbl
 
 export function slotWorkingDirectory(template: string, rigName: string, slotMemberId: string): string {
   return template.replaceAll("{slot}", slotMemberId).replaceAll("{rig}", rigName);
+}
+
+/** The history entries that time a drain. Recorded by the executor (started, ended, expired) and by the job's stop
+ *  (left); the drain's clock is read back from them, so a daemon restart doesn't reset it. */
+export const SEAT_POOL_DRAIN_STARTED = "seat_pool_drain_started";
+export const SEAT_POOL_DRAIN_ENDED = "seat_pool_drain_ended";
+export const SEAT_POOL_DRAIN_EXPIRED = "seat_pool_drain_expired";
+export const SEAT_POOL_LEFT = "seat_pool_left";
+export const SEAT_POOL_DRAIN_EVENTS = [SEAT_POOL_DRAIN_STARTED, SEAT_POOL_DRAIN_ENDED, SEAT_POOL_DRAIN_EXPIRED] as const;
+
+/** One of the drain's history entries, oldest first. */
+export interface SeatPoolDrainEvent {
+  reason: string;
+  notes: Record<string, unknown> | null;
+}
+
+/** Why a seat the forced pass could not take out is still there. */
+export type SeatPoolLeftWhy = "release_refused" | "stop_failed" | "move_failed" | "remove_failed" | "remove_cmd_failed";
+
+/** The current drain: since its latest `started` with no `ended` after it. */
+export interface SeatPoolDrainEpisode {
+  startedAt: string;
+  /** Null when the drain has no deadline (`drain_deadline_s: 0`). */
+  deadlineAt: string | null;
+  /** The forced pass's result, once it ran for this drain. */
+  expired: { at: string; left: Array<{ slot: string; why: string }>; moved: Array<{ qitemId: string; to: string }> } | null;
+}
+
+const text = (value: unknown): string | null => (typeof value === "string" ? value : null);
+
+/** Pure: folds the drain's history entries, oldest first, into the current drain, or null when none is on. */
+export function seatPoolDrainEpisode(events: SeatPoolDrainEvent[]): SeatPoolDrainEpisode | null {
+  let episode: SeatPoolDrainEpisode | null = null;
+  for (const event of events) {
+    const notes = event.notes ?? {};
+    if (event.reason === SEAT_POOL_DRAIN_STARTED) {
+      const startedAt = text(notes["startedAt"]);
+      if (startedAt) episode = { startedAt, deadlineAt: text(notes["deadlineAt"]), expired: null };
+    } else if (event.reason === SEAT_POOL_DRAIN_ENDED) {
+      episode = null;
+    } else if (event.reason === SEAT_POOL_DRAIN_EXPIRED && episode && text(notes["startedAt"]) === episode.startedAt) {
+      episode.expired = {
+        at: text(notes["at"]) ?? episode.deadlineAt ?? episode.startedAt,
+        left: Array.isArray(notes["left"]) ? notes["left"] as Array<{ slot: string; why: string }> : [],
+        moved: Array.isArray(notes["moved"]) ? notes["moved"] as Array<{ qitemId: string; to: string }> : [],
+      };
+    }
+  }
+  return episode;
 }
 
 /** `adding`: recorded, the add not yet confirmed. `added`: the node exists without a session. `live`: launched and
@@ -274,7 +341,8 @@ export function seatPoolOutOfUsage(state: Pick<SeatPoolState, "modelCause" | "sl
  * While a seat of the pool is out of usage, the pool adds no seat and launches none: neither a stopped seat nor one it
  * added and has not started, which waits as it is (and may still be removed). Only a free seat the pool added, idle
  * for `idle_grace_s`, is drained, the newest first; an adopted seat is never drained, and under `drain` it is unlinked.
- * Adds and new drains wait for `cooldown_s` after the last add or removal, except under `drain`.
+ * Adds and new drains wait for `cooldown_s` after the last add or removal, except under `drain`. A seat that never
+ * becomes free under `drain` is the executor's: once `drain_deadline_s` passes it takes the seat out (the forced pass).
  */
 export function planSeatPool(spec: SeatPoolSpec, state: SeatPoolState, nowMs: number, sampleMaxAgeMs: number): SeatPoolPlan {
   const hold = (reason: string): SeatPoolPlan => ({ intents: [], reason, target: null, current: state.slots.length });

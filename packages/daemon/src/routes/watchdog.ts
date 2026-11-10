@@ -12,6 +12,7 @@ import { parseWatchdogSpec, type WatchdogPolicyEngine } from "../domain/watchdog
 import { specProblem, updateWatchdogJob } from "../domain/watchdog-job-update.js";
 import { requireSenderIdentity } from "./require-sender-identity.js";
 import { SEAT_POOL_POLICY_NAME } from "../domain/policies/seat-pool.js";
+import type { QueueRepository } from "../domain/queue-repository.js";
 
 /**
  * Watchdog HTTP routes (PL-004 Phase C). Backs `rig watchdog` CLI verb.
@@ -24,9 +25,9 @@ import { SEAT_POOL_POLICY_NAME } from "../domain/policies/seat-pool.js";
  *   POST /register          register a new watchdog job
  *   GET  /list              list all watchdog jobs (active + stopped + terminal)
  *   GET  /sse               SSE stream of watchdog.* events
- *   GET  /:job_id           show one job
+ *   GET  /:job_id           show one job (a seat pool's with `seatPool`: its drain and its seats)
  *   GET  /:job_id/status    job + recent history (compact summary) + quiet count since the daemon started
- *   POST /:job_id/stop      operator stop
+ *   POST /:job_id/stop      operator stop (a drained seat pool past its deadline answers `leftRunning`)
  *   POST /:job_id/update    change an active job's interval, spec or message in place
  */
 export function watchdogRoutes(): Hono {
@@ -283,11 +284,17 @@ export function watchdogRoutes(): Hono {
     }
   });
 
+  // A seat pool's job also carries its drain and its seats as the pool holds them (seat_pool_slots), not as the rig's
+  // nodes show them: a seat whose node is gone but which the pool still holds is listed.
   app.get("/:job_id", (c) => {
     const jobId = c.req.param("job_id");
-    const job = getJobsRepo(c).getById(jobId);
+    const jobsRepo = getJobsRepo(c);
+    const job = jobsRepo.getById(jobId);
     if (!job) return c.json({ error: "job_not_found", jobId }, 404);
-    return c.json(job);
+    if (job.policy !== SEAT_POOL_POLICY_NAME) return c.json(job);
+    const queueRepo = c.get("queueRepo" as never) as QueueRepository | undefined;
+    const seatPool = jobsRepo.seatPoolView(jobId, queueRepo ? (session) => queueRepo.listOpenObligations(session, 500).length : undefined);
+    return c.json(seatPool ? { ...job, seatPool } : job);
   });
 
   return app;
