@@ -408,7 +408,8 @@ export function planSeatPool(spec: SeatPoolSpec, state: SeatPoolState, nowMs: nu
   const starting = present.filter((slot) => slot.phase === "adding" || slot.phase === "added");
   // A stopped adopted seat takes no row and is not reaped: it isn't one of the pool's seats until it runs again. A seat
   // this plan reaps is on its way out: it isn't counted as current either, so the same plan can add its replacement
-  // (the executor checks the room again after the reap, and adds nothing if the reap launched the seat instead).
+  // (the executor checks the room again after the reap, so the add never takes the pool past `max` if the reap launched the
+  // seat instead).
   const live = present.filter((slot) => slot.phase === "live" && !(slot.adopted && slot.cause === "stopped") && !seatPoolReapable(slot));
   const idle = (slot: SeatPoolSlotView) => slot.openRows === 0 && slot.heldMessages === 0 && slot.idleSince !== null;
   const usageLimited = seatPoolOutOfUsage(state);
@@ -494,7 +495,8 @@ export function planSeatPool(spec: SeatPoolSpec, state: SeatPoolState, nowMs: nu
   if (target > current && !cooling) {
     // The same room the executor checks before each seat: an add it would refuse is never asked for. A seat the same
     // plan forgets (its node is gone) or reaps is out of the count: the executor applies those intents before the add,
-    // and checks the room again before each seat, so a reap that ends up launching its seat instead adds nothing.
+    // and checks the room again before each seat, so a reap that ends up launching its seat instead never takes the pool
+    // past `max` (below it, the add may still start one seat more than the target, idle until idle_grace_s).
     const leaving = new Set([...state.slots.filter((slot) => !present.includes(slot)), ...present.filter(seatPoolReapable)]);
     const count = Math.min(target - current, seatPoolRoom(spec, state.slots.filter((slot) => !leaving.has(slot)), state.adoptable.length));
     if (count > 0) intents.push({ kind: "add", count });
