@@ -26,6 +26,7 @@ import {
   type SeatPoolDrainEpisode,
   type SeatPoolDrainEvent,
   type SeatPoolLeftEntry,
+  type SeatPoolRetryWaiting,
   type SeatPoolLeftWhy,
   type SeatPoolIntent,
   type SeatPoolModel,
@@ -374,6 +375,11 @@ export interface SeatPoolEffects {
   cleanSlot(input: { sessionName: string }): Promise<SeatPoolEffectResult>;
   /** The pending, in-progress and blocked rows addressed to a seat, with their claim time when the queue gives it. */
   openRows(sessionName: string): Array<{ qitemId: string; state: "pending" | "in-progress" | "blocked"; claimedAt?: string | null }>;
+  /** A mark on the queue's transitions, taken before the forced pass asks a seat's release command (seatActedSince). */
+  queueMark?(): number;
+  /** Whether the seat itself claimed, blocked, closed or handed off a row after `mark`, also a row that arrived and was
+   *  closed in between (it is in neither picture of its open rows). */
+  seatActedSince?(sessionName: string, mark: number): boolean;
   /** Returns an in-progress row to pending, releasing its claim. */
   unclaimRow(input: { qitemId: string; seat: string; reason: string }): SeatPoolEffectResult;
   /** How many reaps moved the row before: its reroutes whose reason is `reap:<seat>`. */
@@ -423,7 +429,7 @@ export function seatPoolQueueEffects(deps: {
   queueRepo: QueueRepository;
   /** Where an escalation about a seat of the pool goes: the model's escalation owner, or why it has none. */
   escalationOwner(modelSession: string): { owner: string | null; reason: string };
-}): Pick<SeatPoolEffects, "openRows" | "unclaimRow" | "reapCount" | "moveRow" | "escalationOwner" | "escalate"> {
+}): Pick<SeatPoolEffects, "openRows" | "queueMark" | "seatActedSince" | "unclaimRow" | "reapCount" | "moveRow" | "escalationOwner" | "escalate"> {
   const { queueRepo } = deps;
   const ownerOf = (modelSession: string, override?: string | null): { owner: string | null; reason: string } => {
     if (!override) return deps.escalationOwner(modelSession);
@@ -433,6 +439,8 @@ export function seatPoolQueueEffects(deps: {
   };
   return {
     openRows: (sessionName) => queueRepo.listOpenObligationClaims(sessionName, 500),
+    queueMark: () => queueRepo.transitionMark(),
+    seatActedSince: (sessionName, mark) => queueRepo.sessionActedSince(sessionName, mark),
     unclaimRow: ({ qitemId, seat, reason }) => {
       try {
         queueRepo.unclaim(qitemId, seat, reason);
@@ -885,8 +893,8 @@ export class SeatPoolExecutor {
   private async expireDrain(jobId: string, run: Run, episode: SeatPoolDrainEpisode): Promise<boolean> {
     const left: SeatPoolLeftEntry[] = [...(episode.retry?.left ?? [])];
     const moved: Array<{ qitemId: string; to: string }> = [...(episode.retry?.moved ?? [])];
-    const unanswered = new Map((episode.retry?.waiting ?? []).map((w) => [w.slot, w.exitCode]));
-    const waiting: Array<{ slot: string; exitCode: number | null }> = [];
+    const unanswered = new Map((episode.retry?.waiting ?? []).map((w) => [w.slot, w]));
+    const waiting: SeatPoolRetryWaiting[] = [];
     const retryUntil = Date.parse(episode.deadlineAt!) + SEAT_POOL_RELEASE_RETRY_SECONDS * 1000;
     // Read at each seat: the commands before it can take minutes, and a seat is never asked again past the window.
     const pastRetry = () => this.now().getTime() >= retryUntil;
@@ -896,7 +904,7 @@ export class SeatPoolExecutor {
       if (left.length === 0 && moved.length === 0 && waiting.length === 0 && unanswered.size === 0) return;
       this.record(jobId, false, SEAT_POOL_DRAIN_RETRYING, {
         startedAt: episode.startedAt, deadlineAt: episode.deadlineAt, at: this.at(), retryUntil: new Date(retryUntil).toISOString(),
-        left, moved, waiting: [...waiting, ...[...unanswered].map(([slot, exitCode]) => ({ slot, exitCode }))],
+        left, moved, waiting: [...waiting, ...unanswered.values()],
       });
     };
     for (const slot of this.deps.slots.listOpen(jobId)) {
@@ -905,8 +913,9 @@ export class SeatPoolExecutor {
       if (this.deps.slots.get(slot.slotId)?.retiredAt !== null) continue;
       // Left for good earlier in this pass (refused, or a failed stop or move): not asked, stopped or moved again.
       if (left.some((entry) => entry.slot === slot.logicalId)) continue;
-      if (pastRetry() && unanswered.has(slot.logicalId)) {
-        left.push({ slot: slot.logicalId, why: "release_unavailable", exitCode: unanswered.get(slot.logicalId)! });
+      const asked = unanswered.get(slot.logicalId);
+      if (pastRetry() && asked) {
+        left.push({ slot: slot.logicalId, why: asked.why ?? "release_unavailable", exitCode: asked.exitCode });
         unanswered.delete(slot.logicalId);
         continue;
       }
@@ -923,6 +932,9 @@ export class SeatPoolExecutor {
       if (outcome.unavailable) {
         if (pastRetry()) left.push({ slot: slot.logicalId, why: "release_unavailable", exitCode });
         else waiting.push({ slot: slot.logicalId, exitCode });
+      } else if (outcome.why === "work_arrived" && !pastRetry()) {
+        // Working, or only seemed to be (another actor touched its rows): asked again until the window closes.
+        waiting.push({ slot: slot.logicalId, exitCode, why: "work_arrived" });
       } else if (outcome.why) left.push({ slot: slot.logicalId, why: outcome.why, exitCode, ...(outcome.stopped ? { stopped: true as const } : {}) });
     }
     if (!this.fresh(jobId, run)) { keep(); return false; }
@@ -974,6 +986,7 @@ export class SeatPoolExecutor {
       if (inLease.spec.releaseCmd && !resumed) {
         // The seat's rows as the release command is asked: the command answers for those.
         const rowsBefore = rowPicture(this.deps.effects.openRows(sessionName));
+        const mark = this.deps.effects.queueMark?.() ?? null;
         this.setIntent(slot.slotId, "release");
         const released = await this.deps.effects.runCommand(inLease.spec.releaseCmd, this.releaseEnv(inLease, sessionName, "drain-deadline"), run.controller.signal);
         if (run.controller.signal.aborted) return { stop: true, moved: [] };
@@ -993,22 +1006,25 @@ export class SeatPoolExecutor {
         }
         // The lease holds deliveries back, not queue writes (as in the drain of a free seat): a turn already under way
         // may have worked on its rows while the command ran (a claim, a release and claim again, a block, a close),
-        // which the command never answered for. That seat is working: it is not stopped, and its rows stay with it.
-        if (tookRowsSince(rowsBefore, rowPicture(this.deps.effects.openRows(sessionName)))) return leftAs("work_arrived");
+        // which the command never answered for. That seat is working: it is not stopped, and its rows stay with it. A row
+        // that arrived and was closed in between is in neither picture: the queue's transitions say the seat moved it.
+        // The pass asks the seat again until the retry window closes (expireDrain): the picture also sees what another
+        // actor did to its rows (an auto-unpark, a usage-limit park, a reroute), and the release command answers again.
+        if (tookRowsSince(rowsBefore, rowPicture(this.deps.effects.openRows(sessionName)))
+          || (mark !== null && this.deps.effects.seatActedSince?.(sessionName, mark) === true)) return leftAs("work_arrived");
       }
       this.setIntent(slot.slotId, "stop", "draining");
       const stopped = await this.deps.effects.stopSlot({ sessionName, expected });
       // A seat whose session is gone (stopped earlier in the pass, or killed by this stop before it failed) stays
       // draining: back in admission, the reap would launch it again.
       if (!stopped.ok && !STOPPED_CODES.has(stopped.code)) {
-        if (!this.deps.effects.sessionRunning(nodeId)) return leftStopped("stop_failed", []);
-        // A stop that tried the kill may have failed at the kill itself, the session still alive: tmux says which (the
-        // check the reap's clean makes), and only a session it finds gone is a seat stopped.
-        if (stopped.killAttempted) {
-          const cleaned = await this.deps.effects.cleanSlot({ sessionName });
-          if (cleaned.ok || cleaned.code === "nothing_to_clean") return leftStopped("stop_failed", []);
-        }
-        return leftAs("stop_failed");
+        // A stop that tried the kill may have failed at the kill itself, the session still alive, or after it (its
+        // record already reading exited): tmux says which (the check the reap's clean makes), and only a session it finds
+        // gone is a seat stopped. That is the proof a `session_not_live` stop gives: the pass carries on with its rows
+        // and its removal.
+        const gone = stopped.killAttempted === true
+          && await this.deps.effects.cleanSlot({ sessionName }).then((cleaned) => cleaned.ok || cleaned.code === "nothing_to_clean");
+        if (!gone) return this.deps.effects.sessionRunning(nodeId) ? leftAs("stop_failed") : leftStopped("stop_failed", []);
       }
 
       const reason = `${SEAT_POOL_DRAIN_REASON}${sessionName}`;
