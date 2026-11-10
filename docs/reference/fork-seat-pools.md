@@ -28,6 +28,7 @@ context:
   dispatch_after_s: 60      # how long a row waits at its seat before the pool moves it or wakes the seat (default 60)
   dispatch_tag: role:impl   # move only the model's rows with this tag (default: every row to the model)
   drain: false              # true empties the pool (see below)
+  drain_deadline_s: 900     # how long a drain waits for seats to become free before taking them out (default 900, at most 86400; 0: no deadline)
   adopt: [dev.impl2]        # existing seats the pool counts and gives rows to, but never stops or removes
   cwd_template: /work/{rig}/{slot}   # required: absolute, with {slot}; {rig} is optional
   demand_cmd:  { argv: [/usr/local/bin/pool-demand], timeout_s: 30 }
@@ -201,8 +202,53 @@ waits out a usage limit like any other launch.
 `drain: true` is the kill switch. Set it with `rig watchdog update <jobId> --spec <file>`: the pool adds nothing,
 removes the seats that haven't started, and drains the rest of its own seats as each becomes free, so no work is
 killed. It gives the adopted seats back at once (`seat_pool_unlinked`): their link ends, and their nodes, sessions and
-rows stay as they are. `rig watchdog
-stop` refuses a pool that still holds seats (`pool_has_slots`); stop it once its seats are gone.
+rows stay as they are.
+
+A seat that never becomes free (it holds a row it didn't take, a blocked row, or a claim it never finishes) would hold
+the drain forever, so a drain has a deadline, `drain_deadline_s` after it began (default 900, 15 minutes: the window a
+working seat has to finish on its own). The first evaluation that reads `drain: true` records
+`seat_pool_drain_started` with its `deadlineAt`; setting `drain: false` before then records `seat_pool_drain_ended`,
+and the seats go back to admission, and a later `drain: true` starts a new deadline. The deadline is read back from
+the job's history, so a daemon restart doesn't reset it. `drain_deadline_s: 0` keeps the drain without a deadline.
+The deadline is fixed when the drain starts: changing `drain_deadline_s` during a drain applies to the next one (set
+`drain: false`, then `drain: true` again, to start over). Only a pool holding a seat it added starts the clock; a pool
+already set to `drain: true` when the daemon is upgraded starts it at its first evaluation after the restart.
+The deadline is at most 86400 (1 day), the shortest history retention the settings allow, so the history keeps the
+drain's start until its deadline passes. A drain left open for longer than the retention window (14 days by default,
+with 50 or more newer entries for the job) can lose its entries: it then starts a new deadline, the forced pass runs
+again, and `rig watchdog stop` refuses until that pass is recorded.
+
+Once the deadline passes, the pool takes out each seat it added that is still there, once, in the order a reap uses,
+under the seat's lifecycle lease:
+
+1. `release_cmd`, if set. When it refuses, the seat is **not** stopped (its work may not be saved): it keeps running,
+   with its rows, and is left (`why: release_refused`).
+2. A [checked stop](checked-seat-stop.md), with the `expected` read at the start; a refused stop leaves the seat
+   (`why: stop_failed`), its rows unmoved.
+3. Each open row goes to the model: an in-progress row is unclaimed first, and each row moves only while it is still
+   addressed to the seat, in one transaction, keeping its id and its state (a pending row wakes the model; a blocked
+   one stays blocked). The reroute's reason is `drain:<seat>`, not `reap:<seat>`, so a drained row is not counted as one
+   that lost its seat. A row claimed, closed or moved since it was read is left as it went.
+4. The node is removed and `remove_cmd` runs; when `remove_cmd` refuses, the seat stays on record
+   (`why: remove_cmd_failed`).
+
+Messages the typing guard holds for the seat are left as a reap leaves them. The pass records
+`seat_pool_drain_expired` with `left` (each seat it couldn't take out, and why) and `moved` (each row and where it went).
+An adopted seat is never stopped or removed by the deadline, and its rows are never moved. A pool shrinking by
+`idle_grace_s` without `drain` has no deadline.
+
+`rig watchdog stop` refuses a pool that still holds seats (`pool_has_slots`), and says when the drain's deadline
+passes. Once `seat_pool_drain_expired` is recorded for the current drain, it stops a pool whose remaining seats are all
+listed in that entry's `left`: in the same transaction those seats are retired (`seat_pool_left`, one per seat) and the
+answer lists them in `leftRunning` (`slot`, `sessionName`, `why`), for you to deal with by hand. It still refuses
+without `drain`, before the deadline, with `drain_deadline_s: 0`, or when a seat appeared after the pass. An adopted
+seat never holds the stop of a draining pool.
+
+To prove a pool is empty, read the pool, not the rig's nodes: `rig watchdog show <jobId> --json` carries `seatPool`,
+with `drain` (`startedAt`, `deadlineAt`, `expired`) and `slots` (`logicalId`, `phase`, `adopted`, `nodeExists`,
+`openRows`), every seat the pool still holds, from `seat_pool_slots`. A seat whose node is gone but whose `remove_cmd`
+refused is still listed. The pool is empty when `seatPool.slots` is `[]`, or once the stop is accepted with its
+`leftRunning`.
 
 A pool can still end with seats in it: a daemon that doesn't know the `seat-pool` policy, such as an earlier version
 started on the same `OPENRIG_HOME`, marks the job terminal (`unknown_policy:seat-pool`), and the job can't be updated
