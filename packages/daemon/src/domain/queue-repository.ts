@@ -4610,6 +4610,26 @@ export class QueueRepository {
     return rows.map((r) => ({ qitemId: r.qitem_id, state: r.state, claimedAt: r.claimed_at }));
   }
 
+  /** The latest transition's id: a mark to read later what happened on the queue after it (seatActedSince). */
+  transitionMark(): number {
+    const row = this.db.prepare("SELECT COALESCE(MAX(transition_id), 0) AS mark FROM queue_transitions").get() as { mark: number };
+    return row.mark;
+  }
+
+  /**
+   * Whether `session` (in any of its addresses) moved a row out of pending after `mark` (transitionMark): a claim, a
+   * block, a close or a handoff it made itself, on any row, also one that arrived and was closed after the mark. A
+   * pending transition (a row it created or let go) is not counted, nor anything another actor did.
+   */
+  sessionActedSince(session: string, mark: number): boolean {
+    const addresses = this.resolveSessionAddresses(session);
+    if (!addresses.length) return false;
+    const slots = addresses.map(() => "?").join(",");
+    return !!this.db.prepare(
+      `SELECT 1 FROM queue_transitions WHERE transition_id > ? AND actor_session IN (${slots}) AND state <> 'pending' LIMIT 1`,
+    ).get(mark, ...addresses);
+  }
+
   list(opts: QueueListOptions & { compact: true }): CompactQueueItem[];
   list(opts?: QueueListOptions & { compact?: false }): QueueItem[];
   list(opts?: QueueListOptions): Array<QueueItem | CompactQueueItem>;
