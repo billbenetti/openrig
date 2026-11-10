@@ -47,11 +47,14 @@ export interface SeatPoolSpec {
   /** Runs once the node of a seat the pool added is gone, so what `prepareCmd` set up can be undone; the seat stays on
    *  record until it exits 0. */
   removeCmd: SeatPoolCommand | null;
+  /** Where an escalation about a seat of the pool goes (a needs-input escalation, and a row a reap moves a second
+   *  time), in place of the model's escalation owner. Null: the model's escalation owner, as without the field. */
+  escalationOwner: string | null;
 }
 
 const SPEC_KEYS = new Set([
   "min", "max", "cooldown_s", "idle_grace_s", "dispatch_after_s", "dispatch_tag", "drain", "drain_deadline_s", "adopt", "cwd_template",
-  "demand_cmd", "release_cmd", "prepare_cmd", "reap_cmd", "remove_cmd",
+  "demand_cmd", "release_cmd", "prepare_cmd", "reap_cmd", "remove_cmd", "escalation_owner",
 ]);
 const DEFAULT_COOLDOWN_SECONDS = 60;
 const DEFAULT_IDLE_GRACE_SECONDS = 300;
@@ -128,6 +131,10 @@ export function parseSeatPoolSpec(context: Record<string, unknown>): { spec: Sea
   }
   const placeholder = cwdTemplate.match(/\{(?!slot\}|rig\})[^}]*\}/);
   if (placeholder) return { problem: { field: "cwd_template", message: `seat-pool: cwd_template may use only {slot} and {rig} (found ${placeholder[0]})` } };
+  const escalationOwner = context["escalation_owner"] ?? null;
+  if (escalationOwner !== null && (typeof escalationOwner !== "string" || !/^[^\s@]+@[^\s@]+$/.test(escalationOwner))) {
+    return { problem: { field: "escalation_owner", message: "seat-pool: escalation_owner must be a seat address (<session>@<rig>)" } };
+  }
   const commands: Record<string, SeatPoolCommand | null> = {};
   for (const field of ["demand_cmd", "release_cmd", "prepare_cmd", "reap_cmd", "remove_cmd"]) {
     const parsed = command(context[field], field);
@@ -140,7 +147,7 @@ export function parseSeatPoolSpec(context: Record<string, unknown>): { spec: Sea
       dispatchAfterSeconds: dispatchAfterSeconds as number, dispatchTag: dispatchTag as string | null, drain,
       drainDeadlineSeconds: drainDeadlineSeconds as number, adopt: [...new Set(adopt as string[])], cwdTemplate,
       demandCmd: commands["demand_cmd"]!, releaseCmd: commands["release_cmd"]!, prepareCmd: commands["prepare_cmd"]!,
-      reapCmd: commands["reap_cmd"]!, removeCmd: commands["remove_cmd"]!,
+      reapCmd: commands["reap_cmd"]!, removeCmd: commands["remove_cmd"]!, escalationOwner: escalationOwner as string | null,
     },
   };
 }
@@ -368,7 +375,8 @@ export function seatPoolOutOfUsage(state: Pick<SeatPoolState, "modelCause" | "sl
  * The target is the demand (the demand command's last answer, or the waiting rows no free seat takes plus the seats
  * holding work), never below the seats holding work plus the seats still starting, clamped to min..max; with `drain`
  * it is 0, and nothing is moved or woken. An add asks for no more seats than the room `max` leaves (seatPoolRoom: every
- * seat on record counts, adopted or added, running, stopped or draining); with no room it is not asked for at all. A demand answer older than `sampleMaxAgeMs` holds the pool's size as it is.
+ * seat on record counts, adopted or added, running, stopped or draining, but not one the same plan forgets or reaps);
+ * with no room it is not asked for at all, and a plan left with nothing to do says so (`max_reached`, held). A demand answer older than `sampleMaxAgeMs` holds the pool's size as it is.
  * While a seat of the pool is out of usage, the pool adds no seat and launches none: neither a stopped seat nor one it
  * added and has not started, which waits as it is (and may still be removed). Only a free seat the pool added, idle
  * for `idle_grace_s`, is drained, the newest first; an adopted seat is never drained, and under `drain` it is unlinked.
@@ -391,8 +399,10 @@ export function planSeatPool(spec: SeatPoolSpec, state: SeatPoolState, nowMs: nu
   if (spec.drain) for (const slot of present.filter((s) => s.adopted)) intents.push({ kind: "unlink", slotId: slot.slotId });
 
   const starting = present.filter((slot) => slot.phase === "adding" || slot.phase === "added");
-  // A stopped adopted seat takes no row and is not reaped: it isn't one of the pool's seats until it runs again.
-  const live = present.filter((slot) => slot.phase === "live" && !(slot.adopted && slot.cause === "stopped"));
+  // A stopped adopted seat takes no row and is not reaped: it isn't one of the pool's seats until it runs again. A seat
+  // this plan reaps is on its way out: it isn't counted as current either, so the same plan can add its replacement
+  // (the executor checks the room again after the reap, and adds nothing if the reap launched the seat instead).
+  const live = present.filter((slot) => slot.phase === "live" && !(slot.adopted && slot.cause === "stopped") && !seatPoolReapable(slot));
   const idle = (slot: SeatPoolSlotView) => slot.openRows === 0 && slot.heldMessages === 0 && slot.idleSince !== null;
   const usageLimited = seatPoolOutOfUsage(state);
 
@@ -422,7 +432,13 @@ export function planSeatPool(spec: SeatPoolSpec, state: SeatPoolState, nowMs: nu
     }
     for (const [seat, holder] of holders) {
       if (holder.cause === "stopped" && !usageLimited) intents.push({ kind: "relaunch", seat, nodeId: holder.nodeId });
-      else if (holder.cause === "needs_input") intents.push({ kind: "escalate", seat, qitemIds: holder.rows.map((r) => r.qitemId) });
+      else if (holder.cause === "needs_input") {
+        // With dispatch_tag, the model and an adopted seat are the pool's only for the rows that carry it: their other
+        // rows are their own, so a seat waiting on its own work (a background workflow, a row of its own) is no alert.
+        const ownsOnlyTagged = spec.dispatchTag !== null && (seat === model.sessionName || seatOf.get(seat)?.adopted === true);
+        const rows = ownsOnlyTagged ? holder.rows.filter((r) => r.tags.includes(spec.dispatchTag!)) : holder.rows;
+        if (rows.length > 0) intents.push({ kind: "escalate", seat, qitemIds: rows.map((r) => r.qitemId) });
+      }
     }
   }
 
@@ -469,8 +485,11 @@ export function planSeatPool(spec: SeatPoolSpec, state: SeatPoolState, nowMs: nu
   }
   if (usageLimited && starting.length > removeStarting.length) reason = "usage_limit";
   if (target > current && !cooling) {
-    // The same room the executor checks before each seat: an add it would refuse is never asked for.
-    const count = Math.min(target - current, seatPoolRoom(spec, state.slots, state.adoptable.length));
+    // The same room the executor checks before each seat: an add it would refuse is never asked for. A seat the same
+    // plan forgets (its node is gone) or reaps is out of the count: the executor applies those intents before the add,
+    // and checks the room again before each seat, so a reap that ends up launching its seat instead adds nothing.
+    const leaving = new Set([...state.slots.filter((slot) => !present.includes(slot)), ...present.filter(seatPoolReapable)]);
+    const count = Math.min(target - current, seatPoolRoom(spec, state.slots.filter((slot) => !leaving.has(slot)), state.adoptable.length));
     if (count > 0) intents.push({ kind: "add", count });
     else reason = "max_reached";
   }
@@ -478,7 +497,10 @@ export function planSeatPool(spec: SeatPoolSpec, state: SeatPoolState, nowMs: nu
   return { intents, reason, target, current };
 }
 
-const HELD_REASONS = new Set(["model_not_found", "restore_in_progress", "demand_sample_stale", "usage_limit"]);
+/** A plan with nothing to do for one of these says so in the job's history (`seat_pool_held`); any other is quiet.
+ *  `max_reached`: the pool wants more seats than `max` leaves room for (an adopted seat, stopped or not, and a seat
+ *  draining both take room), so a pool that doesn't grow says why. */
+const HELD_REASONS = new Set(["model_not_found", "restore_in_progress", "demand_sample_stale", "usage_limit", "max_reached"]);
 
 export interface SeatPoolPolicyDeps {
   readState(job: { jobId: string; targetSession: string; spec: SeatPoolSpec }): SeatPoolState | Promise<SeatPoolState>;

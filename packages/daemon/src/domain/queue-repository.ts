@@ -101,6 +101,7 @@ import {
   type ParkWakeStatus,
 } from "./queue-wake-repository.js";
 import { WatchdogJobsRepository } from "./watchdog-jobs-repository.js";
+import { parse as parseYaml } from "yaml";
 import { armQueueWait, backOffQueueWait, refreshQueueWaits, evaluateQueueWait, retargetQueueWait, isQueueWait } from "./queue-wait-backoff.js";
 import { parseHumanQuestions, unansweredQuestions, describeTypedReplyPlacement, formatHumanAnswers, humanAnswerText, type HumanQuestion, type HumanAnswers, type TypedHumanReply, type RecordHumanAnswerResult } from "./human-questions.js";
 import { slackMicros } from "./gateway/slack/state-store.js";
@@ -5768,10 +5769,22 @@ export class QueueRepository {
         "a fallback with a wake requires an attached wake-intent store to make its wake durable — none attached",
       );
     }
-    const ts = new Date().toISOString();
-    let wakeId: string | null = null;
+    const routed = this.db.transaction(() => this.routeInTransaction(qitemId, fallbackDestination, reason, opts))();
+    this.eventBus.notifySubscribers(routed.event);
+    if (routed.wakeId) this.deliverWakeIntentAfterCommit(routed.wakeId);
+    return this.getByIdOrThrow(qitemId);
+  }
 
-    const txn = this.db.transaction(() => {
+  /** routeToFallback's move, inside the caller's transaction: the event to notify and the wake to deliver after the
+   *  commit, and the reroute's transition. */
+  private routeInTransaction(
+    qitemId: string,
+    fallbackDestination: string,
+    reason: string,
+    opts: { expectState?: string; expectDestination?: string; wake?: boolean },
+  ): { event: PersistedEvent; wakeId: string | null; transitionId: number } {
+      const ts = new Date().toISOString();
+      let wakeId: string | null = null;
       const qitem = this.getById(qitemId);
       if (!qitem) {
         throw new QueueRepositoryError("qitem_not_found", `qitem ${qitemId} not found`);
@@ -5859,19 +5872,101 @@ export class QueueRepository {
         }
       }
 
-      return this.eventBus.persistWithinTransaction({
+      const event = this.eventBus.persistWithinTransaction({
         type: "qitem.fallback_routed",
         qitemId,
         originalDestination,
         rerouteDestination: fallbackDestination,
         reason,
       });
-    });
+      return { event, wakeId, transitionId: transition.transitionId };
+  }
 
-    const persistedEvent = txn();
-    this.eventBus.notifySubscribers(persistedEvent);
-    if (wakeId) this.deliverWakeIntentAfterCommit(wakeId);
-    return this.getByIdOrThrow(qitemId);
+  /**
+   * Moves a parked (blocked) row whose owner is going away (a seat pool reaps or drains the seat) to
+   * `fallbackDestination`, keeping what wakes it, in one transaction:
+   * - `queue-wait`: its repeating wait resolves its owner at each delivery; it moves as it is.
+   * - `rearmed`: its `--wake-after` timer aimed at the old owner; the move ends that timer, so a new one with the same
+   *   interval and message is armed for the new owner, and the row stays blocked on the same gate (a live row too).
+   * - `blocker`: it waits on a live row, with no timer of its own; that row wakes whoever holds it when it ends, so it
+   *   moves as it is.
+   * - `person`: it waits on a person, whose answer resumes it; it moves as it is.
+   * - `unparked`: nothing would wake it (a gate that isn't a live row, with no timer of its own, or a watchdog attached
+   *   for the old owner): it goes back to pending with a note naming the blocker it had, and the move wakes the new
+   *   owner.
+   * Refused, as routeToFallback refuses, when the row is no longer blocked or no longer addressed to `expectDestination`.
+   */
+  rerouteParked(
+    qitemId: string,
+    fallbackDestination: string,
+    reason: string,
+    opts: { expectDestination?: string } = {},
+  ): { item: QueueItem; park: "blocker" | "person" | "queue-wait" | "rearmed" | "unparked" } {
+    const jobs = this.watchdogJobsRepo ?? new WatchdogJobsRepository(this.db);
+    const routed = this.db.transaction(() => {
+      const qitem = this.getById(qitemId);
+      if (!qitem) throw new QueueRepositoryError("qitem_not_found", `qitem ${qitemId} not found`);
+      if (qitem.state !== "blocked") {
+        throw new QueueRepositoryError("fallback_state_mismatch", `qitem ${qitemId} is ${qitem.state}, not blocked; it was not rerouted`,
+          { state: qitem.state, destinationSession: qitem.destinationSession });
+      }
+      const blocker = qitem.blockedOn ?? null;
+      const blockerRow = blocker ? this.getById(blocker) : null;
+      const armed = this.wakeRepo.getStatus(qitemId);
+      const armedJob = armed?.kind === "timer" && armed.live ? jobs.getById(armed.ref) : null;
+      const ownTimer = armedJob?.state === "active" && this.wakeRepo.findLiveQitemsByAttachedWatchdog(armedJob.jobId).length === 0
+        ? armedJob : null;
+      // A row parked with both a blocker and a timer (`--on <row> --wake-after <d>`) keeps both: the timer is rearmed.
+      const park = ownTimer && isQueueWait(ownTimer.specYaml) ? "queue-wait" as const
+        : ownTimer?.policy === "periodic-reminder" ? "rearmed" as const
+        : blockerRow && isBlockerLive(blockerRow.state) ? "blocker" as const
+        : blocker && this.isPersonAddress(blocker) ? "person" as const
+        : "unparked" as const;
+      const move = { expectDestination: opts.expectDestination };
+      if (park !== "unparked" && park !== "rearmed") {
+        return { park, ...this.routeInTransaction(qitemId, fallbackDestination, reason, { ...move, expectState: "blocked" }) };
+      }
+      if (park === "rearmed") {
+        let message = defaultParkWakeMessage(qitemId);
+        try {
+          const spec = parseYaml(ownTimer!.specYaml) as { message?: unknown; context?: { message?: unknown } } | null;
+          const written = spec?.message ?? spec?.context?.message;
+          if (typeof written === "string" && written.trim()) message = written;
+        } catch { /* the default message */ }
+        const interval = ownTimer!.intervalSeconds;
+        const result = this.routeInTransaction(qitemId, fallbackDestination, reason, { ...move, expectState: "blocked" });
+        const job = jobs.register({
+          policy: "periodic-reminder",
+          specYaml: ["policy: periodic-reminder", "target:", `  session: ${JSON.stringify(fallbackDestination)}`, `message: ${JSON.stringify(message)}`, ""].join("\n"),
+          targetSession: fallbackDestination,
+          intervalSeconds: interval,
+          registeredBySession: FALLBACK_ACTOR,
+        });
+        jobs.recordEvaluation(job.jobId, job.registeredAt, false);
+        this.wakeRepo.record({ transitionId: result.transitionId, qitemId, phase: "armed", kind: "timer", ref: job.jobId, deliveryStatus: null });
+        return { park, ...result };
+      }
+      if (opts.expectDestination !== undefined && !this.resolveSessionAddresses(opts.expectDestination).includes(qitem.destinationSession)) {
+        throw new QueueRepositoryError("fallback_destination_mismatch",
+          `qitem ${qitemId} is addressed to ${qitem.destinationSession}, not ${opts.expectDestination}; it was not rerouted`,
+          { state: qitem.state, destinationSession: qitem.destinationSession });
+      }
+      if (!this.outbox) {
+        throw new QueueRepositoryError("wake_intent_store_unavailable",
+          "unparking a row for its new owner requires an attached wake-intent store to make its wake durable — none attached");
+      }
+      this.db.prepare("UPDATE queue_items SET state = 'pending', blocked_on = NULL, ts_updated = ? WHERE qitem_id = ?")
+        .run(new Date().toISOString(), qitemId);
+      this.transitionLog.append({
+        qitemId, state: "pending", actorSession: FALLBACK_ACTOR,
+        transitionNote: `unparked for ${fallbackDestination} (${reason}): its owner ${qitem.destinationSession} is gone and nothing would wake it; it was blocked on ${blocker ?? "nothing"}`,
+      });
+      this.retireParkGeneratedTimer(qitemId, "park_ended:owner-gone");
+      return { park, ...this.routeInTransaction(qitemId, fallbackDestination, reason, { ...move, expectState: "pending", wake: true }) };
+    })();
+    this.eventBus.notifySubscribers(routed.event);
+    if (routed.wakeId) this.deliverWakeIntentAfterCommit(routed.wakeId);
+    return { item: this.getByIdOrThrow(qitemId), park: routed.park };
   }
 
   private getByIdOrThrow(qitemId: string): QueueItem {
