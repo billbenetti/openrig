@@ -117,11 +117,13 @@ otherwise. An `escalation_owner` the queue doesn't accept as a destination is no
 (`seat_pool_escalation_failed`) rather than going to the model's escalation owner it replaced. Use it when the model's
 escalation owner is a seat that must not be woken by the pool.
 
-A relaunch that fails (or whose seat is stopped again when the next plan reads it) waits before the next try: 60 s,
+A relaunch that fails (or whose seat is stopped again when the next plan reads it, or whose launch throws) waits before the next try: 60 s,
 doubled by each failure in a row, at most 30 minutes. While it waits, the relaunch takes none of the tick's launches,
 so an add of the same plan (or of another pool) is not starved by a seat that never comes up; the wait is recorded once,
 as `seat_pool_held` with `reason: relaunch_backoff`, the seat, the failures in a row and `retryAt`. A plan that no longer
-asks to relaunch the seat (it runs again, or holds no waiting row) forgets its count. The count lives in the daemon's
+asks to relaunch the seat forgets its count: the seat runs again or holds no waiting row, and also a plan held for a
+passing reason (`usage_limit`, `drain`, a restore in progress, the model not found), which adds and launches nothing
+either. The count lives in the daemon's
 memory: a restart allows one more try before the backoff starts again. The launch a reap makes when the release command
 refuses has no backoff: the reap goes on as soon as that launch fails.
 
