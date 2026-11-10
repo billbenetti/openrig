@@ -10,10 +10,18 @@ import { OPENRIG_SENDER } from "../lib/pane-envelope.js";
 import type { Node } from "./types.js";
 import type { LaunchBudget, LaunchTick } from "./launch-budget.js";
 import {
+  SEAT_POOL_DRAIN_ENDED,
+  SEAT_POOL_DRAIN_EVENTS,
+  SEAT_POOL_DRAIN_EXPIRED,
+  SEAT_POOL_DRAIN_STARTED,
+  seatPoolDrainEpisode,
   seatPoolReapable,
   seatPoolRoom,
   slotWorkingDirectory,
   type SeatPoolCommand,
+  type SeatPoolDrainEpisode,
+  type SeatPoolDrainEvent,
+  type SeatPoolLeftWhy,
   type SeatPoolIntent,
   type SeatPoolModel,
   type SeatPoolPendingRow,
@@ -39,6 +47,12 @@ import {
  * launch budget (launch-budget.ts) until it settles, charged to the watchdog tick the plan was submitted in, and starts
  * nothing when the host or that tick has no room. A reap, under the seat's lifecycle lease, checks again that the
  * seat's session is gone, and leaves a seat that came back since the plan.
+ *
+ * Each run also keeps the drain's clock: the first run that reads `drain: true` records `seat_pool_drain_started`
+ * (with its `deadlineAt`), the first that reads `drain: false` after it records `seat_pool_drain_ended`, and the
+ * first run past the deadline takes out every seat the pool added that is still there (the forced pass, expireDrain)
+ * and records `seat_pool_drain_expired`. The clock is read back from those history entries, never from memory, so a
+ * restart doesn't reset it.
  */
 
 export interface SeatPoolSlot {
@@ -100,6 +114,20 @@ export class SeatPoolSlots {
   listRetired(poolJobId: string): string[] {
     return (this.db.prepare("SELECT logical_id FROM seat_pool_slots WHERE pool_job_id = ? AND retired_at IS NOT NULL AND op_id IS NOT NULL ORDER BY id")
       .all(poolJobId) as Array<{ logical_id: string }>).map((row) => row.logical_id);
+  }
+
+  /**
+   * The drain's history entries for the pool (seat_pool_drain_started, _ended, _expired), oldest first, from the
+   * job's watchdog history. Null when this database has no history table; empty when the table has none for the job,
+   * including once the retention pruned them.
+   */
+  drainEvents(poolJobId: string): SeatPoolDrainEvent[] | null {
+    if (!this.db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'watchdog_history'").get()) return null;
+    const rows = this.db.prepare(
+      `SELECT skip_reason, evaluation_notes FROM watchdog_history
+        WHERE job_id = ? AND skip_reason IN (${SEAT_POOL_DRAIN_EVENTS.map(() => "?").join(",")}) ORDER BY rowid`,
+    ).all(poolJobId, ...SEAT_POOL_DRAIN_EVENTS) as Array<{ skip_reason: string; evaluation_notes: string | null }>;
+    return rows.map((row) => ({ reason: row.skip_reason, notes: row.evaluation_notes ? JSON.parse(row.evaluation_notes) as Record<string, unknown> : null }));
   }
 
   /** The latest add or removal in the pool; adopting or unlinking a seat is neither. */
@@ -356,6 +384,9 @@ export interface SeatPoolEffects {
 export const SEAT_POOL_NEEDS_INPUT_TAG = "seat-pool-needs-input";
 /** The reason a reap gives each row it moves, followed by the seat; counting these reroutes counts the row's reaps. */
 export const SEAT_POOL_REAP_REASON = "reap:";
+/** The reason the forced pass at a drain's deadline gives each row it moves, followed by the seat. It is not
+ *  `reap:`, so a drained row is never counted as one that lost its seat (reapCount). */
+export const SEAT_POOL_DRAIN_REASON = "drain:";
 
 const errorCode = (error: unknown, fallback: string) => {
   const code = (error as { code?: unknown }).code;
@@ -453,6 +484,11 @@ export interface SeatPoolExecutorDeps {
   launchBudget?: LaunchBudget;
   /** Writes one history entry for the job. */
   record(jobId: string, entry: { failed: boolean; reason: string; notes: Record<string, unknown> }): void;
+  /**
+   * The drain's history entries for the pool, oldest first. Default: the job's watchdog history in the slots' database
+   * (SeatPoolSlots.drainEvents), or, until that shows the job's entries, the ones this executor recorded.
+   */
+  drainEvents?(jobId: string): SeatPoolDrainEvent[];
   now?: () => Date;
   /** How long one add, launch or drain may take before the run stops waiting for it. Default 10 minutes. */
   effectTimeoutMs?: number;
@@ -497,12 +533,21 @@ const ROW_MOVED_ON = new Set(["fallback_state_mismatch", "fallback_destination_m
 /** An unclaim refused because the row was closed or released since it was read: the move that follows decides. */
 const UNCLAIM_MOVED_ON = new Set(["qitem_not_in_progress", "qitem_not_found"]);
 const holdsWork = (slot: SeatPoolSlotView) => slot.openRows > 0 || slot.heldMessages > 0;
+
+/** What the forced pass did with one seat: taken out (no `why`), or left with why; `stop` ends the run. */
+interface ForcedOutcome {
+  stop?: true;
+  why?: SeatPoolLeftWhy;
+  moved: Array<{ qitemId: string; to: string }>;
+}
 const TIMED_OUT = Symbol("timed out");
 const NO_ROOM = Symbol("no room");
 
 export class SeatPoolExecutor {
   private readonly runs = new Map<string, Run>();
   private readonly samples = new Map<string, { desired: number; sampledAt: string }>();
+  /** The drain entries this executor recorded, read only until the database shows the job's own (drainEvents). */
+  private readonly recordedDrain = new Map<string, SeatPoolDrainEvent[]>();
   private readonly now: () => Date;
   private readonly effectTimeoutMs: number;
   private stopping = false;
@@ -553,7 +598,24 @@ export class SeatPoolExecutor {
   }
 
   private record(jobId: string, failed: boolean, reason: string, notes: Record<string, unknown>): void {
+    if ((SEAT_POOL_DRAIN_EVENTS as readonly string[]).includes(reason)) {
+      this.recordedDrain.set(jobId, [...(this.recordedDrain.get(jobId) ?? []), { reason, notes }]);
+    }
     this.deps.record(jobId, { failed, reason, notes });
+  }
+
+  /** The pool's current drain, read from its history entries. */
+  private drainEpisode(jobId: string): SeatPoolDrainEpisode | null {
+    if (this.deps.drainEvents) return seatPoolDrainEpisode(this.deps.drainEvents(jobId));
+    // The history is the clock's source, as the job's stop reads it. What this executor recorded stands in only until
+    // the history shows the job's drain entries: the first read that finds them drops the memory, so once the
+    // retention prunes them the drain is over here too, and the next run starts a new one (T-004870 r1, rule 2).
+    const persisted = this.deps.slots.drainEvents(jobId);
+    if (persisted && persisted.length > 0) {
+      this.recordedDrain.delete(jobId);
+      return seatPoolDrainEpisode(persisted);
+    }
+    return seatPoolDrainEpisode(this.recordedDrain.get(jobId) ?? []);
   }
 
   /** The job, spec and pool state read now; null stops the run. */
@@ -620,6 +682,7 @@ export class SeatPoolExecutor {
   }
 
   private async apply(jobId: string, intents: SeatPoolIntent[], run: Run): Promise<void> {
+    if (!(await this.drainClock(jobId, run))) return;
     for (const intent of intents) {
       if (!this.fresh(jobId, run)) return;
       if (intent.kind === "adopt") this.adopt(jobId, run, intent);
@@ -661,6 +724,122 @@ export class SeatPoolExecutor {
       } else if (!(await this.wake(jobId, run, intent))) return;
     }
     await this.refreshDemand(jobId, run);
+  }
+
+  /**
+   * Keeps the drain's clock, once per run: records the start of a drain (with its deadline, from `drain_deadline_s`)
+   * and its end, and runs the forced pass once the deadline has passed. Only `drain: true` starts the clock, and only
+   * while the pool holds a seat it added: a pool shrinking by `idle_grace_s` has no deadline, and one holding only
+   * adopted seats (which drain gives back at once) has nothing to time. False stops the run.
+   */
+  private async drainClock(jobId: string, run: Run): Promise<boolean> {
+    const ctx = this.fresh(jobId, run);
+    if (!ctx) return false;
+    const episode = this.drainEpisode(jobId);
+    const now = this.now();
+    if (!ctx.spec.drain) {
+      if (episode) this.record(jobId, false, SEAT_POOL_DRAIN_ENDED, { startedAt: episode.startedAt, endedAt: now.toISOString() });
+      return true;
+    }
+    if (!episode) {
+      // Only a seat the pool added can hold a drain: one with none (adopted seats only, or empty) times nothing.
+      if (!this.deps.slots.listOpen(jobId).some((slot) => slot.opId !== null)) return true;
+      const deadlineAt = ctx.spec.drainDeadlineSeconds > 0 ? new Date(now.getTime() + ctx.spec.drainDeadlineSeconds * 1000).toISOString() : null;
+      this.record(jobId, false, SEAT_POOL_DRAIN_STARTED, { startedAt: now.toISOString(), deadlineAt, deadlineSeconds: ctx.spec.drainDeadlineSeconds });
+      return true;
+    }
+    if (episode.deadlineAt === null || episode.expired || now.getTime() < Date.parse(episode.deadlineAt)) return true;
+    return this.expireDrain(jobId, run, episode);
+  }
+
+  /**
+   * The forced pass at a drain's deadline. Each seat the pool added that is still there leaves as a reap takes a seat
+   * out, under its lifecycle lease: the release command (a refusal leaves the seat running, its rows where they are),
+   * a stop with the `expected` read at the start, every open row moved to the model (an in-progress one unclaimed
+   * first; each only while still addressed to the seat, with the reason `drain:<seat>`), the node's removal, and last
+   * `remove_cmd` (forget). A seat whose node is already gone is only forgotten. An adopted seat is never touched. The
+   * seats that stay are listed, with why, in `seat_pool_drain_expired`, recorded once the pass is through.
+   */
+  private async expireDrain(jobId: string, run: Run, episode: SeatPoolDrainEpisode): Promise<boolean> {
+    const left: Array<{ slot: string; why: SeatPoolLeftWhy }> = [];
+    const moved: Array<{ qitemId: string; to: string }> = [];
+    for (const slot of this.deps.slots.listOpen(jobId)) {
+      // An adopted seat was someone else's before the pool: its rows and its session are never the pool's to take.
+      if (slot.opId === null) continue;
+      if (this.deps.slots.get(slot.slotId)?.retiredAt !== null) continue;
+      const ctx = this.fresh(jobId, run);
+      if (!ctx) return false;
+      // Drain turned off during the pass: the drain is over, and the next run records its end.
+      if (!ctx.spec.drain) return true;
+      const outcome = await this.forceOut(jobId, run, ctx, slot);
+      moved.push(...outcome.moved);
+      if (outcome.stop) return false;
+      if (outcome.why) left.push({ slot: slot.logicalId, why: outcome.why });
+    }
+    if (!this.fresh(jobId, run)) return false;
+    this.record(jobId, left.length > 0, SEAT_POOL_DRAIN_EXPIRED, {
+      startedAt: episode.startedAt, deadlineAt: episode.deadlineAt, at: this.at(), left, moved,
+    });
+    return true;
+  }
+
+  /** Takes one seat the pool added out at the drain's deadline (expireDrain). */
+  private async forceOut(jobId: string, run: Run, ctx: Context, slot: SeatPoolSlot): Promise<ForcedOutcome> {
+    const view = ctx.state.slots.find((s) => s.slotId === slot.slotId);
+    // Never created, or its node is gone already: nothing to stop and no row the pool can still reach there.
+    if (!slot.nodeId || !view?.nodeExists) {
+      if (!(await this.removeUnstarted(jobId, run, slot.slotId))) return { stop: true, moved: [] };
+      if (this.deps.slots.get(slot.slotId)?.retiredAt) return { moved: [] };
+      const after = this.fresh(jobId, run)?.state.slots.find((s) => s.slotId === slot.slotId);
+      return { why: after?.nodeExists ? "remove_failed" : "remove_cmd_failed", moved: [] };
+    }
+    const nodeId = slot.nodeId;
+    const sessionName = seatSessionName(slot.logicalId, ctx.model.rigName);
+    const outcome = await this.within(run, () => this.deps.effects.lifecycle(nodeId, async (): Promise<ForcedOutcome & { removed?: true }> => {
+      const inLease = this.fresh(jobId, run);
+      // Drain turned off since the deadline: nothing is taken out, and the next run records the drain's end.
+      if (!inLease || !inLease.spec.drain) return { stop: true, moved: [] };
+      const expected = this.deps.effects.stopPrecondition(nodeId);
+      const leftAs = (why: SeatPoolLeftWhy, rows: Array<{ qitemId: string; to: string }> = []): ForcedOutcome => {
+        this.setIntent(slot.slotId, null, "live");
+        return { why, moved: rows };
+      };
+      if (inLease.spec.releaseCmd) {
+        this.setIntent(slot.slotId, "release");
+        const released = await this.deps.effects.runCommand(inLease.spec.releaseCmd, this.commandEnv(inLease, { OPENRIG_SEAT_POOL_SLOT: sessionName }), run.controller.signal);
+        if (run.controller.signal.aborted) return { stop: true, moved: [] };
+        // Its work may not be saved: the seat keeps running, and its rows stay with it.
+        if (released.exitCode !== 0) return leftAs("release_refused");
+      }
+      this.setIntent(slot.slotId, "stop", "draining");
+      const stopped = await this.deps.effects.stopSlot({ sessionName, expected });
+      if (!stopped.ok && !STOPPED_CODES.has(stopped.code)) return leftAs("stop_failed");
+
+      const reason = `${SEAT_POOL_DRAIN_REASON}${sessionName}`;
+      const to = inLease.model.sessionName;
+      const rows: Array<{ qitemId: string; to: string }> = [];
+      for (const row of this.deps.effects.openRows(sessionName)) {
+        if (row.state === "in-progress") {
+          const unclaimed = this.deps.effects.unclaimRow({ qitemId: row.qitemId, seat: sessionName, reason });
+          if (!unclaimed.ok && !UNCLAIM_MOVED_ON.has(unclaimed.code)) return leftAs("move_failed", rows);
+        }
+        const move = this.deps.effects.moveRow({ qitemId: row.qitemId, from: sessionName, to, reason, state: row.state === "blocked" ? "blocked" : "pending" });
+        if (move.ok) rows.push({ qitemId: row.qitemId, to });
+        // A row that was claimed, closed or moved since it was read went on without the pool: nothing failed.
+        else if (!ROW_MOVED_ON.has(move.code)) return leftAs("move_failed", rows);
+      }
+      this.setIntent(slot.slotId, "remove");
+      const removed = await this.deps.effects.removeSlot({ rigId: inLease.model.rigId, nodeId, expected });
+      if (!removed.ok && removed.code !== "node_not_found") return leftAs("remove_failed", rows);
+      return { moved: rows, removed: true };
+    }));
+    if (outcome === TIMED_OUT) {
+      this.gaveUp(jobId, run, "seat_pool_drain_failed", { slot: slot.logicalId });
+      return { stop: true, moved: [] };
+    }
+    if (outcome.stop || !outcome.removed) return outcome;
+    if (!(await this.forget(jobId, run, slot.slotId))) return { stop: true, moved: outcome.moved };
+    return this.deps.slots.get(slot.slotId)?.retiredAt ? { moved: outcome.moved } : { why: "remove_cmd_failed", moved: outcome.moved };
   }
 
   private adopt(jobId: string, run: Run, intent: Extract<SeatPoolIntent, { kind: "adopt" }>): void {

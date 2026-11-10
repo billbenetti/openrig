@@ -305,7 +305,7 @@ The pre-0.5.8 complete array remains available with: rig watchdog list --all --f
 
   cmd
     .command("show <jobId>")
-    .description("Show one watchdog job")
+    .description("Show one watchdog job; a seat pool's also shows seatPool: its drain (startedAt, deadlineAt, expired) and the seats it still holds")
     .option("--json", "JSON output for agents")
     .action(async (jobId: string, opts: { json?: boolean }) => {
       const deps = getDeps();
@@ -329,7 +329,7 @@ The pre-0.5.8 complete array remains available with: rig watchdog list --all --f
 
   cmd
     .command("stop <jobId>")
-    .description("Stop a watchdog job (operator-stopped; scheduler skips it)")
+    .description("Stop a watchdog job (operator-stopped; scheduler skips it). A seat pool stops once its seats are gone, or once its drain's deadline has passed: the seats it left are listed in leftRunning")
     .option("--reason <text>", "Stop reason (free-form; recorded in terminal_reason)")
     .option("--json", "JSON output for agents")
     .action(async (jobId: string, opts: { reason?: string; json?: boolean }) => {

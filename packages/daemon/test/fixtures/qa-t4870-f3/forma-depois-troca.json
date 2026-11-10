@@ -1,0 +1,406 @@
+{
+  "source": "janela-20261109/depois-troca/openrig-depois-troca.sqlite (read-only copy)",
+  "tables": {
+    "watchdog_jobs": {
+      "ddl": "CREATE TABLE watchdog_jobs (\n      job_id TEXT PRIMARY KEY,\n      policy TEXT NOT NULL,\n      spec_yaml TEXT NOT NULL,\n      target_session TEXT NOT NULL,\n      interval_seconds INTEGER NOT NULL,\n      active_wake_interval_seconds INTEGER,\n      scan_interval_seconds INTEGER,\n      last_evaluation_at TEXT,\n      last_fire_at TEXT,\n      actionable INTEGER NOT NULL DEFAULT 0,\n      last_actionable_at TEXT,\n      state TEXT NOT NULL DEFAULT 'active',\n      registered_by_session TEXT NOT NULL,\n      registered_at TEXT NOT NULL,\n      terminal_reason TEXT\n    , registered_by_generation_uuid TEXT, target_generation_uuid TEXT, watched_file_path TEXT, threshold_bytes INTEGER, requires_job_id TEXT, last_fired_generation_uuid TEXT, watched_file_generation_uuid TEXT, last_fired_condition TEXT, threshold_tokens INTEGER, threshold_percent REAL)",
+      "columns": [
+        {
+          "name": "job_id",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt": null,
+          "pk": 1
+        },
+        {
+          "name": "policy",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt": null,
+          "pk": 0
+        },
+        {
+          "name": "spec_yaml",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt": null,
+          "pk": 0
+        },
+        {
+          "name": "target_session",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt": null,
+          "pk": 0
+        },
+        {
+          "name": "interval_seconds",
+          "type": "INTEGER",
+          "notnull": 1,
+          "dflt": null,
+          "pk": 0
+        },
+        {
+          "name": "active_wake_interval_seconds",
+          "type": "INTEGER",
+          "notnull": 0,
+          "dflt": null,
+          "pk": 0
+        },
+        {
+          "name": "scan_interval_seconds",
+          "type": "INTEGER",
+          "notnull": 0,
+          "dflt": null,
+          "pk": 0
+        },
+        {
+          "name": "last_evaluation_at",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt": null,
+          "pk": 0
+        },
+        {
+          "name": "last_fire_at",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt": null,
+          "pk": 0
+        },
+        {
+          "name": "actionable",
+          "type": "INTEGER",
+          "notnull": 1,
+          "dflt": "0",
+          "pk": 0
+        },
+        {
+          "name": "last_actionable_at",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt": null,
+          "pk": 0
+        },
+        {
+          "name": "state",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt": "'active'",
+          "pk": 0
+        },
+        {
+          "name": "registered_by_session",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt": null,
+          "pk": 0
+        },
+        {
+          "name": "registered_at",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt": null,
+          "pk": 0
+        },
+        {
+          "name": "terminal_reason",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt": null,
+          "pk": 0
+        },
+        {
+          "name": "registered_by_generation_uuid",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt": null,
+          "pk": 0
+        },
+        {
+          "name": "target_generation_uuid",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt": null,
+          "pk": 0
+        },
+        {
+          "name": "watched_file_path",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt": null,
+          "pk": 0
+        },
+        {
+          "name": "threshold_bytes",
+          "type": "INTEGER",
+          "notnull": 0,
+          "dflt": null,
+          "pk": 0
+        },
+        {
+          "name": "requires_job_id",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt": null,
+          "pk": 0
+        },
+        {
+          "name": "last_fired_generation_uuid",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt": null,
+          "pk": 0
+        },
+        {
+          "name": "watched_file_generation_uuid",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt": null,
+          "pk": 0
+        },
+        {
+          "name": "last_fired_condition",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt": null,
+          "pk": 0
+        },
+        {
+          "name": "threshold_tokens",
+          "type": "INTEGER",
+          "notnull": 0,
+          "dflt": null,
+          "pk": 0
+        },
+        {
+          "name": "threshold_percent",
+          "type": "REAL",
+          "notnull": 0,
+          "dflt": null,
+          "pk": 0
+        }
+      ],
+      "indexes": [
+        "CREATE INDEX idx_watchdog_jobs_active_next_eval\n      ON watchdog_jobs(last_evaluation_at) WHERE state = 'active'",
+        "CREATE INDEX idx_watchdog_jobs_policy ON watchdog_jobs(policy)",
+        "CREATE INDEX idx_watchdog_jobs_state ON watchdog_jobs(state)",
+        "CREATE INDEX idx_watchdog_jobs_target_session ON watchdog_jobs(target_session)"
+      ],
+      "rows": 13336
+    },
+    "seat_pool_slots": {
+      "ddl": "CREATE TABLE seat_pool_slots (\n      id INTEGER PRIMARY KEY AUTOINCREMENT,\n      pool_job_id TEXT NOT NULL,\n      node_id TEXT,\n      logical_id TEXT NOT NULL,\n      phase TEXT NOT NULL CHECK (phase IN ('adding', 'added', 'live', 'draining', 'retired')),\n      intent TEXT,\n      op_id TEXT,\n      created_at TEXT NOT NULL,\n      retired_at TEXT\n    )",
+      "columns": [
+        {
+          "name": "id",
+          "type": "INTEGER",
+          "notnull": 0,
+          "dflt": null,
+          "pk": 1
+        },
+        {
+          "name": "pool_job_id",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt": null,
+          "pk": 0
+        },
+        {
+          "name": "node_id",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt": null,
+          "pk": 0
+        },
+        {
+          "name": "logical_id",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt": null,
+          "pk": 0
+        },
+        {
+          "name": "phase",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt": null,
+          "pk": 0
+        },
+        {
+          "name": "intent",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt": null,
+          "pk": 0
+        },
+        {
+          "name": "op_id",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt": null,
+          "pk": 0
+        },
+        {
+          "name": "created_at",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt": null,
+          "pk": 0
+        },
+        {
+          "name": "retired_at",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt": null,
+          "pk": 0
+        }
+      ],
+      "indexes": [
+        "CREATE UNIQUE INDEX idx_seat_pool_slots_linked_node\n      ON seat_pool_slots(node_id) WHERE retired_at IS NULL AND node_id IS NOT NULL",
+        "CREATE INDEX idx_seat_pool_slots_pool ON seat_pool_slots(pool_job_id, retired_at)"
+      ],
+      "rows": 0
+    },
+    "watchdog_history": {
+      "ddl": "CREATE TABLE watchdog_history (\n      history_id TEXT PRIMARY KEY,\n      job_id TEXT NOT NULL REFERENCES watchdog_jobs(job_id),\n      evaluated_at TEXT NOT NULL,\n      outcome TEXT NOT NULL,\n      skip_reason TEXT,\n      delivery_target_session TEXT,\n      delivery_status TEXT,\n      delivery_message TEXT,\n      evaluation_notes TEXT\n    )",
+      "columns": [
+        {
+          "name": "history_id",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt": null,
+          "pk": 1
+        },
+        {
+          "name": "job_id",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt": null,
+          "pk": 0
+        },
+        {
+          "name": "evaluated_at",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt": null,
+          "pk": 0
+        },
+        {
+          "name": "outcome",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt": null,
+          "pk": 0
+        },
+        {
+          "name": "skip_reason",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt": null,
+          "pk": 0
+        },
+        {
+          "name": "delivery_target_session",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt": null,
+          "pk": 0
+        },
+        {
+          "name": "delivery_status",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt": null,
+          "pk": 0
+        },
+        {
+          "name": "delivery_message",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt": null,
+          "pk": 0
+        },
+        {
+          "name": "evaluation_notes",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt": null,
+          "pk": 0
+        }
+      ],
+      "indexes": [
+        "CREATE INDEX idx_watchdog_history_job_recent\n      ON watchdog_history(job_id, evaluated_at DESC)",
+        "CREATE INDEX idx_watchdog_history_outcome_recent\n      ON watchdog_history(outcome, evaluated_at DESC)"
+      ],
+      "rows": 29853
+    }
+  },
+  "seat_pool": {
+    "jobs": [],
+    "slots_open": 0,
+    "history_seat_pool_rows": 0
+  },
+  "example_job_row_shape": {
+    "job_id": "01M71G3BNQGYH3NFKVKWJRSFGF",
+    "policy": "periodic-reminder",
+    "spec_yaml": {
+      "type": "str",
+      "len": 193,
+      "top_level_keys": [
+        "message",
+        "policy",
+        "target"
+      ]
+    },
+    "target_session": "build-dev-9@fabrica",
+    "interval_seconds": 3600,
+    "active_wake_interval_seconds": null,
+    "scan_interval_seconds": null,
+    "last_evaluation_at": "2026-11-10T01:10:29.815Z",
+    "last_fire_at": null,
+    "actionable": 0,
+    "last_actionable_at": null,
+    "state": "active",
+    "registered_by_session": "build-dev-9@fabrica",
+    "registered_at": "2026-11-10T01:10:29.815Z",
+    "terminal_reason": null,
+    "registered_by_generation_uuid": "d4d11f66-b5e6-47d2-9188-0a5d59f2a338",
+    "target_generation_uuid": null,
+    "watched_file_path": null,
+    "threshold_bytes": null,
+    "requires_job_id": null,
+    "last_fired_generation_uuid": null,
+    "watched_file_generation_uuid": null,
+    "last_fired_condition": null,
+    "threshold_tokens": null,
+    "threshold_percent": null
+  },
+  "example_history_row_shape": {
+    "history_id": "01M71G2WN3VZT9HGA3PGDE225H",
+    "job_id": "01M6FTPFZF5MZSQY63X2F8SGT6",
+    "evaluated_at": "2026-11-10T01:10:14.424Z",
+    "outcome": "skipped",
+    "skip_reason": "all-parked-owners-deferred",
+    "delivery_target_session": null,
+    "delivery_status": null,
+    "delivery_message": null,
+    "evaluation_notes": {
+      "type": "json",
+      "keys": [
+        "skippedSeats"
+      ]
+    }
+  },
+  "history_evaluated_at_samples": [
+    "2026-11-10T01:10:25.978Z",
+    "2026-11-10T01:10:16.796Z",
+    "2026-11-10T01:10:16.793Z"
+  ],
+  "history_retention_view": {
+    "oldest_evaluated_at": "2026-10-31T08:07:45.368Z",
+    "max_rows_per_job": 6057
+  },
+  "migrations_seat_pool": [
+    "158_seat_pool_slots.sql"
+  ]
+}
