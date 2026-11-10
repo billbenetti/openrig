@@ -263,13 +263,19 @@ under the seat's lifecycle lease:
    lease holds deliveries back, not the queue, so a turn already under way can work on its rows while the command runs.
    The pass compares each row's state and claim time with what they were when the command was asked: a row claimed, or
    released and claimed again, blocked, closed or handed off since, or a new row that is not pending, means the seat is
-   working on something the command never answered for: it is not stopped, keeps its rows, and is left
-   (`why: work_arrived`). A pending row that only arrived goes to the model with the others.
+   working on something the command never answered for. So does a row the seat itself claimed, blocked, closed or
+   handed off since (the queue's transitions, by the seat as the actor), also one that arrived and was closed in
+   between. Such a seat is not stopped and keeps its rows; it is asked again on the next evaluations, as one whose
+   command did not answer, until 10 minutes after the deadline, and only then left (`why: work_arrived`). The rows'
+   faces also change by another actor's hand (an auto-unpark when a blocker closes, a usage-limit park, a reroute), so
+   the release command answers for the seat again: it lets go of a seat that is not working. A pending row that only
+   arrived goes to the model with the others.
 2. A [checked stop](checked-seat-stop.md), with the `expected` read at the start; a refused stop leaves the seat
    (`why: stop_failed`), its rows unmoved: back in admission while its session runs, draining once it is gone (a stop
    that failed after the kill, or a seat the pass had stopped before), so the reap does not launch it again. A stop
    that tried the kill is taken as one that stopped the seat only once tmux finds its session gone (the check the
-   reap's clean makes): the kill itself can fail with the session alive, and such a seat goes back to admission.
+   reap's clean makes): the kill itself can fail with the session alive, and such a seat goes back to admission. A
+   session tmux finds gone is the proof a stop that found no live session gives: the pass carries on to step 3.
 3. Each open row goes to the model: an in-progress row is unclaimed first, and each row moves only while it is still
    addressed to the seat, in one transaction, keeping its id and its state (a pending row wakes the model; a blocked
    one keeps what wakes it, as a reap moves it, and only one nothing would wake goes back to pending). The reroute's reason is `drain:<seat>`, not `reap:<seat>`, so a drained row is not counted as one
@@ -285,8 +291,9 @@ way out once the pass is through (a free seat the plain drain stopped and a rest
 again: it carries on to the removal, without the release command or another stop, unless a row or a held message
 reached it since (it then goes back to admission, and the reap gives its rows back). `rig watchdog stop` returns the
 seats left after their stop with `stopped: true` in `leftRunning` (and in their `seat_pool_left` entry). While the pass
-asks a release command again, `rig watchdog show` gives `seatPool.drain.retryUntil` and the seats `waiting`, and the
-stop's refusal says until when. A seat whose lifecycle lease the delivery guard refuses (a typing guard on hold, a
+asks a release command again, `rig watchdog show` gives `seatPool.drain.retryUntil` and the seats `waiting` (a
+`seat_pool_drain_retrying` entry carries `why: work_arrived` for a seat that worked on its rows), and the stop's refusal
+says until when. A seat whose lifecycle lease the delivery guard refuses (a typing guard on hold, a
 draft-aware seat with input) is left as it is (`why: delivery_guard`); the plain drain puts it back in admission and
 the reap tries it at the next plan, and neither stops the rest of the run. A pass cut short after the stop (a restart) carries on from that step: a seat whose session is gone is not
 asked `release_cmd` again; one whose session is running is.
