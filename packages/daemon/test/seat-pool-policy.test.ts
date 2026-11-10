@@ -71,6 +71,7 @@ describe("seat-pool spec", () => {
     expect(parsed).toEqual({ spec: {
       min: 0, max: 2, cooldownSeconds: 60, idleGraceSeconds: 300, dispatchAfterSeconds: 60, dispatchTag: null, drain: false, drainDeadlineSeconds: 900, adopt: [], cwdTemplate: "/w/{slot}",
       demandCmd: null, prepareCmd: null, releaseCmd: { argv: ["/bin/release", "--now"], timeoutSeconds: 9 }, reapCmd: null, removeCmd: null,
+      escalationOwner: null,
     } });
   });
 
@@ -521,5 +522,69 @@ describe("seat-pool registration, update and stop", () => {
     const refused = await app.request(`/api/watchdog/${job.jobId}/stop`, { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
     expect(refused.status).toBe(409);
     expect(await refused.json()).toMatchObject({ error: "pool_has_slots", message: expect.stringContaining("started with drain_deadline_s: 0") });
+  });
+});
+
+describe("F6a: escalation_owner, max_reached in the history, the room a plan frees", () => {
+  it("reads escalation_owner as a seat address, and refuses anything else", () => {
+    expect(spec({ escalation_owner: "plataforma-supervisor@comando" }).escalationOwner).toBe("plataforma-supervisor@comando");
+    expect(spec().escalationOwner).toBeNull();
+    for (const bad of ["", "  ", "supervisor", "a b@c", 3, ["x@y"]]) {
+      expect(parseSeatPoolSpec({ max: 1, cwd_template: "/w/{slot}", escalation_owner: bad })).toMatchObject({ problem: { field: "escalation_owner" } });
+    }
+  });
+
+  it("a pool held at max with nothing to change says so in its history", async () => {
+    // The REVISAO-f1 S2 shape: a stopped adopted seat takes room under max but isn't one of the seats taking work.
+    const full = [slot({ cause: "working", idleSince: null, openRows: 1 }), slot({ adopted: true, cause: "stopped", idleSince: null })];
+    const evaluated = await makeSeatPoolPolicy({ readState: () => state({ slots: full, pending: rows(3) }), submit: () => true, now: () => NOW })
+      .evaluate({ jobId: "pool-1", policy: SEAT_POOL_POLICY_NAME, target: { session: "dev-impl@r" }, intervalSeconds: 60,
+        context: { max: 2, cwd_template: "/w/{slot}" } } as PolicyJob);
+    expect(evaluated).toMatchObject({ action: "skip", reason: "seat_pool_held", notes: { reason: "max_reached", intents: [] } });
+  });
+
+  it("counts as room the seats the same plan forgets or reaps, so a full pool replaces a gone seat in the same plan", () => {
+    const busy = () => slot({ cause: "working", idleSince: null, openRows: 1 });
+    const gone = slot({ nodeExists: false, cause: "stopped", idleSince: null });
+    const result = plan(spec({ max: 3, cooldown_s: 300 }), state({ slots: [busy(), busy(), gone], pending: rows(3) }));
+    expect(result.intents).toEqual([{ kind: "remove", slotId: gone.slotId }, { kind: "add", count: 1 }]);
+    const dead = slot({ cause: "stopped", idleSince: null });
+    const reaping = plan(spec({ max: 3, demand_cmd: { argv: ["demand"] } }),
+      state({ slots: [busy(), dead], demand: { desired: 3, sampledAt: ago(10) } }));
+    // The seat being reaped is neither current nor room: demand 3 with one working seat asks for 2.
+    expect(reaping.intents).toEqual([{ kind: "reap", slotId: dead.slotId }, { kind: "add", count: 2 }]);
+    // RC r1 S1: with max 2, one working seat and one to reap, demand 2 replaces the reaped seat in the same plan.
+    const one = busy();
+    const gonePlan = plan(spec({ max: 2, demand_cmd: { argv: ["demand"] } }),
+      state({ slots: [one, slot({ cause: "stopped", idleSince: null })], demand: { desired: 2, sampledAt: ago(10) } }));
+    expect(gonePlan.intents.filter((intent) => intent.kind === "add")).toEqual([{ kind: "add", count: 1 }]);
+    expect(gonePlan.current).toBe(1);
+  });
+});
+
+describe("F6a: a needs-input escalation only for the rows the pool owns", () => {
+  const tagged = (destination: string) => rows(1, destination, 120, ["pool:new"]);
+  it("with dispatch_tag, an adopted seat or the model waiting on an untagged row of its own is no alert", () => {
+    const fixa = slot({ adopted: true, cause: "needs_input", idleSince: null, openRows: 1 });
+    const own = rows(1, fixa.sessionName);
+    const s = spec({ dispatch_tag: "pool:new" });
+    expect(plan(s, state({ slots: [fixa], pending: own })).intents.filter((i) => i.kind === "escalate")).toEqual([]);
+    const model = plan(s, state({ modelCause: "needs_input", pending: rows(1) }));
+    expect(model.intents.filter((i) => i.kind === "escalate")).toEqual([]);
+    // A tagged row is the pool's: it is escalated, and only it is named.
+    const work = tagged(fixa.sessionName);
+    expect(plan(s, state({ slots: [fixa], pending: [...own, ...work] })).intents.filter((i) => i.kind === "escalate"))
+      .toEqual([{ kind: "escalate", seat: fixa.sessionName, qitemIds: [work[0]!.qitemId] }]);
+  });
+
+  it("a seat the pool added is escalated for any waiting row, and without dispatch_tag every seat is, as before", () => {
+    const added = slot({ cause: "needs_input", idleSince: null, openRows: 1 });
+    const fixa = slot({ adopted: true, cause: "needs_input", idleSince: null, openRows: 1 });
+    const waiting = [...rows(1, added.sessionName), ...rows(1, fixa.sessionName)];
+    const withTag = plan(spec({ dispatch_tag: "pool:new" }), state({ slots: [added, fixa], pending: waiting }));
+    expect(withTag.intents.filter((i) => i.kind === "escalate").map((i) => (i as { seat: string }).seat)).toEqual([added.sessionName]);
+    const withoutTag = plan(spec(), state({ slots: [added, fixa], pending: waiting }));
+    expect(withoutTag.intents.filter((i) => i.kind === "escalate").map((i) => (i as { seat: string }).seat).sort())
+      .toEqual([added.sessionName, fixa.sessionName].sort());
   });
 });
