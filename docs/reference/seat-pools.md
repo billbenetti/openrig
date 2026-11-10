@@ -257,9 +257,14 @@ under the seat's lifecycle lease:
    then left (`why: release_unavailable`); the pass isn't through until then (`seat_pool_drain_retrying` records what it
    did so far, so a restart carries on with it). A release command that answers 3 to every seat (a stop switch it
    honours) therefore leaves every seat. After the release, the pass reads the spec again: with `drain: false` set
-   while the command ran, the seat is not stopped and goes back to admission.
+   while the command ran, the seat is not stopped and goes back to admission. It also reads the seat's rows again: the
+   lease holds deliveries back, not the queue, so a turn already under way can claim a row while the command runs. A
+   row claimed since the command was asked means the seat is working on something the command never answered for: it
+   is not stopped, keeps its rows, and is left (`why: work_arrived`). A pending row that only arrived goes to the model
+   with the others.
 2. A [checked stop](checked-seat-stop.md), with the `expected` read at the start; a refused stop leaves the seat
-   (`why: stop_failed`), its rows unmoved.
+   (`why: stop_failed`), its rows unmoved: back in admission while its session runs, draining once it is gone (a stop
+   that failed after the kill, or a seat the pass had stopped before), so the reap does not launch it again.
 3. Each open row goes to the model: an in-progress row is unclaimed first, and each row moves only while it is still
    addressed to the seat, in one transaction, keeping its id and its state (a pending row wakes the model; a blocked
    one keeps what wakes it, as a reap moves it, and only one nothing would wake goes back to pending). The reroute's reason is `drain:<seat>`, not `reap:<seat>`, so a drained row is not counted as one
@@ -269,7 +274,10 @@ under the seat's lifecycle lease:
 
 Once a seat is stopped, a failure that follows (a row that won't move: `why: move_failed`; a removal refused:
 `why: remove_failed`) leaves it draining, with the step it was at, never back in admission, where the reap would launch
-it again. A pass cut short after the stop (a restart) carries on from that step: a seat whose session is gone is not
+it again. Its entry in `left` carries `stopped: true`, and it stays draining after the pass too, whatever its
+session's record reads (a stop that failed after the kill can leave it reading running). Any other seat stopped on its
+way out once the pass is through (a free seat the plain drain stopped and a restart cut short) is the plain drain's
+again. A pass cut short after the stop (a restart) carries on from that step: a seat whose session is gone is not
 asked `release_cmd` again; one whose session is running is.
 
 Messages the typing guard holds for the seat are left as a reap leaves them. The pass records
