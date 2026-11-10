@@ -161,7 +161,10 @@ export const SEAT_POOL_DRAIN_STARTED = "seat_pool_drain_started";
 export const SEAT_POOL_DRAIN_ENDED = "seat_pool_drain_ended";
 export const SEAT_POOL_DRAIN_EXPIRED = "seat_pool_drain_expired";
 export const SEAT_POOL_LEFT = "seat_pool_left";
-export const SEAT_POOL_DRAIN_EVENTS = [SEAT_POOL_DRAIN_STARTED, SEAT_POOL_DRAIN_ENDED, SEAT_POOL_DRAIN_EXPIRED] as const;
+/** The forced pass is still waiting on a seat whose release command did not answer (exit 3 or 5, or no exit code: a
+ *  timeout): what the pass did so far, so the next tick, or the next daemon, carries on with it. */
+export const SEAT_POOL_DRAIN_RETRYING = "seat_pool_drain_retrying";
+export const SEAT_POOL_DRAIN_EVENTS = [SEAT_POOL_DRAIN_STARTED, SEAT_POOL_DRAIN_ENDED, SEAT_POOL_DRAIN_EXPIRED, SEAT_POOL_DRAIN_RETRYING] as const;
 
 /** One of the drain's history entries, oldest first. */
 export interface SeatPoolDrainEvent {
@@ -169,8 +172,24 @@ export interface SeatPoolDrainEvent {
   notes: Record<string, unknown> | null;
 }
 
-/** Why a seat the forced pass could not take out is still there. */
-export type SeatPoolLeftWhy = "release_refused" | "stop_failed" | "move_failed" | "remove_failed" | "remove_cmd_failed";
+/** Why a seat the forced pass could not take out is still there. `release_unavailable`: its release command did not
+ *  answer (exit 3 or 5, or a timeout) on any try within SEAT_POOL_RELEASE_RETRY_SECONDS of the deadline. */
+export type SeatPoolLeftWhy =
+  | "release_refused" | "release_unavailable" | "stop_failed" | "move_failed" | "remove_failed" | "remove_cmd_failed";
+
+/** A seat the forced pass left, with the release command's exit code in that pass (null when it did not run). */
+export interface SeatPoolLeftEntry { slot: string; why: string; exitCode?: number | null }
+
+/** How long after a drain's deadline the forced pass keeps asking again a release command that did not answer. */
+export const SEAT_POOL_RELEASE_RETRY_SECONDS = 600;
+
+/**
+ * Why the release command is asked, in OPENRIG_SEAT_POOL_RELEASE_REASON (release_cmd only): `idle` for a free seat the
+ * pool drains (by `drain` or by `idle_grace_s`), `drain-deadline` for the forced pass at a drain's deadline (the seat's
+ * open rows go to the model after its stop), `reap` for a seat whose session is gone.
+ */
+export const SEAT_POOL_RELEASE_REASON_ENV = "OPENRIG_SEAT_POOL_RELEASE_REASON";
+export type SeatPoolReleaseReason = "idle" | "drain-deadline" | "reap";
 
 /** The current drain: since its latest `started` with no `ended` after it. */
 export interface SeatPoolDrainEpisode {
@@ -178,7 +197,12 @@ export interface SeatPoolDrainEpisode {
   /** Null when the drain has no deadline (`drain_deadline_s: 0`). */
   deadlineAt: string | null;
   /** The forced pass's result, once it ran for this drain. */
-  expired: { at: string; left: Array<{ slot: string; why: string }>; moved: Array<{ qitemId: string; to: string }> } | null;
+  expired: { at: string; left: SeatPoolLeftEntry[]; moved: Array<{ qitemId: string; to: string }> } | null;
+  /**
+   * A forced pass still under way: the seats it left for good, the rows it moved, and the seats whose release command
+   * did not answer, to ask again (with the last exit code). Absent when no pass is waiting.
+   */
+  retry?: { left: SeatPoolLeftEntry[]; moved: Array<{ qitemId: string; to: string }>; waiting: Array<{ slot: string; exitCode: number | null }> };
 }
 
 const text = (value: unknown): string | null => (typeof value === "string" ? value : null);
@@ -196,8 +220,15 @@ export function seatPoolDrainEpisode(events: SeatPoolDrainEvent[]): SeatPoolDrai
     } else if (event.reason === SEAT_POOL_DRAIN_EXPIRED && episode && text(notes["startedAt"]) === episode.startedAt) {
       episode.expired = {
         at: text(notes["at"]) ?? episode.deadlineAt ?? episode.startedAt,
-        left: Array.isArray(notes["left"]) ? notes["left"] as Array<{ slot: string; why: string }> : [],
+        left: Array.isArray(notes["left"]) ? notes["left"] as SeatPoolLeftEntry[] : [],
         moved: Array.isArray(notes["moved"]) ? notes["moved"] as Array<{ qitemId: string; to: string }> : [],
+      };
+      delete episode.retry;
+    } else if (event.reason === SEAT_POOL_DRAIN_RETRYING && episode && !episode.expired && text(notes["startedAt"]) === episode.startedAt) {
+      episode.retry = {
+        left: Array.isArray(notes["left"]) ? notes["left"] as SeatPoolLeftEntry[] : [],
+        moved: Array.isArray(notes["moved"]) ? notes["moved"] as Array<{ qitemId: string; to: string }> : [],
+        waiting: Array.isArray(notes["waiting"]) ? notes["waiting"] as Array<{ slot: string; exitCode: number | null }> : [],
       };
     }
   }
