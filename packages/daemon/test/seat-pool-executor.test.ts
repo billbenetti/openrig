@@ -1428,6 +1428,7 @@ describe("seat-pool executor", () => {
       await run(executor, []);
     };
     const expired = () => history.filter((h) => h.reason === "seat_pool_drain_expired");
+    const retrying = () => history.filter((h) => h.reason === "seat_pool_drain_retrying");
     beforeEach(() => {
       clock = T0;
       migrate(db, [inboxEntriesSchema, outboxEntriesSchema, i3IdentityProvenanceSchema]);
@@ -1450,9 +1451,9 @@ describe("seat-pool executor", () => {
       expect(repo.getById(row.qitemId)).toMatchObject({ destinationSession: SEAT, state: "in-progress" });
       expect(world.nodes.get("node-1")?.session).toBe("running");
       expect(slots.get(slot.slotId)).toMatchObject({ phase: "live", intent: null, retiredAt: null });
-      expect(expired()).toEqual([expect.objectContaining({
-        failed: true, notes: expect.objectContaining({ left: [{ slot: "dev.impl-s1", why: "work_arrived", exitCode: 0 }], moved: [] }),
-      })]);
+      // T-005250 S11: asked again until the retry window closes, not left for good at once.
+      expect(expired()).toEqual([]);
+      expect(retrying().at(-1)?.notes).toMatchObject({ left: [], moved: [], waiting: [{ slot: "dev.impl-s1", exitCode: 0, why: "work_arrived" }] });
     });
 
     it("B1: a row claimed before the release, that the release command lets go, is still unclaimed and moved (the claim is not new)", async () => {
@@ -1505,26 +1506,79 @@ describe("seat-pool executor", () => {
       expect(expired()).toEqual([expect.objectContaining({ notes: expect.objectContaining({ left: [{ slot: "dev.impl-s1", why: "stop_failed", exitCode: 0, stopped: true }] }) })]);
     });
 
-    it("S1: a stop that tried the kill and failed to record it (stopPhase kill_attempted, the record still running) leaves the seat draining", async () => {
+    // T-005250 S12: a stop that tried the kill and failed to record it, its session found gone by tmux (the clean), has
+    // the proof a session_not_live stop gives: the pass carries on, its rows to the model and the node removed.
+    for (const clean of [{ ok: true } as const, { ok: false, code: "nothing_to_clean", error: "already clean" } as const]) {
+      it(`S12: a kill_attempted stop whose session tmux finds gone (${clean.ok ? "cleaned" : clean.code}) moves its rows and removes the seat`, async () => {
+        const row = await repo.create({ sourceSession: "lead@r", destinationSession: SEAT, body: "work", nudge: false });
+        repo.claim({ qitemId: row.qitemId, destinationSession: SEAT });
+        const slot = liveSeat();
+        world.cleanResult = clean;
+        await toDeadline(executorWith({
+          ...withQueue(),
+          // As the daemon's stopSeat answers when the kill ran but the stop could not be persisted: the session's record
+          // (what sessionRunning reads) still says running.
+          stopSlot: async (input) => {
+            world.calls.push(`stop ${input.sessionName}`);
+            return { ok: false, code: "stop_uncertain", error: "Session kill completed, but stop state could not be persisted", killAttempted: true };
+          },
+        }));
+        expect(world.calls).toContain(`clean ${SEAT}`);
+        expect(repo.getById(row.qitemId)).toMatchObject({ destinationSession: MODEL.sessionName, state: "pending" });
+        expect(world.calls.some((c) => c.startsWith("remove dev.impl-s1"))).toBe(true);
+        expect(slots.get(slot.slotId)?.retiredAt).not.toBeNull();
+        expect(expired()).toEqual([expect.objectContaining({ failed: false, notes: expect.objectContaining({ left: [], moved: [{ qitemId: row.qitemId, to: MODEL.sessionName }] }) })]);
+      });
+    }
+
+    it("S12: a stop that failed at its finalization (kill_attempted, the record already exited) moves the rows once tmux finds the session gone", async () => {
+      const row = await repo.create({ sourceSession: "lead@r", destinationSession: SEAT, body: "work", nudge: false });
       const slot = liveSeat();
-      const executor = executorWith({
-        ...world.effects(),
-        // As the daemon's stopSeat answers when the kill ran but the stop could not be persisted: the session's record
-        // (what sessionRunning reads) still says running.
+      await toDeadline(executorWith({
+        ...withQueue(),
+        // As stopSeat answers when the kill and the stop's record went through and only the finalization failed.
         stopSlot: async (input) => {
           world.calls.push(`stop ${input.sessionName}`);
-          return { ok: false, code: "stop_uncertain", error: "Session kill completed, but stop state could not be persisted", killAttempted: true };
+          world.nodes.get(input.expected.nodeId)!.session = "stopped";
+          return { ok: false, code: "stop_uncertain", error: "Session kill completed, but stop finalization failed", killAttempted: true };
         },
-      });
-      await toDeadline(executor);
-      expect(world.nodes.get("node-1")?.session).toBe("running");
+      }));
+      expect(world.calls).toContain(`clean ${SEAT}`);
+      expect(repo.getById(row.qitemId)).toMatchObject({ destinationSession: MODEL.sessionName, state: "pending" });
+      expect(slots.get(slot.slotId)?.retiredAt).not.toBeNull();
+      expect(expired()).toEqual([expect.objectContaining({ failed: false, notes: expect.objectContaining({ left: [], moved: [{ qitemId: row.qitemId, to: MODEL.sessionName }] }) })]);
+    });
+
+    it("S12: a kill_attempted stop with the record exited whose clean cannot tell (probe failed) stays draining, its rows unmoved", async () => {
+      const row = await repo.create({ sourceSession: "lead@r", destinationSession: SEAT, body: "work", nudge: false });
+      const slot = liveSeat();
+      world.cleanResult = { ok: false, code: "probe_failed", error: "tmux did not answer" };
+      await toDeadline(executorWith({
+        ...withQueue(),
+        stopSlot: async (input) => {
+          world.calls.push(`stop ${input.sessionName}`);
+          world.nodes.get(input.expected.nodeId)!.session = "stopped";
+          return { ok: false, code: "stop_uncertain", error: "Session kill completed, but stop finalization failed", killAttempted: true };
+        },
+      }));
+      expect(repo.getById(row.qitemId)).toMatchObject({ destinationSession: SEAT, state: "pending" });
       expect(slots.get(slot.slotId)).toMatchObject({ phase: "draining", intent: "stop", retiredAt: null });
       expect(expired()).toEqual([expect.objectContaining({ notes: expect.objectContaining({ left: [{ slot: "dev.impl-s1", why: "stop_failed", exitCode: 0, stopped: true }] }) })]);
-      // The next plain drain, its record still reading running: the seat stays held, never back in admission.
-      world.calls = [];
-      await run(executor, [drainOf(slot.slotId)]);
-      expect(world.calls).toEqual([]);
-      expect(slots.get(slot.slotId)).toMatchObject({ phase: "draining", intent: "stop", retiredAt: null });
+    });
+
+    it("S12: a kill_attempted stop whose clean fails on the probe (session state unknown) leaves the seat running, back in admission", async () => {
+      const slot = liveSeat();
+      world.cleanResult = { ok: false, code: "probe_failed", error: "tmux did not answer" };
+      await toDeadline(executorWith({
+        ...world.effects(),
+        stopSlot: async (input) => {
+          world.calls.push(`stop ${input.sessionName}`);
+          return { ok: false, code: "stop_uncertain", error: "kill-session failed", killAttempted: true };
+        },
+      }));
+      expect(world.calls.filter((c) => c.startsWith("remove") || c.startsWith("move"))).toEqual([]);
+      expect(slots.get(slot.slotId)).toMatchObject({ phase: "live", intent: null, retiredAt: null });
+      expect(expired()).toEqual([expect.objectContaining({ notes: expect.objectContaining({ left: [{ slot: "dev.impl-s1", why: "stop_failed", exitCode: 0 }] }) })]);
     });
 
     it("S1: a stop refused with the session still running leaves the seat untouched, back in admission (as before)", async () => {
@@ -1591,7 +1645,7 @@ describe("seat-pool executor", () => {
 
     // T-005245 S7: the seat worked on its rows while the release command ran, in a way the B1 check (a new
     // in-progress id) missed: the same row released and claimed again, a claim and then a block or a close, a pending
-    // row parked straight away. Each keeps the seat running: no stop, no unclaim, left work_arrived.
+    // row parked straight away. Each keeps the seat running: no stop, no unclaim, work_arrived (asked again, T-005250 S11).
     const workedDuringRelease = async (before: (id: string) => void, during: (id: string) => Promise<void> | void) => {
       const row = await repo.create({ sourceSession: "lead@r", destinationSession: SEAT, body: "work", nudge: false });
       before(row.qitemId);
@@ -1601,7 +1655,8 @@ describe("seat-pool executor", () => {
       expect(world.calls.filter((c) => c.startsWith("stop") || c.startsWith("remove") || c.startsWith("unclaim"))).toEqual([]);
       expect(world.nodes.get("node-1")?.session).toBe("running");
       expect(slots.get(slot.slotId)).toMatchObject({ phase: "live", intent: null, retiredAt: null });
-      expect(expired()).toEqual([expect.objectContaining({ notes: expect.objectContaining({ left: [{ slot: "dev.impl-s1", why: "work_arrived", exitCode: 0 }], moved: [] }) })]);
+      expect(expired()).toEqual([]);
+      expect(retrying().at(-1)?.notes).toMatchObject({ left: [], moved: [], waiting: [{ slot: "dev.impl-s1", exitCode: 0, why: "work_arrived" }] });
       return row.qitemId;
     };
     it("S7: the same row released and claimed again during the release keeps the seat running", async () => {
@@ -1767,6 +1822,137 @@ describe("seat-pool executor", () => {
       await run(executor, [drainOf(cut.slotId)]);
       expect(world.calls).toEqual([]);
       expect(slots.get(cut.slotId)).toMatchObject({ phase: "draining", intent: "stop" });
+    });
+
+    // T-005250 S11: the picture also sees what another actor did to the seat's rows while its release command ran (an
+    // auto-unpark when the blocker closes, the wake ladder's usage-limit park). Such a seat did not work: it is asked
+    // again on the next run, before the retry window closes, and taken out when the command lets it go.
+    const askedAgain = async (setup: () => Promise<{ rowId: string; during: () => Promise<void> }>) => {
+      const { rowId, during } = await setup();
+      const slot = liveSeat();
+      world.commandGate = async () => { if (world.calls.at(-1) === "run release") await during(); };
+      const executor = executorWith(withQueue());
+      await toDeadline(executor);
+      expect(world.calls.filter((c) => c.startsWith("stop"))).toEqual([]);
+      expect(expired()).toEqual([]);
+      expect(retrying().at(-1)?.notes).toMatchObject({ waiting: [{ slot: "dev.impl-s1", exitCode: 0, why: "work_arrived" }] });
+      // The next run, inside the window: nothing moves while the command runs, and the seat goes.
+      world.commandGate = null;
+      world.calls = [];
+      clock += 30_000;
+      await run(executor, []);
+      expect(world.calls).toContain("run release");
+      expect(world.calls.filter((c) => c.startsWith("stop"))).toHaveLength(1);
+      expect(slots.get(slot.slotId)?.retiredAt).not.toBeNull();
+      expect(expired()).toEqual([expect.objectContaining({ failed: false, notes: expect.objectContaining({ left: [], moved: [{ qitemId: rowId, to: MODEL.sessionName }] }) })]);
+      return rowId;
+    };
+    it("S11: a row auto-unparked (its blocker closed) while the release runs is asked again, and the seat goes on the next run", async () => {
+      const id = await askedAgain(async () => {
+        const blocker = await repo.create({ sourceSession: "lead@r", destinationSession: "lead@r", body: "blocker", nudge: false });
+        const row = await repo.create({ sourceSession: "lead@r", destinationSession: SEAT, body: "work", nudge: false });
+        await repo.update({ qitemId: row.qitemId, actorSession: SEAT, state: "blocked", blockedOn: blocker.qitemId });
+        return {
+          rowId: row.qitemId,
+          during: async () => {
+            await repo.update({ qitemId: blocker.qitemId, actorSession: "lead@r", state: "done", closureReason: "no-follow-on" });
+            expect(repo.getById(row.qitemId)).toMatchObject({ state: "pending", destinationSession: SEAT });
+          },
+        };
+      });
+      expect(repo.getById(id)).toMatchObject({ destinationSession: MODEL.sessionName, state: "pending" });
+    });
+    it("S11: a pending row the wake ladder parks (usage limit) while the release runs is asked again, and moves blocked", async () => {
+      const id = await askedAgain(async () => {
+        const blocker = await repo.create({ sourceSession: "lead@r", destinationSession: "lead@r", body: "usage-limit blocker", nudge: false });
+        const row = await repo.create({ sourceSession: "lead@r", destinationSession: SEAT, body: "work", nudge: false });
+        return {
+          rowId: row.qitemId,
+          during: async () => {
+            // As queue-wake-ladder parks a pending baton under a usage limit (its own actor, never the seat).
+            await repo.update({ qitemId: row.qitemId, actorSession: "wake-ladder@system", state: "blocked", blockedOn: blocker.qitemId,
+              transitionNote: "usage-limit suppressed: pool=claude reset=later; waiting on shared blocker" });
+          },
+        };
+      });
+      expect(repo.getById(id)).toMatchObject({ destinationSession: MODEL.sessionName, state: "blocked" });
+    });
+
+    it("S11: a seat still working when the retry window closes is left work_arrived, not asked again (not release_unavailable)", async () => {
+      const row = await repo.create({ sourceSession: "lead@r", destinationSession: SEAT, body: "work", nudge: false });
+      const slot = liveSeat();
+      world.commandGate = async () => { if (world.calls.at(-1) === "run release") repo.claim({ qitemId: row.qitemId, destinationSession: SEAT }); };
+      const executor = executorWith(withQueue());
+      await toDeadline(executor);
+      world.commandGate = null;
+      world.calls = [];
+      clock = T0 + DEADLINE_MS + 600_000;
+      await run(executor, []);
+      expect(world.calls.filter((c) => c.startsWith("run release") || c.startsWith("stop") || c.startsWith("unclaim"))).toEqual([]);
+      expect(slots.get(slot.slotId)).toMatchObject({ phase: "live", retiredAt: null });
+      expect(repo.getById(row.qitemId)).toMatchObject({ destinationSession: SEAT, state: "in-progress" });
+      expect(expired()).toEqual([expect.objectContaining({ failed: true, notes: expect.objectContaining({ left: [{ slot: "dev.impl-s1", why: "work_arrived", exitCode: 0 }], moved: [] }) })]);
+    });
+
+    it("S11: a seat asked again while it still holds its claim, whose release command refuses, is left release_refused with its row", async () => {
+      const row = await repo.create({ sourceSession: "lead@r", destinationSession: SEAT, body: "work", nudge: false });
+      liveSeat();
+      world.commandGate = async () => { if (world.calls.at(-1) === "run release") repo.claim({ qitemId: row.qitemId, destinationSession: SEAT }); };
+      const executor = executorWith(withQueue());
+      await toDeadline(executor);
+      world.commandGate = null;
+      world.exit["release"] = 1;
+      clock += 30_000;
+      await run(executor, []);
+      expect(world.calls.filter((c) => c.startsWith("stop") || c.startsWith("unclaim"))).toEqual([]);
+      expect(repo.getById(row.qitemId)).toMatchObject({ destinationSession: SEAT, state: "in-progress" });
+      expect(expired()).toEqual([expect.objectContaining({ notes: expect.objectContaining({ left: [{ slot: "dev.impl-s1", why: "release_refused", exitCode: 1 }] }) })]);
+    });
+
+    // T-005250 S10: a row that arrives, is claimed and is closed (or handed off) while the release command runs is in
+    // neither picture of the seat's open rows; the queue's transitions say the seat itself moved it: the seat worked.
+    it("S10: a new row the seat claims and closes while the release runs keeps the seat running (asked again)", async () => {
+      const slot = liveSeat();
+      let arrived: string | null = null;
+      world.commandGate = async () => {
+        if (world.calls.at(-1) !== "run release") return;
+        arrived = (await repo.create({ sourceSession: "lead@r", destinationSession: SEAT, body: "quick", nudge: false })).qitemId;
+        repo.claim({ qitemId: arrived, destinationSession: SEAT });
+        await repo.update({ qitemId: arrived, actorSession: SEAT, state: "done", closureReason: "no-follow-on" });
+      };
+      await toDeadline(executorWith(withQueue()));
+      expect(repo.getById(arrived!)).toMatchObject({ state: "done" });
+      expect(world.calls.filter((c) => c.startsWith("stop") || c.startsWith("remove"))).toEqual([]);
+      expect(slots.get(slot.slotId)).toMatchObject({ phase: "live", intent: null, retiredAt: null });
+      expect(expired()).toEqual([]);
+      expect(retrying().at(-1)?.notes).toMatchObject({ waiting: [{ slot: "dev.impl-s1", exitCode: 0, why: "work_arrived" }] });
+    });
+
+    it("S10: a new row another actor creates and cancels while the release runs is not the seat's work: the seat goes", async () => {
+      const slot = liveSeat();
+      world.commandGate = async () => {
+        if (world.calls.at(-1) !== "run release") return;
+        const row = await repo.create({ sourceSession: "lead@r", destinationSession: SEAT, body: "never mind", nudge: false });
+        await repo.update({ qitemId: row.qitemId, actorSession: "lead@r", state: "done", closureReason: "canceled" });
+        expect(repo.getById(row.qitemId)).toMatchObject({ state: "done" });
+      };
+      await toDeadline(executorWith(withQueue()));
+      expect(world.calls.filter((c) => c.startsWith("stop"))).toHaveLength(1);
+      expect(slots.get(slot.slotId)?.retiredAt).not.toBeNull();
+      expect(expired()).toEqual([expect.objectContaining({ failed: false, notes: expect.objectContaining({ left: [] }) })]);
+    });
+
+    it("S10: the queue's mark reads only the seat's own moves out of pending, in any of its addresses", async () => {
+      const effects = withQueue();
+      const mark = effects.queueMark!();
+      const row = await repo.create({ sourceSession: SEAT, destinationSession: "lead@r", body: "a row the seat sends", nudge: false });
+      expect(effects.seatActedSince!(SEAT, mark)).toBe(false);
+      repo.claim({ qitemId: row.qitemId, destinationSession: "lead@r" });
+      expect(effects.seatActedSince!(SEAT, mark)).toBe(false);
+      const mine = await repo.create({ sourceSession: "lead@r", destinationSession: SEAT, body: "work", nudge: false });
+      repo.claim({ qitemId: mine.qitemId, destinationSession: SEAT });
+      expect(effects.seatActedSince!(SEAT, mark)).toBe(true);
+      expect(effects.seatActedSince!(SEAT, effects.queueMark!())).toBe(false);
     });
   });
 
