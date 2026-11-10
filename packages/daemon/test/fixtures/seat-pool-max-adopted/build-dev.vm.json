@@ -1,0 +1,79 @@
+{
+ "policy": "seat-pool",
+ "context": {
+  "min": 0,
+  "max": 16,
+  "cooldown_s": 300,
+  "idle_grace_s": 600,
+  "dispatch_after_s": 120,
+  "dispatch_tag": "tarefa-nova",
+  "drain": false,
+  "adopt": [
+   "build.dev-2",
+   "build.dev-3",
+   "build.dev-4",
+   "build.dev-5",
+   "build.dev-6",
+   "build.dev-7",
+   "build.dev-8",
+   "build.dev-9",
+   "build.dev-10",
+   "build.dev-11",
+   "build.dev-12",
+   "build.dev-13"
+  ],
+  "cwd_template": "/home/bruno/dev/setup/cadeiras/fabrica/build-{slot}",
+  "demand_cmd": {
+   "argv": [
+    "/usr/bin/python3",
+    "-I",
+    "/home/bruno/dev/setup/ops/autoscale/demanda.py",
+    "--pool",
+    "build-dev",
+    "--host",
+    "vm"
+   ],
+   "timeout_s": 30
+  },
+  "prepare_cmd": {
+   "argv": [
+    "/usr/bin/python3",
+    "-I",
+    "/home/bruno/dev/setup/ops/autoscale/preparar.py",
+    "--pool",
+    "build-dev"
+   ],
+   "timeout_s": 60
+  },
+  "release_cmd": {
+   "argv": [
+    "/usr/bin/python3",
+    "-I",
+    "/home/bruno/dev/setup/ops/autoscale/recibos.py",
+    "--pool",
+    "build-dev"
+   ],
+   "timeout_s": 180
+  },
+  "reap_cmd": {
+   "argv": [
+    "/usr/bin/python3",
+    "-I",
+    "/home/bruno/dev/setup/ops/autoscale/reap.py",
+    "--pool",
+    "build-dev"
+   ],
+   "timeout_s": 60
+  },
+  "remove_cmd": {
+   "argv": [
+    "/usr/bin/python3",
+    "-I",
+    "/home/bruno/dev/setup/ops/autoscale/remover.py",
+    "--pool",
+    "build-dev"
+   ],
+   "timeout_s": 60
+  }
+ }
+}

@@ -193,6 +193,19 @@ describe("planSeatPool", () => {
     const result = plan(spec(), state({ adoptable: [{ logicalId: "dev.impl2", nodeId: "n2" }] }));
     expect(result.intents).toEqual([{ kind: "adopt", logicalId: "dev.impl2", nodeId: "n2" }]);
   });
+
+  it("counts every adopted seat against max, stopped or adopted in the same plan, and adds only the room left", () => {
+    const adopting = [{ logicalId: "dev.impl2", nodeId: "n2" }, { logicalId: "dev.impl3", nodeId: "n3" }];
+    // The executor links the two seats before it adds: the add asks only for the room they leave.
+    expect(plan(spec(), state({ adoptable: adopting, pending: rows(5) })).intents)
+      .toEqual([...adopting.map((seat) => ({ kind: "adopt", ...seat })), { kind: "add", count: 1 }]);
+    const full = plan(spec({ max: 2 }), state({ adoptable: adopting, pending: rows(5) }));
+    expect(full.intents.filter((intent) => intent.kind === "add")).toEqual([]);
+    expect(full.reason).toBe("max_reached");
+    // A stopped adopted seat takes no row and isn't counted as current, but it still takes room under max.
+    const stopped = slot({ adopted: true, cause: "stopped", idleSince: null });
+    expect(plan(spec({ max: 2 }), state({ slots: [stopped], pending: rows(5) })).intents).toEqual([{ kind: "add", count: 1 }]);
+  });
 });
 
 describe("planSeatPool: dispatch and wake", () => {
