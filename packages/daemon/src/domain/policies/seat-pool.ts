@@ -180,12 +180,19 @@ export interface SeatPoolDrainEvent {
 }
 
 /** Why a seat the forced pass could not take out is still there. `release_unavailable`: its release command did not
- *  answer (exit 3 or 5, or a timeout) on any try within SEAT_POOL_RELEASE_RETRY_SECONDS of the deadline. */
+ *  answer (exit 3 or 5, or a timeout) on any try within SEAT_POOL_RELEASE_RETRY_SECONDS of the deadline.
+ *  `work_arrived`: the seat claimed a row while its release command ran, so it is working and keeps its rows. */
 export type SeatPoolLeftWhy =
-  | "release_refused" | "release_unavailable" | "stop_failed" | "move_failed" | "remove_failed" | "remove_cmd_failed";
+  | "release_refused" | "release_unavailable" | "work_arrived" | "stop_failed" | "move_failed" | "remove_failed" | "remove_cmd_failed";
 
-/** A seat the forced pass left, with the release command's exit code in that pass (null when it did not run). */
-export interface SeatPoolLeftEntry { slot: string; why: string; exitCode?: number | null }
+/** A seat the forced pass left, with the release command's exit code in that pass (null when it did not run).
+ *  `stopped`: left after its stop (draining, never back in admission), as against left running. */
+export interface SeatPoolLeftEntry { slot: string; why: string; exitCode?: number | null; stopped?: true }
+
+/** A seat the forced pass left after its stop. A move or a removal only fails after the stop, so those count too when
+ *  `stopped` is absent (an entry recorded before the field). */
+export const seatPoolLeftStopped = (entry: SeatPoolLeftEntry): boolean =>
+  entry.stopped === true || entry.why === "move_failed" || entry.why === "remove_failed";
 
 /** How long after a drain's deadline the forced pass keeps asking again a release command that did not answer. */
 export const SEAT_POOL_RELEASE_RETRY_SECONDS = 600;

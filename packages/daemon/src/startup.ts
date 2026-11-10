@@ -2481,7 +2481,8 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
         stopPrecondition: (nodeId) => ({ nodeId, sessionId: latestSession(nodeId)?.id ?? null }),
         stopSlot: async ({ sessionName, expected }) => {
           const stopped = await seatPoolStops.stopSeat({ seatRef: sessionName, reason: "seat-pool drain", operator: null, expected });
-          return stopped.ok ? { ok: true } : { ok: false, code: stopped.code, error: stopped.message };
+          return stopped.ok ? { ok: true }
+            : { ok: false, code: stopped.code, error: stopped.message, ...(stopped.stopPhase === "kill_attempted" ? { killAttempted: true } : {}) };
         },
         removeSlot: async ({ rigId, nodeId, expected }) => {
           const removed = await rigLifecycleService.removeNode(rigId, nodeId, { expected });
