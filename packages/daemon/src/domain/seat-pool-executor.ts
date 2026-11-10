@@ -13,7 +13,10 @@ import {
   SEAT_POOL_DRAIN_ENDED,
   SEAT_POOL_DRAIN_EVENTS,
   SEAT_POOL_DRAIN_EXPIRED,
+  SEAT_POOL_DRAIN_RETRYING,
   SEAT_POOL_DRAIN_STARTED,
+  SEAT_POOL_RELEASE_REASON_ENV,
+  SEAT_POOL_RELEASE_RETRY_SECONDS,
   seatPoolDrainEpisode,
   seatPoolReapable,
   seatPoolRoom,
@@ -21,10 +24,12 @@ import {
   type SeatPoolCommand,
   type SeatPoolDrainEpisode,
   type SeatPoolDrainEvent,
+  type SeatPoolLeftEntry,
   type SeatPoolLeftWhy,
   type SeatPoolIntent,
   type SeatPoolModel,
   type SeatPoolPendingRow,
+  type SeatPoolReleaseReason,
   type SeatPoolSeatCause,
   type SeatPoolSlotPhase,
   type SeatPoolSlotView,
@@ -51,8 +56,12 @@ import {
  * Each run also keeps the drain's clock: the first run that reads `drain: true` records `seat_pool_drain_started`
  * (with its `deadlineAt`), the first that reads `drain: false` after it records `seat_pool_drain_ended`, and the
  * first run past the deadline takes out every seat the pool added that is still there (the forced pass, expireDrain)
- * and records `seat_pool_drain_expired`. The clock is read back from those history entries, never from memory, so a
- * restart doesn't reset it.
+ * and records `seat_pool_drain_expired`. A pass waiting on a release command that did not answer records
+ * `seat_pool_drain_retrying` instead, and the next runs carry on with it. The clock and the pass are read back from
+ * those history entries, never from memory, so a restart resets neither.
+ *
+ * The release command is told why it is asked (OPENRIG_SEAT_POOL_RELEASE_REASON): `idle` by the drain of a free seat,
+ * `drain-deadline` by the forced pass, `reap` by the reap. No other command gets the variable.
  */
 
 export interface SeatPoolSlot {
@@ -534,12 +543,21 @@ const ROW_MOVED_ON = new Set(["fallback_state_mismatch", "fallback_destination_m
 const UNCLAIM_MOVED_ON = new Set(["qitem_not_in_progress", "qitem_not_found"]);
 const holdsWork = (slot: SeatPoolSlotView) => slot.openRows > 0 || slot.heldMessages > 0;
 
-/** What the forced pass did with one seat: taken out (no `why`), or left with why; `stop` ends the run. */
+/**
+ * What the forced pass did with one seat: taken out (no `why`), left with why, or still to ask again (`unavailable`: its
+ * release command did not answer); `stop` ends the run. `exitCode`: the release command's in this pass, null when it
+ * did not run.
+ */
 interface ForcedOutcome {
   stop?: true;
   why?: SeatPoolLeftWhy;
+  unavailable?: true;
+  exitCode?: number | null;
   moved: Array<{ qitemId: string; to: string }>;
 }
+/** A release command that did not answer, as against one that refused: exit 3 (the pool's stop switch), exit 5 (a
+ *  source it reads did not answer) or no exit code (its timeout). The forced pass asks it again. */
+const releaseUnanswered = (result: SeatPoolCommandResult) => result.exitCode === null || result.exitCode === 3 || result.exitCode === 5;
 const TIMED_OUT = Symbol("timed out");
 const NO_ROOM = Symbol("no room");
 
@@ -681,6 +699,11 @@ export class SeatPoolExecutor {
     return { OPENRIG_SEAT_POOL_JOB: ctx.jobId, OPENRIG_SEAT_POOL_MODEL: ctx.model.sessionName, ...extra };
   }
 
+  /** The release command's environment: the slot, and why it is asked. */
+  private releaseEnv(ctx: Context, sessionName: string, reason: SeatPoolReleaseReason): Record<string, string> {
+    return this.commandEnv(ctx, { OPENRIG_SEAT_POOL_SLOT: sessionName, [SEAT_POOL_RELEASE_REASON_ENV]: reason });
+  }
+
   private async apply(jobId: string, intents: SeatPoolIntent[], run: Run): Promise<void> {
     if (!(await this.drainClock(jobId, run))) return;
     for (const intent of intents) {
@@ -754,36 +777,82 @@ export class SeatPoolExecutor {
 
   /**
    * The forced pass at a drain's deadline. Each seat the pool added that is still there leaves as a reap takes a seat
-   * out, under its lifecycle lease: the release command (a refusal leaves the seat running, its rows where they are),
-   * a stop with the `expected` read at the start, every open row moved to the model (an in-progress one unclaimed
-   * first; each only while still addressed to the seat, with the reason `drain:<seat>`), the node's removal, and last
-   * `remove_cmd` (forget). A seat whose node is already gone is only forgotten. An adopted seat is never touched. The
-   * seats that stay are listed, with why, in `seat_pool_drain_expired`, recorded once the pass is through.
+   * out, under its lifecycle lease: the release command, told `drain-deadline` (a refusal leaves the seat running, its
+   * rows where they are), a stop with the `expected` read at the start, every open row moved to the model (an
+   * in-progress one unclaimed first; each only while still addressed to the seat, with the reason `drain:<seat>`), the
+   * node's removal, and last `remove_cmd` (forget). A seat whose node is already gone is only forgotten. An adopted seat
+   * is never touched. The seats that stay are listed, with why and the release's exit code, in
+   * `seat_pool_drain_expired`, recorded once the pass is through.
+   *
+   * A release command that did not answer (releaseUnanswered) is asked again on the next runs, for up to
+   * SEAT_POOL_RELEASE_RETRY_SECONDS after the deadline, and then the seat is left as `release_unavailable`. Until then
+   * the pass is not through: each run records `seat_pool_drain_retrying` with what it did so far (the seats left for
+   * good, the rows moved, the seats to ask again), and the next run, after a restart too, carries on from it, asking
+   * only the seats that did not answer. The pass ends with one `seat_pool_drain_expired` holding all of it.
    */
   private async expireDrain(jobId: string, run: Run, episode: SeatPoolDrainEpisode): Promise<boolean> {
-    const left: Array<{ slot: string; why: SeatPoolLeftWhy }> = [];
-    const moved: Array<{ qitemId: string; to: string }> = [];
+    const left: SeatPoolLeftEntry[] = [...(episode.retry?.left ?? [])];
+    const moved: Array<{ qitemId: string; to: string }> = [...(episode.retry?.moved ?? [])];
+    const unanswered = new Map((episode.retry?.waiting ?? []).map((w) => [w.slot, w.exitCode]));
+    const waiting: Array<{ slot: string; exitCode: number | null }> = [];
+    const retryUntil = Date.parse(episode.deadlineAt!) + SEAT_POOL_RELEASE_RETRY_SECONDS * 1000;
+    // Read at each seat: the commands before it can take minutes, and a seat is never asked again past the window.
+    const pastRetry = () => this.now().getTime() >= retryUntil;
+    // What the pass did so far (the seats left, the rows moved, the seats still to ask again), kept for the next run
+    // when this one stops before the end.
+    const keep = () => {
+      if (left.length === 0 && moved.length === 0 && waiting.length === 0 && unanswered.size === 0) return;
+      this.record(jobId, false, SEAT_POOL_DRAIN_RETRYING, {
+        startedAt: episode.startedAt, deadlineAt: episode.deadlineAt, at: this.at(), retryUntil: new Date(retryUntil).toISOString(),
+        left, moved, waiting: [...waiting, ...[...unanswered].map(([slot, exitCode]) => ({ slot, exitCode }))],
+      });
+    };
     for (const slot of this.deps.slots.listOpen(jobId)) {
       // An adopted seat was someone else's before the pool: its rows and its session are never the pool's to take.
       if (slot.opId === null) continue;
       if (this.deps.slots.get(slot.slotId)?.retiredAt !== null) continue;
+      // Left for good earlier in this pass (refused, or a failed stop or move): not asked, stopped or moved again.
+      if (left.some((entry) => entry.slot === slot.logicalId)) continue;
+      if (pastRetry() && unanswered.has(slot.logicalId)) {
+        left.push({ slot: slot.logicalId, why: "release_unavailable", exitCode: unanswered.get(slot.logicalId)! });
+        unanswered.delete(slot.logicalId);
+        continue;
+      }
       const ctx = this.fresh(jobId, run);
-      if (!ctx) return false;
+      if (!ctx) { keep(); return false; }
       // Drain turned off during the pass: the drain is over, and the next run records its end.
       if (!ctx.spec.drain) return true;
       const outcome = await this.forceOut(jobId, run, ctx, slot);
       moved.push(...outcome.moved);
-      if (outcome.stop) return false;
-      if (outcome.why) left.push({ slot: slot.logicalId, why: outcome.why });
+      // Cut short: a seat that was waiting stays waiting (with its last exit code) for the next run.
+      if (outcome.stop) { keep(); return false; }
+      unanswered.delete(slot.logicalId);
+      const exitCode = outcome.exitCode ?? null;
+      if (outcome.unavailable) {
+        if (pastRetry()) left.push({ slot: slot.logicalId, why: "release_unavailable", exitCode });
+        else waiting.push({ slot: slot.logicalId, exitCode });
+      } else if (outcome.why) left.push({ slot: slot.logicalId, why: outcome.why, exitCode });
     }
-    if (!this.fresh(jobId, run)) return false;
-    this.record(jobId, left.length > 0, SEAT_POOL_DRAIN_EXPIRED, {
-      startedAt: episode.startedAt, deadlineAt: episode.deadlineAt, at: this.at(), left, moved,
-    });
+    if (!this.fresh(jobId, run)) { keep(); return false; }
+    // A seat asked again that is gone since (removed by hand, or retired by the stop) is nothing to wait for.
+    const notes = { startedAt: episode.startedAt, deadlineAt: episode.deadlineAt, at: this.at(), left, moved };
+    if (waiting.length > 0) {
+      this.record(jobId, false, SEAT_POOL_DRAIN_RETRYING, { ...notes, retryUntil: new Date(retryUntil).toISOString(), waiting });
+      return true;
+    }
+    this.record(jobId, left.length > 0, SEAT_POOL_DRAIN_EXPIRED, notes);
     return true;
   }
 
-  /** Takes one seat the pool added out at the drain's deadline (expireDrain). */
+  /**
+   * Takes one seat the pool added out at the drain's deadline (expireDrain).
+   *
+   * A seat the pass already stopped (intent `stop` or `remove`, its session gone), before a restart or a failure, is not
+   * asked again: the pass carries on from where it was (its rows to the model, its removal). With its session running
+   * it is asked again. Once the seat is stopped, a failure leaves it draining with its intent, never back in admission
+   * (where the reap would launch it again). The drain turned off while the release command ran: the seat is not
+   * stopped and goes back to admission.
+   */
   private async forceOut(jobId: string, run: Run, ctx: Context, slot: SeatPoolSlot): Promise<ForcedOutcome> {
     const view = ctx.state.slots.find((s) => s.slotId === slot.slotId);
     // Never created, or its node is gone already: nothing to stop and no row the pool can still reach there.
@@ -791,25 +860,43 @@ export class SeatPoolExecutor {
       if (!(await this.removeUnstarted(jobId, run, slot.slotId))) return { stop: true, moved: [] };
       if (this.deps.slots.get(slot.slotId)?.retiredAt) return { moved: [] };
       const after = this.fresh(jobId, run)?.state.slots.find((s) => s.slotId === slot.slotId);
-      return { why: after?.nodeExists ? "remove_failed" : "remove_cmd_failed", moved: [] };
+      return { why: after?.nodeExists ? "remove_failed" : "remove_cmd_failed", exitCode: null, moved: [] };
     }
     const nodeId = slot.nodeId;
     const sessionName = seatSessionName(slot.logicalId, ctx.model.rigName);
+    let exitCode: number | null = null;
     const outcome = await this.within(run, () => this.deps.effects.lifecycle(nodeId, async (): Promise<ForcedOutcome & { removed?: true }> => {
       const inLease = this.fresh(jobId, run);
       // Drain turned off since the deadline: nothing is taken out, and the next run records the drain's end.
       if (!inLease || !inLease.spec.drain) return { stop: true, moved: [] };
       const expected = this.deps.effects.stopPrecondition(nodeId);
-      const leftAs = (why: SeatPoolLeftWhy, rows: Array<{ qitemId: string; to: string }> = []): ForcedOutcome => {
+      // Before the stop: the seat goes back to admission.
+      const leftAs = (why: SeatPoolLeftWhy): ForcedOutcome => {
         this.setIntent(slot.slotId, null, "live");
-        return { why, moved: rows };
+        return { why, exitCode, moved: [] };
       };
-      if (inLease.spec.releaseCmd) {
+      // After the stop: the seat stays draining, with the intent of the step that failed.
+      const leftStopped = (why: SeatPoolLeftWhy, rows: Array<{ qitemId: string; to: string }>): ForcedOutcome => ({ why, exitCode, moved: rows });
+      const intent = this.deps.slots.get(slot.slotId)?.intent ?? null;
+      const resumed = (intent === "stop" || intent === "remove") && !this.deps.effects.sessionRunning(nodeId);
+      if (inLease.spec.releaseCmd && !resumed) {
         this.setIntent(slot.slotId, "release");
-        const released = await this.deps.effects.runCommand(inLease.spec.releaseCmd, this.commandEnv(inLease, { OPENRIG_SEAT_POOL_SLOT: sessionName }), run.controller.signal);
+        const released = await this.deps.effects.runCommand(inLease.spec.releaseCmd, this.releaseEnv(inLease, sessionName, "drain-deadline"), run.controller.signal);
         if (run.controller.signal.aborted) return { stop: true, moved: [] };
+        exitCode = released.exitCode;
+        if (releaseUnanswered(released)) {
+          this.setIntent(slot.slotId, null);
+          return { unavailable: true, exitCode, moved: [] };
+        }
         // Its work may not be saved: the seat keeps running, and its rows stay with it.
         if (released.exitCode !== 0) return leftAs("release_refused");
+        // The drain may have been turned off while the command ran: read it again, as the drain of a free seat does.
+        const afterRelease = this.fresh(jobId, run);
+        if (!afterRelease) return { stop: true, moved: [] };
+        if (!afterRelease.spec.drain) {
+          this.setIntent(slot.slotId, null, "live");
+          return { stop: true, moved: [] };
+        }
       }
       this.setIntent(slot.slotId, "stop", "draining");
       const stopped = await this.deps.effects.stopSlot({ sessionName, expected });
@@ -821,17 +908,17 @@ export class SeatPoolExecutor {
       for (const row of this.deps.effects.openRows(sessionName)) {
         if (row.state === "in-progress") {
           const unclaimed = this.deps.effects.unclaimRow({ qitemId: row.qitemId, seat: sessionName, reason });
-          if (!unclaimed.ok && !UNCLAIM_MOVED_ON.has(unclaimed.code)) return leftAs("move_failed", rows);
+          if (!unclaimed.ok && !UNCLAIM_MOVED_ON.has(unclaimed.code)) return leftStopped("move_failed", rows);
         }
         const move = this.deps.effects.moveRow({ qitemId: row.qitemId, from: sessionName, to, reason, state: row.state === "blocked" ? "blocked" : "pending" });
         if (move.ok) rows.push({ qitemId: row.qitemId, to });
         // A row that was claimed, closed or moved since it was read went on without the pool: nothing failed.
-        else if (!ROW_MOVED_ON.has(move.code)) return leftAs("move_failed", rows);
+        else if (!ROW_MOVED_ON.has(move.code)) return leftStopped("move_failed", rows);
       }
       this.setIntent(slot.slotId, "remove");
       const removed = await this.deps.effects.removeSlot({ rigId: inLease.model.rigId, nodeId, expected });
-      if (!removed.ok && removed.code !== "node_not_found") return leftAs("remove_failed", rows);
-      return { moved: rows, removed: true };
+      if (!removed.ok && removed.code !== "node_not_found") return leftStopped("remove_failed", rows);
+      return { moved: rows, exitCode, removed: true };
     }));
     if (outcome === TIMED_OUT) {
       this.gaveUp(jobId, run, "seat_pool_drain_failed", { slot: slot.logicalId });
@@ -839,7 +926,9 @@ export class SeatPoolExecutor {
     }
     if (outcome.stop || !outcome.removed) return outcome;
     if (!(await this.forget(jobId, run, slot.slotId))) return { stop: true, moved: outcome.moved };
-    return this.deps.slots.get(slot.slotId)?.retiredAt ? { moved: outcome.moved } : { why: "remove_cmd_failed", moved: outcome.moved };
+    return this.deps.slots.get(slot.slotId)?.retiredAt
+      ? { moved: outcome.moved, exitCode }
+      : { why: "remove_cmd_failed", exitCode, moved: outcome.moved };
   }
 
   private adopt(jobId: string, run: Run, intent: Extract<SeatPoolIntent, { kind: "adopt" }>): void {
@@ -959,6 +1048,11 @@ export class SeatPoolExecutor {
     if (!ctx) return false;
     const view = ctx.state.slots.find((s) => s.slotId === slotId);
     if (!view?.nodeExists) return this.removeUnstarted(jobId, run, slotId);
+    // A seat stopped on its way out (by the forced pass, or by a drain a restart cut short), its session gone, is the
+    // forced pass's to finish while the pool drains toward a deadline: it is never put back in admission, where the
+    // reap would launch it again, and nothing else is done with it here (forceOut carries on from its intent).
+    if (slot.phase === "draining" && (slot.intent === "stop" || slot.intent === "remove") && ctx.spec.drain
+      && !this.deps.effects.sessionRunning(slot.nodeId) && this.drainEpisode(jobId)?.deadlineAt !== null) return true;
     const stillFree = (s: SeatPoolSlotView) => !holdsWork(s) && s.cause === "idle" && s.idleSince === intent.idleSince;
     if (slot.phase === "live") {
       if (!stillFree(view)) return true;
@@ -979,7 +1073,7 @@ export class SeatPoolExecutor {
       const expected = this.deps.effects.stopPrecondition(nodeId);
       if (inLease.spec.releaseCmd) {
         this.setIntent(slotId, "release");
-        const released = await this.deps.effects.runCommand(inLease.spec.releaseCmd, this.commandEnv(inLease, { OPENRIG_SEAT_POOL_SLOT: sessionName }), run.controller.signal);
+        const released = await this.deps.effects.runCommand(inLease.spec.releaseCmd, this.releaseEnv(inLease, sessionName, "idle"), run.controller.signal);
         if (run.controller.signal.aborted) return { stop: true, reason: null };
         if (released.exitCode !== 0) {
           this.setIntent(slotId, null, "live");
@@ -1103,7 +1197,7 @@ export class SeatPoolExecutor {
 
       if (!released && inLease.spec.releaseCmd) {
         this.setIntent(slotId, "release");
-        const release = await this.deps.effects.runCommand(inLease.spec.releaseCmd, this.commandEnv(inLease, { OPENRIG_SEAT_POOL_SLOT: sessionName }), run.controller.signal);
+        const release = await this.deps.effects.runCommand(inLease.spec.releaseCmd, this.releaseEnv(inLease, sessionName, "reap"), run.controller.signal);
         if (run.controller.signal.aborted) return { stop: true, reason: null };
         if (release.exitCode !== 0) {
           this.setIntent(slotId, null);
