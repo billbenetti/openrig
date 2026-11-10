@@ -10,6 +10,7 @@ import { OPENRIG_SENDER } from "../lib/pane-envelope.js";
 import type { Node } from "./types.js";
 import type { LaunchBudget, LaunchTick } from "./launch-budget.js";
 import {
+  seatPoolLeftStopped,
   SEAT_POOL_DRAIN_ENDED,
   SEAT_POOL_DRAIN_EVENTS,
   SEAT_POOL_DRAIN_EXPIRED,
@@ -364,7 +365,9 @@ export interface SeatPoolEffects {
   /** Runs `fn` holding the seat's lifecycle lease, so no launch, stop or delivery of the seat comes between its steps. */
   lifecycle<T>(nodeId: string, fn: () => Promise<T>): Promise<T>;
   stopPrecondition(nodeId: string): StopPrecondition;
-  stopSlot(input: { sessionName: string; expected: StopPrecondition }): Promise<SeatPoolEffectResult>;
+  /** `killAttempted`: a stop that failed after it tried the kill (stopPhase `kill_attempted`), so the session may be
+   *  gone even while its record still reads running. */
+  stopSlot(input: { sessionName: string; expected: StopPrecondition }): Promise<SeatPoolEffectResult & { killAttempted?: boolean }>;
   removeSlot(input: { rigId: string; nodeId: string; expected: StopPrecondition }): Promise<SeatPoolEffectResult>;
   runCommand(command: SeatPoolCommand, env: Record<string, string>, signal: AbortSignal): Promise<SeatPoolCommandResult>;
   /** Returns a seat whose session is gone to launchable, after checking in tmux that it is gone. */
@@ -575,6 +578,9 @@ const ROW_MOVED_ON = new Set(["fallback_state_mismatch", "fallback_destination_m
 /** An unclaim refused because the row was closed or released since it was read: the move that follows decides. */
 const UNCLAIM_MOVED_ON = new Set(["qitem_not_in_progress", "qitem_not_found"]);
 const holdsWork = (slot: SeatPoolSlotView) => slot.openRows > 0 || slot.heldMessages > 0;
+/** The ids of a seat's rows that are claimed (in-progress). */
+const claimedRows = (rows: ReadonlyArray<{ qitemId: string; state: string }>): Set<string> =>
+  new Set(rows.filter((row) => row.state === "in-progress").map((row) => row.qitemId));
 
 /**
  * What the forced pass did with one seat: taken out (no `why`), left with why, or still to ask again (`unavailable`: its
@@ -584,6 +590,8 @@ const holdsWork = (slot: SeatPoolSlotView) => slot.openRows > 0 || slot.heldMess
 interface ForcedOutcome {
   stop?: true;
   why?: SeatPoolLeftWhy;
+  /** Left after its stop (leftStopped). */
+  stopped?: true;
   unavailable?: true;
   exitCode?: number | null;
   moved: Array<{ qitemId: string; to: string }>;
@@ -889,7 +897,7 @@ export class SeatPoolExecutor {
       if (outcome.unavailable) {
         if (pastRetry()) left.push({ slot: slot.logicalId, why: "release_unavailable", exitCode });
         else waiting.push({ slot: slot.logicalId, exitCode });
-      } else if (outcome.why) left.push({ slot: slot.logicalId, why: outcome.why, exitCode });
+      } else if (outcome.why) left.push({ slot: slot.logicalId, why: outcome.why, exitCode, ...(outcome.stopped ? { stopped: true as const } : {}) });
     }
     if (!this.fresh(jobId, run)) { keep(); return false; }
     // A seat asked again that is gone since (removed by hand, or retired by the stop) is nothing to wait for.
@@ -934,10 +942,12 @@ export class SeatPoolExecutor {
         return { why, exitCode, moved: [] };
       };
       // After the stop: the seat stays draining, with the intent of the step that failed.
-      const leftStopped = (why: SeatPoolLeftWhy, rows: Array<{ qitemId: string; to: string }>): ForcedOutcome => ({ why, exitCode, moved: rows });
+      const leftStopped = (why: SeatPoolLeftWhy, rows: Array<{ qitemId: string; to: string }>): ForcedOutcome => ({ why, stopped: true, exitCode, moved: rows });
       const intent = this.deps.slots.get(slot.slotId)?.intent ?? null;
       const resumed = (intent === "stop" || intent === "remove") && !this.deps.effects.sessionRunning(nodeId);
       if (inLease.spec.releaseCmd && !resumed) {
+        // The rows the seat had claimed when the release command was asked: the command answers for those.
+        const claimedBefore = claimedRows(this.deps.effects.openRows(sessionName));
         this.setIntent(slot.slotId, "release");
         const released = await this.deps.effects.runCommand(inLease.spec.releaseCmd, this.releaseEnv(inLease, sessionName, "drain-deadline"), run.controller.signal);
         if (run.controller.signal.aborted) return { stop: true, moved: [] };
@@ -955,10 +965,21 @@ export class SeatPoolExecutor {
           this.setIntent(slot.slotId, null, "live");
           return { stop: true, moved: [] };
         }
+        // The lease holds deliveries back, not queue writes (as in the drain of a free seat): a turn already under way
+        // may have claimed a row while the command ran, which the command never answered for. That seat is working: it
+        // is not stopped, and its rows stay with it.
+        if ([...claimedRows(this.deps.effects.openRows(sessionName))].some((qitemId) => !claimedBefore.has(qitemId))) {
+          return leftAs("work_arrived");
+        }
       }
       this.setIntent(slot.slotId, "stop", "draining");
       const stopped = await this.deps.effects.stopSlot({ sessionName, expected });
-      if (!stopped.ok && !STOPPED_CODES.has(stopped.code)) return leftAs("stop_failed");
+      // A seat whose session is gone (stopped earlier in the pass, or killed by this stop before it failed) stays
+      // draining: back in admission, the reap would launch it again.
+      if (!stopped.ok && !STOPPED_CODES.has(stopped.code)) {
+        const gone = stopped.killAttempted === true || !this.deps.effects.sessionRunning(nodeId);
+        return gone ? leftStopped("stop_failed", []) : leftAs("stop_failed");
+      }
 
       const reason = `${SEAT_POOL_DRAIN_REASON}${sessionName}`;
       const to = inLease.model.sessionName;
@@ -1108,8 +1129,17 @@ export class SeatPoolExecutor {
     // A seat stopped on its way out (by the forced pass, or by a drain a restart cut short), its session gone, is the
     // forced pass's to finish while the pool drains toward a deadline: it is never put back in admission, where the
     // reap would launch it again, and nothing else is done with it here (forceOut carries on from its intent).
+    // A seat the pass left stopped on its way out (listed in its `seat_pool_drain_retrying` or `seat_pool_drain_expired`,
+    // which the job's stop shows) is held whatever its session's record reads: a stop that failed after the kill can leave it
+    // reading running. Once the drain expired the pass never runs again, so it holds no other seat: one this drain
+    // stopped and a restart cut short before its removal is this drain's again, or it would stay draining for ever.
+    const episode = this.drainEpisode(jobId);
+    const leftByPass = (entries: SeatPoolLeftEntry[] | undefined) =>
+      !!entries?.some((entry) => entry.slot === slot.logicalId && seatPoolLeftStopped(entry));
     if (slot.phase === "draining" && (slot.intent === "stop" || slot.intent === "remove") && ctx.spec.drain
-      && !this.deps.effects.sessionRunning(slot.nodeId) && this.drainEpisode(jobId)?.deadlineAt !== null) return true;
+      && episode && episode.deadlineAt !== null
+      && (leftByPass(episode.expired?.left) || leftByPass(episode.retry?.left)
+        || (!episode.expired && !this.deps.effects.sessionRunning(slot.nodeId)))) return true;
     const stillFree = (s: SeatPoolSlotView) => !holdsWork(s) && s.cause === "idle" && s.idleSince === intent.idleSince;
     if (slot.phase === "live") {
       if (!stillFree(view)) return true;
