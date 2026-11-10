@@ -4597,6 +4597,19 @@ export class QueueRepository {
     return rows.map((r) => ({ qitemId: r.qitem_id, state: r.state, summary: r.summary ?? null }));
   }
 
+  /** The open rows of a session with their claim time (listOpenObligations' rows and order): a seat pool's forced pass
+   *  compares two reads of these to see whether the seat took work in between (a claim, a release, a block, a close). */
+  listOpenObligationClaims(destinationSession: string, limit: number): Array<{ qitemId: string; state: "pending" | "in-progress" | "blocked"; claimedAt: string | null }> {
+    const addresses = this.resolveSessionAddresses(destinationSession);
+    const slots = addresses.map(() => "?").join(",");
+    const rows = this.db.prepare(
+      `SELECT qitem_id, state, claimed_at FROM queue_items
+        WHERE destination_session IN (${slots}) AND state IN ('pending', 'in-progress', 'blocked')
+        ORDER BY ts_created DESC LIMIT ?`,
+    ).all(...addresses, limit) as Array<{ qitem_id: string; state: "pending" | "in-progress" | "blocked"; claimed_at: string | null }>;
+    return rows.map((r) => ({ qitemId: r.qitem_id, state: r.state, claimedAt: r.claimed_at }));
+  }
+
   list(opts: QueueListOptions & { compact: true }): CompactQueueItem[];
   list(opts?: QueueListOptions & { compact?: false }): QueueItem[];
   list(opts?: QueueListOptions): Array<QueueItem | CompactQueueItem>;
