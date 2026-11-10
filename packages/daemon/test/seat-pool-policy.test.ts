@@ -19,7 +19,11 @@ import {
   makeSeatPoolPolicy,
   parseSeatPoolSpec,
   planSeatPool,
+  SEAT_POOL_DRAIN_ENDED,
+  SEAT_POOL_DRAIN_EXPIRED,
+  SEAT_POOL_DRAIN_STARTED,
   SEAT_POOL_POLICY_NAME,
+  seatPoolDrainEpisode,
   type SeatPoolIntent,
   type SeatPoolPendingRow,
   type SeatPoolSlotView,
@@ -65,7 +69,7 @@ describe("seat-pool spec", () => {
   it("fills the defaults and keeps commands as argv", () => {
     const parsed = parseSeatPoolSpec({ max: 2, cwd_template: "/w/{slot}", release_cmd: { argv: ["/bin/release", "--now"], timeout_s: 9 } });
     expect(parsed).toEqual({ spec: {
-      min: 0, max: 2, cooldownSeconds: 60, idleGraceSeconds: 300, dispatchAfterSeconds: 60, dispatchTag: null, drain: false, adopt: [], cwdTemplate: "/w/{slot}",
+      min: 0, max: 2, cooldownSeconds: 60, idleGraceSeconds: 300, dispatchAfterSeconds: 60, dispatchTag: null, drain: false, drainDeadlineSeconds: 900, adopt: [], cwdTemplate: "/w/{slot}",
       demandCmd: null, prepareCmd: null, releaseCmd: { argv: ["/bin/release", "--now"], timeoutSeconds: 9 }, reapCmd: null, removeCmd: null,
     } });
   });
@@ -86,9 +90,37 @@ describe("seat-pool spec", () => {
     [{ max: 1, cwd_template: "/w/{slot}", dispatch_tag: " " }, "dispatch_tag"],
     [{ max: 1, cwd_template: "/w/{slot}", dispatch_after_s: -5 }, "dispatch_after_s"],
     [{ max: 1, cwd_template: "/w/{slot}", adopt: "dev.impl2" }, "adopt"],
+    [{ max: 1, cwd_template: "/w/{slot}", drain_deadline_s: 86_401 }, "drain_deadline_s"],
   ])("refuses %j at %s", (context, field) => {
     const parsed = parseSeatPoolSpec(context);
     expect("problem" in parsed && parsed.problem.field).toBe(field);
+  });
+
+  // T-004870 F3, r1: the drain's clock lives in the watchdog history, whose shortest retention is 1 day.
+  it("caps drain_deadline_s at 1 day, the shortest history retention, and keeps 0 as no deadline", () => {
+    const refused = parseSeatPoolSpec({ max: 1, cwd_template: "/w/{slot}", drain_deadline_s: 86_401 });
+    expect("problem" in refused && refused.problem.message).toMatch(/at most 86400/);
+    for (const seconds of [0, 86_400]) {
+      const parsed = parseSeatPoolSpec({ max: 1, cwd_template: "/w/{slot}", drain_deadline_s: seconds });
+      expect("spec" in parsed && parsed.spec.drainDeadlineSeconds).toBe(seconds);
+    }
+  });
+});
+
+describe("seatPoolDrainEpisode", () => {
+  const started = (at: string, deadlineAt: string | null) => ({ reason: SEAT_POOL_DRAIN_STARTED, notes: { startedAt: at, deadlineAt } });
+  const expired = (startedAt: string) => ({ reason: SEAT_POOL_DRAIN_EXPIRED, notes: { startedAt, at: "x", left: [{ slot: "dev.impl-s1", why: "release_refused" }], moved: [] } });
+
+  it("is the latest started with no ended after it, and its own expired only", () => {
+    expect(seatPoolDrainEpisode([])).toBeNull();
+    expect(seatPoolDrainEpisode([started("t1", "d1"), { reason: SEAT_POOL_DRAIN_ENDED, notes: {} }])).toBeNull();
+    const episode = seatPoolDrainEpisode([started("t1", "d1"), expired("t1"), { reason: SEAT_POOL_DRAIN_ENDED, notes: {} }, started("t2", "d2"), expired("t1")]);
+    expect(episode).toEqual({ startedAt: "t2", deadlineAt: "d2", expired: null });
+  });
+
+  // r1 rule 2: a pruned start is a new drain (the executor records another started), never a drain with no clock.
+  it("has no current drain when the start was pruned, even with the drain's expired still there", () => {
+    expect(seatPoolDrainEpisode([expired("t1")])).toBeNull();
   });
 });
 
@@ -453,5 +485,41 @@ describe("seat-pool registration, update and stop", () => {
     slots.retire(held.slotId, ago(0));
     expect((await stop()).status).toBe(200);
     expect(jobsRepo.getByIdOrThrow(job.jobId).state).toBe("stopped");
+  });
+
+  // T-004870 F3, r1 rule 3: the stop needs the forced pass's proof in the history; once it is pruned, the stop refuses.
+  it("refuses to stop a drained pool again once the forced pass's entry is pruned, and says when the deadline passes", async () => {
+    const job = jobsRepo.register({ policy: "seat-pool", specYaml: `${specYaml}  drain: true
+`, targetSession: "dev-impl@r", intervalSeconds: 60, registeredBySession: "ops@kernel" });
+    const slots = new SeatPoolSlots(db);
+    slots.insert({ poolJobId: job.jobId, logicalId: "dev.impl-s1", nodeId: "n1", phase: "live", intent: null, opId: "op-1", at: ago(0) });
+    const log = new WatchdogHistoryLog(db);
+    const entry = (reason: string, notes: Record<string, unknown>) =>
+      log.record({ jobId: job.jobId, evaluatedAt: ago(0), outcome: "skipped", skipReason: reason, evaluationNotes: notes });
+    const startedAt = "2026-11-09T12:00:00.000Z";
+    const deadlineAt = "2026-11-09T12:15:00.000Z";
+    entry(SEAT_POOL_DRAIN_STARTED, { startedAt, deadlineAt });
+    const pass = entry(SEAT_POOL_DRAIN_EXPIRED, { startedAt, deadlineAt, at: deadlineAt, left: [{ slot: "dev.impl-s1", why: "release_refused" }], moved: [] });
+    const stop = () => app.request(`/api/watchdog/${job.jobId}/stop`, { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
+
+    db.prepare("DELETE FROM watchdog_history WHERE history_id = ?").run(pass.historyId);
+    const refused = await stop();
+    expect(refused.status).toBe(409);
+    expect(await refused.json()).toMatchObject({ error: "pool_has_slots", message: expect.stringContaining(deadlineAt) });
+    expect(jobsRepo.getByIdOrThrow(job.jobId).state).toBe("active");
+
+    db.prepare("DELETE FROM watchdog_history WHERE job_id = ?").run(job.jobId);
+    expect((await stop()).status).toBe(409);
+    expect(jobsRepo.getByIdOrThrow(job.jobId).state).toBe("active");
+  });
+
+  // The 409 tells the current drain, not the spec: drain_deadline_s changed during a drain applies to the next one.
+  it("says the current drain has no deadline when it started with 0, even after the spec changed to a deadline", async () => {
+    const job = jobsRepo.register({ policy: "seat-pool", specYaml: `${specYaml}  drain: true\n  drain_deadline_s: 600\n`, targetSession: "dev-impl@r", intervalSeconds: 60, registeredBySession: "ops@kernel" });
+    new SeatPoolSlots(db).insert({ poolJobId: job.jobId, logicalId: "dev.impl-s1", nodeId: "n1", phase: "live", intent: null, opId: "op-1", at: ago(0) });
+    new WatchdogHistoryLog(db).record({ jobId: job.jobId, evaluatedAt: ago(0), outcome: "skipped", skipReason: SEAT_POOL_DRAIN_STARTED, evaluationNotes: { startedAt: ago(0), deadlineAt: null } });
+    const refused = await app.request(`/api/watchdog/${job.jobId}/stop`, { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
+    expect(refused.status).toBe(409);
+    expect(await refused.json()).toMatchObject({ error: "pool_has_slots", message: expect.stringContaining("started with drain_deadline_s: 0") });
   });
 });

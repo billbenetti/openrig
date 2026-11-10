@@ -17,6 +17,8 @@ import { EventBus } from "../src/domain/event-bus.js";
 import { OutboxHandler } from "../src/domain/outbox-handler.js";
 import { QueueRepository } from "../src/domain/queue-repository.js";
 import { WatchdogJobsRepository } from "../src/domain/watchdog-jobs-repository.js";
+import { WatchdogHistoryLog } from "../src/domain/watchdog-history-log.js";
+import { watchdogHistorySchema } from "../src/db/migrations/032_watchdog_history.js";
 import type { StopPrecondition } from "../src/domain/seat-lifecycle-service.js";
 import {
   readSeatPoolState,
@@ -393,6 +395,45 @@ describe("seat-pool executor", () => {
     ]);
   });
 
+  // T-004870 F3, r1 rule 2: the drain's clock is the job's history. Once the retention prunes a drain's entries, the
+  // drain is over for the executor too (as for the job's stop): the next run starts a new one, from what it recorded
+  // in memory neither.
+  it("starts a new drain once the history's drain entries are pruned, without falling back to what it recorded", async () => {
+    jobSpec = spec({ drain: true, release_cmd: { argv: ["release"] } });
+    let nowMs = T0;
+    // The history the daemon keeps for the job, without the job's row (the executor reads its job through readJob).
+    db.pragma("foreign_keys = OFF");
+    migrate(db, [watchdogHistorySchema]);
+    const log = new WatchdogHistoryLog(db);
+    const executor: SeatPoolExecutor = new SeatPoolExecutor({
+      slots, readJob: () => ({ active, targetSession: MODEL.sessionName, spec: jobSpec }),
+      readState: () => world.state(slots, executor, jobSpec), effects: world.effects(), now: () => new Date(nowMs),
+      record: (jobId, entry) => {
+        history.push(entry);
+        log.record({ jobId, evaluatedAt: new Date(nowMs).toISOString(), outcome: entry.failed ? "failed" : "skipped", skipReason: entry.reason, evaluationNotes: entry.notes });
+      },
+    });
+    const slot = slots.insert({ poolJobId: JOB, logicalId: "dev.impl-s1", nodeId: "node-1", phase: "live", intent: null, opId: "op-1", at: new Date(T0).toISOString() });
+    world.nodes.set("node-1", { logicalId: "dev.impl-s1", session: "running", sessionId: "sess-1", openRows: 1, idle: true });
+    world.exit["release"] = 1;
+    const drainReasons = () => history.map((h) => h.reason).filter((r) => r.startsWith("seat_pool_drain_"));
+
+    await run(executor, []);
+    nowMs = T0 + 901_000;
+    await run(executor, []);
+    expect(drainReasons()).toEqual(["seat_pool_drain_started", "seat_pool_drain_expired"]);
+    expect(history.at(-1)).toMatchObject({ notes: { left: [{ slot: "dev.impl-s1", why: "release_refused" }] } });
+    await run(executor, []);
+    expect(drainReasons()).toHaveLength(2);
+
+    db.prepare("DELETE FROM watchdog_history WHERE job_id = ?").run(JOB);
+    nowMs = T0 + 2_000_000;
+    await run(executor, []);
+    expect(drainReasons()).toEqual(["seat_pool_drain_started", "seat_pool_drain_expired", "seat_pool_drain_started"]);
+    expect(history.at(-1)!.notes).toMatchObject({ deadlineAt: new Date(T0 + 2_000_000 + 900_000).toISOString() });
+    expect(slots.get(slot.slotId)?.retiredAt).toBeNull();
+  });
+
   it("leaves a seat that was relaunched since the read, and never removes it", async () => {
     const executor = makeExecutor();
     await run(executor, [{ kind: "add", count: 1 }]);
@@ -735,7 +776,9 @@ describe("seat-pool executor", () => {
       expect(world.rows.get("q-1")).toMatchObject({ destination: MODEL.sessionName });
       expect(world.rows.get("q-2")).toMatchObject({ destination: "dev-impl-s1@r" });
       expect(world.escalations).toEqual([]);
-      expect(history).toEqual([{ failed: false, reason: "seat_pool_relaunched", notes: { seat: "dev-impl@r" } }]);
+      // The first run that reads drain: true starts the drain's clock (T-004870 F3); nothing else is recorded.
+      expect(history.filter((entry) => entry.reason === "seat_pool_drain_started")).toHaveLength(1);
+      expect(history.filter((entry) => entry.reason !== "seat_pool_drain_started")).toEqual([{ failed: false, reason: "seat_pool_relaunched", notes: { seat: "dev-impl@r" } }]);
     });
 
     it("moves a waiting row to a seat it just added, once the seat is up", async () => {
