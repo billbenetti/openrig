@@ -1388,7 +1388,16 @@ export class SeatPoolExecutor {
         }
         return true;
       }
-      const launched = await this.relaunch(jobId, run, ctx, intent.seat, seat.logicalId);
+      let launched: Awaited<ReturnType<SeatPoolExecutor["relaunch"]>>;
+      try {
+        launched = await this.relaunch(jobId, run, ctx, intent.seat, seat.logicalId);
+      } catch (error) {
+        // A relaunch that throws (the delivery guard's lifecycle, a database read) failed like one that answered so: it
+        // waits out its backoff, and the rest of the plan (an add) still runs.
+        this.record(jobId, true, "seat_pool_relaunch_failed", { seat: intent.seat, code: "relaunch_threw", error: error instanceof Error ? error.message : String(error) });
+        this.relaunchFailed(key, this.now().getTime());
+        return true;
+      }
       // A relaunch past the effect timeout failed as well (a cancel only stops waiting: it counts nothing).
       if (launched === "failed" || (launched === "timed_out" && !run.controller.signal.aborted)) this.relaunchFailed(key, this.now().getTime());
       else if (launched === "launched") {
