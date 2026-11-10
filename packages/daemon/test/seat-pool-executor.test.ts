@@ -1204,6 +1204,65 @@ describe("seat-pool executor", () => {
       expect(backoffHolds()).toEqual([]);
     });
 
+    // T-005232 S4 (mutante m1 do QA-f6a): the backoff doubles from 60 s and stops at 30 min.
+    it("S4: six relaunch failures in a row wait 30 min for the next try, not 32 (the ceiling), with no escalation nor failed hold meanwhile", async () => {
+      const executor = clocked();
+      world.modelCause = "stopped";
+      world.relaunchResult = resumeFailed;
+      // Failures 1 to 5 wait 60, 120, 240, 480 and 960 s; each try runs just past the wait.
+      await run(executor, relaunchModel);
+      for (const waitS of [60, 120, 240, 480, 960]) {
+        clock += (waitS + 1) * 1_000;
+        await run(executor, relaunchModel);
+      }
+      expect(relaunches()).toBe(6);
+      const sixth = clock;
+      clock += 1_000;
+      await run(executor, relaunchModel);
+      expect(relaunches()).toBe(6);
+      expect(backoffHolds().at(-1)?.notes).toMatchObject({ failures: 6, retryAt: new Date(sixth + 30 * 60_000).toISOString() });
+      // N12: while it waits, no escalation and no hold recorded as a failure.
+      expect(world.calls.filter((call) => call.startsWith("escalate"))).toEqual([]);
+      expect(history.filter((h) => h.reason === "seat_pool_held" && h.failed)).toEqual([]);
+      clock = sixth + 30 * 60_000 + 1_000;
+      await run(executor, relaunchModel);
+      expect(relaunches()).toBe(7);
+    });
+
+    // T-005232 S2: a relaunch that throws (the delivery guard's lifecycle, a database error) is a failed relaunch: it
+    // waits out its backoff, and the rest of the plan (the add) still runs.
+    it("S2: a relaunch that throws counts as failed and backs off: the plan goes on, and the add starts at the 2nd tick", async () => {
+      const budget = budgetOf(1);
+      const executor = clocked({ launchBudget: budget, effects: { ...world.effects(), relaunchSeat: async (input) => {
+        world.calls.push(`relaunch ${input.logicalId}`);
+        throw new Error("draft_aware_lifecycle");
+      } } });
+      world.modelCause = "stopped";
+      const old = new Date(T0 - 3_600_000).toISOString();
+      world.rows.set("q-1", { destination: MODEL.sessionName, waitingSince: old });
+      world.rows.set("q-2", { destination: MODEL.sessionName, waitingSince: old });
+      const tick = async () => {
+        budget.nextTick();
+        const planned = planSeatPool(jobSpec, world.state(slots, executor, jobSpec), clock, 120_000);
+        await run(executor, planned.intents);
+        return planned;
+      };
+      expect((await tick()).intents.map((intent) => intent.kind)).toEqual(["relaunch", "add"]);
+      expect(history.find((h) => h.reason === "seat_pool_relaunch_failed")).toMatchObject({
+        failed: true, notes: { seat: MODEL.sessionName, code: "relaunch_threw", error: "draft_aware_lifecycle" },
+      });
+      expect(reasons()).not.toContain("seat_pool_run_failed");
+      expect(world.calls.filter((call) => call.startsWith("add "))).toEqual([]);
+      clock += 1_000;
+      await tick();
+      expect(world.calls).toContain("add impl-s1 /work/r/impl-s1");
+      clock += 1_000;
+      await tick();
+      expect(relaunches()).toBe(1);
+      expect(reasons()).not.toContain("seat_pool_run_failed");
+      expect(backoffHolds().at(-1)?.notes).toMatchObject({ failures: 1, retryAt: new Date(T0 + 60_000).toISOString() });
+    });
+
     it("an add the max refuses during the usage check spends none of the tick's launches", async () => {
       const budget = budgetOf(1);
       const executor = clocked({ launchBudget: budget, outOfUsage: async () => { jobSpec = spec({ max: 0 }); return false; } });
@@ -1285,6 +1344,37 @@ describe("seat-pool executor", () => {
         expect(repo.list({ destinationSession: escalatesTo })).toEqual([]);
         expect(db.prepare("SELECT COUNT(*) AS n FROM outbox_entries WHERE destination_session = ?").get(escalatesTo)).toEqual({ n: 0 });
         expect(history.at(-1)).toMatchObject({ reason: "seat_pool_escalated", notes: { to: "plataforma-supervisor@comando" } });
+        // T-005232 S1 (mutante m2 do QA-f6a): the escalation keeps its nudge: the supervisor's wake is staged.
+        const [escalation] = repo.list({ destinationSession: "plataforma-supervisor@comando" });
+        expect(db.prepare("SELECT COUNT(*) AS n FROM outbox_entries WHERE destination_session = ? AND audit_pointer = ?")
+          .get("plataforma-supervisor@comando", escalation!.qitemId)).toEqual({ n: 1 });
+      });
+
+      // T-005232 S3 (mutante m3 do QA-f6a): an escalation_owner the queue refuses never falls back to the model's
+      // escalates_to (the orchestrator's terminal): the escalation fails, owned by no one, and a row the reap moves a
+      // second time stays at the model.
+      it("S3: an escalation_owner the queue refuses leaves the escalation without owner, and nothing reaches escalates_to", async () => {
+        jobSpec = spec({ escalation_owner: "plataforma-supervisor@comando" });
+        const refusing = new QueueRepository(db, new EventBus(db), { validateRig: (ref) => !ref.startsWith("plataforma-supervisor@") });
+        refusing.attachOutbox(new OutboxHandler(db));
+        const effects = (): SeatPoolEffects => ({ ...world.effects(), ...seatPoolQueueEffects({ queueRepo: refusing, escalationOwner: () => ({ owner: escalatesTo, reason: "routed" }) }) });
+        world.nodes.set("node-1", { logicalId: "dev.impl-s1", session: "running", sessionId: "sess-1", openRows: 1, idle: false, cause: "needs_input" });
+        slots.insert({ poolJobId: JOB, logicalId: "dev.impl-s1", nodeId: "node-1", phase: "live", intent: null, opId: "op-1", at: new Date(T0).toISOString() });
+        await run(clocked({ effects: effects() }), [{ kind: "escalate", seat: "dev-impl-s1@r", qitemIds: ["q-1"] }]);
+        expect(history.at(-1)).toMatchObject({ failed: true, reason: "seat_pool_escalation_failed", notes: { seat: "dev-impl-s1@r" } });
+        expect(refusing.list({ destinationSession: escalatesTo })).toEqual([]);
+        expect(db.prepare("SELECT COUNT(*) AS n FROM outbox_entries WHERE destination_session = ?").get(escalatesTo)).toEqual({ n: 0 });
+
+        // The 2nd reap of a row: with the override refused, it stays at the model, never at escalates_to.
+        world.nodes.delete("node-1");
+        const row = await refusing.create({ sourceSession: "lead@r", destinationSession: MODEL.sessionName, body: "work", nudge: false });
+        refusing.routeToFallback(row.qitemId, "dev-impl-s2@r", "reap:dev-impl-s9@r");
+        world.nodes.set("node-2", { logicalId: "dev.impl-s2", session: "stopped", sessionId: "sess-2", openRows: 1, idle: false });
+        const dead = slots.insert({ poolJobId: JOB, logicalId: "dev.impl-s2", nodeId: "node-2", phase: "live", intent: null, opId: "op-2", at: new Date(T0).toISOString() });
+        await run(clocked({ effects: effects() }), [{ kind: "reap", slotId: dead.slotId }]);
+        expect(refusing.getById(row.qitemId)).toMatchObject({ destinationSession: MODEL.sessionName });
+        expect(refusing.list({ destinationSession: escalatesTo })).toEqual([]);
+        expect(db.prepare("SELECT COUNT(*) AS n FROM outbox_entries WHERE destination_session = ?").get(escalatesTo)).toEqual({ n: 0 });
       });
 
       it("a row the reap moves a second time goes to the spec's escalation_owner, never to the model's escalates_to", async () => {
