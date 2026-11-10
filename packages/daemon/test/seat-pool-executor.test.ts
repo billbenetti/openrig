@@ -1589,6 +1589,172 @@ describe("seat-pool executor", () => {
       expect(slots.get(slot.slotId)?.phase).not.toBe("draining");
     });
 
+    // T-005245 S7: the seat worked on its rows while the release command ran, in a way the B1 check (a new
+    // in-progress id) missed: the same row released and claimed again, a claim and then a block or a close, a pending
+    // row parked straight away. Each keeps the seat running: no stop, no unclaim, left work_arrived.
+    const workedDuringRelease = async (before: (id: string) => void, during: (id: string) => Promise<void> | void) => {
+      const row = await repo.create({ sourceSession: "lead@r", destinationSession: SEAT, body: "work", nudge: false });
+      before(row.qitemId);
+      const slot = liveSeat();
+      world.commandGate = async () => { if (world.calls.at(-1) === "run release") await during(row.qitemId); };
+      await toDeadline(executorWith(withQueue()));
+      expect(world.calls.filter((c) => c.startsWith("stop") || c.startsWith("remove") || c.startsWith("unclaim"))).toEqual([]);
+      expect(world.nodes.get("node-1")?.session).toBe("running");
+      expect(slots.get(slot.slotId)).toMatchObject({ phase: "live", intent: null, retiredAt: null });
+      expect(expired()).toEqual([expect.objectContaining({ notes: expect.objectContaining({ left: [{ slot: "dev.impl-s1", why: "work_arrived", exitCode: 0 }], moved: [] }) })]);
+      return row.qitemId;
+    };
+    it("S7: the same row released and claimed again during the release keeps the seat running", async () => {
+      const id = await workedDuringRelease(
+        (qitemId) => { repo.claim({ qitemId, destinationSession: SEAT }); },
+        async (qitemId) => {
+          repo.unclaim(qitemId, SEAT, "manual");
+          await new Promise((resolve) => setTimeout(resolve, 5));
+          repo.claim({ qitemId, destinationSession: SEAT });
+        });
+      expect(repo.getById(id)).toMatchObject({ destinationSession: SEAT, state: "in-progress" });
+    });
+    it("S7: a row claimed and then parked during the release keeps the seat running, the row still blocked there", async () => {
+      const id = await workedDuringRelease(() => {}, (qitemId) => {
+        repo.claim({ qitemId, destinationSession: SEAT });
+        repo.update({ qitemId, actorSession: SEAT, state: "blocked", blockedOn: "external:suite" });
+      });
+      expect(repo.getById(id)).toMatchObject({ destinationSession: SEAT, state: "blocked" });
+    });
+    it("S7: a row claimed and then closed during the release keeps the seat running", async () => {
+      const id = await workedDuringRelease(() => {}, (qitemId) => {
+        repo.claim({ qitemId, destinationSession: SEAT });
+        repo.update({ qitemId, actorSession: SEAT, state: "done", closureReason: "no-follow-on" });
+      });
+      expect(repo.getById(id)).toMatchObject({ state: "done" });
+    });
+    it("S7: a pending row parked straight away during the release keeps the seat running", async () => {
+      const id = await workedDuringRelease(() => {}, (qitemId) => {
+        repo.update({ qitemId, actorSession: SEAT, state: "blocked", blockedOn: "external:suite" });
+      });
+      expect(repo.getById(id)).toMatchObject({ destinationSession: SEAT, state: "blocked" });
+    });
+
+    // T-005245 S8: kill_attempted also comes out of a kill-session that failed with the session alive. tmux decides:
+    // a session the clean finds alive is not a seat stopped, and goes back to admission (never held draining).
+    it("S8: a kill_attempted stop whose session tmux finds alive leaves the seat running, back in admission, not stopped", async () => {
+      const slot = liveSeat();
+      world.cleanResult = { ok: false, code: "session_alive", error: "Session is alive in tmux" };
+      await toDeadline(executorWith({
+        ...world.effects(),
+        stopSlot: async (input) => {
+          world.calls.push(`stop ${input.sessionName}`);
+          return { ok: false, code: "stop_uncertain", error: "kill-session failed", killAttempted: true };
+        },
+      }));
+      expect(world.calls).toContain(`clean ${SEAT}`);
+      expect(slots.get(slot.slotId)).toMatchObject({ phase: "live", intent: null, retiredAt: null });
+      expect(expired()).toEqual([expect.objectContaining({ notes: expect.objectContaining({ left: [{ slot: "dev.impl-s1", why: "stop_failed", exitCode: 0 }] }) })]);
+    });
+
+    // T-005245 S9: a seat the plain drain stopped and a restart cut short before its removal carries on to the removal,
+    // never back to live (where the reap would launch it again), also after the forced pass.
+    it("S9: after the drain expired, a seat the plain drain stopped (its removal cut short) is removed, never relaunched", async () => {
+      jobSpec = spec({ drain: true });
+      liveSeat("running");
+      const executor = executorWith(world.effects());
+      await toDeadline(executor);
+      expect(expired()).toHaveLength(1);
+      world.nodes.set("node-2", { logicalId: "dev.impl-s2", session: "stopped", sessionId: "sess-2", openRows: 0, idle: false });
+      const cut = slots.insert({ poolJobId: JOB, logicalId: "dev.impl-s2", nodeId: "node-2", phase: "draining", intent: "stop", opId: "op-2", at: new Date(T0).toISOString() });
+      world.calls = [];
+      // The plans that follow: the planner's own intents, tick after tick.
+      for (let i = 0; i < 3; i++) {
+        clock += 30_000;
+        await run(executor, planSeatPool(jobSpec, world.state(slots, executor, jobSpec), clock, 120_000).intents);
+      }
+      expect(world.calls.filter((c) => c.startsWith("relaunch") || c.startsWith("run release") || c.startsWith("stop"))).toEqual([]);
+      expect(world.calls).toContain("remove dev.impl-s2 " + JSON.stringify({ nodeId: "node-2", sessionId: "sess-2" }));
+      expect(slots.get(cut.slotId)?.retiredAt).not.toBeNull();
+      expect(history).toContainEqual(expect.objectContaining({ reason: "seat_pool_removed", notes: { slot: "dev.impl-s2", resumed: true } }));
+    });
+
+    it("S9: a seat the plain drain stopped that a row reached since goes back to admission (the reap gives the row back)", async () => {
+      jobSpec = spec({ drain: false });
+      world.nodes.set("node-2", { logicalId: "dev.impl-s2", session: "stopped", sessionId: "sess-2", openRows: 1, idle: false });
+      const cut = slots.insert({ poolJobId: JOB, logicalId: "dev.impl-s2", nodeId: "node-2", phase: "draining", intent: "remove", opId: "op-2", at: new Date(T0).toISOString() });
+      await run(executorWith(world.effects()), [drainOf(cut.slotId)]);
+      expect(world.calls.filter((c) => c.startsWith("remove"))).toEqual([]);
+      expect(slots.get(cut.slotId)).toMatchObject({ phase: "live", intent: null, retiredAt: null });
+    });
+
+    // T-005245 S4: the delivery guard refusing the lease (a typing guard on hold, a draft-aware seat with input) is that
+    // seat's result: the forced pass leaves it (delivery_guard) and goes on with the others; the run never fails.
+    it("S4: a lease the delivery guard refuses leaves that seat in the forced pass, and the pass goes on with the next", async () => {
+      jobSpec = spec({ drain: true });
+      const guarded = liveSeat();
+      world.nodes.set("node-2", { logicalId: "dev.impl-s2", session: "running", sessionId: "sess-2", openRows: 1, idle: false });
+      const other = slots.insert({ poolJobId: JOB, logicalId: "dev.impl-s2", nodeId: "node-2", phase: "live", intent: null, opId: "op-2", at: new Date(T0).toISOString() });
+      const effects = world.effects();
+      await toDeadline(executorWith({
+        ...effects,
+        lifecycle: async (nodeId, fn) => {
+          if (nodeId === "node-1") throw Object.assign(new Error("Automatic input is paused for this seat."), { code: "typing_guard_enabled" });
+          return effects.lifecycle(nodeId, fn);
+        },
+      }));
+      expect(history.map((h) => h.reason)).not.toContain("seat_pool_run_failed");
+      expect(slots.get(guarded.slotId)).toMatchObject({ phase: "live", intent: null, retiredAt: null });
+      expect(slots.get(other.slotId)?.retiredAt).not.toBeNull();
+      expect(expired()).toEqual([expect.objectContaining({ notes: expect.objectContaining({ left: [{ slot: "dev.impl-s1", why: "delivery_guard", exitCode: null }] }) })]);
+    });
+
+    it("S4: the plain drain and the reap take a guard refusal as that seat's result, and the run goes on", async () => {
+      jobSpec = spec({});
+      const effects = world.effects();
+      const refusing: SeatPoolEffects = { ...effects, lifecycle: async () => { throw Object.assign(new Error("draft-aware seat"), { code: "draft_aware_lifecycle" }); } };
+      world.nodes.set("node-1", { logicalId: "dev.impl-s1", session: "running", sessionId: "sess-1", openRows: 0, idle: true });
+      const free = slots.insert({ poolJobId: JOB, logicalId: "dev.impl-s1", nodeId: "node-1", phase: "live", intent: null, opId: "op-1", at: new Date(T0).toISOString() });
+      world.nodes.set("node-2", { logicalId: "dev.impl-s2", session: "stopped", sessionId: "sess-2", openRows: 0, idle: false });
+      const dead = slots.insert({ poolJobId: JOB, logicalId: "dev.impl-s2", nodeId: "node-2", phase: "live", intent: null, opId: "op-2", at: new Date(T0).toISOString() });
+      await run(executorWith(refusing), [drainOf(free.slotId), { kind: "reap", slotId: dead.slotId }]);
+      expect(reasons()).not.toContain("seat_pool_run_failed");
+      expect(slots.get(free.slotId)).toMatchObject({ phase: "live", intent: null });
+      expect(history).toContainEqual({ failed: false, reason: "seat_pool_returned", notes: { slot: "dev.impl-s1", why: "delivery_guard", code: "draft_aware_lifecycle", error: "draft-aware seat" } });
+      expect(history).toContainEqual({ failed: true, reason: "seat_pool_reap_failed", notes: { slot: "dev.impl-s2", step: "lease", code: "draft_aware_lifecycle", error: "draft-aware seat" } });
+    });
+
+    // T-005245 S6: a pass cut short records what it did so far (keep), and a seat whose release does not answer is
+    // asked again only before deadline + 600 s, never at that instant.
+    it("S6: a pass cut short records what it did so far (seat_pool_drain_retrying), never the pass's end", async () => {
+      jobSpec = spec({ drain: true, release_cmd: { argv: ["release"] } });
+      liveSeat();
+      world.nodes.set("node-2", { logicalId: "dev.impl-s2", session: "running", sessionId: "sess-2", openRows: 1, idle: false });
+      slots.insert({ poolJobId: JOB, logicalId: "dev.impl-s2", nodeId: "node-2", phase: "live", intent: null, opId: "op-2", at: new Date(T0).toISOString() });
+      world.exit["release"] = 3;
+      let asked = 0;
+      world.commandGate = async () => { if (world.calls.at(-1) === "run release" && ++asked === 2) active = false; };
+      await toDeadline(executorWith(world.effects()));
+      const retrying = history.filter((h) => h.reason === "seat_pool_drain_retrying");
+      expect(retrying).toHaveLength(1);
+      // The job stopped while the 2nd seat's release ran: both seats are still to ask, and the pass is not through.
+      expect(retrying[0]!.notes).toMatchObject({ waiting: [{ slot: "dev.impl-s1", exitCode: 3 }, { slot: "dev.impl-s2", exitCode: 3 }] });
+      expect(expired()).toEqual([]);
+    });
+
+    it("S6: a release that never answers is asked again until deadline + 600 s, and at that instant the seat is left release_unavailable", async () => {
+      jobSpec = spec({ drain: true, release_cmd: { argv: ["release"] } });
+      liveSeat();
+      world.exit["release"] = 3;
+      const executor = executorWith(world.effects());
+      await toDeadline(executor);
+      const releases = () => world.calls.filter((c) => c === "run release").length;
+      expect(releases()).toBe(1);
+      clock = T0 + DEADLINE_MS + 600_000 - 1;
+      await run(executor, []);
+      expect(releases()).toBe(2);
+      expect(expired()).toEqual([]);
+      clock = T0 + DEADLINE_MS + 600_000;
+      await run(executor, []);
+      expect(releases()).toBe(2);
+      expect(expired()).toEqual([expect.objectContaining({ notes: expect.objectContaining({ left: [{ slot: "dev.impl-s1", why: "release_unavailable", exitCode: 3 }] }) })]);
+    });
+
     it("S2: before the deadline, the guard still holds a seat stopped on its way out for the forced pass", async () => {
       jobSpec = spec({ drain: true });
       liveSeat("running");

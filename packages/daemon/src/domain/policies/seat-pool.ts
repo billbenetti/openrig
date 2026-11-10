@@ -183,7 +183,8 @@ export interface SeatPoolDrainEvent {
  *  answer (exit 3 or 5, or a timeout) on any try within SEAT_POOL_RELEASE_RETRY_SECONDS of the deadline.
  *  `work_arrived`: the seat claimed a row while its release command ran, so it is working and keeps its rows. */
 export type SeatPoolLeftWhy =
-  | "release_refused" | "release_unavailable" | "work_arrived" | "stop_failed" | "move_failed" | "remove_failed" | "remove_cmd_failed";
+  | "release_refused" | "release_unavailable" | "work_arrived" | "delivery_guard" | "stop_failed" | "move_failed" | "remove_failed"
+  | "remove_cmd_failed";
 
 /** A seat the forced pass left, with the release command's exit code in that pass (null when it did not run).
  *  `stopped`: left after its stop (draining, never back in admission), as against left running. */
@@ -216,7 +217,11 @@ export interface SeatPoolDrainEpisode {
    * A forced pass still under way: the seats it left for good, the rows it moved, and the seats whose release command
    * did not answer, to ask again (with the last exit code). Absent when no pass is waiting.
    */
-  retry?: { left: SeatPoolLeftEntry[]; moved: Array<{ qitemId: string; to: string }>; waiting: Array<{ slot: string; exitCode: number | null }> };
+  retry?: {
+    left: SeatPoolLeftEntry[]; moved: Array<{ qitemId: string; to: string }>; waiting: Array<{ slot: string; exitCode: number | null }>;
+    /** Until when the seats `waiting` are asked again (null in an entry recorded before the field). */
+    retryUntil: string | null;
+  };
 }
 
 const text = (value: unknown): string | null => (typeof value === "string" ? value : null);
@@ -243,6 +248,7 @@ export function seatPoolDrainEpisode(events: SeatPoolDrainEvent[]): SeatPoolDrai
         left: Array.isArray(notes["left"]) ? notes["left"] as SeatPoolLeftEntry[] : [],
         moved: Array.isArray(notes["moved"]) ? notes["moved"] as Array<{ qitemId: string; to: string }> : [],
         waiting: Array.isArray(notes["waiting"]) ? notes["waiting"] as Array<{ slot: string; exitCode: number | null }> : [],
+        retryUntil: text(notes["retryUntil"]),
       };
     }
   }
