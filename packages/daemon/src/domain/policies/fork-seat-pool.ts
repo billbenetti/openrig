@@ -238,6 +238,17 @@ export function seatPoolReapable(slot: SeatPoolSlotView): boolean {
   return !slot.adopted && slot.phase === "live" && slot.nodeExists && slot.cause === "stopped";
 }
 
+/**
+ * How many more seats the pool has room for. `max` counts every seat on record: an adopted seat, running or stopped,
+ * and a seat the pool added, starting, live or draining (until it is retired). The planner sizes an add with this and
+ * the executor checks it again before each seat, so every seat an add asks for fits, and the executor never adds one
+ * the plan would not ask for. `adopting`: seats the same plan adopts before its add (the executor applies intents in
+ * order), which take room as soon as they are linked.
+ */
+export function seatPoolRoom(spec: Pick<SeatPoolSpec, "max">, slots: readonly SeatPoolSlotView[], adopting = 0): number {
+  return Math.max(0, spec.max - slots.length - adopting);
+}
+
 /** Whether the model or a seat of the pool is out of provider usage: the pool then adds and launches nothing. */
 export function seatPoolOutOfUsage(state: Pick<SeatPoolState, "modelCause" | "slots">): boolean {
   return state.modelCause === "usage_limit" || state.slots.some((slot) => slot.nodeExists && slot.cause === "usage_limit");
@@ -254,11 +265,12 @@ export function seatPoolOutOfUsage(state: Pick<SeatPoolState, "modelCause" | "sl
  * input is escalated; an idle one is left to the queue's own wakes, and one out of usage waits. Only pending rows are read,
  * so a blocked or claimed row is never moved or counted. A seat the pool added whose session is gone is reaped rather
  * than launched, even under drain or a usage limit; an adopted one is launched when it holds a waiting row, and while
- * it is stopped it is not counted.
+ * it is stopped it is not counted among the seats taking work (`current`), though it still counts against `max`.
  *
  * The target is the demand (the demand command's last answer, or the waiting rows no free seat takes plus the seats
  * holding work), never below the seats holding work plus the seats still starting, clamped to min..max; with `drain`
- * it is 0, and nothing is moved or woken. A demand answer older than `sampleMaxAgeMs` holds the pool's size as it is.
+ * it is 0, and nothing is moved or woken. An add asks for no more seats than the room `max` leaves (seatPoolRoom: every
+ * seat on record counts, adopted or added, running, stopped or draining); with no room it is not asked for at all. A demand answer older than `sampleMaxAgeMs` holds the pool's size as it is.
  * While a seat of the pool is out of usage, the pool adds no seat and launches none: neither a stopped seat nor one it
  * added and has not started, which waits as it is (and may still be removed). Only a free seat the pool added, idle
  * for `idle_grace_s`, is drained, the newest first; an adopted seat is never drained, and under `drain` it is unlinked.
@@ -357,7 +369,12 @@ export function planSeatPool(spec: SeatPoolSpec, state: SeatPoolState, nowMs: nu
     else if (!usageLimited) intents.push({ kind: "launch", slotId: slot.slotId });
   }
   if (usageLimited && starting.length > removeStarting.length) reason = "usage_limit";
-  if (target > current && !cooling) intents.push({ kind: "add", count: target - current });
+  if (target > current && !cooling) {
+    // The same room the executor checks before each seat: an add it would refuse is never asked for.
+    const count = Math.min(target - current, seatPoolRoom(spec, state.slots, state.adoptable.length));
+    if (count > 0) intents.push({ kind: "add", count });
+    else reason = "max_reached";
+  }
   if (cooling && target !== current) reason = "cooldown";
   return { intents, reason, target, current };
 }
