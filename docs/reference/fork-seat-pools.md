@@ -67,6 +67,13 @@ idle at a prompt. Only a seat the pool added, with no open row and no held messa
 no pending input and no background shell, for `idle_grace_s` is drained, the newest first. An adopted seat counts and
 takes rows like the pool's own, but the pool never stops or removes it: it was there before the pool and stays after.
 
+`max` counts every seat on record: each adopted seat, running or stopped, and each seat the pool added, starting, live
+or draining. The plan asks for no more seats than that leaves room for, and the executor checks the same count again
+before each seat, so every seat an add asks for is made and none past `max`. A pool whose adopted seats already fill
+`max` adds none; to let it grow, set `max` to the adopted seats plus the extra ones you want. An add that finds no room
+when it runs writes `seat_pool_held` with `reason: max_reached` to the job's history and takes none of the tick's
+launches.
+
 ## Waiting rows: dispatch and wake
 
 A pending row waits once it has been at its seat for `dispatch_after_s`, counted from its creation or its latest

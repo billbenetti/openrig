@@ -11,6 +11,7 @@ import type { Node } from "./types.js";
 import type { LaunchBudget, LaunchTick } from "./launch-budget.js";
 import {
   seatPoolReapable,
+  seatPoolRoom,
   slotWorkingDirectory,
   type SeatPoolCommand,
   type SeatPoolIntent,
@@ -624,6 +625,15 @@ export class SeatPoolExecutor {
       if (intent.kind === "adopt") this.adopt(jobId, run, intent);
       else if (intent.kind === "add") {
         for (let i = 0; i < intent.count; i++) {
+          // The pool's own room is checked before the launch budget's is reserved: an add past `max` is recorded and
+          // spends none of the tick's launches.
+          const ctx = this.fresh(jobId, run);
+          if (!ctx) return;
+          if (ctx.spec.drain) break;
+          if (seatPoolRoom(ctx.spec, ctx.state.slots) === 0) {
+            this.recordNoRoom(ctx, intent.count - i);
+            break;
+          }
           // Room is reserved before the seat is recorded, so a host without room leaves no seat half-added.
           const added = await this.withLaunchRoom(jobId, run, { add: intent.count - i }, async () => {
             const slot = await this.allocate(jobId, run);
@@ -668,12 +678,22 @@ export class SeatPoolExecutor {
     this.record(jobId, false, "seat_pool_unlinked", { slot: slot.logicalId });
   }
 
+  /** An add the pool has no room for under `max` (seatPoolRoom): said in the history, never a silent no-op. */
+  private recordNoRoom(ctx: Context, add: number): void {
+    this.record(ctx.jobId, false, "seat_pool_held", { reason: "max_reached", max: ctx.spec.max, seats: ctx.state.slots.length, add });
+  }
+
   /** Records a new seat (phase `adding`) if the pool, read again, still has room for it and no seat out of usage. */
   private async allocate(jobId: string, run: Run): Promise<SeatPoolSlot | null> {
     const before = this.fresh(jobId, run);
     if (!before || await this.outOfUsage(before)) return null;
     const ctx = this.fresh(jobId, run);
-    if (!ctx || ctx.spec.drain || ctx.state.slots.length >= ctx.spec.max) return null;
+    if (!ctx || ctx.spec.drain) return null;
+    // Read again after the usage check: the same count as the planner's, so a seat filled in between is not exceeded.
+    if (seatPoolRoom(ctx.spec, ctx.state.slots) === 0) {
+      this.recordNoRoom(ctx, 1);
+      return null;
+    }
     const logicalId = this.deps.slots.nextLogicalId(ctx.model);
     return this.deps.slots.insert({ poolJobId: jobId, logicalId, nodeId: null, phase: "adding", intent: "add", opId: randomUUID(), at: this.at() });
   }
