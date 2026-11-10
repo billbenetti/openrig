@@ -169,7 +169,8 @@ export const SEAT_POOL_DRAIN_ENDED = "seat_pool_drain_ended";
 export const SEAT_POOL_DRAIN_EXPIRED = "seat_pool_drain_expired";
 export const SEAT_POOL_LEFT = "seat_pool_left";
 /** The forced pass is still waiting on a seat whose release command did not answer (exit 3 or 5, or no exit code: a
- *  timeout): what the pass did so far, so the next tick, or the next daemon, carries on with it. */
+ *  timeout), or that worked on its rows while the command ran (work_arrived): what the pass did so far, so the next
+ *  tick, or the next daemon, carries on with it. */
 export const SEAT_POOL_DRAIN_RETRYING = "seat_pool_drain_retrying";
 export const SEAT_POOL_DRAIN_EVENTS = [SEAT_POOL_DRAIN_STARTED, SEAT_POOL_DRAIN_ENDED, SEAT_POOL_DRAIN_EXPIRED, SEAT_POOL_DRAIN_RETRYING] as const;
 
@@ -181,7 +182,8 @@ export interface SeatPoolDrainEvent {
 
 /** Why a seat the forced pass could not take out is still there. `release_unavailable`: its release command did not
  *  answer (exit 3 or 5, or a timeout) on any try within SEAT_POOL_RELEASE_RETRY_SECONDS of the deadline.
- *  `work_arrived`: the seat claimed a row while its release command ran, so it is working and keeps its rows. */
+ *  `work_arrived`: the seat worked on its rows while its release command ran (a claim, a block, a close, a handoff) on
+ *  every try within that window, so it is working and keeps its rows. */
 export type SeatPoolLeftWhy =
   | "release_refused" | "release_unavailable" | "work_arrived" | "delivery_guard" | "stop_failed" | "move_failed" | "remove_failed"
   | "remove_cmd_failed";
@@ -195,7 +197,12 @@ export interface SeatPoolLeftEntry { slot: string; why: string; exitCode?: numbe
 export const seatPoolLeftStopped = (entry: SeatPoolLeftEntry): boolean =>
   entry.stopped === true || entry.why === "move_failed" || entry.why === "remove_failed";
 
-/** How long after a drain's deadline the forced pass keeps asking again a release command that did not answer. */
+/** A seat the forced pass asks again, with the release command's last exit code: one whose command did not answer,
+ *  or one that worked on its rows while it ran (`why: work_arrived`; left as `release_unavailable` without it). */
+export interface SeatPoolRetryWaiting { slot: string; exitCode: number | null; why?: "work_arrived" }
+
+/** How long after a drain's deadline the forced pass keeps asking again a release command that did not answer, or a
+ *  seat that worked on its rows while it ran. */
 export const SEAT_POOL_RELEASE_RETRY_SECONDS = 600;
 
 /**
@@ -214,11 +221,11 @@ export interface SeatPoolDrainEpisode {
   /** The forced pass's result, once it ran for this drain. */
   expired: { at: string; left: SeatPoolLeftEntry[]; moved: Array<{ qitemId: string; to: string }> } | null;
   /**
-   * A forced pass still under way: the seats it left for good, the rows it moved, and the seats whose release command
-   * did not answer, to ask again (with the last exit code). Absent when no pass is waiting.
+   * A forced pass still under way: the seats it left for good, the rows it moved, and the seats to ask again (their
+   * release command did not answer, or they worked on their rows while it ran). Absent when no pass is waiting.
    */
   retry?: {
-    left: SeatPoolLeftEntry[]; moved: Array<{ qitemId: string; to: string }>; waiting: Array<{ slot: string; exitCode: number | null }>;
+    left: SeatPoolLeftEntry[]; moved: Array<{ qitemId: string; to: string }>; waiting: SeatPoolRetryWaiting[];
     /** Until when the seats `waiting` are asked again (null in an entry recorded before the field). */
     retryUntil: string | null;
   };
@@ -247,7 +254,7 @@ export function seatPoolDrainEpisode(events: SeatPoolDrainEvent[]): SeatPoolDrai
       episode.retry = {
         left: Array.isArray(notes["left"]) ? notes["left"] as SeatPoolLeftEntry[] : [],
         moved: Array.isArray(notes["moved"]) ? notes["moved"] as Array<{ qitemId: string; to: string }> : [],
-        waiting: Array.isArray(notes["waiting"]) ? notes["waiting"] as Array<{ slot: string; exitCode: number | null }> : [],
+        waiting: Array.isArray(notes["waiting"]) ? notes["waiting"] as SeatPoolRetryWaiting[] : [],
         retryUntil: text(notes["retryUntil"]),
       };
     }
