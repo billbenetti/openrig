@@ -21,6 +21,7 @@ import {
   planSeatPool,
   SEAT_POOL_DRAIN_ENDED,
   SEAT_POOL_DRAIN_EXPIRED,
+  SEAT_POOL_DRAIN_RETRYING,
   SEAT_POOL_DRAIN_STARTED,
   SEAT_POOL_POLICY_NAME,
   seatPoolDrainEpisode,
@@ -522,6 +523,76 @@ describe("seat-pool registration, update and stop", () => {
     const refused = await app.request(`/api/watchdog/${job.jobId}/stop`, { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
     expect(refused.status).toBe(409);
     expect(await refused.json()).toMatchObject({ error: "pool_has_slots", message: expect.stringContaining("started with drain_deadline_s: 0") });
+  });
+});
+
+// T-005245 (F3s), the stop and the show of a drained pool.
+describe("F3s: the stop says which seats were left stopped, and the show and the 409 say the forced pass's retry", () => {
+  let db: Database.Database;
+  let jobsRepo: WatchdogJobsRepository;
+  let app: Hono;
+  const SPEC = "policy: seat-pool\ncontext:\n  max: 3\n  cwd_template: /w/{slot}\n  drain: true\n";
+  beforeEach(() => {
+    db = createDb();
+    migrate(db, [coreSchema, eventsSchema, watchdogJobsSchema, watchdogHistorySchema, seatPoolSlotsSchema]);
+    jobsRepo = new WatchdogJobsRepository(db);
+    app = new Hono();
+    const log = new WatchdogHistoryLog(db);
+    const bus = new EventBus(db);
+    app.use("*", async (c, next) => {
+      c.set("eventBus" as never, bus);
+      c.set("watchdogJobsRepo" as never, jobsRepo);
+      c.set("watchdogHistoryLog" as never, log);
+      await next();
+    });
+    app.route("/api/watchdog", watchdogRoutes());
+  });
+  afterEach(() => db.close());
+  const startedAt = "2026-11-09T12:00:00.000Z";
+  const deadlineAt = "2026-11-09T12:15:00.000Z";
+  const pool = (seats: string[]) => {
+    const job = jobsRepo.register({ policy: "seat-pool", specYaml: SPEC, targetSession: "dev-impl@r", intervalSeconds: 60, registeredBySession: "ops@kernel" });
+    const slots = new SeatPoolSlots(db);
+    seats.forEach((logicalId, i) => slots.insert({ poolJobId: job.jobId, logicalId, nodeId: `n${i}`, phase: "draining", intent: null, opId: `op-${i}`, at: ago(0) }));
+    const log = new WatchdogHistoryLog(db);
+    const entry = (reason: string, notes: Record<string, unknown>) =>
+      log.record({ jobId: job.jobId, evaluatedAt: ago(0), outcome: "skipped", skipReason: reason, evaluationNotes: notes });
+    entry(SEAT_POOL_DRAIN_STARTED, { startedAt, deadlineAt });
+    return { job, entry };
+  };
+  const stop = (jobId: string) => app.request(`/api/watchdog/${jobId}/stop`, { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
+
+  it("S8: leftRunning and seat_pool_left carry stopped for a seat the pass left stopped (also an older move_failed/remove_failed entry)", async () => {
+    const { job, entry } = pool(["dev.impl-s1", "dev.impl-s2", "dev.impl-s3"]);
+    entry(SEAT_POOL_DRAIN_EXPIRED, { startedAt, deadlineAt, at: deadlineAt, moved: [], left: [
+      { slot: "dev.impl-s1", why: "stop_failed", exitCode: 0, stopped: true },
+      { slot: "dev.impl-s2", why: "release_refused", exitCode: 1 },
+      { slot: "dev.impl-s3", why: "move_failed", exitCode: 0 },
+    ] });
+    const stopped = await stop(job.jobId);
+    expect(stopped.status).toBe(200);
+    expect((await stopped.json() as { leftRunning: unknown[] }).leftRunning).toEqual([
+      { slot: "dev.impl-s1", sessionName: "dev-impl-s1@r", why: "stop_failed", stopped: true },
+      { slot: "dev.impl-s2", sessionName: "dev-impl-s2@r", why: "release_refused" },
+      { slot: "dev.impl-s3", sessionName: "dev-impl-s3@r", why: "move_failed", stopped: true },
+    ]);
+    const left = db.prepare("SELECT evaluation_notes FROM watchdog_history WHERE job_id = ? AND skip_reason = 'seat_pool_left' ORDER BY rowid").all(job.jobId) as Array<{ evaluation_notes: string }>;
+    expect(left.map((row) => JSON.parse(row.evaluation_notes).stopped ?? false)).toEqual([true, false, true]);
+  });
+
+  it("S5: while the pass asks again, the show gives retryUntil and the seats waiting, and the 409 says until when", async () => {
+    const { job, entry } = pool(["dev.impl-s1", "dev.impl-s2"]);
+    const retryUntil = "2026-11-09T12:25:00.000Z";
+    entry(SEAT_POOL_DRAIN_RETRYING, { startedAt, deadlineAt, at: deadlineAt, retryUntil, left: [], moved: [], waiting: [{ slot: "dev.impl-s2", exitCode: 3 }] });
+    const show = await (await app.request(`/api/watchdog/${job.jobId}`)).json() as { seatPool: { drain: Record<string, unknown> } };
+    expect(show.seatPool.drain).toEqual({ startedAt, deadlineAt, expired: false, retryUntil, waiting: ["dev.impl-s2"] });
+    const refused = await stop(job.jobId);
+    expect(refused.status).toBe(409);
+    expect(await refused.json()).toMatchObject({ error: "pool_has_slots", message: expect.stringMatching(new RegExp(`dev\\.impl-s2 until ${retryUntil}`)) });
+    // With no pass under way, the show says nothing of a retry.
+    entry(SEAT_POOL_DRAIN_EXPIRED, { startedAt, deadlineAt, at: retryUntil, moved: [], left: [{ slot: "dev.impl-s2", why: "release_unavailable", exitCode: 3 }] });
+    const after = await (await app.request(`/api/watchdog/${job.jobId}`)).json() as { seatPool: { drain: Record<string, unknown> } };
+    expect(after.seatPool.drain).toEqual({ startedAt, deadlineAt, expired: true });
   });
 });
 
