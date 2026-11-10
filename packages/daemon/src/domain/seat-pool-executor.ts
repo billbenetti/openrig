@@ -377,17 +377,30 @@ export interface SeatPoolEffects {
   reapCount(qitemId: string): number;
   /**
    * Moves a row to `to` only if it is still in `state` (pending by default) and addressed to `from`, in one transaction,
-   * and wakes `to` when the row is pending.
+   * and wakes `to` when the row is pending. A blocked row (only a reap and a drain's forced pass move one: its seat is
+   * going away) keeps what wakes it (QueueRepository.rerouteParked): a timer of its own is armed again for `to`, a live
+   * blocker or a person it waits on still wakes it, and a row nothing would wake goes to `to` pending, with a wake.
+   * `park` says which.
    */
-  moveRow(input: { qitemId: string; from: string; to: string; reason: string; state?: "pending" | "blocked" }): SeatPoolEffectResult;
+  moveRow(input: { qitemId: string; from: string; to: string; reason: string; state?: "pending" | "blocked" }):
+    SeatPoolEffectResult & { park?: SeatPoolReparkOutcome };
   /** Launches a seat whose session stopped, as `rig launch` does for it. */
   relaunchSeat(input: { rigId: string; logicalId: string }): Promise<SeatPoolEffectResult>;
-  /** Where the model's escalations go, or why there is nowhere. */
-  escalationOwner(modelSession: string): { owner: string | null; reason: string };
-  /** Opens a row to the model's escalation owner about a seat that needs input, unless one about that seat is open. */
-  escalate(input: { jobId: string; seat: string; model: string; qitemIds: string[] }):
-    Promise<SeatPoolEffectResult & { qitemId?: string; destination?: string; existing?: boolean }>;
+  /**
+   * Where the pool's escalations go, or why there is nowhere: `override` (the spec's `escalation_owner`) when set and
+   * the queue accepts it as a destination, otherwise the model's escalation owner. An override the queue refuses is
+   * nowhere: an escalation never falls back to the model's owner the spec replaced.
+   */
+  escalationOwner(modelSession: string, override?: string | null): { owner: string | null; reason: string };
+  /** Opens a row to the pool's escalation owner (escalationOwner, with `owner` as the override) about a seat that needs
+   *  input, unless one about that seat is open; then the waiting rows the open one doesn't name yet are added to it as
+   *  a note (`added`), so an open escalation never hides a row that came after it. */
+  escalate(input: { jobId: string; seat: string; model: string; qitemIds: string[]; owner?: string | null }):
+    Promise<SeatPoolEffectResult & { qitemId?: string; destination?: string; existing?: boolean; added?: string[] }>;
 }
+
+/** How a blocked row of a seat going away was moved (QueueRepository.rerouteParked). */
+export type SeatPoolReparkOutcome = "blocker" | "person" | "queue-wait" | "rearmed" | "unparked";
 
 /** The tag on the open escalation about a seat that needs input, followed by that seat: one at a time per seat. */
 export const SEAT_POOL_NEEDS_INPUT_TAG = "seat-pool-needs-input";
@@ -409,6 +422,12 @@ export function seatPoolQueueEffects(deps: {
   escalationOwner(modelSession: string): { owner: string | null; reason: string };
 }): Pick<SeatPoolEffects, "openRows" | "unclaimRow" | "reapCount" | "moveRow" | "escalationOwner" | "escalate"> {
   const { queueRepo } = deps;
+  const ownerOf = (modelSession: string, override?: string | null): { owner: string | null; reason: string } => {
+    if (!override) return deps.escalationOwner(modelSession);
+    return queueRepo.acceptsDestination(override)
+      ? { owner: override, reason: "the pool's escalation_owner" }
+      : { owner: null, reason: `the pool's escalation_owner ${override} is not a destination the queue accepts` };
+  };
   return {
     openRows: (sessionName) => queueRepo.listOpenObligations(sessionName, 500),
     unclaimRow: ({ qitemId, seat, reason }) => {
@@ -426,18 +445,31 @@ export function seatPoolQueueEffects(deps: {
       && /^fallback-routed: .* \(reap:[^\s()]+\)$/.test(t.transitionNote ?? "")).length,
     moveRow: ({ qitemId, from, to, reason, state = "pending" }) => {
       try {
-        queueRepo.routeToFallback(qitemId, to, reason, { expectState: state, expectDestination: from, wake: state === "pending" });
+        if (state === "blocked") return { ok: true, park: queueRepo.rerouteParked(qitemId, to, reason, { expectDestination: from }).park };
+        queueRepo.routeToFallback(qitemId, to, reason, { expectState: state, expectDestination: from, wake: true });
         return { ok: true };
       } catch (error) {
         return { ok: false, code: errorCode(error, "fallback_failed"), error: (error as Error).message };
       }
     },
-    escalationOwner: deps.escalationOwner,
-    escalate: async ({ jobId, seat, model, qitemIds }) => {
+    escalationOwner: ownerOf,
+    escalate: async ({ jobId, seat, model, qitemIds, owner }) => {
       const tag = `${SEAT_POOL_NEEDS_INPUT_TAG}:${seat}`;
       const open = queueRepo.list({ tag, activeOnly: true, limit: 1 })[0];
-      if (open) return { ok: true, qitemId: open.qitemId, destination: open.destinationSession, existing: true };
-      const route = deps.escalationOwner(model);
+      if (open) {
+        const named = [open.body ?? "", ...queueRepo.listTransitions(open.qitemId).map((t) => t.transitionNote ?? "")].join("\n");
+        const added = qitemIds.filter((id) => !named.includes(id));
+        if (added.length > 0) {
+          try {
+            queueRepo.update({ qitemId: open.qitemId, actorSession: OPENRIG_SENDER,
+              transitionNote: `${seat} still needs input and now also holds: ${added.join(", ")}` });
+          } catch (error) {
+            return { ok: false, code: errorCode(error, "escalation_note_failed"), error: (error as Error).message };
+          }
+        }
+        return { ok: true, qitemId: open.qitemId, destination: open.destinationSession, existing: true, ...(added.length > 0 ? { added } : {}) };
+      }
+      const route = ownerOf(model, owner);
       if (!route.owner) return { ok: false, code: "no_escalation_owner", error: route.reason };
       const created = await queueRepo.create({
         sourceSession: OPENRIG_SENDER,
@@ -445,7 +477,8 @@ export function seatPoolQueueEffects(deps: {
         summary: `${seat} needs input and holds ${qitemIds.length} waiting row(s)`,
         body: `${seat} is waiting for input (a permission prompt or a question), so it isn't taking the pending row(s) `
           + `addressed to it: ${qitemIds.join(", ")}. Answer its prompt; rig capture ${seat} shows it. `
-          + `Raised by seat pool ${jobId}, which raises no other until this row is closed.`,
+          + `Raised by seat pool ${jobId}, which opens no other row about ${seat} until this one is closed: rows that `
+          + `wait at ${seat} later are added to this row as notes.`,
         tags: [tag],
         wakeTrigger: "openrig",
       });
@@ -558,6 +591,13 @@ interface ForcedOutcome {
 /** A release command that did not answer, as against one that refused: exit 3 (the pool's stop switch), exit 5 (a
  *  source it reads did not answer) or no exit code (its timeout). The forced pass asks it again. */
 const releaseUnanswered = (result: SeatPoolCommandResult) => result.exitCode === null || result.exitCode === 3 || result.exitCode === 5;
+/** The wait after a seat's relaunch fails before the pool tries it again: doubled by each failure in a row, up to the
+ *  ceiling. A relaunch counts as failed when its launch fails, and when its seat is stopped again at the next plan. */
+export const SEAT_POOL_RELAUNCH_BACKOFF_FIRST_MS = 60_000;
+export const SEAT_POOL_RELAUNCH_BACKOFF_MAX_MS = 30 * 60_000;
+/** A seat whose relaunch failed: how many in a row, when it may be tried again, whether the hold was recorded, and
+ *  whether the latest try launched it (its next stop then counts as a failure). */
+interface RelaunchBackoff { failures: number; retryAtMs: number; held: boolean; launched: boolean }
 const TIMED_OUT = Symbol("timed out");
 const NO_ROOM = Symbol("no room");
 
@@ -566,6 +606,12 @@ export class SeatPoolExecutor {
   private readonly samples = new Map<string, { desired: number; sampledAt: string }>();
   /** The drain entries this executor recorded, read only until the database shows the job's own (drainEvents). */
   private readonly recordedDrain = new Map<string, SeatPoolDrainEvent[]>();
+  /**
+   * Relaunch backoff, by `<job>|<node>`, in memory: a restart starts it over (one more try per seat, then the backoff
+   * again). Kept while the pool's plans keep asking to relaunch the seat; a plan that doesn't (the seat runs again, or
+   * holds no waiting row) forgets it.
+   */
+  private readonly relaunchBackoff = new Map<string, RelaunchBackoff>();
   private readonly now: () => Date;
   private readonly effectTimeoutMs: number;
   private stopping = false;
@@ -705,6 +751,7 @@ export class SeatPoolExecutor {
   }
 
   private async apply(jobId: string, intents: SeatPoolIntent[], run: Run): Promise<void> {
+    this.forgetRelaunchBackoff(jobId, intents);
     if (!(await this.drainClock(jobId, run))) return;
     for (const intent of intents) {
       if (!this.fresh(jobId, run)) return;
@@ -713,6 +760,16 @@ export class SeatPoolExecutor {
         for (let i = 0; i < intent.count; i++) {
           // The pool's own room is checked before the launch budget's is reserved: an add past `max` is recorded and
           // spends none of the tick's launches.
+          const before = this.fresh(jobId, run);
+          if (!before) return;
+          if (before.spec.drain) break;
+          if (seatPoolRoom(before.spec, before.state.slots) === 0) {
+            this.recordNoRoom(before, intent.count - i);
+            break;
+          }
+          // The usage check waits on the provider, so it comes before the room is read again and reserved: nothing that
+          // changes while it waits (a lowered max, a seat filled) spends the tick's launch on an add that is refused.
+          if (await this.outOfUsage(before)) break;
           const ctx = this.fresh(jobId, run);
           if (!ctx) return;
           if (ctx.spec.drain) break;
@@ -720,9 +777,10 @@ export class SeatPoolExecutor {
             this.recordNoRoom(ctx, intent.count - i);
             break;
           }
-          // Room is reserved before the seat is recorded, so a host without room leaves no seat half-added.
+          // Room is reserved before the seat is recorded, so a host without room leaves no seat half-added; nothing
+          // waits between the room read above, the reservation and the record (allocate).
           const added = await this.withLaunchRoom(jobId, run, { add: intent.count - i }, async () => {
-            const slot = await this.allocate(jobId, run);
+            const slot = this.allocate(jobId, run);
             return !!slot && await this.bringUp(jobId, run, slot.slotId);
           });
           if (added !== true) break;
@@ -910,6 +968,7 @@ export class SeatPoolExecutor {
           const unclaimed = this.deps.effects.unclaimRow({ qitemId: row.qitemId, seat: sessionName, reason });
           if (!unclaimed.ok && !UNCLAIM_MOVED_ON.has(unclaimed.code)) return leftStopped("move_failed", rows);
         }
+        // A blocked row keeps what wakes it (moveRow).
         const move = this.deps.effects.moveRow({ qitemId: row.qitemId, from: sessionName, to, reason, state: row.state === "blocked" ? "blocked" : "pending" });
         if (move.ok) rows.push({ qitemId: row.qitemId, to });
         // A row that was claimed, closed or moved since it was read went on without the pool: nothing failed.
@@ -951,13 +1010,11 @@ export class SeatPoolExecutor {
     this.record(ctx.jobId, false, "seat_pool_held", { reason: "max_reached", max: ctx.spec.max, seats: ctx.state.slots.length, add });
   }
 
-  /** Records a new seat (phase `adding`) if the pool, read again, still has room for it and no seat out of usage. */
-  private async allocate(jobId: string, run: Run): Promise<SeatPoolSlot | null> {
-    const before = this.fresh(jobId, run);
-    if (!before || await this.outOfUsage(before)) return null;
+  /** Records a new seat (phase `adding`) if the pool, read again, still has room for it. The add checked the usage and
+   *  the room just before, with nothing awaited since: this read is the guard of record, not a second wait. */
+  private allocate(jobId: string, run: Run): SeatPoolSlot | null {
     const ctx = this.fresh(jobId, run);
     if (!ctx || ctx.spec.drain) return null;
-    // Read again after the usage check: the same count as the planner's, so a seat filled in between is not exceeded.
     if (seatPoolRoom(ctx.spec, ctx.state.slots) === 0) {
       this.recordNoRoom(ctx, 1);
       return null;
@@ -1213,7 +1270,7 @@ export class SeatPoolExecutor {
         if (reaped.exitCode !== 0) return failed("reap_cmd", { exitCode: reaped.exitCode, error: reaped.error ?? null });
       }
       const reason = `${SEAT_POOL_REAP_REASON}${sessionName}`;
-      const rows: Array<{ qitemId: string; to: string; escalated?: true }> = [];
+      const rows: Array<{ qitemId: string; to: string; escalated?: true; park?: SeatPoolReparkOutcome }> = [];
       for (const row of this.deps.effects.openRows(sessionName)) {
         if (row.state === "in-progress") {
           const unclaimed = this.deps.effects.unclaimRow({ qitemId: row.qitemId, seat: sessionName, reason });
@@ -1222,12 +1279,14 @@ export class SeatPoolExecutor {
         let to = inLease.model.sessionName;
         let escalated = false;
         if (this.deps.effects.reapCount(row.qitemId) > 0) {
-          const route = this.deps.effects.escalationOwner(inLease.model.sessionName);
+          const route = this.deps.effects.escalationOwner(inLease.model.sessionName, inLease.spec.escalationOwner);
           if (route.owner) [to, escalated] = [route.owner, true];
           else this.record(jobId, true, "seat_pool_escalation_failed", { seat: sessionName, qitemId: row.qitemId, code: "no_escalation_owner", error: route.reason });
         }
+        // A blocked row keeps what wakes it (moveRow); `park` is noted when the move changed that.
         const moved = this.deps.effects.moveRow({ qitemId: row.qitemId, from: sessionName, to, reason, state: row.state === "blocked" ? "blocked" : "pending" });
-        if (moved.ok) rows.push({ qitemId: row.qitemId, to, ...(escalated ? { escalated: true as const } : {}) });
+        const park = moved.ok && (moved.park === "rearmed" || moved.park === "unparked") ? { park: moved.park } : {};
+        if (moved.ok) rows.push({ qitemId: row.qitemId, to, ...(escalated ? { escalated: true as const } : {}), ...park });
         else if (!ROW_MOVED_ON.has(moved.code)) return failed("move", { qitemId: row.qitemId, code: moved.code, error: moved.error });
       }
       this.setIntent(slotId, "remove");
@@ -1282,23 +1341,66 @@ export class SeatPoolExecutor {
 
     if (intent.kind === "relaunch") {
       if (seat.cause !== "stopped" || seat.nodeId !== intent.nodeId) return true;
-      return await this.relaunch(jobId, run, ctx, intent.seat, seat.logicalId) !== "timed_out";
+      // A relaunch that keeps failing would take the launch budget every tick, and no add would start (the budget is
+      // the daemon's, so no other pool's either): it waits out its backoff first, and takes no room while it waits.
+      const key = `${jobId}|${seat.nodeId}`;
+      const nowMs = this.now().getTime();
+      const backoff = this.relaunchBackoff.get(key);
+      // Launched at the last try and stopped again by this plan: that try failed too.
+      if (backoff?.launched) this.relaunchFailed(key, nowMs);
+      const waiting = this.relaunchBackoff.get(key);
+      if (waiting && nowMs < waiting.retryAtMs) {
+        if (!waiting.held) {
+          waiting.held = true;
+          this.record(jobId, false, "seat_pool_held", {
+            reason: "relaunch_backoff", seat: intent.seat, failures: waiting.failures, retryAt: new Date(waiting.retryAtMs).toISOString(),
+          });
+        }
+        return true;
+      }
+      const launched = await this.relaunch(jobId, run, ctx, intent.seat, seat.logicalId);
+      // A relaunch past the effect timeout failed as well (a cancel only stops waiting: it counts nothing).
+      if (launched === "failed" || (launched === "timed_out" && !run.controller.signal.aborted)) this.relaunchFailed(key, this.now().getTime());
+      else if (launched === "launched") {
+        const entry = this.relaunchBackoff.get(key);
+        if (entry) Object.assign(entry, { launched: true, held: false });
+        else this.relaunchBackoff.set(key, { failures: 0, retryAtMs: 0, held: false, launched: true });
+      }
+      return launched !== "timed_out";
     }
 
     if (seat.cause !== "needs_input") return true;
-    const escalated = await this.within(run, () => this.deps.effects.escalate({ jobId, seat: intent.seat, model: ctx.model.sessionName, qitemIds: intent.qitemIds }));
+    const escalated = await this.within(run, () => this.deps.effects.escalate({
+      jobId, seat: intent.seat, model: ctx.model.sessionName, qitemIds: intent.qitemIds, owner: ctx.spec.escalationOwner,
+    }));
     if (escalated === TIMED_OUT) return this.gaveUp(jobId, run, "seat_pool_escalation_failed", { seat: intent.seat });
     if (!escalated.ok) this.record(jobId, true, "seat_pool_escalation_failed", { seat: intent.seat, code: escalated.code, error: escalated.error });
-    // An escalation about the seat is already open: it is the one, and nothing new is recorded.
+    // An escalation about the seat is already open: it is the one; only rows it didn't name yet are recorded.
     else if (!escalated.existing) {
       this.record(jobId, false, "seat_pool_escalated", { seat: intent.seat, to: escalated.destination, qitemId: escalated.qitemId, rows: intent.qitemIds });
+    } else if (escalated.added?.length) {
+      this.record(jobId, false, "seat_pool_escalated", { seat: intent.seat, to: escalated.destination, qitemId: escalated.qitemId, rows: escalated.added, existing: true });
     }
     return true;
   }
 
+  /** One more relaunch failure in a row for the seat: its next try waits 60 s, doubled per failure, at most 30 min. */
+  private relaunchFailed(key: string, nowMs: number): void {
+    const failures = (this.relaunchBackoff.get(key)?.failures ?? 0) + 1;
+    const delay = Math.min(SEAT_POOL_RELAUNCH_BACKOFF_MAX_MS, SEAT_POOL_RELAUNCH_BACKOFF_FIRST_MS * 2 ** Math.min(failures - 1, 30));
+    this.relaunchBackoff.set(key, { failures, retryAtMs: nowMs + delay, held: false, launched: false });
+  }
+
+  /** Forgets the backoff of every seat of the pool this plan doesn't ask to relaunch: it runs again, or holds no row. */
+  private forgetRelaunchBackoff(jobId: string, intents: SeatPoolIntent[]): void {
+    const asked = new Set(intents.flatMap((intent) => (intent.kind === "relaunch" ? [`${jobId}|${intent.nodeId}`] : [])));
+    for (const key of this.relaunchBackoff.keys()) if (key.startsWith(`${jobId}|`) && !asked.has(key)) this.relaunchBackoff.delete(key);
+  }
+
   /**
    * Launches a stopped seat again, as `rig launch` does, within the launch budget and only while no seat of the pool is
-   * out of usage. `held` started nothing; the next plan tries again.
+   * out of usage. `held` started nothing; the next plan tries again. The reap's relaunch (a refused release) calls this
+   * directly, without the backoff: the reap goes on only once that launch fails.
    */
   private async relaunch(jobId: string, run: Run, ctx: Context, seat: string, logicalId: string, notes: Record<string, unknown> = {}):
     Promise<"launched" | "failed" | "held" | "timed_out"> {
