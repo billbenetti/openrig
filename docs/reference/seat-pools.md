@@ -48,6 +48,7 @@ environment plus:
 | `OPENRIG_SEAT_POOL_MODEL` | every command | the model's session name |
 | `OPENRIG_SEAT_POOL_SLOT` | `prepare_cmd`, `release_cmd`, `reap_cmd`, `remove_cmd` | the seat's session name |
 | `OPENRIG_SEAT_POOL_SLOT_CWD` | `prepare_cmd` | the seat's working directory |
+| `OPENRIG_SEAT_POOL_RELEASE_REASON` | `release_cmd` | why it is asked: `idle` (a free seat drained, by `drain` or by `idle_grace_s`), `drain-deadline` (the forced pass at a drain's deadline) or `reap` (a seat whose session is gone) |
 | `OPENRIG_SEAT_POOL_SLOTS` | `demand_cmd` | JSON list of `{session, phase}` for the pool's seats |
 
 A command that runs past `timeout_s` is killed and counts as failed. Each command has its own `timeout_s` (default 60),
@@ -210,8 +211,11 @@ working seat has to finish on its own). The first evaluation that reads `drain: 
 `seat_pool_drain_started` with its `deadlineAt`; setting `drain: false` before then records `seat_pool_drain_ended`,
 and the seats go back to admission, and a later `drain: true` starts a new deadline. The deadline is read back from
 the job's history, so a daemon restart doesn't reset it. `drain_deadline_s: 0` keeps the drain without a deadline.
-The deadline is fixed when the drain starts: changing `drain_deadline_s` during a drain applies to the next one (set
-`drain: false`, then `drain: true` again, to start over). Only a pool holding a seat it added starts the clock; a pool
+The deadline is fixed when the drain starts: changing `drain_deadline_s` during a drain applies to the next one. To
+start over, set `drain: false`, wait until `seat_pool_drain_ended` is recorded (or `rig watchdog show <jobId> --json`
+shows `seatPool.drain.startedAt` as null), and only then set `drain: true` again: the end is recorded by the first
+evaluation that reads `drain: false`, so a `true` set before that keeps the old deadline, or, once its pass ran, no
+pass at all. Only a pool holding a seat it added starts the clock; a pool
 already set to `drain: true` when the daemon is upgraded starts it at its first evaluation after the restart.
 The deadline is at most 86400 (1 day), the shortest history retention the settings allow, so the history keeps the
 drain's start until its deadline passes. A drain left open for longer than the retention window (14 days by default,
@@ -221,8 +225,15 @@ again, and `rig watchdog stop` refuses until that pass is recorded.
 Once the deadline passes, the pool takes out each seat it added that is still there, once, in the order a reap uses,
 under the seat's lifecycle lease:
 
-1. `release_cmd`, if set. When it refuses, the seat is **not** stopped (its work may not be saved): it keeps running,
-   with its rows, and is left (`why: release_refused`).
+1. `release_cmd`, if set, with `OPENRIG_SEAT_POOL_RELEASE_REASON=drain-deadline`. In this pass the seat's open rows go
+   to the model after its stop (step 3), so the release command doesn't need to refuse for them; it still refuses when
+   the seat's work may not be saved. When it refuses (any exit code but the ones below), the seat is **not** stopped:
+   it keeps running, with its rows, and is left (`why: release_refused`). When it doesn't answer (exit 3, exit 5, or
+   past its `timeout_s`), the seat is asked again on the next evaluations, for up to 10 minutes after the deadline, and
+   then left (`why: release_unavailable`); the pass isn't through until then (`seat_pool_drain_retrying` records what it
+   did so far, so a restart carries on with it). A release command that answers 3 to every seat (a stop switch it
+   honours) therefore leaves every seat. After the release, the pass reads the spec again: with `drain: false` set
+   while the command ran, the seat is not stopped and goes back to admission.
 2. A [checked stop](checked-seat-stop.md), with the `expected` read at the start; a refused stop leaves the seat
    (`why: stop_failed`), its rows unmoved.
 3. Each open row goes to the model: an in-progress row is unclaimed first, and each row moves only while it is still
@@ -232,8 +243,15 @@ under the seat's lifecycle lease:
 4. The node is removed and `remove_cmd` runs; when `remove_cmd` refuses, the seat stays on record
    (`why: remove_cmd_failed`).
 
+Once a seat is stopped, a failure that follows (a row that won't move: `why: move_failed`; a removal refused:
+`why: remove_failed`) leaves it draining, with the step it was at, never back in admission, where the reap would launch
+it again. A pass cut short after the stop (a restart) carries on from that step: a seat whose session is gone is not
+asked `release_cmd` again; one whose session is running is.
+
 Messages the typing guard holds for the seat are left as a reap leaves them. The pass records
-`seat_pool_drain_expired` with `left` (each seat it couldn't take out, and why) and `moved` (each row and where it went).
+`seat_pool_drain_expired`, once, with `left` (each seat it couldn't take out, why, and `exitCode`, the release
+command's in that pass, null when it did not run) and `moved` (each row and where it went, on every evaluation of the
+pass). A seat left for good (refused, or a failed stop, move or removal) is not asked or stopped again in that pass.
 An adopted seat is never stopped or removed by the deadline, and its rows are never moved. A pool shrinking by
 `idle_grace_s` without `drain` has no deadline.
 
