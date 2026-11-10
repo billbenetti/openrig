@@ -6,6 +6,7 @@ import {
   SEAT_POOL_DRAIN_EVENTS,
   SEAT_POOL_LEFT,
   seatPoolDrainEpisode,
+  seatPoolLeftStopped,
   type SeatPoolDrainEpisode,
   type SeatPoolDrainEvent,
 } from "./policies/seat-pool.js";
@@ -203,7 +204,9 @@ function detectWatchdogColumn(db: Database.Database, columnName: string): boolea
 /** A seat-pool job's own view of its drain and seats, read from its history and `seat_pool_slots` (never the rig's
  *  nodes), so a seat whose node is gone but which the pool still holds is shown. */
 export interface SeatPoolJobView {
-  drain: { startedAt: string | null; deadlineAt: string | null; expired: boolean };
+  /** `retryUntil` and `waiting`: while the forced pass asks again the seats whose release command did not answer, until
+   *  when and which seats (absent otherwise). */
+  drain: { startedAt: string | null; deadlineAt: string | null; expired: boolean; retryUntil?: string | null; waiting?: string[] };
   slots: Array<{ logicalId: string; phase: string; adopted: boolean; nodeExists: boolean; openRows: number }>;
 }
 
@@ -212,6 +215,8 @@ export interface SeatPoolLeftRunning {
   slot: string;
   sessionName: string;
   why: string;
+  /** The forced pass left it after its stop: its session is gone, and its rows may still be addressed to it. */
+  stopped?: true;
 }
 
 /** The canonical session of a pool's seat (`<pod>.<member>` in the rig of the pool's model, `<pod>-<member>@<rig>`). */
@@ -898,6 +903,7 @@ export class WatchdogJobsRepository {
     const episode: SeatPoolDrainEpisode | null = pool?.drain ? seatPoolDrainEpisode(this.seatPoolDrainEvents(job.jobId)) : null;
     const own = open.filter((slot) => slot.op_id !== null);
     const leftWhy = new Map((episode?.expired?.left ?? []).map((entry) => [entry.slot, entry.why]));
+    const leftStopped = new Set((episode?.expired?.left ?? []).filter(seatPoolLeftStopped).map((entry) => entry.slot));
     const draining = pool?.drain === true;
     const allowed = open.length === 0
       || (draining && own.length === 0)
@@ -909,6 +915,9 @@ export class WatchdogJobsRepository {
       const when = !draining ? "set drain: true with rig watchdog update, and stop it once they are gone"
         : episode?.expired ? "a seat is still there that the drain's deadline did not leave; stop it once it is gone"
         : episode && episode.deadlineAt === null ? "its drain has no deadline (it started with drain_deadline_s: 0); stop it once they are gone"
+        : episode?.retry ? `its drain's deadline passed at ${episode.deadlineAt}; the pool is asking again the release command of `
+          + `${episode.retry.waiting.map((w) => w.slot).join(", ") || "its seats"} until ${episode.retry.retryUntil ?? "10 minutes after it"}, `
+          + "and takes its seats out by then; stop it after that"
         : episode?.deadlineAt && passed ? `its drain's deadline passed at ${episode.deadlineAt}; the pool takes its seats out at its next evaluation, stop it after that`
         : episode?.deadlineAt ? `its drain's deadline passes at ${episode.deadlineAt}; stop it once they are gone or after that`
         : pool!.deadlineSeconds === 0 ? "its drain has no deadline (drain_deadline_s: 0); stop it once they are gone"
@@ -922,6 +931,7 @@ export class WatchdogJobsRepository {
     const at = this.now().toISOString();
     const leftRunning: SeatPoolLeftRunning[] = own.map((slot) => ({
       slot: slot.logical_id, sessionName: poolSeatSession(slot.logical_id, job.targetSession), why: leftWhy.get(slot.logical_id)!,
+      ...(leftStopped.has(slot.logical_id) ? { stopped: true as const } : {}),
     }));
     const hasHistory = !!this.db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'watchdog_history'").get();
     const note = (name: string, notes: Record<string, unknown>) => {
@@ -970,7 +980,10 @@ export class WatchdogJobsRepository {
         openRows: count(poolSeatSession(slot.logical_id, job.targetSession)),
       }));
     return {
-      drain: { startedAt: episode?.startedAt ?? null, deadlineAt: episode?.deadlineAt ?? null, expired: episode?.expired != null },
+      drain: {
+        startedAt: episode?.startedAt ?? null, deadlineAt: episode?.deadlineAt ?? null, expired: episode?.expired != null,
+        ...(episode?.retry ? { retryUntil: episode.retry.retryUntil, waiting: episode.retry.waiting.map((w) => w.slot) } : {}),
+      },
       slots,
     };
   }
