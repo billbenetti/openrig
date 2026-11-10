@@ -1,5 +1,15 @@
 import type Database from "better-sqlite3";
 import { ulid } from "ulid";
+import { parse as parseYaml } from "yaml";
+import {
+  parseSeatPoolSpec,
+  SEAT_POOL_DRAIN_EVENTS,
+  SEAT_POOL_LEFT,
+  seatPoolDrainEpisode,
+  type SeatPoolDrainEpisode,
+  type SeatPoolDrainEvent,
+} from "./policies/seat-pool.js";
+import { deriveCanonicalSessionName } from "./session-name.js";
 
 /**
  * Watchdog jobs repository (PL-004 Phase C; extended in Phase D).
@@ -188,6 +198,27 @@ function detectWatchdogColumn(db: Database.Database, columnName: string): boolea
   } catch {
     return false;
   }
+}
+
+/** A seat-pool job's own view of its drain and seats, read from its history and `seat_pool_slots` (never the rig's
+ *  nodes), so a seat whose node is gone but which the pool still holds is shown. */
+export interface SeatPoolJobView {
+  drain: { startedAt: string | null; deadlineAt: string | null; expired: boolean };
+  slots: Array<{ logicalId: string; phase: string; adopted: boolean; nodeExists: boolean; openRows: number }>;
+}
+
+/** A seat the stop of a drained pool left running, for the operator to deal with by hand. */
+export interface SeatPoolLeftRunning {
+  slot: string;
+  sessionName: string;
+  why: string;
+}
+
+/** The canonical session of a pool's seat (`<pod>.<member>` in the rig of the pool's model, `<pod>-<member>@<rig>`). */
+function poolSeatSession(logicalId: string, targetSession: string): string {
+  const dot = logicalId.indexOf(".");
+  const rigName = targetSession.slice(targetSession.lastIndexOf("@") + 1);
+  return deriveCanonicalSessionName(logicalId.slice(0, dot), logicalId.slice(dot + 1), rigName);
 }
 
 export class WatchdogJobsRepository {
@@ -821,21 +852,127 @@ export class WatchdogJobsRepository {
       );
     }
     if (existing.state === "stopped") return existing;
-    // A stopped pool could no longer drain its seats; they would be left running with nothing to remove them.
-    if (existing.policy === "seat-pool" && this.hasSeatPoolSlotsTable
-      && this.db.prepare("SELECT 1 FROM seat_pool_slots WHERE pool_job_id = ? AND retired_at IS NULL").get(jobId)) {
-      throw new WatchdogJobsError(
-        "pool_has_slots",
-        `cannot stop seat pool ${jobId}: it still holds seats; set drain: true with rig watchdog update, and stop it once they are gone`,
-        { jobId },
-      );
-    }
+    if (existing.policy === "seat-pool" && this.hasSeatPoolSlotsTable) return this.stopSeatPool(existing, reason);
     this.db
       .prepare(`UPDATE watchdog_jobs SET state = 'stopped', terminal_reason = ? WHERE job_id = ?`)
       .run(reason, jobId);
     const stopped = this.getByIdOrThrow(jobId);
     this.releaseStoppedSchedules([jobId]);
     return stopped;
+  }
+
+  /** The drain's history entries for a pool, oldest first (seat_pool_drain_started, _ended, _expired). */
+  seatPoolDrainEvents(jobId: string): SeatPoolDrainEvent[] {
+    if (!this.db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'watchdog_history'").get()) return [];
+    const rows = this.db.prepare(
+      `SELECT skip_reason, evaluation_notes FROM watchdog_history
+        WHERE job_id = ? AND skip_reason IN (${SEAT_POOL_DRAIN_EVENTS.map(() => "?").join(",")}) ORDER BY rowid`,
+    ).all(jobId, ...SEAT_POOL_DRAIN_EVENTS) as Array<{ skip_reason: string; evaluation_notes: string | null }>;
+    return rows.map((row) => ({ reason: row.skip_reason, notes: row.evaluation_notes ? JSON.parse(row.evaluation_notes) as Record<string, unknown> : null }));
+  }
+
+  /** The pool's spec as stored: whether it drains, or null when it doesn't parse. */
+  private seatPoolDrainSpec(job: WatchdogJob): { drain: boolean; deadlineSeconds: number } | null {
+    try {
+      const parsed = parseYaml(job.specYaml) as { context?: unknown } | null;
+      const context = parsed && typeof parsed.context === "object" && parsed.context !== null ? parsed.context as Record<string, unknown> : {};
+      const pool = parseSeatPoolSpec(context);
+      return "spec" in pool ? { drain: pool.spec.drain, deadlineSeconds: pool.spec.drainDeadlineSeconds } : null;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Stops a seat pool. A pool that still holds seats is refused (a stopped pool could no longer drain them: they would
+   * be left running with nothing to remove them), except once its drain's deadline has passed: with `drain: true`, the
+   * forced pass recorded (`seat_pool_drain_expired`) for the current drain, and every seat the pool added still there
+   * listed in it as left. Those seats are then retired in the same transaction as the stop, each with a
+   * `seat_pool_left` entry, and returned as `leftRunning` for the operator to deal with by hand. An adopted seat never
+   * holds the stop of a draining pool: its link is retired, and the seat is left as it is.
+   */
+  private stopSeatPool(job: WatchdogJob, reason: string): WatchdogJob & { leftRunning?: SeatPoolLeftRunning[] } {
+    const open = this.db.prepare("SELECT id, logical_id, op_id FROM seat_pool_slots WHERE pool_job_id = ? AND retired_at IS NULL ORDER BY id")
+      .all(job.jobId) as Array<{ id: number; logical_id: string; op_id: string | null }>;
+    const pool = this.seatPoolDrainSpec(job);
+    const episode: SeatPoolDrainEpisode | null = pool?.drain ? seatPoolDrainEpisode(this.seatPoolDrainEvents(job.jobId)) : null;
+    const own = open.filter((slot) => slot.op_id !== null);
+    const leftWhy = new Map((episode?.expired?.left ?? []).map((entry) => [entry.slot, entry.why]));
+    const draining = pool?.drain === true;
+    const allowed = open.length === 0
+      || (draining && own.length === 0)
+      || (draining && episode?.expired != null && own.every((slot) => leftWhy.has(slot.logical_id)));
+    if (!allowed) {
+      // Said from the current drain, not from the spec: the deadline is fixed when the drain starts, and a
+      // drain_deadline_s changed since applies to the next drain only.
+      const passed = !!episode?.deadlineAt && Date.parse(episode.deadlineAt) <= this.now().getTime();
+      const when = !draining ? "set drain: true with rig watchdog update, and stop it once they are gone"
+        : episode?.expired ? "a seat is still there that the drain's deadline did not leave; stop it once it is gone"
+        : episode && episode.deadlineAt === null ? "its drain has no deadline (it started with drain_deadline_s: 0); stop it once they are gone"
+        : episode?.deadlineAt && passed ? `its drain's deadline passed at ${episode.deadlineAt}; the pool takes its seats out at its next evaluation, stop it after that`
+        : episode?.deadlineAt ? `its drain's deadline passes at ${episode.deadlineAt}; stop it once they are gone or after that`
+        : pool!.deadlineSeconds === 0 ? "its drain has no deadline (drain_deadline_s: 0); stop it once they are gone"
+        : "its drain has not started yet; stop it once its seats are gone or its deadline has passed";
+      throw new WatchdogJobsError(
+        "pool_has_slots",
+        `cannot stop seat pool ${job.jobId}: it still holds seats; ${when}`,
+        { jobId: job.jobId, deadlineAt: episode?.deadlineAt ?? null },
+      );
+    }
+    const at = this.now().toISOString();
+    const leftRunning: SeatPoolLeftRunning[] = own.map((slot) => ({
+      slot: slot.logical_id, sessionName: poolSeatSession(slot.logical_id, job.targetSession), why: leftWhy.get(slot.logical_id)!,
+    }));
+    const hasHistory = !!this.db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'watchdog_history'").get();
+    const note = (name: string, notes: Record<string, unknown>) => {
+      if (!hasHistory) return;
+      this.db.prepare(
+        `INSERT INTO watchdog_history (history_id, job_id, evaluated_at, outcome, skip_reason, evaluation_notes)
+         VALUES (?, ?, ?, 'skipped', ?, ?)`,
+      ).run(ulid(), job.jobId, at, name, JSON.stringify(notes));
+    };
+    this.db.transaction(() => {
+      for (const slot of open) {
+        this.db.prepare("UPDATE seat_pool_slots SET phase = 'retired', intent = NULL, retired_at = ? WHERE id = ?").run(at, slot.id);
+        if (slot.op_id === null) note("seat_pool_unlinked", { slot: slot.logical_id });
+      }
+      for (const left of leftRunning) note(SEAT_POOL_LEFT, { ...left });
+      this.db.prepare(`UPDATE watchdog_jobs SET state = 'stopped', terminal_reason = ? WHERE job_id = ?`).run(reason, job.jobId);
+    })();
+    const stopped = this.getByIdOrThrow(job.jobId);
+    this.releaseStoppedSchedules([job.jobId]);
+    return leftRunning.length > 0 ? { ...stopped, leftRunning } : stopped;
+  }
+
+  /**
+   * A seat-pool job's drain and its seats that are not retired, read from its history and `seat_pool_slots`, not from
+   * the rig's nodes. `openRows` counts a seat's pending, in-progress and blocked rows (default: the rows addressed to
+   * its canonical session). Null for a job that isn't a seat pool.
+   */
+  seatPoolView(jobId: string, openRows?: (sessionName: string) => number): SeatPoolJobView | null {
+    const job = this.getById(jobId);
+    if (!job || job.policy !== "seat-pool" || !this.hasSeatPoolSlotsTable) return null;
+    const episode = seatPoolDrainEpisode(this.seatPoolDrainEvents(jobId));
+    const hasQueue = !!this.db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'queue_items'").get();
+    const count = openRows ?? ((sessionName: string) => (hasQueue ? (this.db.prepare(
+      "SELECT COUNT(*) AS n FROM queue_items WHERE destination_session = ? AND state IN ('pending', 'in-progress', 'blocked')",
+    ).get(sessionName) as { n: number }).n : 0));
+    const slots = (this.db.prepare(
+      `SELECT s.logical_id, s.phase, s.op_id, s.node_id, (n.id IS NOT NULL) AS node_exists
+         FROM seat_pool_slots s LEFT JOIN nodes n ON n.id = s.node_id
+        WHERE s.pool_job_id = ? AND s.retired_at IS NULL ORDER BY s.id`,
+    ).all(jobId) as Array<{ logical_id: string; phase: string; op_id: string | null; node_id: string | null; node_exists: number }>)
+      .map((slot) => ({
+        logicalId: slot.logical_id,
+        phase: slot.phase,
+        adopted: slot.op_id === null,
+        nodeExists: slot.node_exists === 1,
+        openRows: count(poolSeatSession(slot.logical_id, job.targetSession)),
+      }));
+    return {
+      drain: { startedAt: episode?.startedAt ?? null, deadlineAt: episode?.deadlineAt ?? null, expired: episode?.expired != null },
+      slots,
+    };
   }
 
   /**
