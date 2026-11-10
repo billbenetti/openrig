@@ -36,10 +36,12 @@ context:
   release_cmd: { argv: [/usr/local/bin/pool-release], timeout_s: 60 }
   reap_cmd:    { argv: [/usr/local/bin/pool-reap], timeout_s: 60 }
   remove_cmd:  { argv: [/usr/local/bin/pool-remove], timeout_s: 60 }
+  escalation_owner: lead@my-rig     # where the pool's escalations go (default: the model's escalation owner)
 ```
 
 Registration and `rig watchdog update --spec` refuse a spec with an unknown field, `max` below `min`, a relative
-`cwd_template` or one without `{slot}`, or a command that isn't an argv. Commands run without a shell, with the daemon's
+`cwd_template` or one without `{slot}`, a command that isn't an argv, or an `escalation_owner` that isn't a seat
+address (`<session>@<rig>`). Commands run without a shell, with the daemon's
 environment plus:
 
 | Variable | Set for | Value |
@@ -72,9 +74,12 @@ takes rows like the pool's own, but the pool never stops or removes it: it was t
 `max` counts every seat on record: each adopted seat, running or stopped, and each seat the pool added, starting, live
 or draining. The plan asks for no more seats than that leaves room for, and the executor checks the same count again
 before each seat, so every seat an add asks for is made and none past `max`. A pool whose adopted seats already fill
-`max` adds none; to let it grow, set `max` to the adopted seats plus the extra ones you want. An add that finds no room
-when it runs writes `seat_pool_held` with `reason: max_reached` to the job's history and takes none of the tick's
-launches.
+`max` adds none; to let it grow, set `max` to the adopted seats plus the extra ones you want. A seat the same plan forgets (its
+node is gone) or reaps leaves its room to the add of that plan, which runs after it. A pool that wants more seats than
+`max` leaves room for, with nothing else to change, records `seat_pool_held` with `reason: max_reached` at each
+evaluation, so a pool that doesn't grow says why. The executor reads usage before it reads the room and reserves a
+launch, with nothing awaited between the room it reads and the seat it records, so an add that finds no room when it
+runs (`seat_pool_held`, `reason: max_reached`) takes none of the tick's launches.
 
 ## Waiting rows: dispatch and wake
 
@@ -101,11 +106,24 @@ isn't taking it:
 
 | The seat | The pool |
 | --- | --- |
-| has no live session | launches the model or an adopted seat, as `rig launch` does; reaps a seat the pool added (see [Reaping a seat](#reaping-a-seat)) |
+| has no live session | launches the model or an adopted seat, as `rig launch` does (with a backoff when it keeps failing, below); reaps a seat the pool added (see [Reaping a seat](#reaping-a-seat)) |
 | is idle at its prompt | nothing: the queue's own wakes cover it (the nudge when the row was created or moved, the wake ladder and the stuck sweep) |
-| needs input (a permission prompt or a question) | opens one row to the model's escalation owner, tagged `seat-pool-needs-input:<seat>`; no other is opened about that seat while it is open |
+| needs input (a permission prompt or a question) | opens one row to the pool's escalation owner, tagged `seat-pool-needs-input:<seat>`; no other is opened about that seat while it is open, and a row that waits at the seat later is added to it as a note. With `dispatch_tag`, the model and an adopted seat are escalated only for waiting rows that carry the tag: their other rows are their own work |
 | is out of provider usage | nothing: the row waits |
 | is working | nothing: the row waits, and counts as demand if it is the model's |
+
+The pool's escalation owner is the spec's `escalation_owner` when it is set, and the model's escalation owner
+otherwise. An `escalation_owner` the queue doesn't accept as a destination is no owner at all: the escalation fails
+(`seat_pool_escalation_failed`) rather than going to the model's escalation owner it replaced. Use it when the model's
+escalation owner is a seat that must not be woken by the pool.
+
+A relaunch that fails (or whose seat is stopped again when the next plan reads it) waits before the next try: 60 s,
+doubled by each failure in a row, at most 30 minutes. While it waits, the relaunch takes none of the tick's launches,
+so an add of the same plan (or of another pool) is not starved by a seat that never comes up; the wait is recorded once,
+as `seat_pool_held` with `reason: relaunch_backoff`, the seat, the failures in a row and `retryAt`. A plan that no longer
+asks to relaunch the seat (it runs again, or holds no waiting row) forgets its count. The count lives in the daemon's
+memory: a restart allows one more try before the backoff starts again. The launch a reap makes when the release command
+refuses has no backoff: the reap goes on as soon as that launch fails.
 
 While any seat of the pool is out of usage (its provider account reports the limit, as the wake ladder reads it), the
 pool adds no seat and launches none, neither a stopped seat nor one it added and hasn't started, and records
@@ -136,8 +154,8 @@ only when it exits 0; until then the seat stays on record, counted against `max`
 Every add, launch, removal, row moved (`seat_pool_dispatched`, or `seat_pool_dispatch_skipped` when the row was claimed
 or moved first), relaunch, escalation, refusal and failure is written to the job's history
 (`rig watchdog status <jobId>`). An evaluation that plans changes records the plan (`seat_pool_planned`), and one that
-holds because the model seat is gone, the rig is being restored, the demand answer is stale or a seat is out of usage
-records why (`seat_pool_held`). One with nothing to change records nothing.
+holds because the model seat is gone, the rig is being restored, the demand answer is stale, a seat is out of usage
+or `max` leaves no room records why (`seat_pool_held`). One with nothing to change records nothing.
 
 ## Host budget
 
@@ -182,13 +200,19 @@ pick up:
    exit stops the reap.
 4. Each in-progress row addressed to the seat is unclaimed, and every open row is moved with `rig queue fallback`,
    `--expect-destination <the seat>` and the row's state expected, to the model, with a wake when the row is pending.
-   A blocked row keeps its blocker; a one-shot `--wake-after` timer ends with the move, as with any reroute.
+   A blocked row keeps what wakes it: one with a `--wake-after` timer of its own stays blocked on the same gate, with a
+   new timer of the same interval and message aimed at its new owner; one blocked on a live row, or on a person, stays
+   blocked (that row's end, or the person's answer, wakes its owner); one with a repeating wait keeps it. A blocked row
+   that nothing would wake (a gate that isn't a live row, with no timer, or a watchdog attached for the old seat) goes
+   back to pending, with a note naming the blocker it had, and wakes its new owner. `seat_pool_reaped` notes `park:
+   rearmed` or `park: unparked` on such a row. A drain's forced pass moves blocked rows the same way.
 5. The node is removed with the `expected` read at the start of the reap, as a drain removes it, and `remove_cmd` runs
    as for a drained seat.
 
 Each move gives the reason `reap:<seat>`. A row that a reap already moved once (the pool counts the row's reroutes with
-that reason) goes to the model's escalation owner instead of the model, so a row whose seats keep dying stops cycling
-through the pool. With no escalation owner it goes to the model, and `seat_pool_escalation_failed` is recorded.
+that reason) goes to the pool's escalation owner (the spec's `escalation_owner`, or the model's) instead of the model,
+so a row whose seats keep dying stops cycling through the pool. With no escalation owner it goes to the model, and
+`seat_pool_escalation_failed` is recorded.
 
 An adopted seat is never reaped: it existed before the pool, so its node and its conversation stay. While its session is
 gone it is not counted among the pool's seats and takes no row, and it is launched again when a row waiting at it
@@ -238,7 +262,7 @@ under the seat's lifecycle lease:
    (`why: stop_failed`), its rows unmoved.
 3. Each open row goes to the model: an in-progress row is unclaimed first, and each row moves only while it is still
    addressed to the seat, in one transaction, keeping its id and its state (a pending row wakes the model; a blocked
-   one stays blocked). The reroute's reason is `drain:<seat>`, not `reap:<seat>`, so a drained row is not counted as one
+   one keeps what wakes it, as a reap moves it, and only one nothing would wake goes back to pending). The reroute's reason is `drain:<seat>`, not `reap:<seat>`, so a drained row is not counted as one
    that lost its seat. A row claimed, closed or moved since it was read is left as it went.
 4. The node is removed and `remove_cmd` runs; when `remove_cmd` refuses, the seat stays on record
    (`why: remove_cmd_failed`).

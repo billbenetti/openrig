@@ -17,6 +17,7 @@ import { EventBus } from "../src/domain/event-bus.js";
 import { OutboxHandler } from "../src/domain/outbox-handler.js";
 import { QueueRepository } from "../src/domain/queue-repository.js";
 import { WatchdogJobsRepository } from "../src/domain/watchdog-jobs-repository.js";
+import { QueueWakeRepository } from "../src/domain/queue-wake-repository.js";
 import { WatchdogHistoryLog } from "../src/domain/watchdog-history-log.js";
 import { watchdogHistorySchema } from "../src/db/migrations/032_watchdog_history.js";
 import type { StopPrecondition } from "../src/domain/seat-lifecycle-service.js";
@@ -169,13 +170,14 @@ class World {
         if (logicalId === MODEL.logicalId) this.modelCause = "working";
         return { ok: true };
       },
-      escalationOwner: () => ({ owner: this.escalationOwner, reason: "no escalation destination declared" }),
-      escalate: async ({ seat, qitemIds }) => {
+      escalationOwner: (_model, override) => ({ owner: override ?? this.escalationOwner, reason: "no escalation destination declared" }),
+      escalate: async ({ seat, qitemIds, owner }) => {
         this.calls.push(`escalate ${seat} ${qitemIds.join(",")}`);
-        if (!this.escalationOwner) return { ok: false, code: "no_escalation_owner", error: "no escalation destination declared" };
+        const to = owner ?? this.escalationOwner;
+        if (!to) return { ok: false, code: "no_escalation_owner", error: "no escalation destination declared" };
         const existing = this.escalations.includes(seat);
         if (!existing) this.escalations.push(seat);
-        return { ok: true, qitemId: `esc-${seat}`, destination: this.escalationOwner, existing };
+        return { ok: true, qitemId: `esc-${seat}`, destination: to, existing };
       },
     };
   }
@@ -1070,6 +1072,242 @@ describe("seat-pool executor", () => {
     });
   });
 
+  describe("F6a: relaunch backoff, the add's admission, a reaped seat's blocked rows, the spec's escalation owner", () => {
+    const budgetOf = (maxPerTick: number) => new LaunchBudget({
+      limits: () => ({ maxInFlight: 10, maxPerTick, minFreeMemoryBytes: 0, maxLoadPerCpu: 100 }),
+      sample: () => ({ cpuCount: 1, load1: 0, freeMemoryBytes: 1 }),
+    });
+    const resumeFailed: SeatPoolEffectResult = { ok: false, code: "resume_failed", error: "no conversation to resume" };
+    const relaunchModel = [{ kind: "relaunch" as const, seat: MODEL.sessionName, nodeId: MODEL.nodeId }];
+    let clock: number;
+    const clocked = (opts: { launchBudget?: LaunchBudget; effects?: SeatPoolEffects; outOfUsage?: () => Promise<boolean> } = {}): SeatPoolExecutor => {
+      const executor: SeatPoolExecutor = new SeatPoolExecutor({
+        slots,
+        readJob: () => ({ active, targetSession: MODEL.sessionName, spec: jobSpec }),
+        readState: () => world.state(slots, executor, jobSpec),
+        outOfUsage: opts.outOfUsage ?? (async () => seatPoolOutOfUsage(world.state(slots, executor, jobSpec))),
+        effects: opts.effects ?? world.effects(),
+        record: (_jobId, entry) => { history.push(entry); },
+        now: () => new Date(clock),
+        launchBudget: opts.launchBudget,
+      });
+      return executor;
+    };
+    const relaunches = () => world.calls.filter((call) => call.startsWith("relaunch ")).length;
+    const backoffHolds = () => history.filter((h) => h.reason === "seat_pool_held" && h.notes["reason"] === "relaunch_backoff");
+    beforeEach(() => { clock = T0; });
+
+    it("a stopped seat whose relaunch keeps failing does not starve the add", async () => {
+      const budget = budgetOf(1);
+      const executor = clocked({ launchBudget: budget });
+      world.modelCause = "stopped";
+      world.relaunchResult = resumeFailed;
+      const old = new Date(T0 - 3_600_000).toISOString();
+      world.rows.set("q-1", { destination: MODEL.sessionName, waitingSince: old });
+      world.rows.set("q-2", { destination: MODEL.sessionName, waitingSince: old });
+      const tick = async () => {
+        budget.nextTick();
+        const planned = planSeatPool(jobSpec, world.state(slots, executor, jobSpec), clock, 120_000);
+        await run(executor, planned.intents);
+        return planned;
+      };
+      expect((await tick()).intents.map((intent) => intent.kind)).toEqual(["relaunch", "add"]);
+      // The failed relaunch took the tick's only launch: the add waits for the next tick.
+      expect(world.calls.filter((call) => call.startsWith("add "))).toEqual([]);
+      clock += 1_000;
+      await tick();
+      clock += 1_000;
+      await tick();
+      expect(relaunches()).toBe(1);
+      expect(world.calls.filter((call) => call.startsWith("add ")).length).toBeGreaterThanOrEqual(1);
+      expect(world.calls).toContain("add impl-s1 /work/r/impl-s1");
+      // Held while the backoff runs, recorded once, when it starts holding.
+      expect(backoffHolds()).toEqual([{ failed: false, reason: "seat_pool_held", notes: {
+        reason: "relaunch_backoff", seat: MODEL.sessionName, failures: 1, retryAt: new Date(T0 + 60_000).toISOString(),
+      } }]);
+    });
+
+    it("tries a failed relaunch again once its backoff passes, doubles it, and starts over once the seat stays up", async () => {
+      const executor = clocked();
+      world.modelCause = "stopped";
+      world.relaunchResult = resumeFailed;
+      await run(executor, relaunchModel);
+      clock += 59_000;
+      await run(executor, relaunchModel);
+      expect(relaunches()).toBe(1);
+      clock += 2_000;
+      await run(executor, relaunchModel);
+      expect(relaunches()).toBe(2);
+      // The second failure in a row waits 120 s.
+      clock += 119_000;
+      await run(executor, relaunchModel);
+      expect(relaunches()).toBe(2);
+      clock += 2_000;
+      world.relaunchResult = { ok: true };
+      await run(executor, relaunchModel);
+      expect(relaunches()).toBe(3);
+      // The next plan has no relaunch for it: it stayed up, and its count starts over.
+      clock += 1_000;
+      await run(executor, []);
+      world.modelCause = "stopped";
+      world.relaunchResult = resumeFailed;
+      await run(executor, relaunchModel);
+      expect(relaunches()).toBe(4);
+      clock += 61_000;
+      await run(executor, relaunchModel);
+      expect(relaunches()).toBe(5);
+    });
+
+    it("counts a relaunch whose seat is stopped again at the next plan as one that failed", async () => {
+      const executor = clocked();
+      world.modelCause = "stopped";
+      await run(executor, relaunchModel);
+      expect(relaunches()).toBe(1);
+      world.modelCause = "stopped";
+      clock += 1_000;
+      await run(executor, relaunchModel);
+      expect(relaunches()).toBe(1);
+      expect(backoffHolds().at(-1)?.notes).toMatchObject({ seat: MODEL.sessionName, failures: 1 });
+    });
+
+    it("counts a relaunch past the effect timeout as failed: the next plan waits out the backoff", async () => {
+      // The launch settles only after the run stopped waiting for it (5 ms), so the pool is free again once it does.
+      const executor: SeatPoolExecutor = new SeatPoolExecutor({
+        slots, readJob: () => ({ active, targetSession: MODEL.sessionName, spec: jobSpec }),
+        readState: () => world.state(slots, executor, jobSpec), record: (_j, e) => { history.push(e); }, now: () => new Date(clock),
+        effects: { ...world.effects(), relaunchSeat: async (input) => {
+          world.calls.push(`relaunch ${input.logicalId}`);
+          return new Promise((resolve) => setTimeout(() => resolve({ ok: true }), 30));
+        } },
+        effectTimeoutMs: 5,
+      });
+      world.modelCause = "stopped";
+      await run(executor, relaunchModel);
+      expect(history.at(-1)).toMatchObject({ reason: "seat_pool_relaunch_failed", notes: { code: "effect_timeout" } });
+      world.modelCause = "stopped";
+      clock += 1_000;
+      await run(executor, relaunchModel);
+      expect(relaunches()).toBe(1);
+      expect(backoffHolds().at(-1)?.notes).toMatchObject({ failures: 1 });
+    });
+
+    it("never backs off a relaunch of the reap (a refused release), which the reap waits on", async () => {
+      jobSpec = spec({ release_cmd: { argv: ["release"] } });
+      world.exit["release"] = 1;
+      world.relaunchResult = resumeFailed;
+      world.nodes.set("node-1", { logicalId: "dev.impl-s1", session: "stopped", sessionId: "sess-1", openRows: 0, idle: false });
+      const dead = slots.insert({ poolJobId: JOB, logicalId: "dev.impl-s1", nodeId: "node-1", phase: "live", intent: null, opId: "op-1", at: new Date(T0).toISOString() });
+      await run(clocked(), [{ kind: "reap", slotId: dead.slotId }]);
+      // The refused release launches it again; that launch failed, so the reap goes on without asking again.
+      expect(relaunches()).toBe(1);
+      expect(slots.get(dead.slotId)?.retiredAt).not.toBeNull();
+      expect(backoffHolds()).toEqual([]);
+    });
+
+    it("an add the max refuses during the usage check spends none of the tick's launches", async () => {
+      const budget = budgetOf(1);
+      const executor = clocked({ launchBudget: budget, outOfUsage: async () => { jobSpec = spec({ max: 0 }); return false; } });
+      await run(executor, [{ kind: "add", count: 1 }]);
+      expect(world.calls).toEqual([]);
+      expect(budget.currentTick().admitted).toBe(0);
+      expect(history).toEqual([{ failed: false, reason: "seat_pool_held", notes: { reason: "max_reached", max: 0, seats: 0, add: 1 } }]);
+      // The tick still has its launch for someone else.
+      const room = budget.reserve();
+      expect(room.ok).toBe(true);
+    });
+
+    describe("with the real queue", () => {
+      let repo: QueueRepository;
+      let queueEffects: ReturnType<typeof seatPoolQueueEffects>;
+      let escalatesTo: string;
+      beforeEach(() => {
+        // The shared fixture leaves out the outbox (migration-fixture-parity): the wakes a reroute stages need it.
+        migrate(db, [inboxEntriesSchema, outboxEntriesSchema, i3IdentityProvenanceSchema]);
+        repo = new QueueRepository(db, new EventBus(db));
+        repo.attachOutbox(new OutboxHandler(db));
+        escalatesTo = "coordenacao-orquestradora@comando";
+        queueEffects = seatPoolQueueEffects({ queueRepo: repo, escalationOwner: () => ({ owner: escalatesTo, reason: "routed" }) });
+      });
+      const withQueue = (): SeatPoolEffects => ({ ...world.effects(), ...queueEffects });
+      const deadSeat = () => {
+        world.nodes.set("node-1", { logicalId: "dev.impl-s1", session: "stopped", sessionId: "sess-1", openRows: 1, idle: false });
+        return slots.insert({ poolJobId: JOB, logicalId: "dev.impl-s1", nodeId: "node-1", phase: "live", intent: null, opId: "op-1", at: new Date(T0).toISOString() });
+      };
+      const parked = async (blockedOn: string, wakeAfterSeconds?: number) => {
+        const row = await repo.create({ sourceSession: "lead@r", destinationSession: "dev-impl-s1@r", body: "work", nudge: false });
+        repo.update({ qitemId: row.qitemId, actorSession: "dev-impl-s1@r", state: "blocked", blockedOn, ...(wakeAfterSeconds ? { wakeAfterSeconds } : {}) });
+        return row.qitemId;
+      };
+      const fallbackWakes = (qitemId: string) =>
+        db.prepare("SELECT destination_session FROM outbox_entries WHERE audit_pointer = ? AND outbox_id LIKE 'wake-intent-fallback-%'").all(qitemId);
+      const armedTimer = (qitemId: string) => {
+        const wake = new QueueWakeRepository(db).getStatus(qitemId);
+        if (wake?.kind !== "timer" || !wake.live) return null;
+        const job = new WatchdogJobsRepository(db).getById(wake.ref);
+        return job ? { target: job.targetSession, interval: job.intervalSeconds, state: job.state } : null;
+      };
+
+      it("a reaped seat's row parked with a --wake-after timer reaches the model still parked, with the timer aimed at the model", async () => {
+        const qitemId = await parked("external:ci", 600);
+        expect(armedTimer(qitemId)).toMatchObject({ target: "dev-impl-s1@r", interval: 600 });
+        const dead = deadSeat();
+        await run(clocked({ effects: withQueue() }), [{ kind: "reap", slotId: dead.slotId }]);
+        expect(repo.getById(qitemId)).toMatchObject({ destinationSession: MODEL.sessionName, state: "blocked", blockedOn: "external:ci" });
+        expect(armedTimer(qitemId)).toEqual({ target: MODEL.sessionName, interval: 600, state: "active" });
+        expect(fallbackWakes(qitemId)).toEqual([]);
+      });
+
+      it("a reaped seat's row blocked on a live row stays blocked on it, with no wake: the blocker wakes it", async () => {
+        const blocker = await repo.create({ sourceSession: "lead@r", destinationSession: "qa@r", body: "check", nudge: false });
+        const qitemId = await parked(blocker.qitemId);
+        const dead = deadSeat();
+        await run(clocked({ effects: withQueue() }), [{ kind: "reap", slotId: dead.slotId }]);
+        expect(repo.getById(qitemId)).toMatchObject({ destinationSession: MODEL.sessionName, state: "blocked", blockedOn: blocker.qitemId });
+        expect(fallbackWakes(qitemId)).toEqual([]);
+      });
+
+      it("a reaped seat's row parked on a gate with nothing to wake it goes to the model pending, with a wake and the old blocker in the note", async () => {
+        const qitemId = await parked("external:deploy");
+        const dead = deadSeat();
+        await run(clocked({ effects: withQueue() }), [{ kind: "reap", slotId: dead.slotId }]);
+        expect(repo.getById(qitemId)).toMatchObject({ destinationSession: MODEL.sessionName, state: "pending", blockedOn: null });
+        expect(fallbackWakes(qitemId)).toEqual([{ destination_session: MODEL.sessionName }]);
+        expect(repo.listTransitions(qitemId).map((t) => t.transitionNote ?? "").join("\n")).toContain("external:deploy");
+        expect(history.at(-1)).toMatchObject({ reason: "seat_pool_reaped" });
+      });
+
+      it("the spec's escalation_owner takes a seat's needs-input escalation, and nothing reaches the model's escalates_to", async () => {
+        jobSpec = spec({ escalation_owner: "plataforma-supervisor@comando" });
+        world.nodes.set("node-1", { logicalId: "dev.impl-s1", session: "running", sessionId: "sess-1", openRows: 1, idle: false, cause: "needs_input" });
+        slots.insert({ poolJobId: JOB, logicalId: "dev.impl-s1", nodeId: "node-1", phase: "live", intent: null, opId: "op-1", at: new Date(T0).toISOString() });
+        await run(clocked({ effects: withQueue() }), [{ kind: "escalate", seat: "dev-impl-s1@r", qitemIds: ["q-1"] }]);
+        expect(repo.list({ destinationSession: "plataforma-supervisor@comando" }).map((row) => row.tags)).toEqual([[`${SEAT_POOL_NEEDS_INPUT_TAG}:dev-impl-s1@r`]]);
+        expect(repo.list({ destinationSession: escalatesTo })).toEqual([]);
+        expect(db.prepare("SELECT COUNT(*) AS n FROM outbox_entries WHERE destination_session = ?").get(escalatesTo)).toEqual({ n: 0 });
+        expect(history.at(-1)).toMatchObject({ reason: "seat_pool_escalated", notes: { to: "plataforma-supervisor@comando" } });
+      });
+
+      it("a row the reap moves a second time goes to the spec's escalation_owner, never to the model's escalates_to", async () => {
+        jobSpec = spec({ escalation_owner: "plataforma-supervisor@comando" });
+        const row = await repo.create({ sourceSession: "lead@r", destinationSession: MODEL.sessionName, body: "work", nudge: false });
+        repo.routeToFallback(row.qitemId, "dev-impl-s1@r", "reap:dev-impl-s9@r");
+        const dead = deadSeat();
+        await run(clocked({ effects: withQueue() }), [{ kind: "reap", slotId: dead.slotId }]);
+        expect(repo.getById(row.qitemId)).toMatchObject({ destinationSession: "plataforma-supervisor@comando", state: "pending" });
+        expect(fallbackWakes(row.qitemId)).toEqual([{ destination_session: "plataforma-supervisor@comando" }]);
+        expect(db.prepare("SELECT COUNT(*) AS n FROM outbox_entries WHERE destination_session = ?").get(escalatesTo)).toEqual({ n: 0 });
+      });
+
+      it("without escalation_owner, escalations go to the model's escalates_to as before", async () => {
+        world.nodes.set("node-1", { logicalId: "dev.impl-s1", session: "running", sessionId: "sess-1", openRows: 1, idle: false, cause: "needs_input" });
+        slots.insert({ poolJobId: JOB, logicalId: "dev.impl-s1", nodeId: "node-1", phase: "live", intent: null, opId: "op-1", at: new Date(T0).toISOString() });
+        escalatesTo = "lead@r";
+        await run(clocked({ effects: withQueue() }), [{ kind: "escalate", seat: "dev-impl-s1@r", qitemIds: ["q-1"] }]);
+        expect(repo.list({ destinationSession: "lead@r" })).toHaveLength(1);
+      });
+    });
+  });
+
   it("keeps the demand command's last good answer, and records a bad one", async () => {
     jobSpec = spec({ demand_cmd: { argv: ["demand"] } });
     const executor = makeExecutor();
@@ -1325,10 +1563,24 @@ describe("seatPoolQueueEffects", () => {
 
     const blocked = await repo.create({ sourceSession: "lead@r", destinationSession: "dev-impl-s1@r", body: "work", nudge: false });
     repo.update({ qitemId: blocked.qitemId, actorSession: "dev-impl-s1@r", state: "blocked", blockedOn: claimed.qitemId });
-    expect(effects.moveRow({ qitemId: blocked.qitemId, from: "dev-impl-s1@r", to: "dev-impl@r", reason: "reap:dev-impl-s1@r", state: "blocked" })).toEqual({ ok: true });
+    expect(effects.moveRow({ qitemId: blocked.qitemId, from: "dev-impl-s1@r", to: "dev-impl@r", reason: "reap:dev-impl-s1@r", state: "blocked" })).toEqual({ ok: true, park: "blocker" });
     expect(repo.getById(blocked.qitemId)).toMatchObject({ destinationSession: "dev-impl@r", state: "blocked" });
     expect(fallbackWakes(blocked.qitemId)).toEqual([]);
     expect(effects.reapCount(blocked.qitemId)).toBe(1);
+  });
+
+  it("an open escalation hides no row that waits after it: the new rows are added to it as a note, once", async () => {
+    const first = await effects.escalate({ jobId: "pool-1", seat: "dev-impl-s1@r", model: "dev-impl@r", qitemIds: ["q-1"] });
+    const again = await effects.escalate({ jobId: "pool-1", seat: "dev-impl-s1@r", model: "dev-impl@r", qitemIds: ["q-1", "q-2"] });
+    expect(again).toMatchObject({ ok: true, qitemId: first.qitemId, existing: true, added: ["q-2"] });
+    expect(repo.listTransitions(first.qitemId!).map((t) => t.transitionNote ?? "").join("\n")).toContain("q-2");
+    const third = await effects.escalate({ jobId: "pool-1", seat: "dev-impl-s1@r", model: "dev-impl@r", qitemIds: ["q-1", "q-2"] });
+    expect(third).toEqual({ ok: true, qitemId: first.qitemId, destination: "lead@r", existing: true });
+    // Another seat gets its own row: an open escalation is about its own seat only.
+    const other = await effects.escalate({ jobId: "pool-1", seat: "dev-impl-s2@r", model: "dev-impl@r", qitemIds: ["q-3"] });
+    expect(other).toMatchObject({ ok: true, existing: false });
+    expect(other.qitemId).not.toBe(first.qitemId);
+    expect(repo.getById(first.qitemId!)!.body).toContain("no other row about dev-impl-s1@r");
   });
 
   it("opens one escalation per seat while it is open, and none without an escalation owner", async () => {
@@ -1338,7 +1590,7 @@ describe("seatPoolQueueEffects", () => {
     expect(row).toMatchObject({ destinationSession: "lead@r", sourceSession: "daemon@kernel", tags: [`${SEAT_POOL_NEEDS_INPUT_TAG}:dev-impl-s1@r`] });
     expect(row.body).toContain("q-1");
     expect(await effects.escalate({ jobId: "pool-1", seat: "dev-impl-s1@r", model: "dev-impl@r", qitemIds: ["q-1", "q-2"] }))
-      .toEqual({ ok: true, qitemId: first.qitemId, destination: "lead@r", existing: true });
+      .toEqual({ ok: true, qitemId: first.qitemId, destination: "lead@r", existing: true, added: ["q-2"] });
     owner = { owner: null, reason: "no escalation destination declared" };
     expect(await effects.escalate({ jobId: "pool-1", seat: "dev-impl-s2@r", model: "dev-impl@r", qitemIds: ["q-3"] }))
       .toEqual({ ok: false, code: "no_escalation_owner", error: "no escalation destination declared" });
