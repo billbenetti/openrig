@@ -18,7 +18,8 @@ import {
   SEAT_POOL_DRAIN_STARTED,
   SEAT_POOL_RELEASE_REASON_ENV,
   SEAT_POOL_RELEASE_RETRY_SECONDS,
-  seatPoolCanReceive,
+  seatPoolParkedLoadOver,
+  seatPoolReceives,
   seatPoolDrainEpisode,
   seatPoolReapable,
   seatPoolRoom,
@@ -262,6 +263,14 @@ export interface SeatPoolStateReaderDeps {
   /** A seat's open rows with the park of its only open row when that row is blocked (QueueRepository.
    *  listPoolSeatRowFacts). Read only with `dispatch_to_parked` in the spec; absent, no seat is ever "parked". */
   rowFacts?(sessionName: string): PoolSeatRowFacts;
+  /** The host's load, read for a spec whose `dispatch_to_parked` sets `parked_max_load_per_cpu_percent`, so the plan
+   *  holds a parked seat back as the executor's recheck would (SeatPoolState.hostLoadPerCpuPercent). Absent: not read. */
+  hostSample?(): HostSample;
+}
+
+/** load1 per CPU, in percent; null when the host gives no reading. */
+export function hostLoadPerCpuPercent(host: HostSample): number | null {
+  return host.load1 === null ? null : host.load1 / host.cpuCount * 100;
 }
 
 /** Pending rows addressed to any of `sessions` (in any of their addresses), longest waiting first. A row waits from its
@@ -346,6 +355,7 @@ export function readSeatPoolState(deps: SeatPoolStateReaderDeps, job: { jobId: s
     return node && node.id !== model.nodeId && !deps.slots.isLinked(node.id) ? [{ logicalId, nodeId: node.id }] : [];
   });
   const retired = deps.slots.listRetired(job.jobId).map((logicalId) => seatSessionName(logicalId, model.rigName));
+  const readLoad = parkedRule && (job.spec.dispatchToParked?.parkedMaxLoadPerCpuPercent ?? 0) > 0 && deps.hostSample;
   return {
     model,
     modelCause: causeOf(model.nodeId, model.sessionName, deps.seatState(model.nodeId)),
@@ -355,6 +365,7 @@ export function readSeatPoolState(deps: SeatPoolStateReaderDeps, job: { jobId: s
     pending: readPendingRows(deps, [model.sessionName, ...slots.map((slot) => slot.sessionName), ...retired]),
     demand: job.spec.demandCmd ? deps.demand(job.jobId) : null,
     lastScaleAt: deps.slots.lastScaleAt(job.jobId),
+    ...(readLoad ? { hostLoadPerCpuPercent: hostLoadPerCpuPercent(deps.hostSample!()) } : {}),
   };
 }
 
@@ -544,6 +555,10 @@ export interface SeatPoolExecutorDeps {
   readState(job: { jobId: string; targetSession: string; spec: SeatPoolSpec }): SeatPoolState;
   /** Whether the model or a seat of the pool is out of provider usage, read now. Absent: never. */
   outOfUsage?(job: { jobId: string; targetSession: string; spec: SeatPoolSpec }): Promise<boolean>;
+  /** The sessions whose provider account is out of usage, as the plan reads them (its state's "usage_limit" cause),
+   *  read before a row moves and before the demand command, so neither gives a row to a seat the plan would not.
+   *  Absent: none. */
+  usageLimited?(): Promise<ReadonlySet<string>>;
   effects: SeatPoolEffects;
   /** The daemon's room for seat launches, shared by every pool. Absent: no limit. */
   launchBudget?: LaunchBudget;
@@ -573,6 +588,8 @@ interface Run {
   done: Promise<void>;
   /** The launch budget's tick the plan was submitted in: every launch of the run counts against it. */
   tick?: LaunchTick;
+  /** The usage-limited sessions, read once per run at its first move or demand command (usageLimitedNow). */
+  usageLimited?: Promise<ReadonlySet<string>>;
 }
 
 interface DrainOutcome {
@@ -600,6 +617,7 @@ const STOPPED_CODES = new Set(["session_not_live", "no_session"]);
 const ROW_MOVED_ON = new Set(["fallback_state_mismatch", "fallback_destination_mismatch", "qitem_not_found"]);
 /** An unclaim refused because the row was closed or released since it was read: the move that follows decides. */
 const UNCLAIM_MOVED_ON = new Set(["qitem_not_in_progress", "qitem_not_found"]);
+const NO_SESSIONS: ReadonlySet<string> = new Set();
 const holdsWork = (slot: SeatPoolSlotView) => slot.openRows > 0 || slot.heldMessages > 0;
 /** A picture of a seat's open rows: each row's state and claim time, by id. */
 const rowPicture = (rows: ReadonlyArray<{ qitemId: string; state: string; claimedAt?: string | null }>): Map<string, string> =>
@@ -735,6 +753,24 @@ export class SeatPoolExecutor {
     return { jobId, spec: job.spec, state, model: state.model };
   }
 
+  /** The usage-limited sessions, read once per run (the provider's read model is a whole inventory) at its first move
+   *  or demand command, right after the plan read them; a failed read is none, as the plan's read is. */
+  private usageLimitedNow(run: Run): Promise<ReadonlySet<string>> {
+    run.usageLimited ??= (async () => {
+      try {
+        return (await this.deps.usageLimited?.()) ?? NO_SESSIONS;
+      } catch {
+        return NO_SESSIONS;
+      }
+    })();
+    return run.usageLimited;
+  }
+
+  /** The host's load per CPU read now, only when the spec's parked limit is set (null otherwise or with no reading). */
+  private parkedLoadNow(spec: SeatPoolSpec): number | null {
+    return (spec.dispatchToParked?.parkedMaxLoadPerCpuPercent ?? 0) > 0 ? hostLoadPerCpuPercent((this.deps.hostSample ?? sampleHost)()) : null;
+  }
+
   /** Read just before an add, a launch or a relaunch: the limit can appear after the plan, or while a command runs. */
   private async outOfUsage(ctx: Context): Promise<boolean> {
     return (await this.deps.outOfUsage?.({ jobId: ctx.jobId, targetSession: ctx.model.sessionName, spec: ctx.spec })) ?? false;
@@ -856,7 +892,7 @@ export class SeatPoolExecutor {
       } else if (intent.kind === "unlink") {
         this.unlink(jobId, run, intent.slotId);
       } else if (intent.kind === "dispatch") {
-        if (!this.dispatch(jobId, run, intent)) return;
+        if (!this.dispatch(jobId, run, intent, await this.usageLimitedNow(run))) return;
       } else if (intent.kind === "reap") {
         if (!(await this.reap(jobId, run, intent.slotId))) return;
       } else if (!(await this.wake(jobId, run, intent))) return;
@@ -1447,19 +1483,21 @@ export class SeatPoolExecutor {
   }
 
   /**
-   * Moves a waiting row to a seat that may still receive it (seatPoolCanReceive, asked again now). A seat planned as
+   * Moves a waiting row to a seat that may still receive it (seatPoolReceives, asked again now). A seat planned as
    * free that took work since the plan is left to the next plan, as before; a seat planned as parked on its own wait that
    * no longer is (it left its prompt, got another row, its wake fired, it began to drain) is recorded as skipped
    * (`parked_changed`), and so is one the host's load keeps from a second row (`parked_load`). A seat planned as parked
-   * that became free takes the row as a free seat. A pool set to drain since the plan moves nothing.
+   * that became free takes the row as a free seat. A pool set to drain since the plan moves nothing. A seat whose provider
+   * account ran out of usage since the plan (`usageLimited`, read just before this) is a seat that changed, as the plan
+   * would read it.
    */
-  private dispatch(jobId: string, run: Run, intent: Extract<SeatPoolIntent, { kind: "dispatch" }>): boolean {
+  private dispatch(jobId: string, run: Run, intent: Extract<SeatPoolIntent, { kind: "dispatch" }>, usageLimited: ReadonlySet<string>): boolean {
     const ctx = this.fresh(jobId, run);
     if (!ctx) return false;
     if (ctx.spec.drain) return true;
     const slot = ctx.state.slots.find((s) => s.slotId === intent.slotId);
     if (!slot) return true;
-    const mode = seatPoolCanReceive(ctx.spec, slot, this.now().getTime());
+    const mode = seatPoolReceives(ctx.spec, slot, this.now().getTime(), { usageLimited: usageLimited.has(slot.sessionName) });
     const base = { qitemId: intent.qitemId, from: intent.from, to: slot.sessionName };
     if (intent.mode !== "parked") {
       if (mode !== "free") return true;
@@ -1467,16 +1505,14 @@ export class SeatPoolExecutor {
       this.record(jobId, false, "seat_pool_dispatch_skipped", { ...base, code: "parked_changed" });
       return true;
     } else if (mode === "parked") {
-      const limit = ctx.spec.dispatchToParked?.parkedMaxLoadPerCpuPercent ?? 0;
-      const host = limit > 0 ? (this.deps.hostSample ?? sampleHost)() : null;
-      if (host && host.load1 !== null) {
-        const loadPerCpuPercent = host.load1 / host.cpuCount * 100;
-        if (loadPerCpuPercent > limit) {
-          this.record(jobId, false, "seat_pool_dispatch_skipped", {
-            ...base, code: "parked_load", loadPerCpuPercent: Math.round(loadPerCpuPercent * 100) / 100, limit,
-          });
-          return true;
-        }
+      // The plan read the load too (SeatPoolState.hostLoadPerCpuPercent): this catches a load that rose since.
+      const loadPerCpuPercent = this.parkedLoadNow(ctx.spec);
+      if (seatPoolParkedLoadOver(ctx.spec, loadPerCpuPercent)) {
+        this.record(jobId, false, "seat_pool_dispatch_skipped", {
+          ...base, code: "parked_load", loadPerCpuPercent: Math.round(loadPerCpuPercent! * 100) / 100,
+          limit: ctx.spec.dispatchToParked!.parkedMaxLoadPerCpuPercent,
+        });
+        return true;
       }
     }
     const park = mode === "parked" ? slot.parked! : null;
@@ -1604,13 +1640,17 @@ export class SeatPoolExecutor {
 
   /** Asks the demand command for the next plan. A failure keeps the previous answer, which ages until it holds the pool. */
   private async refreshDemand(jobId: string, run: Run): Promise<void> {
+    if (run.controller.signal.aborted || !this.deps.readJob(jobId)?.spec?.demandCmd) return;
+    const usageLimited = await this.usageLimitedNow(run);
     const ctx = this.fresh(jobId, run);
     if (!ctx?.spec.demandCmd) return;
-    // `receives`: how each seat may take a row now, by the same function the planner and the dispatch ask, so the demand
-    // command never counts a seat the pool would not give a row to.
+    // `receives`: how each seat may take a row now, by the same function the planner and the dispatch ask, with the same
+    // usage limit and load they read, so the demand command never counts a seat the pool would not give a row to.
     const nowMs = this.now().getTime();
+    const loadPerCpuPercent = this.parkedLoadNow(ctx.spec);
     const slots = ctx.state.slots.map((slot) => ({
-      session: seatSessionName(slot.logicalId, ctx.model.rigName), phase: slot.phase, receives: seatPoolCanReceive(ctx.spec, slot, nowMs),
+      session: seatSessionName(slot.logicalId, ctx.model.rigName), phase: slot.phase,
+      receives: seatPoolReceives(ctx.spec, slot, nowMs, { usageLimited: usageLimited.has(slot.sessionName), loadPerCpuPercent }),
     }));
     const result = await this.deps.effects.runCommand(ctx.spec.demandCmd, this.commandEnv(ctx, { OPENRIG_SEAT_POOL_SLOTS: JSON.stringify(slots) }), run.controller.signal);
     if (run.controller.signal.aborted) return;

@@ -57,7 +57,7 @@ environment plus:
 | `OPENRIG_SEAT_POOL_SLOT` | `prepare_cmd`, `release_cmd`, `reap_cmd`, `remove_cmd` | the seat's session name |
 | `OPENRIG_SEAT_POOL_SLOT_CWD` | `prepare_cmd` | the seat's working directory |
 | `OPENRIG_SEAT_POOL_RELEASE_REASON` | `release_cmd` | why it is asked: `idle` (a free seat drained, by `drain` or by `idle_grace_s`), `drain-deadline` (the forced pass at a drain's deadline) or `reap` (a seat whose session is gone) |
-| `OPENRIG_SEAT_POOL_SLOTS` | `demand_cmd` | JSON list of `{session, phase, receives}` for the pool's seats; `receives` is how the seat may take a waiting row now: `"free"`, `"parked"` (see [A seat parked on its own wait](#a-seat-parked-on-its-own-wait)) or `null` |
+| `OPENRIG_SEAT_POOL_SLOTS` | `demand_cmd` | JSON list of `{session, phase, receives}` for the pool's seats; `receives` is how the seat may take a waiting row now: `"free"`, `"parked"` (see [A seat parked on its own wait](#a-seat-parked-on-its-own-wait)) or `null`, as the plan reads it: a seat out of provider usage, and a parked seat while the load is above `parked_max_load_per_cpu_percent`, say `null` |
 
 A command that runs past `timeout_s` is killed and counts as failed. Each command has its own `timeout_s` (default 60),
 so a slow `release_cmd` can be given longer than `demand_cmd`; `release_cmd` runs under the seat's lifecycle lease,
@@ -137,10 +137,13 @@ CI run it left in the background) may receive one row more, after the free seats
 A seat with two open rows never receives, so one row more is the ceiling. The free seats get rows first, in their usual
 order, then the parked ones by id. A parked seat still counts as holding work: it is never drained, and the row it
 receives lowers the pool's target without `demand_cmd` as any dispatch does. The parked row is not touched: it stays
-blocked at the seat with its own timer. Just before the move the executor asks the rule again: a seat that is no longer
-parked keeps nothing (`seat_pool_dispatch_skipped`, `code: parked_changed`), and with
-`parked_max_load_per_cpu_percent` set, a host above that 1-minute load per CPU gives the parked seat no row
-(`code: parked_load`); a free seat is never checked for load. The move's note and the row's resolution say
+blocked at the seat with its own timer. With `parked_max_load_per_cpu_percent` set, the plan reads the host's
+1-minute load per CPU and, above the limit, leaves every parked seat out: the row is demand, as with no seat to take it
+(an add when there is room), and `receives` says `null` for those seats. A free seat is never checked for load. Just
+before the move the executor asks the rule again, with the provider usage and the load read then: a seat that is no
+longer parked, or whose account ran out of usage, keeps nothing (`seat_pool_dispatch_skipped`, `code: parked_changed`;
+a free seat that changed is left to the next plan with no entry), and a load that rose above the limit since the plan
+gives the parked seat no row (`code: parked_load`). The move's note and the row's resolution say
 `<seat> was parked on <gate> (2nd row)`, and `seat_pool_dispatched` carries `mode` (`free` or `parked`) and, for a
 parked seat, `parkedQitemId`.
 
@@ -166,7 +169,10 @@ refuses has no backoff: the reap goes on as soon as that launch fails.
 While any seat of the pool is out of usage (its provider account reports the limit, as the wake ladder reads it), the
 pool adds no seat and launches none, neither a stopped seat nor one it added and hasn't started, and records
 `usage_limit`; a seat added but not launched waits until the limit lifts. A run reads usage again just before each add,
-launch and relaunch, so a limit that appears after the plan, or while `prepare_cmd` runs, holds the seat too. Under
+launch and relaunch, so a limit that appears after the plan, or while `prepare_cmd` runs, holds the seat too. It also
+reads the seats out of usage once, at its first move or `demand_cmd`: a seat whose account ran out since the plan takes
+no row (a free one is left to the next plan with no entry) and `receives` says `null` for it, with or without
+`dispatch_to_parked`. Under
 `drain`, nothing is moved or woken, even a move or a wake planned before `drain` was set.
 
 ## Adding and removing a seat
