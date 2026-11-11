@@ -418,6 +418,10 @@ export interface SeatPoolState {
   demand: { desired: number; sampledAt: string } | null;
   /** The latest add or removal in this pool. */
   lastScaleAt: string | null;
+  /** The host's load per CPU (load1 / CPUs × 100), read for a spec whose `dispatch_to_parked` sets
+   *  `parked_max_load_per_cpu_percent`; null when the host gives no reading. Absent: not read, and no seat is held back
+   *  by the load in the plan. */
+  hostLoadPerCpuPercent?: number | null;
 }
 
 export type SeatPoolIntent =
@@ -486,6 +490,27 @@ export function seatPoolCanReceive(spec: SeatPoolSpec, slot: SeatPoolSlotView, n
   // Written so that an unreadable time (NaN) refuses.
   if (!(parkedMs >= takenMs) || !(nowMs - takenMs <= rule.maxClaimAgeSeconds * 1000)) return null;
   return "parked";
+}
+
+/** Whether the host's load keeps a seat parked on its own wait from a 2nd row: `parked_max_load_per_cpu_percent` is set
+ *  and the load per CPU is above it. An unknown load (null) holds nothing back. */
+export function seatPoolParkedLoadOver(spec: SeatPoolSpec, loadPerCpuPercent: number | null): boolean {
+  const limit = spec.dispatchToParked?.parkedMaxLoadPerCpuPercent ?? 0;
+  return limit > 0 && loadPerCpuPercent !== null && loadPerCpuPercent > limit;
+}
+
+/**
+ * How a seat may take a row now, with what the plan reads besides the seat's view: a seat whose provider account is out
+ * of usage takes none (as its cause reads "usage_limit" in the plan's state), and a seat parked on its own wait takes
+ * none while the host's load is above `parked_max_load_per_cpu_percent` (seatPoolParkedLoadOver). The planner, the
+ * executor's recheck and the demand command's `receives` ask this, so a seat one of them would not give a row to is
+ * never counted by another.
+ */
+export function seatPoolReceives(
+  spec: SeatPoolSpec, slot: SeatPoolSlotView, nowMs: number, facts: { usageLimited?: boolean; loadPerCpuPercent?: number | null } = {},
+): SeatPoolReceiveMode | null {
+  const mode = seatPoolCanReceive(spec, facts.usageLimited ? { ...slot, cause: "usage_limit" } : slot, nowMs);
+  return mode === "parked" && seatPoolParkedLoadOver(spec, facts.loadPerCpuPercent ?? null) ? null : mode;
 }
 
 /**
@@ -558,8 +583,10 @@ export function planSeatPool(spec: SeatPoolSpec, state: SeatPoolState, nowMs: nu
   const movable = waiting.filter((row) => !seatOf.has(row.destination)
     && (row.destination !== model.sessionName || spec.dispatchTag === null || row.tags.includes(spec.dispatchTag)));
   // The free seats first, in today's order, then the seats parked on their own wait, by id: a parked seat never goes
-  // before a seat that is really free. A parked seat stays out of `idle`, so it is neither free nor drained.
-  const modes = new Map(live.map((slot) => [slot, spec.drain ? null : seatPoolCanReceive(spec, slot, nowMs)]));
+  // before a seat that is really free. A parked seat stays out of `idle`, so it is neither free nor drained. While the
+  // host's load is above the parked limit no parked seat receives: the row is demand, as with no seat to take it.
+  const loadPerCpuPercent = state.hostLoadPerCpuPercent ?? null;
+  const modes = new Map(live.map((slot) => [slot, spec.drain ? null : seatPoolReceives(spec, slot, nowMs, { loadPerCpuPercent })]));
   const receivers = [
     ...live.filter((slot) => modes.get(slot) === "free"),
     ...live.filter((slot) => modes.get(slot) === "parked").sort((a, b) => a.slotId - b.slotId),
