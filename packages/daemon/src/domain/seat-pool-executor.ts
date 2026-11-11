@@ -5,10 +5,10 @@ import type { StopPrecondition } from "./seat-lifecycle-service.js";
 import type { ArbitratedSeatState } from "./activity-taxonomy.js";
 import { deriveCanonicalSessionName } from "./session-name.js";
 import { physicalSessionName } from "./session-registry.js";
-import { FALLBACK_ACTOR, type QueueRepository } from "./queue-repository.js";
+import { FALLBACK_ACTOR, type PoolSeatRowFacts, type QueueRepository } from "./queue-repository.js";
 import { OPENRIG_SENDER } from "../lib/pane-envelope.js";
 import type { Node } from "./types.js";
-import type { LaunchBudget, LaunchTick } from "./launch-budget.js";
+import { sampleHost, type HostSample, type LaunchBudget, type LaunchTick } from "./launch-budget.js";
 import {
   seatPoolLeftStopped,
   SEAT_POOL_DRAIN_ENDED,
@@ -18,6 +18,7 @@ import {
   SEAT_POOL_DRAIN_STARTED,
   SEAT_POOL_RELEASE_REASON_ENV,
   SEAT_POOL_RELEASE_RETRY_SECONDS,
+  seatPoolCanReceive,
   seatPoolDrainEpisode,
   seatPoolReapable,
   seatPoolRoom,
@@ -258,6 +259,9 @@ export interface SeatPoolStateReaderDeps {
   usageLimited?(sessionName: string): boolean;
   restoring(rigId: string): boolean;
   demand(jobId: string): { desired: number; sampledAt: string } | null;
+  /** A seat's open rows with the park of its only open row when that row is blocked (QueueRepository.
+   *  listPoolSeatRowFacts). Read only with `dispatch_to_parked` in the spec; absent, no seat is ever "parked". */
+  rowFacts?(sessionName: string): PoolSeatRowFacts;
 }
 
 /** Pending rows addressed to any of `sessions` (in any of their addresses), longest waiting first. A row waits from its
@@ -308,11 +312,15 @@ export function readSeatPoolState(deps: SeatPoolStateReaderDeps, job: { jobId: s
     return state?.activity === "idle-at-prompt" && !state.backgroundWork ? "idle" : "working";
   };
   const nodeExists = (nodeId: string) => !!db.prepare("SELECT 1 FROM nodes WHERE id = ? AND rig_id = ?").get(nodeId, model.rigId);
+  // dispatch_to_parked: the view gains what seatPoolCanReceive reads for a parked seat. Without the key the view is the
+  // one from before it, field for field.
+  const parkedRule = job.spec.dispatchToParked !== undefined;
   const slots = deps.slots.listOpen(job.jobId).map((slot): SeatPoolSlotView => {
     const present = slot.nodeId !== null && nodeExists(slot.nodeId);
     const state = present ? deps.seatState(slot.nodeId!) : null;
     const idle = state?.activity === "idle-at-prompt" && state.needsInput.count === 0 && !state.backgroundWork;
     const sessionName = seatSessionName(slot.logicalId, model.rigName);
+    const facts = present && parkedRule && deps.rowFacts ? deps.rowFacts(sessionName) : null;
     return {
       slotId: slot.slotId,
       logicalId: slot.logicalId,
@@ -321,12 +329,16 @@ export function readSeatPoolState(deps: SeatPoolStateReaderDeps, job: { jobId: s
       phase: slot.phase as Exclude<SeatPoolSlotPhase, "retired">,
       adopted: slot.opId === null,
       nodeExists: present,
-      openRows: present ? deps.openRows(sessionName).length : 0,
+      openRows: present ? (facts ? facts.rows.length : deps.openRows(sessionName).length) : 0,
       heldMessages: present ? deps.heldMessages(slot.nodeId!) : 0,
       idleSince: idle ? state!.changedAt : null,
       // A seat of the pool whose session is gone is reaped, which a usage limit doesn't hold, so for it a stopped session
       // comes before its account's usage; for the model, which the pool can only launch, the usage limit comes first.
       cause: !present || deps.seatStopped(slot.nodeId!) ? "stopped" : causeOf(slot.nodeId!, sessionName, state),
+      ...(present && parkedRule
+        ? { atPrompt: state?.activity === "idle-at-prompt" && state.needsInput.count === 0, backgroundWork: !!state?.backgroundWork }
+        : {}),
+      ...(facts?.parked ? { parked: facts.parked } : {}),
     };
   });
   const adoptable = job.spec.adopt.flatMap((logicalId) => {
@@ -535,6 +547,9 @@ export interface SeatPoolExecutorDeps {
   effects: SeatPoolEffects;
   /** The daemon's room for seat launches, shared by every pool. Absent: no limit. */
   launchBudget?: LaunchBudget;
+  /** The host's load, read before a row goes to a seat parked on its own wait when the spec's
+   *  `dispatch_to_parked.parked_max_load_per_cpu_percent` is set. Default: sampleHost. */
+  hostSample?: () => HostSample;
   /** Writes one history entry for the job. */
   record(jobId: string, entry: { failed: boolean; reason: string; notes: Record<string, unknown> }): void;
   /**
@@ -1432,17 +1447,47 @@ export class SeatPoolExecutor {
   }
 
   /**
-   * Moves a waiting row to a seat that is still free. A seat that took work since the plan is left to the next plan, and
-   * a pool set to drain since the plan moves nothing.
+   * Moves a waiting row to a seat that may still receive it (seatPoolCanReceive, asked again now). A seat planned as
+   * free that took work since the plan is left to the next plan, as before; a seat planned as parked on its own wait that
+   * no longer is (it left its prompt, got another row, its wake fired, it began to drain) is recorded as skipped
+   * (`parked_changed`), and so is one the host's load keeps from a second row (`parked_load`). A seat planned as parked
+   * that became free takes the row as a free seat. A pool set to drain since the plan moves nothing.
    */
   private dispatch(jobId: string, run: Run, intent: Extract<SeatPoolIntent, { kind: "dispatch" }>): boolean {
     const ctx = this.fresh(jobId, run);
     if (!ctx) return false;
     if (ctx.spec.drain) return true;
     const slot = ctx.state.slots.find((s) => s.slotId === intent.slotId);
-    if (!slot || slot.phase !== "live" || !slot.nodeExists || slot.cause !== "idle" || holdsWork(slot)) return true;
-    const notes = { qitemId: intent.qitemId, from: intent.from, to: slot.sessionName };
-    const moved = this.deps.effects.moveRow({ ...notes, reason: `seat pool ${jobId}: ${intent.from} had not taken it; ${slot.sessionName} was free` });
+    if (!slot) return true;
+    const mode = seatPoolCanReceive(ctx.spec, slot, this.now().getTime());
+    const base = { qitemId: intent.qitemId, from: intent.from, to: slot.sessionName };
+    if (intent.mode !== "parked") {
+      if (mode !== "free") return true;
+    } else if (mode === null) {
+      this.record(jobId, false, "seat_pool_dispatch_skipped", { ...base, code: "parked_changed" });
+      return true;
+    } else if (mode === "parked") {
+      const limit = ctx.spec.dispatchToParked?.parkedMaxLoadPerCpuPercent ?? 0;
+      const host = limit > 0 ? (this.deps.hostSample ?? sampleHost)() : null;
+      if (host && host.load1 !== null) {
+        const loadPerCpuPercent = host.load1 / host.cpuCount * 100;
+        if (loadPerCpuPercent > limit) {
+          this.record(jobId, false, "seat_pool_dispatch_skipped", {
+            ...base, code: "parked_load", loadPerCpuPercent: Math.round(loadPerCpuPercent * 100) / 100, limit,
+          });
+          return true;
+        }
+      }
+    }
+    const park = mode === "parked" ? slot.parked! : null;
+    // Without dispatch_to_parked the entry is the one from before the key: no mode.
+    const notes: Record<string, unknown> = {
+      ...base,
+      ...(ctx.spec.dispatchToParked ? { mode } : {}),
+      ...(park ? { parkedQitemId: park.qitemId } : {}),
+    };
+    const why = park ? `was parked on ${park.blockedOn} (2nd row)` : "was free";
+    const moved = this.deps.effects.moveRow({ ...base, reason: `seat pool ${jobId}: ${intent.from} had not taken it; ${slot.sessionName} ${why}` });
     if (moved.ok) this.record(jobId, false, "seat_pool_dispatched", notes);
     else if (ROW_MOVED_ON.has(moved.code)) this.record(jobId, false, "seat_pool_dispatch_skipped", { ...notes, code: moved.code });
     else this.record(jobId, true, "seat_pool_dispatch_failed", { ...notes, code: moved.code, error: moved.error });
@@ -1561,7 +1606,12 @@ export class SeatPoolExecutor {
   private async refreshDemand(jobId: string, run: Run): Promise<void> {
     const ctx = this.fresh(jobId, run);
     if (!ctx?.spec.demandCmd) return;
-    const slots = ctx.state.slots.map((slot) => ({ session: seatSessionName(slot.logicalId, ctx.model.rigName), phase: slot.phase }));
+    // `receives`: how each seat may take a row now, by the same function the planner and the dispatch ask, so the demand
+    // command never counts a seat the pool would not give a row to.
+    const nowMs = this.now().getTime();
+    const slots = ctx.state.slots.map((slot) => ({
+      session: seatSessionName(slot.logicalId, ctx.model.rigName), phase: slot.phase, receives: seatPoolCanReceive(ctx.spec, slot, nowMs),
+    }));
     const result = await this.deps.effects.runCommand(ctx.spec.demandCmd, this.commandEnv(ctx, { OPENRIG_SEAT_POOL_SLOTS: JSON.stringify(slots) }), run.controller.signal);
     if (run.controller.signal.aborted) return;
     let desired: unknown;

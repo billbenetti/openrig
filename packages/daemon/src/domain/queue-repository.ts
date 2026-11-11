@@ -92,6 +92,7 @@ import {
   type ParkWakeStatus,
 } from "./queue-wake-repository.js";
 import { WatchdogJobsRepository } from "./watchdog-jobs-repository.js";
+import type { ParkFacts } from "./policies/seat-pool.js";
 import { parse as parseYaml } from "yaml";
 import { armQueueWait, backOffQueueWait, refreshQueueWaits, evaluateQueueWait, retargetQueueWait, isQueueWait } from "./queue-wait-backoff.js";
 import { parseHumanQuestions, unansweredQuestions, describeTypedReplyPlacement, formatHumanAnswers, humanAnswerText, type HumanQuestion, type HumanAnswers, type TypedHumanReply, type RecordHumanAnswerResult } from "./human-questions.js";
@@ -1031,6 +1032,14 @@ export interface QueueDestinationAdvisory {
   destinationSession: string;
   availableDestinations: string[];
   message: string;
+}
+
+/** A seat pool seat's open rows and, when its only open row is blocked, that row's park (listPoolSeatRowFacts). */
+export interface PoolSeatRowFacts {
+  /** The open rows: listOpenObligations' rows, in its order (newest first) and with its limit. */
+  rows: Array<{ qitemId: string; state: "pending" | "in-progress" | "blocked" }>;
+  /** Only when `rows` is exactly one blocked row; null otherwise. */
+  parked: ParkFacts | null;
 }
 
 export class QueueRepository {
@@ -4595,6 +4604,52 @@ export class QueueRepository {
         ORDER BY ts_created DESC LIMIT ?`,
     ).all(...addresses, limit) as Array<{ qitem_id: string; state: "pending" | "in-progress" | "blocked"; summary?: string | null }>;
     return rows.map((r) => ({ qitemId: r.qitem_id, state: r.state, summary: r.summary ?? null }));
+  }
+
+  /**
+   * A seat pool's read of one seat's open rows (listOpenObligations' rows, order and limit) and, when the only open row
+   * is blocked, the facts of its park (ParkFacts): the current wake (the latest armed record, the one getStatus reads)
+   * gives the transition that armed it (its actor and time) and, for a timer, its job's interval in any state of the job;
+   * getStatus says whether that wake is still armed and live. The row was taken at its claim, or else at its first move
+   * to in-progress by one of its destination's addresses (a seat that takes a row by update, with no claim).
+   */
+  listPoolSeatRowFacts(sessionName: string): PoolSeatRowFacts {
+    const rows = this.listOpenObligations(sessionName, 500).map((row) => ({ qitemId: row.qitemId, state: row.state }));
+    if (rows.length !== 1 || rows[0]!.state !== "blocked") return { rows, parked: null };
+    const qitemId = rows[0]!.qitemId;
+    const item = this.db.prepare("SELECT blocked_on, claimed_at, destination_session FROM queue_items WHERE qitem_id = ?")
+      .get(qitemId) as { blocked_on: string | null; claimed_at: string | null; destination_session: string } | undefined;
+    if (!item) return { rows, parked: null };
+    let armed: { wake_kind: string; wake_ref: string; actor_session: string | null; ts: string | null } | undefined;
+    try {
+      armed = this.db.prepare(
+        `SELECT w.wake_kind, w.wake_ref, t.actor_session, t.ts
+           FROM queue_transition_wakes w LEFT JOIN queue_transitions t ON t.transition_id = w.transition_id
+          WHERE w.qitem_id = ? AND w.phase = 'armed'
+          ORDER BY w.transition_id DESC LIMIT 1`,
+      ).get(qitemId) as typeof armed;
+    } catch {
+      armed = undefined; // a database without the wake records: no wake to read
+    }
+    const interval = armed?.wake_kind === "timer"
+      ? (this.db.prepare("SELECT interval_seconds FROM watchdog_jobs WHERE job_id = ?").get(armed.wake_ref) as { interval_seconds: number } | undefined)
+      : undefined;
+    const status = armed ? this.wakeRepo.getStatus(qitemId) : null;
+    const destinations = this.resolveSessionAddresses(item.destination_session);
+    const firstTake = item.claimed_at ? null : this.db.prepare(
+      `SELECT MIN(ts) AS ts FROM queue_transitions
+        WHERE qitem_id = ? AND state = 'in-progress' AND actor_session IN (${destinations.map(() => "?").join(",")})`,
+    ).get(qitemId, ...destinations) as { ts: string | null } | undefined;
+    const parked: ParkFacts = {
+      qitemId,
+      blockedOn: item.blocked_on ?? "",
+      timerIntervalS: interval?.interval_seconds ?? null,
+      timerArmedLive: !!status && status.kind === "timer" && status.phase === "armed" && status.live === true && status.unconsumed === false,
+      parkActor: armed?.actor_session ?? null,
+      parkedAt: armed?.ts ?? null,
+      takenAt: item.claimed_at ?? firstTake?.ts ?? null,
+    };
+    return { rows, parked };
   }
 
   /** The open rows of a session with their claim time (listOpenObligations' rows and order): a seat pool's forced pass
