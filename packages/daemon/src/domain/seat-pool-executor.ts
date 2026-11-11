@@ -588,7 +588,8 @@ interface Run {
   done: Promise<void>;
   /** The launch budget's tick the plan was submitted in: every launch of the run counts against it. */
   tick?: LaunchTick;
-  /** The usage-limited sessions, read once per run at its first move or demand command (usageLimitedNow). */
+  /** The usage-limited sessions, read at the run's first move or demand command and again after each lifecycle step
+   *  (usageLimitedNow; apply drops it after every step that awaits an effect). */
   usageLimited?: Promise<ReadonlySet<string>>;
 }
 
@@ -753,8 +754,9 @@ export class SeatPoolExecutor {
     return { jobId, spec: job.spec, state, model: state.model };
   }
 
-  /** The usage-limited sessions, read once per run (the provider's read model is a whole inventory) at its first move
-   *  or demand command, right after the plan read them; a failed read is none, as the plan's read is. */
+  /** The usage-limited sessions, read once (the provider's read model is a whole inventory) at the run's first move or
+   *  demand command, right after the plan read them, and again after each lifecycle step of the run (apply drops the
+   *  read, S3); a failed read is none, as the plan's read is. */
   private usageLimitedNow(run: Run): Promise<ReadonlySet<string>> {
     run.usageLimited ??= (async () => {
       try {
@@ -896,6 +898,9 @@ export class SeatPoolExecutor {
       } else if (intent.kind === "reap") {
         if (!(await this.reap(jobId, run, intent.slotId))) return;
       } else if (!(await this.wake(jobId, run, intent))) return;
+      // Every step but adopt, unlink and dispatch awaits a lifecycle effect (a command, a launch, a stop) that can take
+      // minutes: an account may run out meanwhile, so the next move or the demand command reads the usage again (S3).
+      if (intent.kind !== "adopt" && intent.kind !== "unlink" && intent.kind !== "dispatch") run.usageLimited = undefined;
     }
     await this.refreshDemand(jobId, run);
   }
