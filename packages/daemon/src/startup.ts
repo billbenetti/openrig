@@ -2374,6 +2374,8 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
       db,
       slots: seatPoolSlots,
       openRows: (sessionName) => queueRepoInstance.listOpenObligations(sessionName, 500),
+      // Read only for a pool with dispatch_to_parked: the seat's open rows and the park of its only blocked row.
+      rowFacts: (sessionName) => queueRepoInstance.listPoolSeatRowFacts(sessionName),
       sessionAddresses: (sessionName) => sessionRegistry.sessionAddresses(sessionName),
       heldMessages: (nodeId) => outboxHandlerInstance.heldCount(nodeId),
       // The live statuses getLatestLiveSessions reads, and the identity verdict that a "running" session is gone.
