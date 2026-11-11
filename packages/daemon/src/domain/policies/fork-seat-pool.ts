@@ -50,11 +50,27 @@ export interface SeatPoolSpec {
   /** Where an escalation about a seat of the pool goes (a needs-input escalation, and a row a reap moves a second
    *  time), in place of the model's escalation owner. Null: the model's escalation owner, as without the field. */
   escalationOwner: string | null;
+  /** A seat whose only open row it parked itself on a wait of its own may receive one row more (seatPoolCanReceive).
+   *  Absent (no such property) when the key is not in the context: the rule is off, as before the key. */
+  dispatchToParked?: SeatPoolDispatchToParked;
+}
+
+/** `dispatch_to_parked` in the job's context: when a seat parked on its own wait counts as a receiver of one more row. */
+export interface SeatPoolDispatchToParked {
+  /** `max_wake_s`: the longest timer of the park that still counts as the seat's own short wait (default 3600). */
+  maxWakeSeconds: number;
+  /** `max_claim_age_s`: how long ago the seat may have taken the parked row (default 21600, 6 h). */
+  maxClaimAgeSeconds: number;
+  /** `allow_background_work`: false keeps out a seat with a background shell (default true). */
+  allowBackgroundWork: boolean;
+  /** `parked_max_load_per_cpu_percent`: above this 1-minute load per CPU (in percent) the executor gives a parked seat
+   *  no row; 0 (the default) checks no load. A free seat is never checked. */
+  parkedMaxLoadPerCpuPercent: number;
 }
 
 const SPEC_KEYS = new Set([
   "min", "max", "cooldown_s", "idle_grace_s", "dispatch_after_s", "dispatch_tag", "drain", "drain_deadline_s", "adopt", "cwd_template",
-  "demand_cmd", "release_cmd", "prepare_cmd", "reap_cmd", "remove_cmd", "escalation_owner",
+  "demand_cmd", "release_cmd", "prepare_cmd", "reap_cmd", "remove_cmd", "escalation_owner", "dispatch_to_parked",
 ]);
 const DEFAULT_COOLDOWN_SECONDS = 60;
 const DEFAULT_IDLE_GRACE_SECONDS = 300;
@@ -93,6 +109,48 @@ function command(value: unknown, field: string): SeatPoolCommand | null | SpecPr
     return { field: `${field}.timeout_s`, message: `seat-pool: ${field}.timeout_s must be a positive whole number of seconds` };
   }
   return { argv: argv as string[], timeoutSeconds: timeout as number };
+}
+
+const DISPATCH_TO_PARKED = "dispatch_to_parked";
+/** The fields of `dispatch_to_parked`: the bounds of each whole number, and its default. */
+const DISPATCH_TO_PARKED_NUMBERS = {
+  max_wake_s: { min: 60, max: 86_400, fallback: 3600 },
+  max_claim_age_s: { min: 600, max: 172_800, fallback: 21_600 },
+  parked_max_load_per_cpu_percent: { min: 0, max: 10_000, fallback: 0 },
+} as const;
+const DISPATCH_TO_PARKED_KEYS = new Set([...Object.keys(DISPATCH_TO_PARKED_NUMBERS), "allow_background_work"]);
+
+/** `dispatch_to_parked`: an object (`{}` takes every default). A field given as null is wrong, as for the other keys:
+ *  only a field left out takes its default. */
+function dispatchToParked(value: unknown): SeatPoolDispatchToParked | SpecProblem {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return { field: DISPATCH_TO_PARKED, message: `seat-pool: ${DISPATCH_TO_PARKED} must be an object ({} turns it on with its defaults)` };
+  }
+  const record = value as Record<string, unknown>;
+  const unknown = Object.keys(record).filter((key) => !DISPATCH_TO_PARKED_KEYS.has(key));
+  if (unknown.length > 0) {
+    return {
+      field: DISPATCH_TO_PARKED,
+      message: `seat-pool: ${DISPATCH_TO_PARKED} has unknown field ${unknown.join(", ")}; known fields are ${[...DISPATCH_TO_PARKED_KEYS].join(", ")}`,
+    };
+  }
+  const numbers: Record<string, number> = {};
+  for (const [key, { min, max, fallback }] of Object.entries(DISPATCH_TO_PARKED_NUMBERS)) {
+    const field = record[key];
+    if (field === undefined) { numbers[key] = fallback; continue; }
+    if (!Number.isInteger(field) || (field as number) < min || (field as number) > max) {
+      return { field: `${DISPATCH_TO_PARKED}.${key}`, message: `seat-pool: ${DISPATCH_TO_PARKED}.${key} must be a whole number from ${min} to ${max}` };
+    }
+    numbers[key] = field as number;
+  }
+  const allow = record["allow_background_work"];
+  if (allow !== undefined && typeof allow !== "boolean") {
+    return { field: `${DISPATCH_TO_PARKED}.allow_background_work`, message: `seat-pool: ${DISPATCH_TO_PARKED}.allow_background_work must be true or false` };
+  }
+  return {
+    maxWakeSeconds: numbers["max_wake_s"]!, maxClaimAgeSeconds: numbers["max_claim_age_s"]!, allowBackgroundWork: allow ?? true,
+    parkedMaxLoadPerCpuPercent: numbers["parked_max_load_per_cpu_percent"]!,
+  };
 }
 
 const isProblem = (value: unknown): value is SpecProblem =>
@@ -141,6 +199,12 @@ export function parseSeatPoolSpec(context: Record<string, unknown>): { spec: Sea
     if (isProblem(parsed)) return { problem: parsed };
     commands[field] = parsed;
   }
+  let parkedRule: SeatPoolDispatchToParked | undefined;
+  if (context[DISPATCH_TO_PARKED] !== undefined) {
+    const parsed = dispatchToParked(context[DISPATCH_TO_PARKED]);
+    if (isProblem(parsed)) return { problem: parsed };
+    parkedRule = parsed;
+  }
   return {
     spec: {
       min: min as number, max: max as number, cooldownSeconds: cooldownSeconds as number, idleGraceSeconds: idleGraceSeconds as number,
@@ -148,6 +212,7 @@ export function parseSeatPoolSpec(context: Record<string, unknown>): { spec: Sea
       drainDeadlineSeconds: drainDeadlineSeconds as number, adopt: [...new Set(adopt as string[])], cwdTemplate,
       demandCmd: commands["demand_cmd"]!, releaseCmd: commands["release_cmd"]!, prepareCmd: commands["prepare_cmd"]!,
       reapCmd: commands["reap_cmd"]!, removeCmd: commands["remove_cmd"]!, escalationOwner: escalationOwner as string | null,
+      ...(parkedRule ? { dispatchToParked: parkedRule } : {}),
     },
   };
 }
@@ -299,7 +364,35 @@ export interface SeatPoolSlotView {
   idleSince: string | null;
   /** Meaningful for a live seat whose node exists. */
   cause: SeatPoolSeatCause;
+  /** Only with `dispatch_to_parked` in the spec and the node present: idle at its prompt with no needs-input, whatever
+   *  runs in the background. */
+  atPrompt?: boolean;
+  /** Only with `dispatch_to_parked` in the spec and the node present: a background shell runs in the seat. */
+  backgroundWork?: boolean;
+  /** Only with `dispatch_to_parked` in the spec, the row facts read and exactly one open row, blocked: that row's park. */
+  parked?: ParkFacts;
 }
+
+/** The park of a seat's only open row, a blocked one: what seatPoolCanReceive checks to call it the seat's own wait. */
+export interface ParkFacts {
+  qitemId: string;
+  /** The row's blocked_on. */
+  blockedOn: string;
+  /** The interval of the job behind the row's current wake when that wake is a timer, whatever the job's state now;
+   *  null with no wake, or a watchdog or blocker wake. */
+  timerIntervalS: number | null;
+  /** The current wake is a timer, armed, live and not consumed: it has not fired yet (a park timer fires once). */
+  timerArmedLive: boolean;
+  /** Who made the transition that armed the current wake, as recorded; null with no wake. */
+  parkActor: string | null;
+  /** When that transition was made; null with no wake. */
+  parkedAt: string | null;
+  /** When the row was taken: its claim, or else its first move to in-progress by one of its destination's addresses. */
+  takenAt: string | null;
+}
+
+/** How a seat may receive a waiting row: `free` (no open row, idle at its prompt) or `parked` (dispatch_to_parked). */
+export type SeatPoolReceiveMode = "free" | "parked";
 
 /** A pending row addressed to the model, to one of the pool's seats or to a seat the pool removed. */
 export interface SeatPoolPendingRow {
@@ -338,8 +431,9 @@ export type SeatPoolIntent =
   | { kind: "remove"; slotId: number }
   /** Give back an adopted seat under drain: the pool's link ends, and the node and its session stay as they are. */
   | { kind: "unlink"; slotId: number }
-  /** Move a waiting row to a free seat, only while it is still pending and addressed to `from`, and wake that seat. */
-  | { kind: "dispatch"; qitemId: string; from: string; slotId: number }
+  /** Move a waiting row to a free seat, only while it is still pending and addressed to `from`, and wake that seat.
+   *  `mode: "parked"` (absent for a free seat): the seat was planned as parked on its own wait (seatPoolCanReceive). */
+  | { kind: "dispatch"; qitemId: string; from: string; slotId: number; mode?: "parked" }
   /** Launch a stopped seat (the model or one of the pool's) that holds a waiting row. */
   | { kind: "relaunch"; seat: string; nodeId: string }
   /** Tell the model's escalation owner that a seat holding waiting rows needs input. */
@@ -361,6 +455,37 @@ export interface SeatPoolPlan {
  *  the executor both ask this. */
 export function seatPoolReapable(slot: SeatPoolSlotView): boolean {
   return !slot.adopted && slot.phase === "live" && slot.nodeExists && slot.cause === "stopped";
+}
+
+/**
+ * Whether a seat may receive a waiting row now, and how; null when it may not. The planner, the executor's check just
+ * before the move and the slots the demand command is given (`receives`) all ask this one function.
+ *
+ * Both ways need the pool not draining, the seat live, its node present, not to be reaped and no held message.
+ * `free`: no open row and idle at its prompt (the rule from before `dispatch_to_parked`). `parked`, only with
+ * `dispatch_to_parked`: a seat the pool added (not adopted), at its prompt (idle, or working only through a background
+ * shell, which `allow_background_work: false` refuses), whose only open row is blocked on an `external:` gate with a
+ * timer of at most `max_wake_s` still armed and live, armed by the seat itself, after it took the row (by claim or by
+ * update) no more than `max_claim_age_s` ago. A seat with two open rows never receives: one row more is the ceiling.
+ */
+export function seatPoolCanReceive(spec: SeatPoolSpec, slot: SeatPoolSlotView, nowMs: number): SeatPoolReceiveMode | null {
+  if (spec.drain || slot.phase !== "live" || !slot.nodeExists || seatPoolReapable(slot) || slot.heldMessages !== 0) return null;
+  if (slot.openRows === 0 && slot.idleSince !== null && slot.cause === "idle") return "free";
+  const rule = spec.dispatchToParked;
+  if (!rule || slot.adopted) return null;
+  if (slot.atPrompt !== true || (slot.cause !== "idle" && slot.cause !== "working")) return null;
+  if (!rule.allowBackgroundWork && slot.backgroundWork === true) return null;
+  const park = slot.parked;
+  if (slot.openRows !== 1 || !park) return null;
+  if (!park.blockedOn.startsWith("external:")) return null;
+  if (!park.timerArmedLive || park.timerIntervalS === null || park.timerIntervalS > rule.maxWakeSeconds) return null;
+  if (park.parkActor !== slot.sessionName) return null;
+  if (park.takenAt === null || park.parkedAt === null) return null;
+  const takenMs = Date.parse(park.takenAt);
+  const parkedMs = Date.parse(park.parkedAt);
+  // Written so that an unreadable time (NaN) refuses.
+  if (!(parkedMs >= takenMs) || !(nowMs - takenMs <= rule.maxClaimAgeSeconds * 1000)) return null;
+  return "parked";
 }
 
 /**
@@ -432,9 +557,18 @@ export function planSeatPool(spec: SeatPoolSpec, state: SeatPoolState, nowMs: nu
   // A row to the model is the model's own unless the spec's dispatch tag marks it as the pool's to hand out.
   const movable = waiting.filter((row) => !seatOf.has(row.destination)
     && (row.destination !== model.sessionName || spec.dispatchTag === null || row.tags.includes(spec.dispatchTag)));
-  const receivers = spec.drain ? [] : live.filter((slot) => idle(slot) && slot.cause === "idle");
+  // The free seats first, in today's order, then the seats parked on their own wait, by id: a parked seat never goes
+  // before a seat that is really free. A parked seat stays out of `idle`, so it is neither free nor drained.
+  const modes = new Map(live.map((slot) => [slot, spec.drain ? null : seatPoolCanReceive(spec, slot, nowMs)]));
+  const receivers = [
+    ...live.filter((slot) => modes.get(slot) === "free"),
+    ...live.filter((slot) => modes.get(slot) === "parked").sort((a, b) => a.slotId - b.slotId),
+  ];
   const dispatched = movable.slice(0, receivers.length);
-  dispatched.forEach((row, i) => intents.push({ kind: "dispatch", qitemId: row.qitemId, from: row.destination, slotId: receivers[i]!.slotId }));
+  dispatched.forEach((row, i) => intents.push({
+    kind: "dispatch", qitemId: row.qitemId, from: row.destination, slotId: receivers[i]!.slotId,
+    ...(modes.get(receivers[i]!) === "parked" ? { mode: "parked" as const } : {}),
+  }));
   const receiving = new Set(receivers.slice(0, dispatched.length));
 
   if (!spec.drain) {

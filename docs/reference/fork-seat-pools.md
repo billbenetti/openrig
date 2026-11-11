@@ -37,11 +37,17 @@ context:
   reap_cmd:    { argv: [/usr/local/bin/pool-reap], timeout_s: 60 }
   remove_cmd:  { argv: [/usr/local/bin/pool-remove], timeout_s: 60 }
   escalation_owner: lead@my-rig     # where the pool's escalations go (default: the model's escalation owner)
+  dispatch_to_parked:               # absent (the default): only a free seat receives a row; see "A seat parked on its own wait"
+    max_wake_s: 3600                # the longest park timer that still counts (60..86400, default 3600)
+    max_claim_age_s: 21600          # how long ago the seat may have taken the parked row (600..172800, default 21600)
+    allow_background_work: true     # false: a seat with a background shell does not receive (default true)
+    parked_max_load_per_cpu_percent: 0   # above this load per CPU (percent) a parked seat gets no row; 0: not checked (default 0)
 ```
 
 Registration and `rig watchdog update --spec` refuse a spec with an unknown field, `max` below `min`, a relative
-`cwd_template` or one without `{slot}`, a command that isn't an argv, or an `escalation_owner` that isn't a seat
-address (`<session>@<rig>`). Commands run without a shell, with the daemon's
+`cwd_template` or one without `{slot}`, a command that isn't an argv, an `escalation_owner` that isn't a seat
+address (`<session>@<rig>`), or a `dispatch_to_parked` that isn't an object, has an unknown field or a value out of its
+range (`dispatch_to_parked: {}` turns it on with every default). Commands run without a shell, with the daemon's
 environment plus:
 
 | Variable | Set for | Value |
@@ -51,7 +57,7 @@ environment plus:
 | `OPENRIG_SEAT_POOL_SLOT` | `prepare_cmd`, `release_cmd`, `reap_cmd`, `remove_cmd` | the seat's session name |
 | `OPENRIG_SEAT_POOL_SLOT_CWD` | `prepare_cmd` | the seat's working directory |
 | `OPENRIG_SEAT_POOL_RELEASE_REASON` | `release_cmd` | why it is asked: `idle` (a free seat drained, by `drain` or by `idle_grace_s`), `drain-deadline` (the forced pass at a drain's deadline) or `reap` (a seat whose session is gone) |
-| `OPENRIG_SEAT_POOL_SLOTS` | `demand_cmd` | JSON list of `{session, phase}` for the pool's seats |
+| `OPENRIG_SEAT_POOL_SLOTS` | `demand_cmd` | JSON list of `{session, phase, receives}` for the pool's seats; `receives` is how the seat may take a waiting row now: `"free"`, `"parked"` (see [A seat parked on its own wait](#a-seat-parked-on-its-own-wait)) or `null` |
 
 A command that runs past `timeout_s` is killed and counts as failed. Each command has its own `timeout_s` (default 60),
 so a slow `release_cmd` can be given longer than `demand_cmd`; `release_cmd` runs under the seat's lifecycle lease,
@@ -111,6 +117,36 @@ isn't taking it:
 | needs input (a permission prompt or a question) | opens one row to the pool's escalation owner, tagged `seat-pool-needs-input:<seat>`; no other is opened about that seat while it is open, and a row that waits at the seat later is added to it as a note. With `dispatch_tag`, the model and an adopted seat are escalated only for waiting rows that carry the tag: their other rows are their own work |
 | is out of provider usage | nothing: the row waits |
 | is working | nothing: the row waits, and counts as demand if it is the model's |
+
+### A seat parked on its own wait
+
+With `dispatch_to_parked` in the spec, a seat that parked its only open row on a short wait of its own (a suite or a
+CI run it left in the background) may receive one row more, after the free seats. It receives when all of these hold:
+
+- the pool added it (an adopted seat never does), it is live, its node exists, it is not being reaped and holds no
+  held message;
+- it is at its prompt with no needs-input: idle, or working only through a background shell
+  (`allow_background_work: false` refuses that one); a seat out of usage or stopped does not receive;
+- its only open row is blocked on an `external:` gate (a row blocked on another row, on a seat or on `gate:` is not
+  its own wait);
+- that row's current wake is a timer of at most `max_wake_s`, still armed and live (a park timer fires once: after it
+  fired, the seat stops counting as parked until it parks again);
+- the seat armed that wake itself (a note on the row by another seat doesn't change it, a wake armed by another seat
+  does), after it took the row, by claim or by `--state in-progress`, at most `max_claim_age_s` ago.
+
+A seat with two open rows never receives, so one row more is the ceiling. The free seats get rows first, in their usual
+order, then the parked ones by id. A parked seat still counts as holding work: it is never drained, and the row it
+receives lowers the pool's target without `demand_cmd` as any dispatch does. The parked row is not touched: it stays
+blocked at the seat with its own timer. Just before the move the executor asks the rule again: a seat that is no longer
+parked keeps nothing (`seat_pool_dispatch_skipped`, `code: parked_changed`), and with
+`parked_max_load_per_cpu_percent` set, a host above that 1-minute load per CPU gives the parked seat no row
+(`code: parked_load`); a free seat is never checked for load. The move's note and the row's resolution say
+`<seat> was parked on <gate> (2nd row)`, and `seat_pool_dispatched` carries `mode` (`free` or `parked`) and, for a
+parked seat, `parkedQitemId`.
+
+The key is read at each evaluation, so `rig watchdog update --spec` turns it on or off with no restart. A daemon that
+predates the key refuses it as an unknown field and holds the pool (`seat_pool_spec_invalid`): take the key out of the
+spec before going back to such a daemon.
 
 The pool's escalation owner is the spec's `escalation_owner` when it is set, and the model's escalation owner
 otherwise. An `escalation_owner` the queue doesn't accept as a destination is no owner at all: the escalation fails
