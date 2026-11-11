@@ -166,7 +166,7 @@ import { makeSeatPoolPolicy, parseSeatPoolSpec, seatPoolOutOfUsage, type SeatPoo
 import {
   readSeatPoolState, runSeatPoolCommand, SeatPoolExecutor, SeatPoolSlots, seatPoolQueueEffects, slotMemberFragment,
 } from "./domain/seat-pool-executor.js";
-import { LaunchBudget, launchBudgetLimits } from "./domain/launch-budget.js";
+import { LaunchBudget, launchBudgetLimits, sampleHost } from "./domain/launch-budget.js";
 import { launchStatusIsRunning } from "./domain/restore-orchestrator.js";
 import { resolveEscalationOwner } from "./domain/escalation-owner.js";
 import { deriveUsageLimitPools } from "./domain/provider/provider-signals.js";
@@ -2384,6 +2384,8 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
       usageLimited: usageLimited ? (sessionName) => usageLimited.has(sessionName) : undefined,
       restoring: (rigId) => restoreOrchestrator.restoreInProgress(rigId),
       demand: (jobId) => seatPoolExecutor.demandSample(jobId),
+      // Read only for a spec with dispatch_to_parked.parked_max_load_per_cpu_percent: the plan holds a parked seat back.
+      hostSample: sampleHost,
     }, job);
     // The seats whose provider account is out of usage, as the wake ladder reads them: the plan reads them, and the run
     // again just before each add, launch and relaunch.
@@ -2425,6 +2427,8 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
       },
       readState: readPoolState,
       outOfUsage: async (job) => seatPoolOutOfUsage(readPoolState(job, await usageLimitedSessions())),
+      // The plan's own read: the dispatch recheck and the demand command's receives see the usage limit as the plan does.
+      usageLimited: usageLimitedSessions,
       record: (jobId, entry) => {
         watchdogHistoryLogInstance.record({
           jobId, evaluatedAt: new Date().toISOString(), outcome: entry.failed ? "failed" : "skipped",
