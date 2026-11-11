@@ -485,3 +485,80 @@ describe("c1b T-005481 (T-005673): the parked dispatch reads the usage limit and
     expect(h.events(SKIPPED)).toHaveLength(0);
   });
 });
+
+// c1c of T-005481 (T-005758): S3 of REVISAO-c1b. The usage read of a run is not reused across a lifecycle step: an
+// account that runs out while a slow command of the run (here prepare_cmd) runs is seen by the demand command at the
+// run's end. The harness's usage read returns the SAME mutable Set (so a mutation leaks into a cached read); the real
+// read (usageLimitedSessions) returns a new Set each time, which these tests reproduce by assigning h.limited.
+describe("c1c T-005481 (T-005758): the demand command reads the usage limit after the run's lifecycle steps (S3)", () => {
+  let h: Harness;
+
+  beforeEach(() => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    h = new Harness();
+  });
+  afterEach(async () => {
+    await h.executor.stop();
+    h.db.close();
+    vi.useRealTimers();
+  });
+
+  /** The executor's own effects (the object startup hands it), so a test can make one command slow. */
+  const effectsOf = (x: Harness) => (x.executor as unknown as { deps: { effects: SeatPoolEffects } }).deps.effects;
+
+  it("S3: a parked seat whose account runs out while prepare_cmd runs (after the run's dispatch read the usage) says null to demand_cmd", async () => {
+    h.register({ ...BASE, max: 5, ...ON, demand_cmd: { argv: ["demand"] }, prepare_cmd: { argv: ["prepare"] } });
+    h.demandDesired = 3;
+    const p = h.poolSeat("dev.impl-s1", "background");
+    await h.park(p);
+    const w = h.poolSeat("dev.impl-s2", "background");
+    await h.park(w);
+    // A seat the pool added and has not started: the run's launch runs prepare_cmd for it.
+    const s = h.addSeat("dev.impl-s3", "idle");
+    h.endSession(s);
+    const added = h.slots.insert({ poolJobId: h.jobId, logicalId: s.logicalId, nodeId: s.nodeId, phase: "added", intent: null, opId: `op-${s.logicalId}`, at: iso(T0) });
+    h.nowMs = T0 + 61_000;
+    const b = await h.row(MODEL);
+    h.nowMs = T0 + 200_000;
+    const dispatch = planSeatPool(h.spec(), h.state(), h.nowMs, 600_000).intents.find((i) => i.kind === "dispatch")!;
+    expect(dispatch).toMatchObject({ kind: "dispatch", qitemId: b, mode: "parked" });
+    const witness = dispatch.kind === "dispatch" && dispatch.slotId === p.slotId ? w : p;
+    // Control: before its account runs out, the witness is a parked seat that receives (so a null below is the limit).
+    expect(seatPoolCanReceive(h.spec(), h.state().slots.find((x) => x.sessionName === witness.session)!, h.nowMs)).toBe("parked");
+
+    const effects = effectsOf(h);
+    const run = effects.runCommand;
+    effects.runCommand = async (command, env, signal) => {
+      if (command.argv[0] === "prepare") {
+        await new Promise((r) => setTimeout(r, 20)); // a slow prepare: the account runs out while it runs
+        h.limited = new Set([witness.session]);
+      }
+      return run(command, env, signal);
+    };
+    h.limitedReads = 0;
+    await h.submit([dispatch, { kind: "launch", slotId: added.slotId }]);
+
+    expect(h.calls).toContain("run prepare");
+    expect(h.notes(DISPATCHED)).toHaveLength(1);
+    expect(h.demandSlots.at(-1)!.find((x) => x.session === witness.session)!.receives).toBeNull();
+    // Read at the dispatch and again after the launch: the launch's await invalidates the run's read.
+    expect(h.limitedReads).toBe(2);
+  });
+
+  it("S3: a run with no lifecycle step between the dispatch and the demand command still reads the usage once", async () => {
+    h.register({ ...BASE, max: 5, ...ON, demand_cmd: { argv: ["demand"] } });
+    h.demandDesired = 2;
+    const p = h.poolSeat("dev.impl-s1", "background");
+    await h.park(p);
+    const w = h.poolSeat("dev.impl-s2", "background");
+    await h.park(w);
+    h.nowMs = T0 + 61_000;
+    await h.row(MODEL);
+    h.nowMs = T0 + 200_000;
+    const dispatch = planSeatPool(h.spec(), h.state(), h.nowMs, 600_000).intents.find((i) => i.kind === "dispatch")!;
+    h.limitedReads = 0;
+    await h.submit([dispatch]);
+    expect(h.notes(DISPATCHED)).toHaveLength(1);
+    expect(h.limitedReads).toBe(1);
+  });
+});
