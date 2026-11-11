@@ -170,9 +170,11 @@ While any seat of the pool is out of usage (its provider account reports the lim
 pool adds no seat and launches none, neither a stopped seat nor one it added and hasn't started, and records
 `usage_limit`; a seat added but not launched waits until the limit lifts. A run reads usage again just before each add,
 launch and relaunch, so a limit that appears after the plan, or while `prepare_cmd` runs, holds the seat too. It also
-reads the seats out of usage once, at its first move or `demand_cmd`: a seat whose account ran out since the plan takes
-no row (a free one is left to the next plan with no entry) and `receives` says `null` for it, with or without
-`dispatch_to_parked`. Under
+reads the seats out of usage at its first move or `demand_cmd`, and again after each of its lifecycle steps (an add,
+launch, relaunch, escalation, drain, removal or reap: every step that waits on an effect, which can take
+minutes), never reusing a read across one: a seat whose
+account ran out since the plan, or while an earlier step of the run ran, takes no row (a free one is left to the next
+plan with no entry) and `receives` says `null` for it, with or without `dispatch_to_parked`. Under
 `drain`, nothing is moved or woken, even a move or a wake planned before `drain` was set.
 
 ## Adding and removing a seat
