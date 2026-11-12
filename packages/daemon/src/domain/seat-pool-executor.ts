@@ -266,6 +266,9 @@ export interface SeatPoolStateReaderDeps {
   /** The host's load, read for a spec whose `dispatch_to_parked` sets `parked_max_load_per_cpu_percent`, so the plan
    *  holds a parked seat back as the executor's recheck would (SeatPoolState.hostLoadPerCpuPercent). Absent: not read. */
   hostSample?(): HostSample;
+  /** Why a seat is busy with heavy local work (readSeatPoolBusySessions), null when it is not, undefined when it was not
+   *  read. Asked only for a spec whose `dispatch_to_parked` sets `busy_processes`; absent, no seat is held back. */
+  busyProcess?(sessionName: string): string | null | undefined;
 }
 
 /** load1 per CPU, in percent; null when the host gives no reading. */
@@ -293,6 +296,11 @@ function readPendingRows(deps: SeatPoolStateReaderDeps, sessions: string[]): Sea
     qitemId: row.qitem_id, destination: sessionOf.get(row.destination_session)!, waitingSince: row.since,
     tags: row.tags ? JSON.parse(row.tags) as string[] : [],
   }));
+}
+
+/** The view's `busyProcess`, only when it was read. */
+function busyOf(busy: string | null | undefined): { busyProcess?: string | null } {
+  return busy === undefined ? {} : { busyProcess: busy };
 }
 
 /** The pool's state as the planner sees it. */
@@ -324,6 +332,7 @@ export function readSeatPoolState(deps: SeatPoolStateReaderDeps, job: { jobId: s
   // dispatch_to_parked: the view gains what seatPoolCanReceive reads for a parked seat. Without the key the view is the
   // one from before it, field for field.
   const parkedRule = job.spec.dispatchToParked !== undefined;
+  const busyRule = parkedRule && (job.spec.dispatchToParked?.busyProcesses?.length ?? 0) > 0 && deps.busyProcess;
   const slots = deps.slots.listOpen(job.jobId).map((slot): SeatPoolSlotView => {
     const present = slot.nodeId !== null && nodeExists(slot.nodeId);
     const state = present ? deps.seatState(slot.nodeId!) : null;
@@ -348,6 +357,7 @@ export function readSeatPoolState(deps: SeatPoolStateReaderDeps, job: { jobId: s
         ? { atPrompt: state?.activity === "idle-at-prompt" && state.needsInput.count === 0, backgroundWork: !!state?.backgroundWork }
         : {}),
       ...(facts?.parked ? { parked: facts.parked } : {}),
+      ...busyOf(busyRule && present ? deps.busyProcess!(sessionName) : undefined),
     };
   });
   const adoptable = job.spec.adopt.flatMap((logicalId) => {
@@ -559,6 +569,10 @@ export interface SeatPoolExecutorDeps {
    *  read before a row moves and before the demand command, so neither gives a row to a seat the plan would not.
    *  Absent: none. */
   usageLimited?(): Promise<ReadonlySet<string>>;
+  /** For a spec whose `dispatch_to_parked` sets `busy_processes`: why each seat the plan would give a parked 2nd row is
+   *  busy with heavy local work, or null (readSeatPoolBusySessions), read just before a parked row moves and before the
+   *  demand command. A seat not in the map was not read. Absent: no seat is held back. */
+  busySessions?(job: { jobId: string; targetSession: string; spec: SeatPoolSpec }): Promise<ReadonlyMap<string, string | null>>;
   effects: SeatPoolEffects;
   /** The daemon's room for seat launches, shared by every pool. Absent: no limit. */
   launchBudget?: LaunchBudget;
@@ -619,6 +633,22 @@ const ROW_MOVED_ON = new Set(["fallback_state_mismatch", "fallback_destination_m
 /** An unclaim refused because the row was closed or released since it was read: the move that follows decides. */
 const UNCLAIM_MOVED_ON = new Set(["qitem_not_in_progress", "qitem_not_found"]);
 const NO_SESSIONS: ReadonlySet<string> = new Set();
+
+/** The busy seats as the executor read them just before a move or the demand command (busyNow): not read, read, or a
+ *  read that failed, which holds back every parked seat. */
+type BusyRead = { notRead: true } | { read: ReadonlyMap<string, string | null> } | { failed: string };
+const NOT_READ: BusyRead = { notRead: true };
+
+/** The slot as busyNow read it: its `busyProcess` from the read, or the failure for every seat; unchanged when not
+ *  read. A seat the read left out (it was not parked when the read picked its seats, and is parked again now) counts as
+ *  not read, which holds it back as a failed read does. */
+function withBusy(slot: SeatPoolSlotView, busy: BusyRead): SeatPoolSlotView {
+  if ("failed" in busy) return { ...slot, busyProcess: busy.failed };
+  if ("read" in busy) {
+    return { ...slot, busyProcess: busy.read.has(slot.sessionName) ? busy.read.get(slot.sessionName)! : "busy processes not read for this seat" };
+  }
+  return slot;
+}
 const holdsWork = (slot: SeatPoolSlotView) => slot.openRows > 0 || slot.heldMessages > 0;
 /** A picture of a seat's open rows: each row's state and claim time, by id. */
 const rowPicture = (rows: ReadonlyArray<{ qitemId: string; state: string; claimedAt?: string | null }>): Map<string, string> =>
@@ -768,6 +798,18 @@ export class SeatPoolExecutor {
     return run.usageLimited;
   }
 
+  /** The busy seats read now, only for a spec whose `dispatch_to_parked` sets `busy_processes`. A read that throws
+   *  holds back every parked seat (failed), as an unreadable table does in readSeatPoolBusySessions. */
+  private async busyNow(jobId: string): Promise<BusyRead> {
+    const job = this.deps.readJob(jobId);
+    if (!job?.spec || !(job.spec.dispatchToParked?.busyProcesses?.length) || !this.deps.busySessions) return NOT_READ;
+    try {
+      return { read: await this.deps.busySessions({ jobId, targetSession: job.targetSession, spec: job.spec }) };
+    } catch (error) {
+      return { failed: `busy processes not read: ${error instanceof Error ? error.message : String(error)}` };
+    }
+  }
+
   /** The host's load per CPU read now, only when the spec's parked limit is set (null otherwise or with no reading). */
   private parkedLoadNow(spec: SeatPoolSpec): number | null {
     return (spec.dispatchToParked?.parkedMaxLoadPerCpuPercent ?? 0) > 0 ? hostLoadPerCpuPercent((this.deps.hostSample ?? sampleHost)()) : null;
@@ -894,7 +936,10 @@ export class SeatPoolExecutor {
       } else if (intent.kind === "unlink") {
         this.unlink(jobId, run, intent.slotId);
       } else if (intent.kind === "dispatch") {
-        if (!this.dispatch(jobId, run, intent, await this.usageLimitedNow(run))) return;
+        const usageLimited = await this.usageLimitedNow(run);
+        // Only a parked 2nd row reads the processes, and every time (no cache: a suite can start between two moves).
+        const busy = intent.mode === "parked" ? await this.busyNow(jobId) : NOT_READ;
+        if (!this.dispatch(jobId, run, intent, usageLimited, busy)) return;
       } else if (intent.kind === "reap") {
         if (!(await this.reap(jobId, run, intent.slotId))) return;
       } else if (!(await this.wake(jobId, run, intent))) return;
@@ -1496,16 +1541,25 @@ export class SeatPoolExecutor {
    * account ran out of usage since the plan (`usageLimited`, read just before this) is a seat that changed, as the plan
    * would read it.
    */
-  private dispatch(jobId: string, run: Run, intent: Extract<SeatPoolIntent, { kind: "dispatch" }>, usageLimited: ReadonlySet<string>): boolean {
+  private dispatch(
+    jobId: string, run: Run, intent: Extract<SeatPoolIntent, { kind: "dispatch" }>, usageLimited: ReadonlySet<string>, busy: BusyRead,
+  ): boolean {
     const ctx = this.fresh(jobId, run);
     if (!ctx) return false;
     if (ctx.spec.drain) return true;
-    const slot = ctx.state.slots.find((s) => s.slotId === intent.slotId);
-    if (!slot) return true;
-    const mode = seatPoolReceives(ctx.spec, slot, this.now().getTime(), { usageLimited: usageLimited.has(slot.sessionName) });
+    const read = ctx.state.slots.find((s) => s.slotId === intent.slotId);
+    if (!read) return true;
+    const slot = withBusy(read, busy);
+    const nowMs = this.now().getTime();
+    const limited = usageLimited.has(slot.sessionName);
+    const mode = seatPoolReceives(ctx.spec, slot, nowMs, { usageLimited: limited });
     const base = { qitemId: intent.qitemId, from: intent.from, to: slot.sessionName };
     if (intent.mode !== "parked") {
       if (mode !== "free") return true;
+    } else if (mode === null && slot.busyProcess && seatPoolReceives(ctx.spec, { ...read, busyProcess: null }, nowMs, { usageLimited: limited }) === "parked") {
+      // Parked as the plan read it, but busy with heavy local work under its pane (T-006090).
+      this.record(jobId, false, "seat_pool_dispatch_skipped", { ...base, code: "parked_busy", busyProcess: slot.busyProcess });
+      return true;
     } else if (mode === null) {
       this.record(jobId, false, "seat_pool_dispatch_skipped", { ...base, code: "parked_changed" });
       return true;
@@ -1647,6 +1701,7 @@ export class SeatPoolExecutor {
   private async refreshDemand(jobId: string, run: Run): Promise<void> {
     if (run.controller.signal.aborted || !this.deps.readJob(jobId)?.spec?.demandCmd) return;
     const usageLimited = await this.usageLimitedNow(run);
+    const busy = await this.busyNow(jobId);
     const ctx = this.fresh(jobId, run);
     if (!ctx?.spec.demandCmd) return;
     // `receives`: how each seat may take a row now, by the same function the planner and the dispatch ask, with the same
@@ -1655,7 +1710,7 @@ export class SeatPoolExecutor {
     const loadPerCpuPercent = this.parkedLoadNow(ctx.spec);
     const slots = ctx.state.slots.map((slot) => ({
       session: seatSessionName(slot.logicalId, ctx.model.rigName), phase: slot.phase,
-      receives: seatPoolReceives(ctx.spec, slot, nowMs, { usageLimited: usageLimited.has(slot.sessionName), loadPerCpuPercent }),
+      receives: seatPoolReceives(ctx.spec, withBusy(slot, busy), nowMs, { usageLimited: usageLimited.has(slot.sessionName), loadPerCpuPercent }),
     }));
     const result = await this.deps.effects.runCommand(ctx.spec.demandCmd, this.commandEnv(ctx, { OPENRIG_SEAT_POOL_SLOTS: JSON.stringify(slots) }), run.controller.signal);
     if (run.controller.signal.aborted) return;
