@@ -1,0 +1,81 @@
+{
+ "session": "qualidade-qa-7@fabrica",
+ "panePid": 1331572,
+ "rows": [
+  {
+   "pid": 58473,
+   "ppid": 1350231,
+   "command": "/bin/bash -c source /home/bruno/.claude-proxy/shell-snapshots/snapshot-bash-1794401415765-sm7vm8.sh 2>/dev/null || true && shopt -u extglob 2>/dev/null || true && { \\builtin unalias -- 'which'; \\builtin unset -f -- 'which'; } >/dev/null 2>&1 || true && { \\builtin unalias -- 'unsetenv'; \\builtin unset -f -- 'unsetenv'; } >/dev/null 2>&1 || true && eval 'cd ~/.local/state/qualidade-qa-7/stage/pl2 &&"
+  },
+  {
+   "pid": 58489,
+   "ppid": 58473,
+   "command": "bash /home/bruno/dev/setup/ops/bin/suite-flock nice -n 10 bash prova-pl2-mutdev.sh"
+  },
+  {
+   "pid": 59486,
+   "ppid": 58489,
+   "command": "flock 6"
+  },
+  {
+   "pid": 1331572,
+   "ppid": 2460,
+   "command": "/bin/bash -l"
+  },
+  {
+   "pid": 1350231,
+   "ppid": 1331572,
+   "command": "/home/bruno/.local/bin/claude [args omitted]"
+  },
+  {
+   "pid": 1352557,
+   "ppid": 1350231,
+   "command": "node /home/bruno/.local/share/context7-mcp/node_modules/.bin/context7-mcp"
+  },
+  {
+   "pid": 2461655,
+   "ppid": 1350231,
+   "command": "/bin/bash -c source /home/bruno/.claude-proxy/shell-snapshots/snapshot-bash-1794401415765-sm7vm8.sh 2>/dev/null || true && shopt -u extglob 2>/dev/null || true && { \\builtin unalias -- 'which'; \\builtin unset -f -- 'which'; } >/dev/null 2>&1 || true && { \\builtin unalias -- 'unsetenv'; \\builtin unset -f -- 'unsetenv'; } >/dev/null 2>&1 || true && eval 'cd ~/.local/state/qualidade-qa-7/stage/congel"
+  },
+  {
+   "pid": 2461664,
+   "ppid": 2461655,
+   "command": "bash /home/bruno/dev/setup/ops/bin/suite-flock nice -n 10 bash congelar-lugar.sh novo-6"
+  },
+  {
+   "pid": 2462228,
+   "ppid": 2461664,
+   "command": "flock 6"
+  },
+  {
+   "pid": 2466708,
+   "ppid": 1350231,
+   "command": "/bin/bash -c source /home/bruno/.claude-proxy/shell-snapshots/snapshot-bash-1794401415765-sm7vm8.sh 2>/dev/null || true && shopt -u extglob 2>/dev/null || true && { \\builtin unalias -- 'which'; \\builtin unset -f -- 'which'; } >/dev/null 2>&1 || true && { \\builtin unalias -- 'unsetenv'; \\builtin unset -f -- 'unsetenv'; } >/dev/null 2>&1 || true && eval 'cd ~/.local/state/qualidade-qa-7/stage/congel"
+  },
+  {
+   "pid": 2466714,
+   "ppid": 2466708,
+   "command": "bash /home/bruno/dev/setup/ops/bin/suite-flock nice -n 10 bash congelar-lugar.sh novo-7"
+  },
+  {
+   "pid": 2467149,
+   "ppid": 2466714,
+   "command": "flock 6"
+  },
+  {
+   "pid": 2470808,
+   "ppid": 1350231,
+   "command": "/bin/bash -c source /home/bruno/.claude-proxy/shell-snapshots/snapshot-bash-1794401415765-sm7vm8.sh 2>/dev/null || true && shopt -u extglob 2>/dev/null || true && { \\builtin unalias -- 'which'; \\builtin unset -f -- 'which'; } >/dev/null 2>&1 || true && { \\builtin unalias -- 'unsetenv'; \\builtin unset -f -- 'unsetenv'; } >/dev/null 2>&1 || true && eval 'cd ~/.local/state/qualidade-qa-7/stage/congel"
+  },
+  {
+   "pid": 2470820,
+   "ppid": 2470808,
+   "command": "bash /home/bruno/dev/setup/ops/bin/suite-flock nice -n 10 bash congelar-lugar.sh novo-8"
+  },
+  {
+   "pid": 2471298,
+   "ppid": 2470820,
+   "command": "flock 6"
+  }
+ ]
+}
