@@ -156,6 +156,7 @@ async function driveEveryMethod(): Promise<RunCall[]> {
   await a.readAllPaneProcesses();
   await a.readPaneLastActivity(SESSION);
   await a.listClients();
+  await a.lastClientActivity(SESSION);  // T-006631: the client activity read before an automatic paste
   await a.switchClient("/dev/ttys001", SESSION);
   // A runtime switch's exchange: two session-id reads, then the guarded if-shell swap (nested quoting); and its env writes.
   await a.swapRuntimeSwitchPanes({ nodeId: "n1", stagingSession: "staging'q a", canonicalSession: SESSION, canonicalPane: "%1", stagedPane: "%1" });
