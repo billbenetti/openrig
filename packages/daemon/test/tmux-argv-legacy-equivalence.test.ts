@@ -155,6 +155,7 @@ async function driveEveryMethod(): Promise<RunCall[]> {
   await a.readAllSessionWindowActivity();
   await a.readAllSessionWindows();
   await a.readAllPaneProcesses();
+  await a.listAllPanePids();
   await a.readPaneLastActivity(SESSION);
   await a.listClients();
   await a.listSessionClientTerminals(SESSION);
