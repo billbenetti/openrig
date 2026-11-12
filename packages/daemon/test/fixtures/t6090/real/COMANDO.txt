@@ -8,3 +8,8 @@ python3 -I capturar-arvore.py coordenacao-coord-3@fabrica > coord-3-pane-tree.js
 python3 -I -c "import sqlite3,json;c=sqlite3.connect('file:/home/bruno/.openrig/openrig.sqlite?mode=ro',uri=True);print(json.dumps([dict(zip(('ts','state','note','actor'),r)) for r in c.execute(\"select ts,state,substr(transition_note,1,160),actor_session from queue_transitions where qitem_id='fc-6e0aaa3b8a52-1794431600' order by transition_id\")],indent=1))" > qa-s10-parked-row.transitions.json
 # 3) Processos suite-flock/congelar-eval órfãos (fora da árvore de qualquer pane) com o TMUX_PANE herdado e a sessão dona do pane agora:
 python3 -I capturar-orfao.py > orfao-tmux-pane.json
+# 4) O ambiente de execução (T-003643): o daemon do OpenRig (pid em ~/.openrig/daemon.json) que roda o seat-pool e lê
+#    /proc e o tmux; só os NOMES das variáveis, nunca o valor (o PATH é o único valor gravado):
+P=$(python3 -I -c "import json;print(json.load(open('/home/bruno/.openrig/daemon.json'))['pid'])")
+{ echo "usuario=$(ps -o user= -p $P)"; echo "host=$(hostname)"; echo "daemon_pid=$P"; echo "PATH=$(tr '\0' '\n' < /proc/$P/environ | grep -E '^PATH=' | cut -d= -f2-)";
+  echo "tmux_socket=$(tmux display-message -p '#{socket_path}')"; echo "env_nomes:"; tr '\0' '\n' < /proc/$P/environ | grep -oE '^[A-Z_][A-Z0-9_]*=' | sort; } > ambiente-daemon.txt
