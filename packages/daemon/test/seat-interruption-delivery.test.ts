@@ -137,6 +137,21 @@ describe("queue wakes: who triggered the wake decides its source", () => {
     await vi.waitFor(() => expect(f.queue.getById(peer.qitemId)!.lastNudgeResult).toBe("retained:typing_guard"));
   });
 
+  it("at queue-only, an urgent row's auto-unpark wake is OpenRig's own and is held, never typed (T-006631 B1)", async () => {
+    const f = fixture();
+    const blocker = await f.queue.create({ sourceSession: "peer@test", destinationSession: "peer@test", body: "Vendor reply", nudge: false });
+    const parked = await f.queue.create({ sourceSession: "peer@test", destinationSession: seat, body: "Prod fix after the vendor replies", nudge: false, priority: "urgent" });
+    await f.queue.update({ qitemId: parked.qitemId, actorSession: seat, state: "blocked", blockedOn: blocker.qitemId } as never);
+    await f.level("queue-only");
+    await f.queue.update({ qitemId: blocker.qitemId, actorSession: "peer@test", state: "done", closureReason: "no-follow-on" } as never);
+    await vi.waitFor(() => expect(f.held().some(h => h.body.includes(`parked qitem ${parked.qitemId}`))).toBe(true));
+    expect(f.typed.join("\n")).not.toContain(parked.qitemId);
+    // A deliberate send, urgent or not, still types at queue-only.
+    const urgent = await f.transport.send(seat, "From: lead@test — the build is red", { actorSession: "lead@test", urgent: { by: "lead@test" } });
+    expect(urgent.outcome === "retained" || (urgent as { status?: string }).status === "retained").toBe(false);
+    expect(f.typed.at(-1)).toContain("Urgent (marked by lead@test):");
+  });
+
   it("a row OpenRig creates itself (a stuck-sweep finding) wakes as OpenRig's: typed at openrig-urgent, held at sends-only", async () => {
     const f = fixture();
     await f.level("openrig-urgent");

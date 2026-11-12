@@ -492,16 +492,17 @@ export class TmuxAdapter {
     }, target => this.lastClientActivity(target.session));
   }
 
-  /** When a tmux client attached to this session last had a key (epoch ms), or null when none is attached or tmux
-   *  can't say. Read-only; the guard uses it so an automatic paste waits while a person is typing there (T-006631). */
+  /** When a tmux client attached to this session last had a key (epoch ms, whole seconds), or null when no client is
+   *  attached. A tmux failure or an unreadable row throws: the guard then holds the paste rather than take it for "nobody typing". Read-only;
+   *  the guard uses it so an automatic paste waits while a person is typing there (T-006631). */
   async lastClientActivity(session: string): Promise<number | null> {
-    try {
-      const exact = exactTarget(session, "session");
-      const output = await this.run(["tmux", "list-clients", "-t", exact, "-F", "#{client_activity}"],
-        `tmux list-clients -t ${shellQuote(exact)} -F "#{client_activity}"`);
-      const seconds = output.split("\n").map(line => Number(line.trim())).filter(n => Number.isFinite(n) && n > 0);
-      return seconds.length ? Math.max(...seconds) * 1000 : null;
-    } catch { return null; }
+    const exact = exactTarget(session, "session");
+    const output = await this.run(["tmux", "list-clients", "-t", exact, "-F", "#{client_activity}"],
+      `tmux list-clients -t ${shellQuote(exact)} -F "#{client_activity}"`);
+    const rows = output.split("\n").map(line => line.trim()).filter(line => line !== "");
+    // A row that isn't a key time is a client whose activity can't be known: that is not "nobody typed".
+    if (rows.some(row => !/^[1-9]\d*$/.test(row))) throw new Error(`tmux list-clients: unreadable client_activity for ${session}`);
+    return rows.length ? Math.max(...rows.map(Number)) * 1000 : null;
   }
   private readonly freshProbes = new Map<string, string>();
   private readonly freshManaged = new Map<string, {nodeId: string; pane: string}>();
