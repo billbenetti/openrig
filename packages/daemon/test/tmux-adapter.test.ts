@@ -29,6 +29,21 @@ function mockExec(responses: Record<string, { stdout?: string; error?: Error }>)
   };
 }
 
+describe("TmuxAdapter.lastClientActivity (T-006631)", () => {
+  const activity = (stdout: string) => adapterFor(mockExec({ "list-clients": { stdout } })).lastClientActivity("op@kernel");
+  it("is the latest client key in milliseconds, and null with no client", async () => {
+    expect(await activity("1790000100\n1790000105\n")).toBe(1790000105000);
+    expect(await activity("")).toBeNull();
+    expect(await activity("\n")).toBeNull();
+  });
+  it("throws on a row that isn't a key time, alone or next to a readable one", async () => {
+    for (const stdout of ["abc\n", "0\n", "1790000100x\n", "1790000105\nabc\n"]) await expect(activity(stdout)).rejects.toThrow();
+  });
+  it("throws when tmux fails, so the guard holds instead of reading 'nobody typed'", async () => {
+    await expect(adapterFor(mockExec({ "list-clients": { error: new Error("command timed out") } })).lastClientActivity("op@kernel")).rejects.toThrow();
+  });
+});
+
 describe("TmuxAdapter", () => {
   it("starts only an empty terminal server and reconciles repeated requests", async () => {
     let live = false;
