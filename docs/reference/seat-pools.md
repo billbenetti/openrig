@@ -42,12 +42,15 @@ context:
     max_claim_age_s: 21600          # how long ago the seat may have taken the parked row (600..172800, default 21600)
     allow_background_work: true     # false: a seat with a background shell does not receive (default true)
     parked_max_load_per_cpu_percent: 0   # above this load per CPU (percent) a parked seat gets no row; 0: not checked (default 0)
+    refuse_gates: [congelar, suite-flock]  # a parked row whose gate contains one of these is no wait for a 2nd row (default: none)
+    busy_processes: [suite-flock]   # a seat with one of these programs running under its pane gets no 2nd row (default: none)
 ```
 
 Registration and `rig watchdog update --spec` refuse a spec with an unknown field, `max` below `min`, a relative
 `cwd_template` or one without `{slot}`, a command that isn't an argv, an `escalation_owner` that isn't a seat
 address (`<session>@<rig>`), or a `dispatch_to_parked` that isn't an object, has an unknown field or a value out of its
-range (`dispatch_to_parked: {}` turns it on with every default). Commands run without a shell, with the daemon's
+range (`dispatch_to_parked: {}` turns it on with every default; `refuse_gates` and `busy_processes` are lists of at most
+32 strings of 1 to 128 characters with no whitespace, and a `busy_processes` entry has no `/`). Commands run without a shell, with the daemon's
 environment plus:
 
 | Variable | Set for | Value |
@@ -57,7 +60,7 @@ environment plus:
 | `OPENRIG_SEAT_POOL_SLOT` | `prepare_cmd`, `release_cmd`, `reap_cmd`, `remove_cmd` | the seat's session name |
 | `OPENRIG_SEAT_POOL_SLOT_CWD` | `prepare_cmd` | the seat's working directory |
 | `OPENRIG_SEAT_POOL_RELEASE_REASON` | `release_cmd` | why it is asked: `idle` (a free seat drained, by `drain` or by `idle_grace_s`), `drain-deadline` (the forced pass at a drain's deadline) or `reap` (a seat whose session is gone) |
-| `OPENRIG_SEAT_POOL_SLOTS` | `demand_cmd` | JSON list of `{session, phase, receives}` for the pool's seats; `receives` is how the seat may take a waiting row now: `"free"`, `"parked"` (see [A seat parked on its own wait](#a-seat-parked-on-its-own-wait)) or `null`, as the plan reads it: a seat out of provider usage, and a parked seat while the load is above `parked_max_load_per_cpu_percent`, say `null` |
+| `OPENRIG_SEAT_POOL_SLOTS` | `demand_cmd` | JSON list of `{session, phase, receives}` for the pool's seats; `receives` is how the seat may take a waiting row now: `"free"`, `"parked"` (see [A seat parked on its own wait](#a-seat-parked-on-its-own-wait)) or `null`, as the plan reads it: a seat out of provider usage, a parked seat while the load is above `parked_max_load_per_cpu_percent`, and a parked seat with a `busy_processes` program running, say `null` |
 
 A command that runs past `timeout_s` is killed and counts as failed. Each command has its own `timeout_s` (default 60),
 so a slow `release_cmd` can be given longer than `demand_cmd`; `release_cmd` runs under the seat's lifecycle lease,
@@ -132,7 +135,20 @@ CI run it left in the background) may receive one row more, after the free seats
 - that row's current wake is a timer of at most `max_wake_s`, still armed and live (a park timer fires once: after it
   fired, the seat stops counting as parked until it parks again);
 - the seat armed that wake itself (a note on the row by another seat doesn't change it, a wake armed by another seat
-  does), after it took the row, by claim or by `--state in-progress`, at most `max_claim_age_s` ago.
+  does), after it took the row, by claim or by `--state in-progress`, at most `max_claim_age_s` ago;
+- with `refuse_gates`, that row's gate contains none of its strings: a wait that is itself heavy local work (an eval
+  being frozen, a suite queued for the host's lock) is not one the seat takes a 2nd row through, and a seat given one
+  there hands it back;
+- with `busy_processes`, no process of the seat runs one of those programs: a process under its pane (its descendants,
+  read from the process table), or one whose inherited `TMUX_PANE` is the seat's pane (started in the background and
+  reparented out of the pane's tree when its parent left; on Linux, only matching processes have their environment
+  read). The program is the first word of the command after the usual wrappers (`bash`, `sh`, `env`, `nice`,
+  `timeout`, `nohup`, `python3`, `node`…), options, `NAME=value` and numbers, compared by base name: `bash /x/suite-flock
+  …` and `nice -n 10 /x/congelar-eval` match `suite-flock` and `congelar-eval`, `grep suite-flock …` does not, and an
+  option's value given as a separate word (`timeout -s KILL 600 …`) is a miss. A wrapper name is refused as an entry.
+  The table is read when the plan is made, again just before each parked row moves and before the demand command, only
+  for the seats that would be parked; a table or pane that cannot be read within 5 seconds, or a parked seat the read
+  left out, holds the seat back.
 
 A seat with two open rows never receives, so one row more is the ceiling. The free seats get rows first, in their usual
 order, then the parked ones by id. A parked seat still counts as holding work: it is never drained, and the row it
@@ -143,7 +159,8 @@ blocked at the seat with its own timer. With `parked_max_load_per_cpu_percent` s
 before the move the executor asks the rule again, with the provider usage and the load read then: a seat that is no
 longer parked, or whose account ran out of usage, keeps nothing (`seat_pool_dispatch_skipped`, `code: parked_changed`;
 a free seat that changed is left to the next plan with no entry), and a load that rose above the limit since the plan
-gives the parked seat no row (`code: parked_load`). The move's note and the row's resolution say
+gives the parked seat no row (`code: parked_load`), and so does a busy process read then (`code: parked_busy`, with
+`busyProcess`: the program and its pid, or why the processes could not be read). The move's note and the row's resolution say
 `<seat> was parked on <gate> (2nd row)`, and `seat_pool_dispatched` carries `mode` (`free` or `parked`) and, for a
 parked seat, `parkedQitemId`.
 

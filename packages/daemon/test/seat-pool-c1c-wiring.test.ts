@@ -33,7 +33,8 @@ describe("c1c wiring pin: startup gives the seat pool the host's load and the us
   it("S1: the executor reads the usage-limited sessions the plan reads", () => {
     expect(executor()).toMatch(/^\s*usageLimited: usageLimitedSessions,\s*$/m);
     // The plan's read, the same function: the recheck and receives see the limit the plan saw.
-    expect(src).toMatch(/makeSeatPoolPolicy\(\{\s*readState: async \(job\) => readPoolState\(job, await usageLimitedSessions\(\)\),/);
+    // T-006090: the plan reads the usage, then the busy seats with that same set, and gives both to the reader.
+    expect(src).toMatch(/makeSeatPoolPolicy\(\{\s*readState: async \(job\) => \{\s*const usageLimited = await usageLimitedSessions\(\);\s*return readPoolState\(job, usageLimited, await busyPoolSessions\(job, usageLimited\)\);/);
     // The reader turns that set into its usageLimited dep (without it, no seat is ever out of usage).
     expect(reader()).toMatch(/^\s*usageLimited: usageLimited \? \(sessionName\) => usageLimited\.has\(sessionName\) : undefined,\s*$/m);
   });

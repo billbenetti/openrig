@@ -162,7 +162,9 @@ import { resolveWorkflowHumanDestination } from "./domain/workflow-human-destina
 import { makeWorkflowKeepalivePolicy } from "./domain/policies/workflow-keepalive.js";
 import { makeIdleGateQitemPolicy } from "./domain/policies/idle-gate-qitem.js";
 import { makeParkedOwnerConsumerPolicy, makeRigAnchor, PARKED_OWNER_POLICY_NAME } from "./domain/policies/parked-owner-consumer.js";
-import { makeSeatPoolPolicy, parseSeatPoolSpec, seatPoolOutOfUsage, type SeatPoolSpec } from "./domain/policies/seat-pool.js";
+import { makeSeatPoolPolicy, parseSeatPoolSpec, seatPoolCanReceive, seatPoolOutOfUsage, type SeatPoolSpec } from "./domain/policies/seat-pool.js";
+import { readSeatPoolBusySessions } from "./domain/seat-pool-busy.js";
+import { readProcessTable } from "./domain/process-table.js";
 import {
   readSeatPoolState, runSeatPoolCommand, SeatPoolExecutor, SeatPoolSlots, seatPoolQueueEffects, slotMemberFragment,
 } from "./domain/seat-pool-executor.js";
@@ -2370,7 +2372,9 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
     const seatPoolStops = new SeatLifecycleService({ db, rigRepo, sessionRegistry, eventBus, tmuxAdapter, nodeLauncher });
     const latestSession = (nodeId: string) =>
       db.prepare("SELECT id, status FROM sessions WHERE node_id = ? ORDER BY id DESC LIMIT 1").get(nodeId) as { id: string; status: string } | undefined;
-    const readPoolState = (job: { jobId: string; targetSession: string; spec: SeatPoolSpec }, usageLimited?: ReadonlySet<string>) => readSeatPoolState({
+    const readPoolState = (
+      job: { jobId: string; targetSession: string; spec: SeatPoolSpec }, usageLimited?: ReadonlySet<string>, busy?: ReadonlyMap<string, string | null>,
+    ) => readSeatPoolState({
       db,
       slots: seatPoolSlots,
       openRows: (sessionName) => queueRepoInstance.listOpenObligations(sessionName, 500),
@@ -2386,7 +2390,40 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
       demand: (jobId) => seatPoolExecutor.demandSample(jobId),
       // Read only for a spec with dispatch_to_parked.parked_max_load_per_cpu_percent: the plan holds a parked seat back.
       hostSample: sampleHost,
+      // Read only for a spec with dispatch_to_parked.busy_processes: the seats busy with heavy local work (T-006090).
+      busyProcess: busy ? (sessionName) => busy.get(sessionName) : undefined,
     }, job);
+    // A seat's bound pane (`%12`), or null; the pid of the process its pane runs (the bound pane, or else the session's
+    // active pane).
+    const poolPaneId = (sessionName: string): string | null => (db.prepare(
+      `SELECT b.tmux_pane FROM sessions s JOIN bindings b ON b.node_id = s.node_id AND b.tmux_session = s.session_name
+        WHERE s.session_name = ? ORDER BY s.id DESC LIMIT 1`,
+    ).get(physicalSessionName(db, sessionName)) as { tmux_pane: string | null } | undefined)?.tmux_pane ?? null;
+    const poolPanePid = async (sessionName: string): Promise<number | null> =>
+      tmuxAdapter.getPanePid(poolPaneId(sessionName) ?? physicalSessionName(db, sessionName));
+    // The TMUX_PANE a process inherited, read from /proc (Linux); null elsewhere or when unreadable.
+    const processTmuxPane = (pid: number): string | null => {
+      if (process.platform !== "linux") return null;
+      try {
+        const found = fs.readFileSync(`/proc/${pid}/environ`, "latin1").split("\0").find((entry) => entry.startsWith("TMUX_PANE="));
+        return found ? found.slice("TMUX_PANE=".length) : null;
+      } catch {
+        return null;
+      }
+    };
+    // For a spec with dispatch_to_parked.busy_processes: the seats the plan would give a parked 2nd row, and why each is
+    // busy with heavy local work under its pane, or null. Undefined for any other spec (nothing read).
+    const busyPoolSessions = async (
+      job: { jobId: string; targetSession: string; spec: SeatPoolSpec }, usageLimited?: ReadonlySet<string>,
+    ): Promise<ReadonlyMap<string, string | null> | undefined> => {
+      const programs = job.spec.dispatchToParked?.busyProcesses;
+      if (!programs?.length) return undefined;
+      const nowMs = Date.now();
+      const candidates = readPoolState(job, usageLimited).slots.filter((slot) => seatPoolCanReceive(job.spec, slot, nowMs) === "parked");
+      return readSeatPoolBusySessions(candidates.map((slot) => slot.sessionName), programs, {
+        panePid: poolPanePid, paneId: poolPaneId, processPane: processTmuxPane, processes: readProcessTable,
+      });
+    };
     // The seats whose provider account is out of usage, as the wake ladder reads them: the plan reads them, and the run
     // again just before each add, launch and relaunch.
     const usageLimitedSessions = async (): Promise<ReadonlySet<string>> => {
@@ -2429,6 +2466,8 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
       outOfUsage: async (job) => seatPoolOutOfUsage(readPoolState(job, await usageLimitedSessions())),
       // The plan's own read: the dispatch recheck and the demand command's receives see the usage limit as the plan does.
       usageLimited: usageLimitedSessions,
+      // The busy seats read again just before a parked row moves and before the demand command (T-006090).
+      busySessions: async (job) => (await busyPoolSessions(job)) ?? new Map(),
       record: (jobId, entry) => {
         watchdogHistoryLogInstance.record({
           jobId, evaluatedAt: new Date().toISOString(), outcome: entry.failed ? "failed" : "skipped",
@@ -2551,7 +2590,10 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
         }),
         makeIdleGateQitemPolicy({ db, seatActivity: seatActivityService }),
         makeSeatPoolPolicy({
-          readState: async (job) => readPoolState(job, await usageLimitedSessions()),
+          readState: async (job) => {
+            const usageLimited = await usageLimitedSessions();
+            return readPoolState(job, usageLimited, await busyPoolSessions(job, usageLimited));
+          },
           submit: (jobId, intents) => seatPoolExecutor.submit(jobId, intents),
         }),
         // OPR.0.5.6.24 F-14: the parked-owner consumer — the WHOLE shipped
