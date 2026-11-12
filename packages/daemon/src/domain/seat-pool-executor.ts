@@ -9,6 +9,7 @@ import { FALLBACK_ACTOR, type PoolSeatRowFacts, type QueueRepository } from "./q
 import { OPENRIG_SENDER } from "../lib/pane-envelope.js";
 import type { Node } from "./types.js";
 import { sampleHost, type HostSample, type LaunchBudget, type LaunchTick } from "./launch-budget.js";
+import { readSeatPoolBusySessions, type SeatPoolBusyReadDeps } from "./seat-pool-busy.js";
 import {
   seatPoolLeftStopped,
   SEAT_POOL_DRAIN_ENDED,
@@ -18,6 +19,7 @@ import {
   SEAT_POOL_DRAIN_STARTED,
   SEAT_POOL_RELEASE_REASON_ENV,
   SEAT_POOL_RELEASE_RETRY_SECONDS,
+  seatPoolCanReceive,
   seatPoolParkedLoadOver,
   seatPoolReceives,
   seatPoolDrainEpisode,
@@ -305,6 +307,24 @@ function busyOf(busy: string | null | undefined): { busyProcess?: string | null 
   return busy === undefined ? {} : { busyProcess: busy };
 }
 
+/**
+ * For a spec whose `dispatch_to_parked` sets `busy_processes`: the seats that could take a row now (seatPoolCanReceive
+ * read without the processes: free, since T-006251 B1, or parked), and why each is busy with heavy local work, or null
+ * (readSeatPoolBusySessions, with the spec's `busy_orphan_max_age_s`). Undefined for any other spec: nothing is read.
+ * The daemon's busy read for the plan, the recheck before a move and the demand command (startup.ts).
+ */
+export function readSeatPoolBusyCandidates(
+  spec: SeatPoolSpec, slots: readonly SeatPoolSlotView[], nowMs: number, deps: SeatPoolBusyReadDeps, timeoutMs?: number,
+): Promise<ReadonlyMap<string, string | null>> | undefined {
+  const programs = spec.dispatchToParked?.busyProcesses;
+  if (!programs?.length) return undefined;
+  const candidates = slots.filter((slot) => seatPoolCanReceive(spec, slot, nowMs) !== null).map((slot) => slot.sessionName);
+  return readSeatPoolBusySessions(candidates, programs, deps, {
+    ...(timeoutMs !== undefined ? { timeoutMs } : {}),
+    ...(spec.dispatchToParked?.busyOrphanMaxAgeSeconds !== undefined ? { orphanMaxAgeSeconds: spec.dispatchToParked.busyOrphanMaxAgeSeconds } : {}),
+  });
+}
+
 /** The pool's state as the planner sees it. */
 export function readSeatPoolState(deps: SeatPoolStateReaderDeps, job: { jobId: string; targetSession: string; spec: SeatPoolSpec }): SeatPoolState {
   const { db } = deps;
@@ -573,9 +593,9 @@ export interface SeatPoolExecutorDeps {
    *  read before a row moves and before the demand command, so neither gives a row to a seat the plan would not.
    *  Absent: none. */
   usageLimited?(): Promise<ReadonlySet<string>>;
-  /** For a spec whose `dispatch_to_parked` sets `busy_processes`: why each seat the plan would give a parked 2nd row is
-   *  busy with heavy local work, or null (readSeatPoolBusySessions), read just before a parked row moves and before the
-   *  demand command. A seat not in the map was not read. Absent: no seat is held back. */
+  /** For a spec whose `dispatch_to_parked` sets `busy_processes`: why each seat the plan could give a row (free or
+   *  parked, readSeatPoolBusyCandidates) is busy with heavy local work, or null, read just before a row moves and before
+   *  the demand command. A seat not in the map was not read. Absent: no seat is held back. */
   busySessions?(job: { jobId: string; targetSession: string; spec: SeatPoolSpec }): Promise<ReadonlyMap<string, string | null>>;
   effects: SeatPoolEffects;
   /** The daemon's room for seat launches, shared by every pool. Absent: no limit. */
@@ -639,13 +659,13 @@ const UNCLAIM_MOVED_ON = new Set(["qitem_not_in_progress", "qitem_not_found"]);
 const NO_SESSIONS: ReadonlySet<string> = new Set();
 
 /** The busy seats as the executor read them just before a move or the demand command (busyNow): not read, read, or a
- *  read that failed, which holds back every parked seat. */
+ *  read that failed, which holds back every seat that could take a row (free or parked, T-006251). */
 type BusyRead = { notRead: true } | { read: ReadonlyMap<string, string | null> } | { failed: string };
 const NOT_READ: BusyRead = { notRead: true };
 
 /** The slot as busyNow read it: its `busyProcess` from the read, or the failure for every seat; unchanged when not
- *  read. A seat the read left out (it was not parked when the read picked its seats, and is parked again now) counts as
- *  not read, which holds it back as a failed read does. */
+ *  read. A seat the read left out (it could take no row when the read picked its seats, and can now) counts as not
+ *  read, which holds it back as a failed read does. */
 function withBusy(slot: SeatPoolSlotView, busy: BusyRead): SeatPoolSlotView {
   if ("failed" in busy) return { ...slot, busyProcess: busy.failed };
   if ("read" in busy) {
@@ -803,7 +823,7 @@ export class SeatPoolExecutor {
   }
 
   /** The busy seats read now, only for a spec whose `dispatch_to_parked` sets `busy_processes`. A read that throws
-   *  holds back every parked seat (failed), as an unreadable table does in readSeatPoolBusySessions. */
+   *  holds back every seat, free or parked (failed), as an unreadable table does in readSeatPoolBusySessions. */
   private async busyNow(jobId: string): Promise<BusyRead> {
     const job = this.deps.readJob(jobId);
     if (!job?.spec || !(job.spec.dispatchToParked?.busyProcesses?.length) || !this.deps.busySessions) return NOT_READ;
@@ -941,8 +961,9 @@ export class SeatPoolExecutor {
         this.unlink(jobId, run, intent.slotId);
       } else if (intent.kind === "dispatch") {
         const usageLimited = await this.usageLimitedNow(run);
-        // Only a parked 2nd row reads the processes, and every time (no cache: a suite can start between two moves).
-        const busy = intent.mode === "parked" ? await this.busyNow(jobId) : NOT_READ;
+        // Every move reads the processes (busyNow reads nothing without busy_processes), a free seat's too since
+        // T-006251 (B1), and every time (no cache: a suite can start between two moves).
+        const busy = await this.busyNow(jobId);
         if (!this.dispatch(jobId, run, intent, usageLimited, busy)) return;
       } else if (intent.kind === "reap") {
         if (!(await this.reap(jobId, run, intent.slotId))) return;
@@ -1559,7 +1580,13 @@ export class SeatPoolExecutor {
     const mode = seatPoolReceives(ctx.spec, slot, nowMs, { usageLimited: limited });
     const base = { qitemId: intent.qitemId, from: intent.from, to: slot.sessionName };
     if (intent.mode !== "parked") {
-      if (mode !== "free") return true;
+      if (mode !== "free") {
+        // Free as the plan read it, but busy with heavy local work it does not track (T-006251, B1): said once here.
+        if (slot.busyProcess && seatPoolReceives(ctx.spec, { ...read, busyProcess: null }, nowMs, { usageLimited: limited }) === "free") {
+          this.record(jobId, false, "seat_pool_dispatch_skipped", { ...base, code: "free_busy", busyProcess: slot.busyProcess });
+        }
+        return true;
+      }
     } else if (mode === null && slot.busyProcess && seatPoolReceives(ctx.spec, { ...read, busyProcess: null }, nowMs, { usageLimited: limited }) === "parked") {
       // Parked as the plan read it, but busy with heavy local work under its pane (T-006090).
       this.record(jobId, false, "seat_pool_dispatch_skipped", { ...base, code: "parked_busy", busyProcess: slot.busyProcess });

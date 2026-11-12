@@ -1624,6 +1624,26 @@ export class TmuxAdapter {
     }
   }
 
+  /** Every pane of the server in one `tmux list-panes -a` (T-006251 S3: the seat pool's busy read asks once, not once
+   *  per seat): its id, the pid it runs, its session and whether it is the one a session target resolves to (the active
+   *  pane of the active window). No server: none. Any other failure rejects. */
+  async listAllPanePids(): Promise<Array<{ paneId: string; panePid: number; session: string; active: boolean }>> {
+    const format = "#{pane_id}\t#{pane_pid}\t#{window_active}#{pane_active}\t#{session_name}";
+    let output: string;
+    try {
+      output = await this.run(["tmux", "list-panes", "-a", "-F", format], `tmux list-panes -a -F ${shellQuote(format)}`);
+    } catch (err) {
+      if (isNoServerError(err) || isTmuxTransportAbsentError(err)) return [];
+      throw err;
+    }
+    return output.split("\n").flatMap((line) => {
+      const [paneId, pid, active, ...session] = line.split("\t");
+      const panePid = Number(pid);
+      return paneId && /^%\d+$/.test(paneId) && Number.isInteger(panePid) && panePid > 0 && session.length > 0
+        ? [{ paneId, panePid, session: session.join("\t"), active: active === "11" }] : [];
+    });
+  }
+
   /** Get the PID of the foreground process in a pane. Returns null if unavailable. */
   async getPanePid(paneId: string): Promise<number | null> {
     const target = exactTarget(paneId, "pane");
