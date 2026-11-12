@@ -5,7 +5,7 @@ import { describe, expect, it } from "vitest";
 import Database from "better-sqlite3";
 import { migrate } from "../src/db/migrate.js";
 import { ALL_MIGRATIONS } from "../src/db/all-migrations.js";
-import { SeatDeliveryGuard, type AdmissionInput, type GuardTarget } from "../src/domain/seat-delivery-guard.js";
+import { SeatDeliveryGuard, levelAdmits, parseTypingGuardSettings, type AdmissionInput, type GuardTarget } from "../src/domain/seat-delivery-guard.js";
 
 function fixture() {
   const db = new Database(":memory:");
@@ -67,5 +67,14 @@ describe("the level table at the guard", () => {
     expect(row.desired).toBe(1); // a daemon without modes reads the legacy bit: hold
     // Lifecycle work at a middle level is refused, as at hold.
     await expect(f.guard.operation("agent", async () => "restarted")).rejects.toMatchObject({ code: "typing_guard_enabled" });
+  });
+});
+
+
+describe("T-006631: the queue-only level", () => {
+  it("is set by its name, stored as draft-aware, and admits deliberate sends but never OpenRig's own notices", () => {
+    expect(parseTypingGuardSettings({ mode: "queue-only" })).toEqual({ mode: "draft-aware", level: "queue-only" });
+    expect(levelAdmits("queue-only", { source: "agent", urgent: false })).toBe(true);
+    expect(levelAdmits("queue-only", { source: "openrig", urgent: false })).toBe(false);
   });
 });
