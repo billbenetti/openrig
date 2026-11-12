@@ -66,6 +66,8 @@ const PASTE_SETTLE_MS = 300;
 /** A key from any tmux client of the seat this recently means a person is typing there: the paste waits for a later
  *  attempt. tmux reports client activity in whole seconds, so this is three of them. */
 const INPUT_QUIET_MS = 3000;
+/** tmux's client_activity is in whole seconds; the key may have come up to this much after the second it reports. */
+const CLIENT_ACTIVITY_PRECISION_MS = 999;
 /** A terminal member with nothing set holds OpenRig's own notices and takes deliberate sends. */
 const TERMINAL_DEFAULT: TypingGuardConfig = { mode: "off", level: "sends-only", revision: "terminal-default" };
 /** The actor a guard change records when its request carries no seat identity, as from an ordinary terminal (#2350).
@@ -77,10 +79,12 @@ export interface AdmissionInput { source: "openrig" | "agent"; urgent: boolean; 
 
 /** Whether a level lets this input type. Every other input at the seat is held, never refused or lost. */
 export function levelAdmits(level: InterruptionLevel, input: AdmissionInput): boolean {
+  // queue-only: OpenRig's own notices never type, urgent ones included (no hidden urgent bypass); they are held or
+  // reach the seat as queue rows. Deliberate sends type, draft-aware.
+  if (level === "queue-only") return input.source === "agent";
   if (input.urgent) return true;
   if (level === "openrig-urgent") return input.source === "openrig";
-  // queue-only: OpenRig's own notices (watchdogs, wake timers) never type; they reach the seat as queue rows.
-  if (level === "sends-only" || level === "queue-only") return input.source === "agent";
+  if (level === "sends-only") return input.source === "agent";
   return false;
 }
 
@@ -517,16 +521,25 @@ export class SeatDeliveryGuard {
     }
   }
 
-  /** No key from a tmux client of the seat in the last seconds, and the input still empty after a short wait. */
+  /** No key from a tmux client of the seat in the last seconds, read before and again after a short wait, and the input
+   *  still empty when read after it. A key time tmux can't report holds the paste, as an unreadable input does. */
   private async quietBeforePaste(target: GuardTarget, read: () => Promise<ComposerInput | null>,
     unknown: () => DeliveryGuardError): Promise<ComposerInput> {
-    const busy = () => new DeliveryGuardError("draft_input_busy", "A person is typing at this seat. Automatic delivery is held; nothing was pasted.");
-    const last = await this.inputActivity?.(target).catch(() => null) ?? null;
-    if (last !== null && Date.now() - last < INPUT_QUIET_MS) throw busy();
+    const typing = async () => {
+      if (!this.inputActivity) return;
+      const last = await this.inputActivity(target).then(at => ({ at }), () => null);
+      if (!last) throw new DeliveryGuardError("draft_input_unknown", "OpenRig couldn't read when the seat's terminal last had a key. Automatic delivery is held; nothing was pasted.");
+      // tmux reports whole seconds: a key at N.999 s reads as N, so the quiet window counts from the end of that second.
+      if (last.at !== null && Date.now() - (last.at + CLIENT_ACTIVITY_PRECISION_MS) < INPUT_QUIET_MS) {
+        throw new DeliveryGuardError("draft_input_busy", "A person is typing at this seat. Automatic delivery is held; nothing was pasted.");
+      }
+    };
+    await typing();
     await this.sleep(PASTE_SETTLE_MS);
+    await typing();
     const again = await read();
     if (!again || again.state === "unknown") throw unknown();
-    if (again.state !== "empty") throw busy();
+    if (again.state !== "empty") throw new DeliveryGuardError("draft_input_busy", "The input changed just before the paste. Automatic delivery is held; nothing was pasted.");
     return again;
   }
 
