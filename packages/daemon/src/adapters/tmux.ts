@@ -492,7 +492,19 @@ export class TmuxAdapter {
       if (probe.state !== "present") return false;
       const panes = await this.listPanes(target.session);
       return panes.length === 1 && panes[0]!.id === target.pane && await this.isPaneDead(target.pane);
-    });
+    }, target => this.lastClientActivity(target.session));
+  }
+
+  /** When a tmux client attached to this session last had a key (epoch ms), or null when none is attached or tmux
+   *  can't say. Read-only; the guard uses it so an automatic paste waits while a person is typing there (T-006631). */
+  async lastClientActivity(session: string): Promise<number | null> {
+    try {
+      const exact = exactTarget(session, "session");
+      const output = await this.run(["tmux", "list-clients", "-t", exact, "-F", "#{client_activity}"],
+        `tmux list-clients -t ${shellQuote(exact)} -F "#{client_activity}"`);
+      const seconds = output.split("\n").map(line => Number(line.trim())).filter(n => Number.isFinite(n) && n > 0);
+      return seconds.length ? Math.max(...seconds) * 1000 : null;
+    } catch { return null; }
   }
   private readonly freshProbes = new Map<string, string>();
   private readonly freshManaged = new Map<string, {nodeId: string; pane: string}>();

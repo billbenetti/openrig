@@ -217,6 +217,7 @@ const LEVEL_WORDS: Record<string, string> = {
   "openrig-urgent": "OpenRig's own messages and anything marked urgent type.",
   "urgent-only": "Only messages marked urgent type.",
   "sends-only": "Deliberate sends from people and agents type; OpenRig's own notices are held.",
+  "queue-only": "Deliberate sends type, never over a draft; OpenRig's reminders arrive as queue rows, never typed.",
 };
 
 // JSON escapes C0; also escape C1, format/separator and default-ignorable characters.
@@ -512,7 +513,7 @@ export function seatCommand(depsOverride?: SeatDeps & { readStdin?: () => Promis
     });
   cmd.command("set-typing-guard").argument("<seat>")
     .option("--enabled <boolean>", "Compatibility: true selects hold; false selects off")
-    .option("--mode <mode>", "off, draft-aware, openrig-urgent, urgent-only, sends-only or hold; choose this or --enabled")
+    .option("--mode <mode>", "off, draft-aware, openrig-urgent, urgent-only, sends-only, queue-only or hold; choose this or --enabled")
     .requiredOption("--reason <text>").option("--json").description("Choose how this seat's typing guard handles automatic input")
     .addHelpText("after", `
 This one persistent guard defaults off. Hold pauses ALL automatic input, including
@@ -533,6 +534,10 @@ Between off (always interrupt) and hold (full quiet):
                   item at priority urgent or critical).
   sends-only      deliberate sends from people and agents type; OpenRig's own
                   notices are held. A terminal member defaults to this.
+  queue-only      deliberate sends type as draft-aware (never over a draft);
+                  watchdog reminders and wake timers become queue rows with no
+                  nudge, the parked-owner reminder is skipped (the open rows
+                  already are the reminder), and other OpenRig notices are held.
 What openrig-urgent and urgent-only let through never types over a draft.
 sends-only types like off: a terminal member's typing isn't protected, as today
 (its shell input can't be read). Everything else is held, the sender is told, and
@@ -563,8 +568,8 @@ Examples:
     .action(async (seat: string, opts: { enabled?: string; mode?: string; reason: string; json?: boolean }) => {
       if ((opts.enabled === undefined) === (opts.mode === undefined)
         || opts.enabled !== undefined && !["true", "false"].includes(opts.enabled)
-        || opts.mode !== undefined && !["off", "draft-aware", "openrig-urgent", "urgent-only", "sends-only", "hold"].includes(opts.mode)) {
-        console.error("Choose --enabled true|false or --mode off|draft-aware|openrig-urgent|urgent-only|sends-only|hold.");
+        || opts.mode !== undefined && !["off", "draft-aware", "openrig-urgent", "urgent-only", "sends-only", "queue-only", "hold"].includes(opts.mode)) {
+        console.error("Choose --enabled true|false or --mode off|draft-aware|openrig-urgent|urgent-only|sends-only|queue-only|hold.");
         process.exitCode = 1; return;
       }
       await guardRequest("POST", `/api/seat/set-typing-guard/${encodeURIComponent(seat)}`, {

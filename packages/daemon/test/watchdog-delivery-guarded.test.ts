@@ -413,6 +413,30 @@ describe("watchdog positive no-input outcomes", () => {
     expect(deliberate.status).toBe("ok");
     expect(sends).toHaveBeenCalledTimes(1);
   });
+
+  it("T-006631: a queue-only seat gets each wake timer as one cold queue row, never typed", async () => {
+    const sends = vi.fn().mockResolvedValue({ ok: true });
+    const rows: Array<{ qitemId: string; destinationSession: string; body: string; summary: string; tags: string[] }> = [];
+    const deliver = makeWatchdogDeliver({ sessionTransport: { send: sends }, isQueueOnlySeat: s => s === seat,
+      createQueueRow: async row => { if (!rows.some(r => r.qitemId === row.qitemId)) rows.push(row); } });
+    const wake = { jobId: "wake-1", policy: "periodic-reminder", occurrenceId: "occ-1" };
+    expect(await deliver({ targetSession: seat, message: "Wake timer fired for parked qitem fc-1." }, wake)).toMatchObject({ status: "ok" });
+    expect(await deliver({ targetSession: seat, message: "Wake timer fired for parked qitem fc-1." }, wake)).toMatchObject({ status: "ok" });
+    const digest = { jobId: "digest", policy: "periodic-reminder", members: [{ jobId: "a", occurrenceId: "o-a" }, { jobId: "b", occurrenceId: "o-b" }] };
+    expect(await deliver({ targetSession: seat, message: "Two reminders" }, digest)).toMatchObject({ status: "ok" });
+    expect(sends).not.toHaveBeenCalled();
+    expect(rows).toHaveLength(2);
+    expect(rows[0]).toMatchObject({ destinationSession: seat, tags: ["watchdog", "queue-only", "policy:periodic-reminder"] });
+    expect(rows[0]!.body).toContain("[OpenRig watchdog scheduler · policy: periodic-reminder · job: wake-1]");
+    expect(rows[0]!.body).toContain("Wake timer fired for parked qitem fc-1.");
+    // Another seat is unchanged: typed as before.
+    expect(await deliver({ targetSession: "other@test", message: "Typed" }, { jobId: "x", policy: "periodic-reminder", occurrenceId: "o-x" })).toMatchObject({ status: "ok" });
+    expect(sends).toHaveBeenCalledTimes(1);
+    // A row that can't be created leaves the occurrence owed, with no input.
+    const failing = makeWatchdogDeliver({ sessionTransport: { send: sends }, isQueueOnlySeat: () => true, createQueueRow: async () => { throw new Error("queue down"); } });
+    expect(await failing({ targetSession: seat, message: "m" }, { jobId: "f", policy: "periodic-reminder", occurrenceId: "o-f" }))
+      .toMatchObject({ status: "failed", sent: false, inputPhase: "not_reached" });
+  });
 });
 
 
