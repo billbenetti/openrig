@@ -8,6 +8,7 @@
 // policy itself never creates, launches, stops, removes, moves or sends anything, so one slow launch can't hold every
 // other job's evaluation.
 
+import { seatPoolBusyWrapper } from "../seat-pool-busy.js";
 import type { Policy, PolicyEvaluation, PolicyJob } from "./types.js";
 
 export const SEAT_POOL_POLICY_NAME = "seat-pool";
@@ -66,6 +67,14 @@ export interface SeatPoolDispatchToParked {
   /** `parked_max_load_per_cpu_percent`: above this 1-minute load per CPU (in percent) the executor gives a parked seat
    *  no row; 0 (the default) checks no load. A free seat is never checked. */
   parkedMaxLoadPerCpuPercent: number;
+  /** `refuse_gates`: a parked row whose gate (its blocked_on) contains one of these strings is not a wait the seat can
+   *  take a 2nd row through (a heavy local run, such as an eval being frozen or a suite queued for the host's lock).
+   *  Absent (no property) when the field is not given: every `external:` gate counts. */
+  refuseGates?: string[];
+  /** `busy_processes`: program names; a seat with a live process under its pane whose program (after the usual
+   *  wrappers, seatPoolBusyCommand) is one of them takes no 2nd row (SeatPoolSlotView.busyProcess). Absent (no
+   *  property) when the field is not given: processes are not read. */
+  busyProcesses?: string[];
 }
 
 const SPEC_KEYS = new Set([
@@ -118,7 +127,30 @@ const DISPATCH_TO_PARKED_NUMBERS = {
   max_claim_age_s: { min: 600, max: 172_800, fallback: 21_600 },
   parked_max_load_per_cpu_percent: { min: 0, max: 10_000, fallback: 0 },
 } as const;
-const DISPATCH_TO_PARKED_KEYS = new Set([...Object.keys(DISPATCH_TO_PARKED_NUMBERS), "allow_background_work"]);
+const DISPATCH_TO_PARKED_LISTS = ["refuse_gates", "busy_processes"] as const;
+const DISPATCH_TO_PARKED_KEYS = new Set([...Object.keys(DISPATCH_TO_PARKED_NUMBERS), "allow_background_work", ...DISPATCH_TO_PARKED_LISTS]);
+/** The most entries a `dispatch_to_parked` list may hold, and the longest entry. */
+const DISPATCH_TO_PARKED_LIST_MAX = 32;
+const DISPATCH_TO_PARKED_ENTRY_MAX = 128;
+
+/** A `dispatch_to_parked` list: strings, each non-empty, without whitespace, at most DISPATCH_TO_PARKED_ENTRY_MAX
+ *  characters, at most DISPATCH_TO_PARKED_LIST_MAX of them; a `busy_processes` entry is a program name, so no `/`. */
+function parkedList(value: unknown, key: (typeof DISPATCH_TO_PARKED_LISTS)[number]): string[] | SpecProblem {
+  const field = `${DISPATCH_TO_PARKED}.${key}`;
+  const what = key === "busy_processes"
+    ? "program names (no whitespace, no /, none of the wrappers it looks past: bash, sh, env, nice, timeout, python3, node…)"
+    : "strings without whitespace";
+  const problem = {
+    field,
+    message: `seat-pool: ${field} must be a list of at most ${DISPATCH_TO_PARKED_LIST_MAX} ${what}, each 1 to ${DISPATCH_TO_PARKED_ENTRY_MAX} characters`,
+  };
+  if (!Array.isArray(value) || value.length > DISPATCH_TO_PARKED_LIST_MAX) return problem;
+  for (const entry of value) {
+    if (typeof entry !== "string" || entry.length === 0 || entry.length > DISPATCH_TO_PARKED_ENTRY_MAX || /\s/.test(entry)) return problem;
+    if (key === "busy_processes" && (entry.includes("/") || seatPoolBusyWrapper(entry))) return problem;
+  }
+  return [...value] as string[];
+}
 
 /** `dispatch_to_parked`: an object (`{}` takes every default). A field given as null is wrong, as for the other keys:
  *  only a field left out takes its default. */
@@ -147,9 +179,19 @@ function dispatchToParked(value: unknown): SeatPoolDispatchToParked | SpecProble
   if (allow !== undefined && typeof allow !== "boolean") {
     return { field: `${DISPATCH_TO_PARKED}.allow_background_work`, message: `seat-pool: ${DISPATCH_TO_PARKED}.allow_background_work must be true or false` };
   }
+  const lists: Partial<Record<(typeof DISPATCH_TO_PARKED_LISTS)[number], string[]>> = {};
+  for (const key of DISPATCH_TO_PARKED_LISTS) {
+    if (record[key] === undefined) continue;
+    const list = parkedList(record[key], key);
+    if (isProblem(list)) return list;
+    lists[key] = list;
+  }
   return {
     maxWakeSeconds: numbers["max_wake_s"]!, maxClaimAgeSeconds: numbers["max_claim_age_s"]!, allowBackgroundWork: allow ?? true,
     parkedMaxLoadPerCpuPercent: numbers["parked_max_load_per_cpu_percent"]!,
+    // Only a list that was given becomes a property, so `{}` reads as it did before the lists.
+    ...(lists.refuse_gates ? { refuseGates: lists.refuse_gates } : {}),
+    ...(lists.busy_processes ? { busyProcesses: lists.busy_processes } : {}),
   };
 }
 
@@ -371,6 +413,10 @@ export interface SeatPoolSlotView {
   backgroundWork?: boolean;
   /** Only with `dispatch_to_parked` in the spec, the row facts read and exactly one open row, blocked: that row's park. */
   parked?: ParkFacts;
+  /** Only with `dispatch_to_parked.busy_processes` in the spec, for a seat the process read looked at: why the seat
+   *  counts as busy for a 2nd row (the matching process, or that its processes could not be read), or null when no
+   *  process under its pane matches. Absent: not read, which holds nothing back. */
+  busyProcess?: string | null;
 }
 
 /** The park of a seat's only open row, a blocked one: what seatPoolCanReceive checks to call it the seat's own wait. */
@@ -470,7 +516,9 @@ export function seatPoolReapable(slot: SeatPoolSlotView): boolean {
  * `dispatch_to_parked`: a seat the pool added (not adopted), at its prompt (idle, or working only through a background
  * shell, which `allow_background_work: false` refuses), whose only open row is blocked on an `external:` gate with a
  * timer of at most `max_wake_s` still armed and live, armed by the seat itself, after it took the row (by claim or by
- * update) no more than `max_claim_age_s` ago. A seat with two open rows never receives: one row more is the ceiling.
+ * update) no more than `max_claim_age_s` ago, on a gate that contains none of `refuse_gates`, and with no
+ * `busy_processes` program under its pane (`busyProcess`). A seat with two open rows never receives: one row more is the
+ * ceiling.
  */
 export function seatPoolCanReceive(spec: SeatPoolSpec, slot: SeatPoolSlotView, nowMs: number): SeatPoolReceiveMode | null {
   if (spec.drain || slot.phase !== "live" || !slot.nodeExists || seatPoolReapable(slot) || slot.heldMessages !== 0) return null;
@@ -482,6 +530,10 @@ export function seatPoolCanReceive(spec: SeatPoolSpec, slot: SeatPoolSlotView, n
   const park = slot.parked;
   if (slot.openRows !== 1 || !park) return null;
   if (!park.blockedOn.startsWith("external:")) return null;
+  // A wait that is itself heavy local work (an eval being frozen, a suite queued for the host's lock) is not one the seat
+  // can take a 2nd row through: it gives the row back and the row goes round (T-006090).
+  if (rule.refuseGates?.some((part) => park.blockedOn.includes(part))) return null;
+  if (slot.busyProcess) return null;
   if (!park.timerArmedLive || park.timerIntervalS === null || park.timerIntervalS > rule.maxWakeSeconds) return null;
   if (park.parkActor !== slot.sessionName) return null;
   if (park.takenAt === null || park.parkedAt === null) return null;

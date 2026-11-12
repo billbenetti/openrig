@@ -1,0 +1,62 @@
+[
+ {
+  "ts": "2026-11-11T21:13:20.755Z",
+  "state": "pending",
+  "note": "created",
+  "actor": "qualidade-qa-4@fabrica"
+ },
+ {
+  "ts": "2026-11-11T23:25:02.311Z",
+  "state": "pending",
+  "note": "fallback-routed: qualidade-qa@fabrica \u2192 qualidade-qa-s10@fabrica (seat pool 01M7370FNT20116YKCYXXBXTGR: qualidade-qa@fabrica had not taken it; qualidade-qa-s10@",
+  "actor": "system:queue-fallback"
+ },
+ {
+  "ts": "2026-11-11T23:25:12.684Z",
+  "state": "in-progress",
+  "note": null,
+  "actor": "qualidade-qa-s10@fabrica"
+ },
+ {
+  "ts": "2026-11-11T23:55:01.255Z",
+  "state": "blocked",
+  "note": "parked on external:kro3-rodada-longa",
+  "actor": "qualidade-qa-s10@fabrica"
+ },
+ {
+  "ts": "2026-11-12T00:55:02.262Z",
+  "state": "blocked",
+  "note": "park wake fired: watchdog 01M76GJK85EQ4ZS9B4RWMH9XZX; delivery=ok; awaiting owner consumption",
+  "actor": "watchdog@system"
+ },
+ {
+  "ts": "2026-11-12T00:55:12.888Z",
+  "state": "in-progress",
+  "note": "Blocker external:kro3-rodada-longa resolved: rodada longa do kro3 conclu\u00edda 00:1xZ (ref 228/228, 30/30 mutantes vermelhos, kro1 v6 605/605, kro2 609/609); agora",
+  "actor": "qualidade-qa-s10@fabrica"
+ },
+ {
+  "ts": "2026-11-12T00:55:14.022Z",
+  "state": "blocked",
+  "note": "parked on external:kro1v6-congelar-eval",
+  "actor": "qualidade-qa-s10@fabrica"
+ },
+ {
+  "ts": "2026-11-12T01:55:16.244Z",
+  "state": "blocked",
+  "note": "park wake fired: watchdog 01M76M0VB4YJEGDYQNGFM2843H; delivery=ok; awaiting owner consumption",
+  "actor": "watchdog@system"
+ },
+ {
+  "ts": "2026-11-12T01:55:33.406Z",
+  "state": "in-progress",
+  "note": "Blocker external:kro1v6-congelar-eval resolved: 01:55Z: o congelar-eval da kro1 v6 (pid em bg) ainda espera vaga no pool de congelar (qa-6 e qa-5 na frente); se",
+  "actor": "qualidade-qa-s10@fabrica"
+ },
+ {
+  "ts": "2026-11-12T01:55:34.900Z",
+  "state": "blocked",
+  "note": "parked on external:kro1v6-congelar-eval",
+  "actor": "qualidade-qa-s10@fabrica"
+ }
+]
