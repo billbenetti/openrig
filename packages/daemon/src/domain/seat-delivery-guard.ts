@@ -80,10 +80,12 @@ export interface AdmissionInput { source: "openrig" | "agent"; urgent: boolean; 
 
 /** Whether a level lets this input type. Every other input at the seat is held, never refused or lost. */
 export function levelAdmits(level: InterruptionLevel, input: AdmissionInput): boolean {
+  // queue-only: OpenRig's own notices never type, urgent ones included (no hidden urgent bypass); they are held or
+  // reach the seat as queue rows. Deliberate sends type, draft-aware.
+  if (level === "queue-only") return input.source === "agent";
   if (input.urgent) return true;
   if (level === "openrig-urgent") return input.source === "openrig";
-  // queue-only: OpenRig's own notices (watchdogs, wake timers) never type; they reach the seat as queue rows.
-  if (level === "sends-only" || level === "queue-only") return input.source === "agent";
+  if (level === "sends-only") return input.source === "agent";
   return false;
 }
 

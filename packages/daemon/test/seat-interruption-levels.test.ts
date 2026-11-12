@@ -77,4 +77,9 @@ describe("T-006631: the queue-only level", () => {
     expect(levelAdmits("queue-only", { source: "agent", urgent: false })).toBe(true);
     expect(levelAdmits("queue-only", { source: "openrig", urgent: false })).toBe(false);
   });
+
+  it("never lets an OpenRig notice type, urgent ones included; an agent's urgent send still types (B1)", () => {
+    expect(levelAdmits("queue-only", { source: "openrig", urgent: true })).toBe(false);
+    expect(levelAdmits("queue-only", { source: "agent", urgent: true })).toBe(true);
+  });
 });
