@@ -1,0 +1,16 @@
+{
+ "session": "coordenacao-coord-3@fabrica",
+ "panePid": 2449336,
+ "rows": [
+  {
+   "pid": 2449336,
+   "ppid": 2460,
+   "command": "/bin/bash -l"
+  },
+  {
+   "pid": 2451904,
+   "ppid": 2449336,
+   "command": "/home/bruno/.local/bin/claude [args omitted]"
+  }
+ ]
+}

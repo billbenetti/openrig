@@ -1,0 +1,43 @@
+[
+ {
+  "process": {
+   "pid": 53678,
+   "ppid": 53674,
+   "command": "bash /home/bruno/.local/bin/suite-flock nice -n 10 /home/bruno/dev/setup/ops/fabrica/congelar-eval /home/bruno/dev/fabrica/demandas/2026-11-08-hillclimb-operador-browser/eval/t4907 --clone /home/bruno"
+  },
+  "parents": [
+   {
+    "pid": 53674,
+    "ppid": 53669,
+    "command": "/bin/bash -c source /home/bruno/.claude-proxy/shell-snapshots/snapshot-bash-1794412390735-2z5gdc.sh 2>/dev/null || true && shopt -u extglob 2>/dev/null || true && { \\builtin unalias -- 'which'; \\built"
+   },
+   {
+    "pid": 53669,
+    "ppid": 1474,
+    "command": "/bin/bash -c source /home/bruno/.claude-proxy/shell-snapshots/snapshot-bash-1794412390735-2z5gdc.sh 2>/dev/null || true && shopt -u extglob 2>/dev/null || true && { \\builtin unalias -- 'which'; \\built"
+   }
+  ],
+  "tmuxPane": "%93",
+  "paneSessionNow": "qualidade-qa-s8@fabrica"
+ },
+ {
+  "process": {
+   "pid": 693305,
+   "ppid": 1474,
+   "command": "bash /home/bruno/.local/bin/suite-flock /usr/bin/python3 -I /home/bruno/dev/wt/billverso-sre-vigia-T005932/ops/ci/pronto.py --sem-fetch --base e03732aa6a88d87a7dffe64f3ce2edfd403a094c --raiz /home/bru"
+  },
+  "parents": [],
+  "tmuxPane": "%184",
+  "paneSessionNow": "build-dev-10@fabrica"
+ },
+ {
+  "process": {
+   "pid": 781461,
+   "ppid": 1474,
+   "command": "bash /home/bruno/.local/bin/suite-flock nice -n 10 /home/bruno/dev/setup/ops/fabrica/congelar-eval /home/bruno/dev/fabrica/demandas/2026-11-11-sia-transferencia-responde-pendente/eval/e1 --clone /home"
+  },
+  "parents": [],
+  "tmuxPane": "%24",
+  "paneSessionNow": "qualidade-qa-s7@fabrica"
+ }
+]

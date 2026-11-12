@@ -1,0 +1,10 @@
+# T-006090: captura real (VM setup-openrig, usuário bruno, 12/11 ~03:1xZ), sem segredo (o command do claude vai sem
+# argumentos; a linha do bash -c do Claude Code vai cortada em 400 caracteres).
+# 1) A árvore de processos sob o pane de um seat (pid, ppid, command), por /proc:
+python3 -I capturar-arvore.py qualidade-qa-7@fabrica > qa-7-pane-tree.json        # 3 suite-flock em segundo plano
+python3 -I capturar-arvore.py coordenacao-coord-3@fabrica > coord-3-pane-tree.json # controle: nada pesado no pane
+# 2) As transições da linha que a qualidade-qa-s10@fabrica tinha estacionada quando o coord-3 lhe deu a 2ª linha da
+#    T-006052 (00:25Z e 01:19Z de 12/11), do sqlite do daemon, só leitura:
+python3 -I -c "import sqlite3,json;c=sqlite3.connect('file:/home/bruno/.openrig/openrig.sqlite?mode=ro',uri=True);print(json.dumps([dict(zip(('ts','state','note','actor'),r)) for r in c.execute(\"select ts,state,substr(transition_note,1,160),actor_session from queue_transitions where qitem_id='fc-6e0aaa3b8a52-1794431600' order by transition_id\")],indent=1))" > qa-s10-parked-row.transitions.json
+# 3) Processos suite-flock/congelar-eval órfãos (fora da árvore de qualquer pane) com o TMUX_PANE herdado e a sessão dona do pane agora:
+python3 -I capturar-orfao.py > orfao-tmux-pane.json
