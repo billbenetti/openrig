@@ -74,6 +74,8 @@ export interface ParkedOwnerConsumerDeps {
   hasPendingPostCompactStage?: (sessionName: string) => boolean;
   /** Existing bound-terminal authority; only a positive result excludes automated reminders. */
   isTerminalSeat?: (sessionName: string) => boolean;
+  /** The seat's typing guard is at queue-only (T-006631): its open rows already are the reminder, so nothing types. */
+  isQueueOnlySeat?: (sessionName: string) => boolean;
   /** Opaque current node/guard revision/retained quota inputs, not a parked-state oracle. */
   retentionState?: (sessionName: string) => string | null;
   /** The clock the waiting grace is measured on; the wall clock when absent. */
@@ -109,6 +111,7 @@ export const DELIVERED_PREFIX = "parked-owner wake delivered:";
 export const NUDGE_FAIL_PREFIX = "failed: parked-owner wake delivery";
 const QUOTA_NO_INPUT = "; code retained_quota_full; input not_reached;";
 const TERMINAL_NO_INPUT = "; code terminal_seat; input not_reached;";
+const QUEUE_ONLY_NO_INPUT = "; code queue_only_seat; input not_reached;";
 export const PARKED_OWNER_COMPACTION_PENDING = "[managed-compaction-pending] Parked-owner reminder deferred until the existing post-compact stages clear.";
 
 /** Only the transport's interactive-prompt refusal counts — a generic failed
@@ -375,6 +378,11 @@ export function makeParkedOwnerConsumerPolicy(deps: ParkedOwnerConsumerDeps): Po
           skipped.push({ seat: seat.sessionName, why: "terminal-seat" });
           continue;
         }
+        const queueOnly = !terminal && deps.isQueueOnlySeat?.(seat.sessionName) === true;
+        if (queueOnly && open && sameGeneration && transitions.some(t => t.transitionNote?.startsWith(`${FAILED_PREFIX} ${lastKey}${QUEUE_ONLY_NO_INPUT}`))) {
+          skipped.push({ seat: seat.sessionName, why: "queue-only-seat" });
+          continue;
+        }
         const episodeKey = `${seat.sessionName}|${idsHash}#${randomUUID()}`;
         let noted = false;
         try {
@@ -383,6 +391,15 @@ export function makeParkedOwnerConsumerPolicy(deps: ParkedOwnerConsumerDeps): Po
         } catch { /* the current row, not the receipt write, governs the wake */ }
         if (!noted && !deps.rows.listOpenIds(seat.sessionName).includes(primaryRow)) {
           skipped.push({ seat: seat.sessionName, why: "obligation-closed-between-derive-and-wake" });
+          continue;
+        }
+
+        if (queueOnly) {
+          // The rows are in the seat's queue already; a person reads that terminal, so nothing is typed into it.
+          const reason = "The seat takes OpenRig's reminders only in its queue (typing guard queue-only); its open rows are the reminder. No input was written.";
+          try { deps.rows.appendNote(primaryRow, `${FAILED_PREFIX} ${episodeKey}${QUEUE_ONLY_NO_INPUT} ${reason}`); } catch { /* the row stays open and listed */ }
+          try { deps.rows.recordNudgeResult(primaryRow, `skipped:queue-only-seat: ${reason}`); } catch { /* no reporting failure permits input */ }
+          skipped.push({ seat: seat.sessionName, why: "queue-only-seat" });
           continue;
         }
 

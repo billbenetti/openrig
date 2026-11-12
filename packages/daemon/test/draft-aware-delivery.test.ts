@@ -1156,3 +1156,85 @@ describe("draft-aware at a full held quota (#2430)", () => {
     expect(f.outbox.retentionUsage("a").count).toBe(100);
   });
 });
+
+
+describe("T-006631: a draft typed between the guard's read and the paste", () => {
+  const draft = "Please send it to the team. Also";
+  it("is seen before the paste: the watchdog notice is held and nothing is pasted into the person's input", async () => {
+    const f = fixture(undefined, { runtime: "claude-code" });
+    await f.enable();
+    const real = f.tmux.captureComposerSnapshot.getMockImplementation()!;
+    let armed = false;
+    f.hooks.load = () => { armed = true; };
+    // The person starts typing right after the read that comes just before the paste.
+    vi.spyOn(f.tmux, "captureComposerSnapshot").mockImplementation(async (name: string) => {
+      const shot = await real(name);
+      if (armed) { armed = false; f.bodies.a = draft; }
+      return shot;
+    });
+    const result = await f.send("watchdog-wake", "[OpenRig watchdog scheduler · policy: periodic-reminder · job: j]\nWake timer fired.", { openrigNotice: true, verify: false });
+    expect(result).toMatchObject({ outcome: "retained", sent: false, reason: "draft_input_busy" });
+    expect(f.writes.filter(w => w.startsWith("paste:"))).toEqual([]);
+    expect(f.submissions).toEqual([]);
+    expect(f.bodies.a).toBe(draft);
+  });
+
+  it("waits while a tmux client typed in the last seconds, and delivers once it is quiet", async () => {
+    const f = fixture(undefined, { runtime: "claude-code" });
+    await f.enable();
+    let last: number | null = Date.now() - 1000;
+    (f.tmux as unknown as { lastClientActivity: () => Promise<number | null> }).lastClientActivity = async () => last;
+    const busy = await f.send("wake-1", "Wake timer fired.", { openrigNotice: true, verify: false });
+    expect(busy).toMatchObject({ outcome: "retained", sent: false, reason: "draft_input_busy" });
+    expect(f.writes.filter(w => w.startsWith("paste:"))).toEqual([]);
+    last = Date.now() - 60_000;
+    f.advance();
+    const sent = await f.send("wake-2", "Wake timer fired again.", { openrigNotice: true, verify: false });
+    expect(sent).toMatchObject({ ok: true });
+    expect(f.submissions).toHaveLength(1);
+  });
+
+  const activity = (f: ReturnType<typeof fixture>, impl: () => Promise<number | null>) =>
+    vi.spyOn(f.tmux, "lastClientActivity").mockImplementation(impl);
+  const pastes = (f: ReturnType<typeof fixture>) => f.writes.filter(w => w.startsWith("paste:"));
+
+  it("B2: a key during the wait before the paste holds it (the activity is read again after the wait)", async () => {
+    const f = fixture(undefined, { runtime: "claude-code" });
+    await f.enable();
+    let reads = 0;
+    activity(f, async () => (++reads === 1 ? null : Date.now()));
+    const result = await f.send("key-during-wait", "Wake timer fired.", { openrigNotice: true, verify: false });
+    expect(result).toMatchObject({ outcome: "retained", sent: false, reason: "draft_input_busy" });
+    expect(reads).toBe(2);
+    expect(pastes(f)).toEqual([]);
+    expect(f.submissions).toEqual([]);
+  });
+
+  it("B2: tmux reports whole seconds, so a key reported 3.5 s ago (up to 2.5 s ago in fact) still holds; 4.1 s ago delivers", async () => {
+    const f = fixture(undefined, { runtime: "claude-code" });
+    await f.enable();
+    let last = Date.now() - 3500;
+    activity(f, async () => last);
+    const held = await f.send("n99", "Wake timer fired.", { openrigNotice: true, verify: false });
+    expect(held).toMatchObject({ outcome: "retained", sent: false, reason: "draft_input_busy" });
+    expect(pastes(f)).toEqual([]);
+    last = Date.now() - 4100 - 400; // the 300 ms wait still leaves it past the quiet window
+    f.advance();
+    const sent = await f.send("n99-later", "Wake timer fired again.", { openrigNotice: true, verify: false });
+    expect(sent).toMatchObject({ ok: true });
+    expect(f.submissions).toHaveLength(1);
+  });
+
+  it("B2: when tmux can't say when the seat last had a key, the paste is held as unreadable; no client attached delivers", async () => {
+    const f = fixture(undefined, { runtime: "claude-code" });
+    await f.enable();
+    activity(f, async () => { throw new Error("command timed out"); });
+    const held = await f.send("activity-unreadable", "Wake timer fired.", { openrigNotice: true, verify: false });
+    expect(held).toMatchObject({ sent: false, reason: "draft_input_unknown" });
+    expect(pastes(f)).toEqual([]);
+    activity(f, async () => null);
+    f.advance();
+    const sent = await f.send("no-client", "Wake timer fired again.", { openrigNotice: true, verify: false });
+    expect(sent).toMatchObject({ ok: true });
+  });
+});

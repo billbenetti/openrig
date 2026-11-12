@@ -52,13 +52,21 @@ export const TYPING_GUARD_MODES = ["off", "draft-aware", "hold"] as const;
 export type TypingGuardMode = (typeof TYPING_GUARD_MODES)[number];
 /** The middle interruption levels, and a terminal member's default. `off` is always interrupt and `hold` is full quiet;
  *  these sit between, deciding by the input's source and urgency. */
-export const INTERRUPTION_LEVELS = ["openrig-urgent", "urgent-only", "sends-only"] as const;
+export const INTERRUPTION_LEVELS = ["openrig-urgent", "urgent-only", "sends-only", "queue-only"] as const;
 export type InterruptionLevel = (typeof INTERRUPTION_LEVELS)[number];
 export interface TypingGuardSettings { mode: TypingGuardMode; level?: InterruptionLevel }
 export interface TypingGuardConfig extends TypingGuardSettings { revision: string }
 const DEFAULT_GUARD: TypingGuardConfig = { mode: "off", revision: "legacy-off" };
 /** How long the guard waits before reading again an input it couldn't read right after its own paste or Enter (#2429). */
 const OWN_INPUT_REREAD_MS = 300;
+/** Right before an automatic paste, the empty input is read once more after this wait: a draft typed (or redrawn by the
+ *  agent's TUI) since the first read is seen before the paste, not after it, where nothing is removed (#2447). */
+const PASTE_SETTLE_MS = 300;
+/** A key from any tmux client of the seat this recently means a person is typing there: the paste waits for a later
+ *  attempt. tmux reports client activity in whole seconds, so this is three of them. */
+const INPUT_QUIET_MS = 3000;
+/** tmux's client_activity is in whole seconds; the key may have come up to this much after the second it reports. */
+const CLIENT_ACTIVITY_PRECISION_MS = 999;
 /** A terminal member with nothing set holds OpenRig's own notices and takes deliberate sends. */
 const TERMINAL_DEFAULT: TypingGuardConfig = { mode: "off", level: "sends-only", revision: "terminal-default" };
 /** The actor a guard change records when its request carries no seat identity, as from an ordinary terminal (#2350).
@@ -70,6 +78,9 @@ export interface AdmissionInput { source: "openrig" | "agent"; urgent: boolean; 
 
 /** Whether a level lets this input type. Every other input at the seat is held, never refused or lost. */
 export function levelAdmits(level: InterruptionLevel, input: AdmissionInput): boolean {
+  // queue-only: OpenRig's own notices never type, urgent ones included (no hidden urgent bypass); they are held or
+  // reach the seat as queue rows. Deliberate sends type, draft-aware.
+  if (level === "queue-only") return input.source === "agent";
   if (input.urgent) return true;
   if (level === "openrig-urgent") return input.source === "openrig";
   if (level === "sends-only") return input.source === "agent";
@@ -81,13 +92,14 @@ export function parseTypingGuardSettings(value: unknown): TypingGuardSettings {
   if (!input || typeof input !== "object" || Array.isArray(input)) throw new DeliveryGuardError("invalid_typing_guard", "Supply an enabled boolean or a typing-guard mode.");
   const config = input as Record<string, unknown>;
   // A level is set as a mode name and stored with the coarse mode older daemons understand: `hold` for the middle
-  // levels (an older daemon holds everything there, never typing what the level would hold), `off` for sends-only.
+  // levels (an older daemon holds everything there, never typing what the level would hold), `off` for sends-only,
+  // `draft-aware` for queue-only (the sends it admits never type over a person's draft).
   if ((INTERRUPTION_LEVELS as readonly unknown[]).includes(config.mode)) {
     const level = config.mode as InterruptionLevel;
-    return { mode: level === "sends-only" ? "off" : "hold", level };
+    return { mode: level === "sends-only" ? "off" : level === "queue-only" ? "draft-aware" : "hold", level };
   }
   if (!(TYPING_GUARD_MODES as readonly unknown[]).includes(config.mode)) {
-    throw new DeliveryGuardError("invalid_typing_guard", "mode must be off, draft-aware, openrig-urgent, urgent-only, sends-only or hold.");
+    throw new DeliveryGuardError("invalid_typing_guard", "mode must be off, draft-aware, openrig-urgent, urgent-only, sends-only, queue-only or hold.");
   }
   if (config.holdSeconds !== undefined || config.maxAttempts !== undefined) throw new DeliveryGuardError("invalid_typing_guard", "Draft-aware sends return their result immediately; retry settings are not supported.");
   return { mode: config.mode as TypingGuardMode };
@@ -121,6 +133,8 @@ export class SeatDeliveryGuard {
   /** A paste this guard kept from being submitted because it couldn't read the input, per node (#2429). */
   private readonly leftovers = new Map<string, { target: GuardTarget; humanEpoch: number; text: string; collapsedPaste: string | null }>();
   private inspectInput?: (target: GuardTarget, owned?: ComposerOwnership) => Promise<ComposerInput | null>;
+  /** When a tmux client of the seat last had a key (epoch ms), or null when unknown. */
+  private inputActivity?: (target: GuardTarget) => Promise<number | null>;
   private inputAbsent?: (target: GuardTarget) => Promise<boolean>;
   private readonly hasModeConfig: boolean;
 
@@ -132,9 +146,11 @@ export class SeatDeliveryGuard {
     this.hasModeConfig = (db.prepare("PRAGMA table_info(seat_delivery_guards)").all() as Array<{ name: string }>).some(c => c.name === "desired_config");
   }
 
-  attachInputInspection(inspect: (target: GuardTarget, owned?: ComposerOwnership) => Promise<ComposerInput | null>, absent: (target: GuardTarget) => Promise<boolean>): void {
+  attachInputInspection(inspect: (target: GuardTarget, owned?: ComposerOwnership) => Promise<ComposerInput | null>, absent: (target: GuardTarget) => Promise<boolean>,
+    activity?: (target: GuardTarget) => Promise<number | null>): void {
     this.inspectInput = inspect;
     this.inputAbsent = absent;
+    this.inputActivity = activity;
   }
 
   /** Startup-only, before exposing routes or starting writers. A stopped operation cannot
@@ -165,6 +181,12 @@ export class SeatDeliveryGuard {
     return { nodeId, desired: desired.mode === "hold", effective: effective.mode === "hold", pending: desired.revision !== effective.revision,
       desiredMode: desired.mode, effectiveMode: effective.mode,
       ...(desired.level ? { desiredLevel: desired.level } : {}), ...(effective.level ? { effectiveLevel: effective.level } : {}) };
+  }
+
+  /** Whether the seat takes OpenRig's own notices only as queue rows (the queue-only level, desired or effective). */
+  queueOnly(nodeId: string): boolean {
+    const { desired, effective } = this.configuration(nodeId);
+    return desired.level === "queue-only" || effective.level === "queue-only";
   }
 
   /** Whether the seat's configuration would hold this input now (desired or effective, as the operation decides). */
@@ -491,8 +513,33 @@ export class SeatDeliveryGuard {
             : "OpenRig couldn't confirm the complete message would stay visible in this Codex viewport. Open a larger terminal or shorten the message, then retry this request; nothing was pasted.";
         throw new DeliveryGuardError("draft_input_unknown", message);
       }
+      // Right before the paste (the adapter's check passes the text): the read above is a snapshot, and a draft typed
+      // after it would get the paste appended and then lose the Enter, with the paste left in the person's input.
+      if (pasteText !== undefined) input = await this.quietBeforePaste(target, read, unknown);
       lease.inputFrame = input.frame;
     }
+  }
+
+  /** No key from a tmux client of the seat in the last seconds, read before and again after a short wait, and the input
+   *  still empty when read after it. A key time tmux can't report holds the paste, as an unreadable input does. */
+  private async quietBeforePaste(target: GuardTarget, read: () => Promise<ComposerInput | null>,
+    unknown: () => DeliveryGuardError): Promise<ComposerInput> {
+    const typing = async () => {
+      if (!this.inputActivity) return;
+      const last = await this.inputActivity(target).then(at => ({ at }), () => null);
+      if (!last) throw new DeliveryGuardError("draft_input_unknown", "OpenRig couldn't read when the seat's terminal last had a key. Automatic delivery is held; nothing was pasted.");
+      // tmux reports whole seconds: a key at N.999 s reads as N, so the quiet window counts from the end of that second.
+      if (last.at !== null && Date.now() - (last.at + CLIENT_ACTIVITY_PRECISION_MS) < INPUT_QUIET_MS) {
+        throw new DeliveryGuardError("draft_input_busy", "A person is typing at this seat. Automatic delivery is held; nothing was pasted.");
+      }
+    };
+    await typing();
+    await this.sleep(PASTE_SETTLE_MS);
+    await typing();
+    const again = await read();
+    if (!again || again.state === "unknown") throw unknown();
+    if (again.state !== "empty") throw new DeliveryGuardError("draft_input_busy", "The input changed just before the paste. Automatic delivery is held; nothing was pasted.");
+    return again;
   }
 
   /** A leftover paste is OpenRig's only while it's exactly there: the same occupant, no person's input through OpenRig
