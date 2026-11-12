@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { OutboxHandlerError, type OutboxHandler } from "./outbox-handler.js";
 import { withWatchdogReceipts } from "./watchdog-delivery-receipts.js";
 import { DeliveryGuardError } from "./seat-delivery-guard.js";
@@ -19,6 +20,10 @@ export function makeWatchdogDeliver(deps: {
   hasPendingPostCompactStage?: (sessionName: string) => boolean;
   isTerminalSeat?: (sessionName: string) => boolean;
   createContinuityAction?: (action: NonNullable<DeliveryRequest["continuityAction"]>) => Promise<void>;
+  /** The seat's typing guard is at queue-only: OpenRig's reminders reach it as queue rows, never typed (T-006631). */
+  isQueueOnlySeat?: (sessionName: string) => boolean;
+  /** Creates the reminder's queue row with no nudge; an existing id is the same row (a retried occurrence). */
+  createQueueRow?: (row: { qitemId: string; destinationSession: string; body: string; summary: string; tags: string[] }) => Promise<void>;
 }): DeliveryFn {
   const deliver: DeliveryFn = async ({ targetSession, message, continuityAction }, source) => {
     let continuityActionCompleted = false;
@@ -31,6 +36,24 @@ export function makeWatchdogDeliver(deps: {
       if (continuityAction) {
         await deps.createContinuityAction?.(continuityAction);
         continuityActionCompleted = true;
+      }
+      if (deps.isQueueOnlySeat?.(targetSession) && deps.createQueueRow) {
+        // Nothing types into this seat's terminal (a person's own, as the orchestrator's): the reminder is a cold row
+        // in its queue, with an id fixed by the occurrence so a retry finds the same row.
+        const occurrences = source.members?.map(m => m.occurrenceId) ?? (source.occurrenceId ? [source.occurrenceId] : []);
+        const key = occurrences.length ? occurrences.join(",") : `${source.jobId}|${message}`;
+        const qitemId = `wd-${createHash("sha256").update(`${source.policy}|${key}`).digest("hex").slice(0, 24)}`;
+        const firstLine = message.split("\n").find(line => line.trim()) ?? source.policy;
+        try {
+          await deps.createQueueRow({
+            qitemId, destinationSession: targetSession, body: formatWatchdogDeliveryMessage(source, message),
+            summary: `Watchdog (${source.policy}): ${firstLine.slice(0, 160)}`, tags: ["watchdog", "queue-only", `policy:${source.policy}`],
+          });
+        } catch (err) {
+          // No row and no input: the occurrence stays owed and retries.
+          return { status: "failed", sent: false, inputPhase: "not_reached", error: err instanceof Error ? err.message : String(err), continuityActionCompleted };
+        }
+        return { status: "ok", continuityActionCompleted, sentMessage: message };
       }
       const warning = deps.outbox && source.policy === "periodic-reminder" ? "" : "Delivery may repeat after an unconfirmed attempt.\n";
       const payload = formatWatchdogDeliveryMessage(source, warning + message);
