@@ -268,13 +268,14 @@ class Harness {
       readState: (job) => this.readState(job, false),
       effects: this.effects(),
       hostSample: () => this.host,
-      // As startup.ts's busyPoolSessions: the seats that would be parked now, each with why it is busy or null.
+      // As startup.ts's busyPoolSessions (readSeatPoolBusyCandidates): the seats that could take a row now, free or
+      // parked (T-006251), each with why it is busy or null.
       busySessions: async (job) => {
         this.busyReads += 1;
         if (this.busyThrows) throw new Error("no /proc");
         const read = new Map<string, string | null>();
         for (const slot of this.readState(job, false).slots) {
-          if (this.busyLeftOut.has(slot.sessionName) || seatPoolCanReceive(job.spec, slot, this.nowMs) !== "parked") continue;
+          if (this.busyLeftOut.has(slot.sessionName) || seatPoolCanReceive(job.spec, slot, this.nowMs) === null) continue;
           read.set(slot.sessionName, this.busy.get(slot.sessionName) ?? null);
         }
         return read;
@@ -440,12 +441,18 @@ describe("T-006090: a parked seat on heavy local work takes no 2nd row (predicat
     expect(can(spec(HEAVY), parkedSlot("external:ci-x"))).toBe("parked");
   });
 
-  it("a free seat is never held back by the new fields", () => {
+  it("a free seat is held back by a busy process only with busy_processes (T-006251, B1; it was never held back before)", () => {
     const free: SeatPoolSlotView = {
       slotId: 90, logicalId: "dev.impl-s90", sessionName: "dev-impl-s90@r", nodeId: "node-90", phase: "live", adopted: false, nodeExists: true,
       openRows: 0, heldMessages: 0, idleSince: ago(600), cause: "idle", atPrompt: true, backgroundWork: false, busyProcess: "suite-flock (pid 1)",
     };
-    expect(can(spec(HEAVY), free)).toBe("free");
+    expect(can(spec(HEAVY), free)).toBeNull();
+    expect(can(spec(HEAVY), { ...free, busyProcess: null })).toBe("free");
+    expect(can(spec(HEAVY), { ...free, busyProcess: undefined })).toBe("free");
+    // refuse_gates alone (no busy_processes), `{}` and no dispatch_to_parked: a busyProcess holds nothing back.
+    expect(can(spec({ dispatch_to_parked: { refuse_gates: GATES } }), free)).toBe("free");
+    expect(can(spec(ON), free)).toBe("free");
+    expect(can(spec({}), free)).toBe("free");
   });
 
   it("the planner gives the row to the seat waiting on CI, not to the one freezing an eval (nor to a busy one)", () => {
@@ -508,17 +515,22 @@ describe("T-006090: the busy program under a seat's pane (seatPoolBusyCommand, s
   it("readSeatPoolBusySessions reads the table once; an unreadable table or pane holds the seat back", async () => {
     const qa7 = realTree("qa-7-pane-tree.json");
     const processes = vi.fn(async () => qa7.rows);
-    const panes: Record<string, number | null> = { "a@r": qa7.panePid, "b@r": 999_999_999, "c@r": null };
-    const read = await readSeatPoolBusySessions(["a@r", "b@r", "c@r"], PROGRAMS, { processes, panePid: async (s) => panes[s]! });
+    // T-006251 (S3): the server's panes in one read; a seat's pane by its bound id.
+    const panes = vi.fn(async () => [
+      { paneId: "%1", panePid: qa7.panePid, session: "a@r", active: true }, { paneId: "%2", panePid: 999_999_999, session: "b@r", active: true },
+    ]);
+    const paneOf = (s: string) => ({ paneId: ({ "a@r": "%1", "b@r": "%2", "c@r": "%3" } as Record<string, string>)[s]!, tmuxSession: s });
+    const read = await readSeatPoolBusySessions(["a@r", "b@r", "c@r"], PROGRAMS, { processes, panes, paneOf });
     expect(processes).toHaveBeenCalledTimes(1);
+    expect(panes).toHaveBeenCalledTimes(1);
     expect(read.get("a@r")).toMatch(/^suite-flock/);
     expect(read.get("b@r")).toBeNull();
     expect(read.get("c@r")).toBe("pane not found");
-    const failed = await readSeatPoolBusySessions(["a@r"], PROGRAMS, { processes: async () => { throw new Error("EACCES"); }, panePid: async () => 1 });
+    const failed = await readSeatPoolBusySessions(["a@r"], PROGRAMS, { processes: async () => { throw new Error("EACCES"); }, panes, paneOf });
     expect(failed.get("a@r")).toBe("process table not read: EACCES");
-    const thrown = await readSeatPoolBusySessions(["a@r"], PROGRAMS, { processes, panePid: async () => { throw new Error("tmux gone"); } });
-    expect(thrown.get("a@r")).toBe("pane not read: tmux gone");
-    expect((await readSeatPoolBusySessions([], PROGRAMS, { processes, panePid: async () => 1 })).size).toBe(0);
+    const thrown = await readSeatPoolBusySessions(["a@r"], PROGRAMS, { processes, panes: async () => { throw new Error("tmux gone"); }, paneOf });
+    expect(thrown.get("a@r")).toBe("panes not read: tmux gone");
+    expect((await readSeatPoolBusySessions([], PROGRAMS, { processes, panes, paneOf })).size).toBe(0);
   });
 
   it("golden of the real: a suite-flock reparented out of the pane's tree still holds its seat by the TMUX_PANE it inherited", async () => {
@@ -533,8 +545,9 @@ describe("T-006090: the busy program under a seat's pane (seatPoolBusyCommand, s
     expect(seatPoolBusyProcess(rows, panePid, PROGRAMS)).toBeNull();
     const env = new Map(orphans.map((x) => [x.process.pid, x.tmuxPane]));
     const read = await readSeatPoolBusySessions(["qualidade-qa-s8@fabrica", "other@r"], PROGRAMS, {
-      processes: async () => rows, panePid: async () => panePid,
-      paneId: (s) => (s === "qualidade-qa-s8@fabrica" ? "%93" : "%7"), processPane: (pid) => env.get(pid) ?? null,
+      processes: async () => rows,
+      panes: async () => [{ paneId: "%93", panePid, session: "qualidade-qa-s8@fabrica", active: true }, { paneId: "%7", panePid, session: "other@r", active: true }],
+      paneOf: (s) => ({ paneId: s === "qualidade-qa-s8@fabrica" ? "%93" : "%7", tmuxSession: s }), processPane: async (pid) => env.get(pid) ?? null,
     });
     expect(read.get("qualidade-qa-s8@fabrica")).toBe(`suite-flock (pid ${o.process.pid}, TMUX_PANE %93)`);
     expect(read.get("other@r")).toBeNull();
@@ -542,10 +555,12 @@ describe("T-006090: the busy program under a seat's pane (seatPoolBusyCommand, s
 
   it("a read that never answers counts as failed after the timeout, and holds the seat", async () => {
     const never = new Promise<never>(() => {});
-    const slowTable = await readSeatPoolBusySessions(["a@r"], PROGRAMS, { processes: () => never, panePid: async () => 1 }, 20);
+    const paneOf = (s: string) => ({ paneId: "%1", tmuxSession: s });
+    const panes = async () => [{ paneId: "%1", panePid: 1, session: "a@r", active: true }];
+    const slowTable = await readSeatPoolBusySessions(["a@r"], PROGRAMS, { processes: () => never, panes, paneOf }, 20);
     expect(slowTable.get("a@r")).toBe("process table not read: the process table took over 20 ms");
-    const slowPane = await readSeatPoolBusySessions(["a@r"], PROGRAMS, { processes: async () => [], panePid: () => never }, 20);
-    expect(slowPane.get("a@r")).toBe("pane not read: the pane took over 20 ms");
+    const slowPane = await readSeatPoolBusySessions(["a@r"], PROGRAMS, { processes: async () => [], panes: () => never, paneOf }, 20);
+    expect(slowPane.get("a@r")).toBe("panes not read: the tmux panes took over 20 ms");
   });
 });
 
@@ -639,7 +654,7 @@ describe("T-006090: the executor (real queue, reader and history)", () => {
     expect(h.get(a)).toMatchObject({ state: "blocked", blockedOn: "external:ci-x" });
   });
 
-  it("recheck: a process read that throws holds the parked seat back (parked_busy), never the free one", async () => {
+  it("recheck: a process read that throws holds the parked seat back (parked_busy), and since T-006251 the free one too (free_busy)", async () => {
     h.register({ ...BASE, max: 2, ...HEAVY });
     const p = h.poolSeat("dev.impl-s1", "background");
     await h.park(p, { gate: "external:ci-x" });
@@ -651,11 +666,17 @@ describe("T-006090: the executor (real queue, reader and history)", () => {
     await h.submit([intent]);
     expect(h.notes(SKIPPED)).toEqual([expect.objectContaining({ code: "parked_busy", busyProcess: "busy processes not read: no /proc" })]);
     expect(h.get(b).destinationSession).toBe(MODEL);
-    // A free seat's move reads no processes.
+    // A free seat's move reads the processes too (T-006251, B1), and a read that throws holds it back.
     const before = h.busyReads;
     const f = h.poolSeat("dev.impl-s2", "idle");
     await h.submit([{ kind: "dispatch", qitemId: b, from: MODEL, slotId: f.slotId }]);
-    expect(h.busyReads).toBe(before);
+    expect(h.busyReads).toBe(before + 1);
+    // Both entries carry the same instant, so they are looked up by code, not by order.
+    expect(h.notes(SKIPPED).filter((n) => n["code"] === "free_busy"))
+      .toEqual([{ qitemId: b, from: MODEL, to: f.session, code: "free_busy", busyProcess: "busy processes not read: no /proc" }]);
+    expect(h.get(b).destinationSession).toBe(MODEL);
+    h.busyThrows = false;
+    await h.submit([{ kind: "dispatch", qitemId: b, from: MODEL, slotId: f.slotId }]);
     expect(h.get(b).destinationSession).toBe(f.session);
   });
 
@@ -723,15 +744,97 @@ describe("T-006090: the executor (real queue, reader and history)", () => {
   });
 });
 
+// ---------------------------------------------------------------------------------------------------------------
+// T-006251 (B1 of REVISAO-T-006182): a free seat (no open row) with heavy local work its runtime does not track
+// ---------------------------------------------------------------------------------------------------------------
+describe("T-006251: a free seat with an orphaned suite-flock takes no row (B1)", () => {
+  let h: Harness;
+
+  beforeEach(() => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    h = new Harness();
+  });
+  afterEach(async () => {
+    await h.executor.stop();
+    h.db.close();
+    vi.useRealTimers();
+  });
+
+  it("the negative case: the orphan outlives the seat's last row; idle at its prompt with no row, the seat takes no tarefa-nova", async () => {
+    h.register({ ...BASE, max: 1, ...HEAVY });
+    const p = h.poolSeat("dev.impl-s1", "background");
+    const a = await h.park(p, { gate: "external:ci-x" });
+    // The seat started a suite-flock with nohup and closed its only row: the shell it ran in is gone, so its runtime
+    // tracks no background work, and the seat is free (idle at its prompt, no open row) with the suite still queued.
+    h.busy.set(p.session, "suite-flock (pid 781461, TMUX_PANE %24)");
+    h.queue.update({ qitemId: a, actorSession: p.session, state: "done", closureReason: "no-follow-on", transitionNote: "done" } as never);
+    h.setMode(p, "idle");
+    const free = h.state().slots[0]!;
+    expect(free).toMatchObject({ openRows: 0, cause: "idle", busyProcess: "suite-flock (pid 781461, TMUX_PANE %24)" });
+    expect(seatPoolCanReceive(h.spec(), free, h.nowMs)).toBeNull();
+    const b = await h.row(MODEL);
+    await h.tickAt(61);
+    expect(h.events(DISPATCHED)).toHaveLength(0);
+    expect(h.get(b)).toMatchObject({ destinationSession: MODEL, state: "pending" });
+    // The suite ends: the next plan gives the row to the seat.
+    h.busy.set(p.session, null);
+    await h.tickAt(120);
+    expect(h.notes(DISPATCHED)).toEqual([expect.objectContaining({ qitemId: b, to: p.session })]);
+    expect(h.get(b).destinationSession).toBe(p.session);
+  });
+
+  it("recheck: a suite orphaned between the plan and the move skips the free row with free_busy; the row stays at the model", async () => {
+    h.register({ ...BASE, max: 1, ...HEAVY });
+    const f = h.poolSeat("dev.impl-s1", "idle");
+    h.nowMs = T0 - 120_000;
+    const b = await h.row(MODEL);
+    h.nowMs = T0;
+    const intent = dispatchesOf(planSeatPool(h.spec(), h.state(), h.nowMs, 120_000).intents)[0]!;
+    expect(intent).toMatchObject({ qitemId: b, slotId: f.slotId });
+    expect(intent).not.toHaveProperty("mode", "parked");
+    h.busy.set(f.session, "congelar-eval (pid 77, TMUX_PANE %9)");
+    await h.submit([intent]);
+    expect(h.notes(SKIPPED)).toEqual([{ qitemId: b, from: MODEL, to: f.session, code: "free_busy", busyProcess: "congelar-eval (pid 77, TMUX_PANE %9)" }]);
+    expect(h.get(b)).toMatchObject({ destinationSession: MODEL, state: "pending" });
+  });
+
+  it("without busy_processes a free seat's move and plan read no processes, and a busy one still receives", async () => {
+    h.register({ ...BASE, max: 1, dispatch_to_parked: { refuse_gates: GATES } });
+    const f = h.poolSeat("dev.impl-s1", "idle");
+    h.busy.set(f.session, "suite-flock (pid 5)");
+    expect(h.state().slots[0]).not.toHaveProperty("busyProcess");
+    const b = await h.row(MODEL);
+    await h.tickAt(61);
+    expect(h.busyReads).toBe(0);
+    expect(h.get(b).destinationSession).toBe(f.session);
+  });
+
+  it("the demand command's receives says null for a free seat with a busy process, free for one without", async () => {
+    h.register({ ...BASE, max: 2, ...HEAVY, demand_cmd: { argv: ["demand"] } });
+    const busy = h.poolSeat("dev.impl-s1", "idle");
+    const quiet = h.poolSeat("dev.impl-s2", "idle");
+    h.busy.set(busy.session, "suite-flock (pid 8)");
+    h.busy.set(quiet.session, null);
+    await h.tickAt(1);
+    const last = h.demandSlots.at(-1)!;
+    expect(last.find((x) => x.session === busy.session)?.receives).toBeNull();
+    expect(last.find((x) => x.session === quiet.session)?.receives).toBe("free");
+  });
+});
+
 describe("T-006090: the daemon's wiring (startup.ts, read as text as seat-pool-c1c-wiring.test.ts does)", () => {
   const startup = readFileSync(join(HERE, "..", "src", "startup.ts"), "utf8");
   it("the reader gets the busy map, the planner reads it after the usage, and the executor reads it again", () => {
     expect(startup).toContain("busyProcess: busy ? (sessionName) => busy.get(sessionName) : undefined,");
     expect(startup).toContain("return readPoolState(job, usageLimited, await busyPoolSessions(job, usageLimited));");
     expect(startup).toContain("busySessions: async (job) => (await busyPoolSessions(job)) ?? new Map(),");
-    expect(startup).toContain("panePid: poolPanePid, paneId: poolPaneId, processPane: processTmuxPane, processes: readProcessTable,");
-    // Only the seats the plan would give a parked row are read.
-    expect(startup).toMatch(/const candidates = readPoolState\(job, usageLimited\)\.slots\.filter\(\(slot\) => seatPoolCanReceive\(job\.spec, slot, nowMs\) === "parked"\);/);
+    // T-006251: the seats that could take a row (free or parked, readSeatPoolBusyCandidates), the panes in one read and
+    // the environment off the event loop.
+    expect(startup).toContain("return readSeatPoolBusyCandidates(job.spec, readPoolState(job, usageLimited).slots, Date.now(), {");
+    expect(startup).toContain("panes: () => tmuxAdapter.listAllPanePids(),");
+    expect(startup).toContain("processPane: processTmuxPane,");
+    expect(startup).toContain("readFile: (path: string) => fs.promises.readFile(path, \"latin1\"),");
+    expect(startup).not.toContain("readFileSync(`/proc/${pid}/environ`");
     // The executor's own reader has no busy map: its recheck reads through busySessions.
     expect(startup).toMatch(/new SeatPoolExecutor\(\{[\s\S]*?readState: readPoolState,[\s\S]*?busySessions: async \(job\) =>/);
   });
