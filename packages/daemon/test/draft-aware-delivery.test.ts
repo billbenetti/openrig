@@ -1156,3 +1156,41 @@ describe("draft-aware at a full held quota (#2430)", () => {
     expect(f.outbox.retentionUsage("a").count).toBe(100);
   });
 });
+
+
+describe("T-006631: a draft typed between the guard's read and the paste", () => {
+  const draft = "Pode mandar pra luiza. Alem disso";
+  it("is seen before the paste: the watchdog notice is held and nothing is pasted into the person's input", async () => {
+    const f = fixture(undefined, { runtime: "claude-code" });
+    await f.enable();
+    const real = f.tmux.captureComposerSnapshot.getMockImplementation()!;
+    let armed = false;
+    f.hooks.load = () => { armed = true; };
+    // The person starts typing right after the read that comes just before the paste.
+    vi.spyOn(f.tmux, "captureComposerSnapshot").mockImplementation(async (name: string) => {
+      const shot = await real(name);
+      if (armed) { armed = false; f.bodies.a = draft; }
+      return shot;
+    });
+    const result = await f.send("watchdog-wake", "[OpenRig watchdog scheduler · policy: periodic-reminder · job: j]\nWake timer fired.", { openrigNotice: true, verify: false });
+    expect(result).toMatchObject({ outcome: "retained", sent: false, reason: "draft_input_busy" });
+    expect(f.writes.filter(w => w.startsWith("paste:"))).toEqual([]);
+    expect(f.submissions).toEqual([]);
+    expect(f.bodies.a).toBe(draft);
+  });
+
+  it("waits while a tmux client typed in the last seconds, and delivers once it is quiet", async () => {
+    const f = fixture(undefined, { runtime: "claude-code" });
+    await f.enable();
+    let last: number | null = Date.now() - 1000;
+    (f.tmux as unknown as { lastClientActivity: () => Promise<number | null> }).lastClientActivity = async () => last;
+    const busy = await f.send("wake-1", "Wake timer fired.", { openrigNotice: true, verify: false });
+    expect(busy).toMatchObject({ outcome: "retained", sent: false, reason: "draft_input_busy" });
+    expect(f.writes.filter(w => w.startsWith("paste:"))).toEqual([]);
+    last = Date.now() - 60_000;
+    f.advance();
+    const sent = await f.send("wake-2", "Wake timer fired again.", { openrigNotice: true, verify: false });
+    expect(sent).toMatchObject({ ok: true });
+    expect(f.submissions).toHaveLength(1);
+  });
+});

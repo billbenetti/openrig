@@ -591,6 +591,13 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
   setDaemonTmuxServer(tmuxSelection?.serverArgs ?? (opts?.tmuxExec ? [] : tmuxServerArgs(process.env)), tmuxSelection);
   const deliveryGuard = new SeatDeliveryGuard(db, target => resolveGuardTarget(db, target));
   deliveryGuard.recoverActivation();
+  /** The seat's typing guard is at queue-only (T-006631); an unknown seat is not. */
+  const isQueueOnlyGuardSeat = (sessionName: string): boolean => {
+    try {
+      const target = resolveGuardTarget(db, sessionName);
+      return !!target && deliveryGuard.queueOnly(target.nodeId);
+    } catch { return false; }
+  };
   tmuxAdapter.deliveryGuard = deliveryGuard;
 
   // Slice 15 — Seat-activity service for the `terminal-active` primitive.
@@ -2567,6 +2574,10 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
         isTerminalSeat: (sessionName) => isBoundTerminalSeat(db, sessionName),
         hasPendingPostCompactStage: (sessionName) => deps.compactionEnforcer?.hasPendingPostCompactStage(sessionName) ?? false,
         createContinuityAction: (action) => createContinuityCutoverBaton(action, queueRepoInstance).then(() => {}),
+        // T-006631: a seat at the queue-only level gets its reminders as cold queue rows, never typed.
+        isQueueOnlySeat: (sessionName) => isQueueOnlyGuardSeat(sessionName),
+        createQueueRow: (row) => queueRepoInstance.create({ qitemId: row.qitemId, sourceSession: "watchdog@system",
+          destinationSession: row.destinationSession, body: row.body, summary: row.summary, tags: row.tags, nudge: false }).then(() => {}),
       }),
       // (i-c) fire-time target-generation gate: resolve the target's LIVE occupant-generation (P12
       // occupant_tenures) so a generation-bound wake is refused once the target has handed over.
@@ -2668,6 +2679,7 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
               queueRepoInstance.listOpenObligations(destinationSession, 500).map((r) => r.qitemId),
           },
           isTerminalSeat: (sessionName) => isBoundTerminalSeat(db, sessionName),
+          isQueueOnlySeat: (sessionName) => isQueueOnlyGuardSeat(sessionName),
           retentionState: (sessionName) => {
             const target = resolveGuardTarget(db, sessionName);
             if (!target) return null;
