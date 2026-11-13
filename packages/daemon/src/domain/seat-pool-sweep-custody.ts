@@ -8,8 +8,8 @@ interface PoolQueueFacts {
   /** A seat of the pool is live, with its node present. A seat still being added doesn't count: an add that keeps
    *  failing would hold the queue forever. */
   hasSeat: boolean;
-  /** When the pool last had a seat: the latest retirement of a seat it launched (seat_pool_launched in the job's
-   *  history) or adopted, or else its registration. A seat retired before it was launched never counts. */
+  /** When the pool last had a seat: the latest retirement of a seat that got its node or was adopted, or else its
+   *  registration. A seat retired before its node was added never counts. */
   lastSeatMs: number;
   graceMs: number;
 }
@@ -36,15 +36,12 @@ export function seatPoolQueueCustody(
         `SELECT 1 FROM seat_pool_slots s JOIN nodes n ON n.id = s.node_id
           WHERE s.pool_job_id = ? AND s.retired_at IS NULL AND s.phase = 'live' LIMIT 1`,
       );
-      const hasHistory = !!db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'watchdog_history'").get();
-      // A retired seat counts as one the pool had only if it was adopted (op_id null) or the pool launched it. A history
-      // entry the retention already removed reads as never launched: the finding comes sooner, never later.
+      // A retired seat counts as one the pool had only if it was adopted (op_id null) or got its node (node_id stays on
+      // the retired row): an add that failed before its node never had a seat. The slot's own row, not the job's history
+      // (whose retention keeps only the newest evaluations), so the grace holds as long as the row does.
       const lastRetired = db.prepare(
         `SELECT MAX(s.retired_at) AS at FROM seat_pool_slots s
-          WHERE s.pool_job_id = ? AND s.retired_at IS NOT NULL
-            AND (s.op_id IS NULL${hasHistory ? ` OR EXISTS (SELECT 1 FROM watchdog_history h
-                   WHERE h.job_id = s.pool_job_id AND h.skip_reason = 'seat_pool_launched'
-                     AND json_extract(h.evaluation_notes, '$.slot') = s.logical_id)` : ""})`,
+          WHERE s.pool_job_id = ? AND s.retired_at IS NOT NULL AND (s.op_id IS NULL OR s.node_id IS NOT NULL)`,
       );
       for (const job of jobs) {
         const parsed = parseYaml(job.spec_yaml) as { context?: unknown } | null;
