@@ -3,6 +3,7 @@ import { isQueueWait } from "./queue-wait-backoff.js";
 import { isTypedGateBlocker } from "./queue-blocker.js";
 import { isHumanSeatSessionRef } from "./session-name.js";
 import { loadHumanRegistry, resolveRegisteredHumanAddress } from "./gateway/human-registry.js";
+import { deliveryReachedSeat } from "./watchdog-history-log.js";
 
 export type ParkWakeKind = "watchdog" | "timer" | "blocker";
 export type ParkWakePhase = "armed" | "fired";
@@ -181,7 +182,7 @@ export class QueueWakeRepository {
         WHERE qitem_id = ? AND phase = 'fired' AND wake_ref = ? AND transition_id > ?
         ORDER BY transition_id DESC LIMIT 1`,
     ).get(qitemId, armed.wake_ref, armed.transition_id) as { delivery_status: string | null } | undefined;
-    if (fired?.delivery_status !== "ok") return false;
+    if (!deliveryReachedSeat(fired?.delivery_status)) return false;
     // A refusal never reaches the row's own records (it isn't a delivery attempt), so the job's latest evaluation
     // must itself be a delivered send. Latest = the history log's own order: evaluated_at, then history_id (a ULID).
     const hasHistory = this.db.prepare(
@@ -194,7 +195,7 @@ export class QueueWakeRepository {
       `SELECT outcome, delivery_status, delivery_target_session FROM watchdog_history
         WHERE job_id = ? ORDER BY evaluated_at DESC, history_id DESC LIMIT 1`,
     ).get(armed.wake_ref) as { outcome: string; delivery_status: string | null; delivery_target_session: string | null } | undefined;
-    return latest?.outcome === "sent" && latest.delivery_status === "ok"
+    return latest?.outcome === "sent" && deliveryReachedSeat(latest.delivery_status)
       && latest.delivery_target_session === job.destination_session;
   }
 
