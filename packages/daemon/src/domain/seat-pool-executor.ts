@@ -1578,12 +1578,15 @@ export class SeatPoolExecutor {
         return true;
       }
     }
-    const park = mode === "parked" ? slot.parked! : null;
+    // With max_open_rows above 1 a seat parked on 2 or more rows carries parkedRows, not parked: the audit names the
+    // newest (parkedRows keeps listOpenObligations' order, newest first) and counts them.
+    const park = mode === "parked" ? (slot.parked ?? slot.parkedRows?.[0] ?? null) : null;
     // Without dispatch_to_parked the entry is the one from before the key: no mode.
     const notes: Record<string, unknown> = {
       ...base,
       ...(ctx.spec.dispatchToParked ? { mode } : {}),
       ...(park ? { parkedQitemId: park.qitemId } : {}),
+      ...(mode === "parked" && (slot.parkedRows?.length ?? 0) > 1 ? { parkedRows: slot.parkedRows!.length } : {}),
     };
     const why = park ? `was parked on ${park.blockedOn} (2nd row)` : "was free";
     const moved = this.deps.effects.moveRow({ ...base, reason: `seat pool ${jobId}: ${intent.from} had not taken it; ${slot.sessionName} ${why}` });
