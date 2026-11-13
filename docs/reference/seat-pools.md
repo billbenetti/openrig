@@ -29,6 +29,7 @@ context:
   dispatch_tag: role:impl   # move only the model's rows with this tag (default: every row to the model)
   drain: false              # true empties the pool (see below)
   drain_deadline_s: 900     # how long a drain waits for seats to become free before taking them out (default 900, at most 86400; 0: no deadline)
+  no_seat_grace_s: 1800     # how long the stuck sweep leaves the pool's queue to it with no live seat (60..86400, default 1800)
   adopt: [dev.impl2]        # existing seats the pool counts and gives rows to, but never stops or removes
   cwd_template: /work/{rig}/{slot}   # required: absolute, with {slot}; {rig} is optional
   demand_cmd:  { argv: [/usr/local/bin/pool-demand], timeout_s: 30 }
@@ -123,6 +124,14 @@ isn't taking it:
 | is working | nothing: the row waits, and counts as demand if it is the model's |
 
 ### A seat parked on its own wait
+
+### The stuck sweep and the pool's queue
+
+A row waiting for the model and carrying the pool's `dispatch_tag` is the pool's to move to a seat, not a stuck
+obligation: while the pool is active, not draining, and has a live seat (or one being added) or had one within
+`no_seat_grace_s`, the stuck sweep files no `unclaimed-obligation` finding for it. A pool that drains or is stopped, a
+pool with no `dispatch_tag`, a row without the tag, and a pool without a seat for longer than `no_seat_grace_s` keep the
+finding, so a queue nothing will move is still reported.
 
 With `dispatch_to_parked` in the spec, a seat that parked its only open row on a short wait of its own (a suite or a
 CI run it left in the background) may receive one row more, after the free seats. It receives when all of these hold:
