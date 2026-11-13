@@ -75,6 +75,10 @@ export interface SeatPoolDispatchToParked {
    *  wrappers, seatPoolBusyCommand) is one of them takes no 2nd row (SeatPoolSlotView.busyProcess). Absent (no
    *  property) when the field is not given: processes are not read. */
   busyProcesses?: string[];
+  /** `max_open_rows`: a seat may hold up to this many open rows and still receive, when ALL of them are blocked on its
+   *  own `external:` waits, each passing the checks the single park passes (T-007036). Absent (no property) when the
+   *  field is not given, which reads as 1: exactly one open row, the rule from before the field. */
+  maxOpenRows?: number;
 }
 
 const SPEC_KEYS = new Set([
@@ -127,8 +131,11 @@ const DISPATCH_TO_PARKED_NUMBERS = {
   max_claim_age_s: { min: 600, max: 172_800, fallback: 21_600 },
   parked_max_load_per_cpu_percent: { min: 0, max: 10_000, fallback: 0 },
 } as const;
+/** `max_open_rows`: its bounds; absent reads as 1 (DISPATCH_TO_PARKED_MAX_OPEN_ROWS_DEFAULT). */
+const DISPATCH_TO_PARKED_MAX_OPEN_ROWS = { min: 1, max: 20 } as const;
+export const DISPATCH_TO_PARKED_MAX_OPEN_ROWS_DEFAULT = 1;
 const DISPATCH_TO_PARKED_LISTS = ["refuse_gates", "busy_processes"] as const;
-const DISPATCH_TO_PARKED_KEYS = new Set([...Object.keys(DISPATCH_TO_PARKED_NUMBERS), "allow_background_work", ...DISPATCH_TO_PARKED_LISTS]);
+const DISPATCH_TO_PARKED_KEYS = new Set([...Object.keys(DISPATCH_TO_PARKED_NUMBERS), "allow_background_work", ...DISPATCH_TO_PARKED_LISTS, "max_open_rows"]);
 /** The most entries a `dispatch_to_parked` list may hold, and the longest entry. */
 const DISPATCH_TO_PARKED_LIST_MAX = 32;
 const DISPATCH_TO_PARKED_ENTRY_MAX = 128;
@@ -179,6 +186,13 @@ function dispatchToParked(value: unknown): SeatPoolDispatchToParked | SpecProble
   if (allow !== undefined && typeof allow !== "boolean") {
     return { field: `${DISPATCH_TO_PARKED}.allow_background_work`, message: `seat-pool: ${DISPATCH_TO_PARKED}.allow_background_work must be true or false` };
   }
+  const maxOpenRows = record["max_open_rows"];
+  if (maxOpenRows !== undefined) {
+    const { min, max } = DISPATCH_TO_PARKED_MAX_OPEN_ROWS;
+    if (!Number.isInteger(maxOpenRows) || (maxOpenRows as number) < min || (maxOpenRows as number) > max) {
+      return { field: `${DISPATCH_TO_PARKED}.max_open_rows`, message: `seat-pool: ${DISPATCH_TO_PARKED}.max_open_rows must be a whole number from ${min} to ${max}` };
+    }
+  }
   const lists: Partial<Record<(typeof DISPATCH_TO_PARKED_LISTS)[number], string[]>> = {};
   for (const key of DISPATCH_TO_PARKED_LISTS) {
     if (record[key] === undefined) continue;
@@ -192,6 +206,7 @@ function dispatchToParked(value: unknown): SeatPoolDispatchToParked | SpecProble
     // Only a list that was given becomes a property, so `{}` reads as it did before the lists.
     ...(lists.refuse_gates ? { refuseGates: lists.refuse_gates } : {}),
     ...(lists.busy_processes ? { busyProcesses: lists.busy_processes } : {}),
+    ...(maxOpenRows !== undefined ? { maxOpenRows: maxOpenRows as number } : {}),
   };
 }
 
@@ -413,6 +428,9 @@ export interface SeatPoolSlotView {
   backgroundWork?: boolean;
   /** Only with `dispatch_to_parked` in the spec, the row facts read and exactly one open row, blocked: that row's park. */
   parked?: ParkFacts;
+  /** Only with `dispatch_to_parked.max_open_rows` above 1, the row facts read and 2 or more open rows, all blocked (at
+   *  most that many): the park of each (T-007036). A seat with one open row carries `parked` instead. */
+  parkedRows?: ParkFacts[];
   /** Only with `dispatch_to_parked.busy_processes` in the spec, for a seat the process read looked at: why the seat
    *  counts as busy for a 2nd row (the matching process, or that its processes could not be read), or null when no
    *  process under its pane matches. Absent: not read, which holds nothing back. */
@@ -527,21 +545,29 @@ export function seatPoolCanReceive(spec: SeatPoolSpec, slot: SeatPoolSlotView, n
   if (!rule || slot.adopted) return null;
   if (slot.atPrompt !== true || (slot.cause !== "idle" && slot.cause !== "working")) return null;
   if (!rule.allowBackgroundWork && slot.backgroundWork === true) return null;
-  const park = slot.parked;
-  if (slot.openRows !== 1 || !park) return null;
-  if (!park.blockedOn.startsWith("external:")) return null;
+  // Every open row must be one of the seat's own parks: exactly one (`parked`), or with max_open_rows above 1 up to that
+  // many (`parkedRows`, T-007036). A pending or in-progress row has no park, so the counts then differ and it refuses.
+  const maxOpenRows = rule.maxOpenRows ?? DISPATCH_TO_PARKED_MAX_OPEN_ROWS_DEFAULT;
+  const parks = slot.openRows === 1 ? (slot.parked ? [slot.parked] : []) : (slot.parkedRows ?? []);
+  if (slot.openRows < 1 || slot.openRows > maxOpenRows || parks.length !== slot.openRows) return null;
+  if (slot.busyProcess) return null;
+  return parks.every((park) => seatPoolOwnPark(rule, slot.sessionName, park, nowMs)) ? "parked" : null;
+}
+
+/** Whether one blocked row is the seat's own short wait: an `external:` gate not refused, a live timer it armed within
+ *  max_wake_s, taken within max_claim_age_s and parked after it was taken. */
+function seatPoolOwnPark(rule: SeatPoolDispatchToParked, sessionName: string, park: ParkFacts, nowMs: number): boolean {
+  if (!park.blockedOn.startsWith("external:")) return false;
   // A wait that is itself heavy local work (an eval being frozen, a suite queued for the host's lock) is not one the seat
   // can take a 2nd row through: it gives the row back and the row goes round (T-006090).
-  if (rule.refuseGates?.some((part) => park.blockedOn.includes(part))) return null;
-  if (slot.busyProcess) return null;
-  if (!park.timerArmedLive || park.timerIntervalS === null || park.timerIntervalS > rule.maxWakeSeconds) return null;
-  if (park.parkActor !== slot.sessionName) return null;
-  if (park.takenAt === null || park.parkedAt === null) return null;
+  if (rule.refuseGates?.some((part) => park.blockedOn.includes(part))) return false;
+  if (!park.timerArmedLive || park.timerIntervalS === null || park.timerIntervalS > rule.maxWakeSeconds) return false;
+  if (park.parkActor !== sessionName) return false;
+  if (park.takenAt === null || park.parkedAt === null) return false;
   const takenMs = Date.parse(park.takenAt);
   const parkedMs = Date.parse(park.parkedAt);
   // Written so that an unreadable time (NaN) refuses.
-  if (!(parkedMs >= takenMs) || !(nowMs - takenMs <= rule.maxClaimAgeSeconds * 1000)) return null;
-  return "parked";
+  return parkedMs >= takenMs && nowMs - takenMs <= rule.maxClaimAgeSeconds * 1000;
 }
 
 /** Whether the host's load keeps a seat parked on its own wait from a 2nd row: `parked_max_load_per_cpu_percent` is set

@@ -262,7 +262,7 @@ export interface SeatPoolStateReaderDeps {
   demand(jobId: string): { desired: number; sampledAt: string } | null;
   /** A seat's open rows with the park of its only open row when that row is blocked (QueueRepository.
    *  listPoolSeatRowFacts). Read only with `dispatch_to_parked` in the spec; absent, no seat is ever "parked". */
-  rowFacts?(sessionName: string): PoolSeatRowFacts;
+  rowFacts?(sessionName: string, maxBlocked?: number): PoolSeatRowFacts;
   /** The host's load, read for a spec whose `dispatch_to_parked` sets `parked_max_load_per_cpu_percent`, so the plan
    *  holds a parked seat back as the executor's recheck would (SeatPoolState.hostLoadPerCpuPercent). Absent: not read. */
   hostSample?(): HostSample;
@@ -332,13 +332,14 @@ export function readSeatPoolState(deps: SeatPoolStateReaderDeps, job: { jobId: s
   // dispatch_to_parked: the view gains what seatPoolCanReceive reads for a parked seat. Without the key the view is the
   // one from before it, field for field.
   const parkedRule = job.spec.dispatchToParked !== undefined;
+  const maxOpenRows = job.spec.dispatchToParked?.maxOpenRows ?? 1;
   const busyRule = parkedRule && (job.spec.dispatchToParked?.busyProcesses?.length ?? 0) > 0 && deps.busyProcess;
   const slots = deps.slots.listOpen(job.jobId).map((slot): SeatPoolSlotView => {
     const present = slot.nodeId !== null && nodeExists(slot.nodeId);
     const state = present ? deps.seatState(slot.nodeId!) : null;
     const idle = state?.activity === "idle-at-prompt" && state.needsInput.count === 0 && !state.backgroundWork;
     const sessionName = seatSessionName(slot.logicalId, model.rigName);
-    const facts = present && parkedRule && deps.rowFacts ? deps.rowFacts(sessionName) : null;
+    const facts = present && parkedRule && deps.rowFacts ? deps.rowFacts(sessionName, maxOpenRows) : null;
     return {
       slotId: slot.slotId,
       logicalId: slot.logicalId,
@@ -357,6 +358,7 @@ export function readSeatPoolState(deps: SeatPoolStateReaderDeps, job: { jobId: s
         ? { atPrompt: state?.activity === "idle-at-prompt" && state.needsInput.count === 0, backgroundWork: !!state?.backgroundWork }
         : {}),
       ...(facts?.parked ? { parked: facts.parked } : {}),
+      ...(facts?.parkedRows ? { parkedRows: facts.parkedRows } : {}),
       ...busyOf(busyRule && present ? deps.busyProcess!(sessionName) : undefined),
     };
   });
