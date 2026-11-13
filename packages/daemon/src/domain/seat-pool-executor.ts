@@ -21,6 +21,7 @@ import {
   SEAT_POOL_RELEASE_RETRY_SECONDS,
   seatPoolCanReceive,
   seatPoolParkedLoadOver,
+  seatPoolHeldByProcess,
   seatPoolReceives,
   seatPoolDrainEpisode,
   seatPoolReapable,
@@ -1742,10 +1743,17 @@ export class SeatPoolExecutor {
     // usage limit and load they read, so the demand command never counts a seat the pool would not give a row to.
     const nowMs = this.now().getTime();
     const loadPerCpuPercent = this.parkedLoadNow(ctx.spec);
-    const slots = ctx.state.slots.map((slot) => ({
-      session: seatSessionName(slot.logicalId, ctx.model.rigName), phase: slot.phase,
-      receives: seatPoolReceives(ctx.spec, withBusy(slot, busy), nowMs, { usageLimited: usageLimited.has(slot.sessionName), loadPerCpuPercent }),
-    }));
+    // `held: "busy"` (T-007527): the free seat in usage held only by a busy_processes program the read found, the one
+    // the plan counts as occupied for it; absent for every other seat (a null `receives` says no more than "no row now").
+    const slots = ctx.state.slots.map((slot) => {
+      const read = withBusy(slot, busy);
+      const limited = usageLimited.has(slot.sessionName);
+      return {
+        session: seatSessionName(slot.logicalId, ctx.model.rigName), phase: slot.phase,
+        receives: seatPoolReceives(ctx.spec, read, nowMs, { usageLimited: limited, loadPerCpuPercent }),
+        ...(seatPoolHeldByProcess(ctx.spec, read, { usageLimited: limited }) ? { held: "busy" as const } : {}),
+      };
+    });
     const result = await this.deps.effects.runCommand(ctx.spec.demandCmd, this.commandEnv(ctx, { OPENRIG_SEAT_POOL_SLOTS: JSON.stringify(slots) }), run.controller.signal);
     if (run.controller.signal.aborted) return;
     let desired: unknown;
