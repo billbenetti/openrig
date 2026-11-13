@@ -45,13 +45,13 @@ describe("stuck sweep: rows waiting in an active seat pool's queue (T-007029, #2
   }
   /** A seat of the pool: `live` with its node present, or retired `retiredMinutesAgo` ago; `hadNode` (default true): the
    *  retired seat got its node before it was retired (an add that failed before its node never had one). */
-  function slot(jobId: string, opts: { live: boolean; retiredMinutesAgo?: number; hadNode?: boolean }): void {
+  function slot(jobId: string, opts: { live: boolean; retiredMinutesAgo?: number; hadNode?: boolean; neverLive?: boolean }): void {
     const rig = rigs.listRigs().find((r) => r.name === "dev") ?? rigs.createRig("dev");
     const n = ++nodeSeq;
     const nodeId = opts.live ? rigs.addNode(rig.id, `impl-s${n}`, { runtime: "claude-code" }).id : (opts.hadNode ?? true) ? `node-gone-${n}` : null;
-    db.prepare(`INSERT INTO seat_pool_slots (pool_job_id, node_id, logical_id, phase, op_id, created_at, retired_at)
-                VALUES (?, ?, ?, ?, 'op', ?, ?)`).run(jobId, nodeId, `impl-s${n}`, opts.live ? "live" : "retired",
-      minutesAgo(500), opts.live ? null : minutesAgo(opts.retiredMinutesAgo ?? 300));
+    db.prepare(`INSERT INTO seat_pool_slots (pool_job_id, node_id, logical_id, phase, intent, op_id, created_at, retired_at)
+                VALUES (?, ?, ?, ?, ?, 'op', ?, ?)`).run(jobId, nodeId, `impl-s${n}`, opts.live ? "live" : "retired",
+      opts.neverLive ? "never_live" : null, minutesAgo(500), opts.live ? null : minutesAgo(opts.retiredMinutesAgo ?? 300));
   }
   async function work(tags: string[] = [TAG], destination = MODEL): Promise<QueueItem> {
     const row = await queue.create({ sourceSession: "lead@dev", destinationSession: destination, body: "work", tags, nudge: false } as never);
@@ -107,6 +107,30 @@ describe("stuck sweep: rows waiting in an active seat pool's queue (T-007029, #2
     const row = await work();
     await sweep();
     expect(findingFor(row)).toBe(true);
+  });
+
+  it("a seat whose node was added but whose launch failed (retired never live) doesn't count either", async () => {
+    slot(pool({}), { live: false, retiredMinutesAgo: 5, neverLive: true });
+    const row = await work();
+    await sweep();
+    expect(findingFor(row)).toBe(true);
+  });
+
+  it("SeatPoolSlots.retire keeps never_live for a seat retired while adding or added, and nothing for a live one", async () => {
+    const { SeatPoolSlots } = await import("../src/domain/seat-pool-executor.js");
+    const jobId = pool({});
+    const slots = new SeatPoolSlots(db);
+    const at = minutesAgo(1);
+    const adding = slots.insert({ poolJobId: jobId, logicalId: "impl-a", nodeId: null, phase: "adding", intent: "add", opId: "op-a", at });
+    const added = slots.insert({ poolJobId: jobId, logicalId: "impl-b", nodeId: "node-b", phase: "added", intent: "launch", opId: "op-b", at });
+    const live = slots.insert({ poolJobId: jobId, logicalId: "impl-c", nodeId: "node-c", phase: "live", intent: null, opId: "op-c", at });
+    for (const s of [adding, added, live]) slots.retire(s.slotId, at);
+    const intents = db.prepare("SELECT logical_id, phase, intent FROM seat_pool_slots WHERE pool_job_id = ? ORDER BY logical_id").all(jobId);
+    expect(intents).toEqual([
+      { logical_id: "impl-a", phase: "retired", intent: "never_live" },
+      { logical_id: "impl-b", phase: "retired", intent: "never_live" },
+      { logical_id: "impl-c", phase: "retired", intent: null },
+    ]);
   });
 
   it("a tagged row addressed to another address of the model: no finding", async () => {

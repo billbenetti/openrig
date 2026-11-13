@@ -188,8 +188,10 @@ export class SeatPoolSlots {
     if (sets.length > 0) this.db.prepare(`UPDATE seat_pool_slots SET ${sets.join(", ")} WHERE id = ?`).run(...values, slotId);
   }
 
+  /** Retires a seat. One retired before it was ever live (still adding or added) keeps `intent = 'never_live'`, so a
+   *  reader of retired seats (the stuck sweep's grace over the pool's queue, T-007029) can tell it never had a seat. */
   retire(slotId: number, at: string): void {
-    this.db.prepare("UPDATE seat_pool_slots SET phase = 'retired', intent = NULL, retired_at = ? WHERE id = ?").run(at, slotId);
+    this.db.prepare("UPDATE seat_pool_slots SET phase = 'retired', intent = CASE WHEN phase IN ('adding', 'added') THEN 'never_live' ELSE NULL END, retired_at = ? WHERE id = ?").run(at, slotId);
   }
 
   /**
