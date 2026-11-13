@@ -43,19 +43,15 @@ describe("stuck sweep: rows waiting in an active seat pool's queue (T-007029, #2
                 VALUES (?, 'seat-pool', ?, ?, 60, ?, 'lead@dev', ?)`).run(jobId, `context:\n${lines}\n`, target, state, minutesAgo(600));
     return jobId;
   }
-  /** A seat of the pool: `live` with its node present, or retired `retiredMinutesAgo` ago; `launched` (default true)
-   *  records in the job's history that the pool launched it, as the executor does. */
-  function slot(jobId: string, opts: { live: boolean; retiredMinutesAgo?: number; launched?: boolean }): void {
+  /** A seat of the pool: `live` with its node present, or retired `retiredMinutesAgo` ago; `hadNode` (default true): the
+   *  retired seat got its node before it was retired (an add that failed before its node never had one). */
+  function slot(jobId: string, opts: { live: boolean; retiredMinutesAgo?: number; hadNode?: boolean }): void {
     const rig = rigs.listRigs().find((r) => r.name === "dev") ?? rigs.createRig("dev");
     const n = ++nodeSeq;
-    const node = opts.live ? rigs.addNode(rig.id, `impl-s${n}`, { runtime: "claude-code" }) : null;
+    const nodeId = opts.live ? rigs.addNode(rig.id, `impl-s${n}`, { runtime: "claude-code" }).id : (opts.hadNode ?? true) ? `node-gone-${n}` : null;
     db.prepare(`INSERT INTO seat_pool_slots (pool_job_id, node_id, logical_id, phase, op_id, created_at, retired_at)
-                VALUES (?, ?, ?, ?, 'op', ?, ?)`).run(jobId, node?.id ?? null, `impl-s${n}`, opts.live ? "live" : "retired",
+                VALUES (?, ?, ?, ?, 'op', ?, ?)`).run(jobId, nodeId, `impl-s${n}`, opts.live ? "live" : "retired",
       minutesAgo(500), opts.live ? null : minutesAgo(opts.retiredMinutesAgo ?? 300));
-    if (opts.launched ?? true) {
-      db.prepare(`INSERT INTO watchdog_history (history_id, job_id, evaluated_at, outcome, skip_reason, evaluation_notes)
-                  VALUES (?, ?, ?, 'skipped', 'seat_pool_launched', ?)`).run(`h-${n}`, jobId, minutesAgo(499), JSON.stringify({ slot: `impl-s${n}` }));
-    }
   }
   async function work(tags: string[] = [TAG], destination = MODEL): Promise<QueueItem> {
     const row = await queue.create({ sourceSession: "lead@dev", destinationSession: destination, body: "work", tags, nudge: false } as never);
@@ -97,7 +93,6 @@ describe("stuck sweep: rows waiting in an active seat pool's queue (T-007029, #2
     const within = await work();
     await sweep();
     expect(findingFor(within)).toBe(false);
-    db.prepare("DELETE FROM watchdog_history").run();
     db.prepare("DELETE FROM watchdog_jobs").run();
     db.prepare("DELETE FROM seat_pool_slots").run();
     slot(pool({}), { live: false, retiredMinutesAgo: 45 });
@@ -106,9 +101,9 @@ describe("stuck sweep: rows waiting in an active seat pool's queue (T-007029, #2
     expect(findingFor(past)).toBe(true);
   });
 
-  it("a seat that failed before it was launched doesn't count as the pool having had one", async () => {
-    // Retired 5 minutes ago, but never launched: the pool has had no seat since it was registered (600 minutes ago).
-    slot(pool({}), { live: false, retiredMinutesAgo: 5, launched: false });
+  it("a seat that failed before its node was added doesn't count as the pool having had one", async () => {
+    // Retired 5 minutes ago, but before its node was added: the pool has had no seat since it was registered (600 min ago).
+    slot(pool({}), { live: false, retiredMinutesAgo: 5, hadNode: false });
     const row = await work();
     await sweep();
     expect(findingFor(row)).toBe(true);
