@@ -1469,6 +1469,7 @@ export class SeatPoolExecutor {
     if (this.deps.effects.sessionRunning(nodeId)) {
       // Launched after all: it is a live seat now, and leaves only by draining.
       this.setIntent(slotId, null, "live");
+      this.deps.slots.markLive(slotId, this.at());   // T-007545 (B1): its start, as a launch that worked records it
       this.record(jobId, false, "seat_pool_launched", { slot: slot.logicalId, nodeId });
       return true;
     }
