@@ -562,6 +562,34 @@ export function seatPoolReapable(slot: SeatPoolSlotView): boolean {
   return !slot.adopted && slot.phase === "live" && slot.nodeExists && slot.cause === "stopped";
 }
 
+/** A seat the plan counts among the pool's running seats: live, its node present, not an adopted seat that stopped and
+ *  not one to be reaped (seatPoolPlan's `live`). */
+function seatPoolLive(slot: SeatPoolSlotView): boolean {
+  return slot.phase === "live" && (slot.nodeId === null || slot.nodeExists) && !(slot.adopted && slot.cause === "stopped") && !seatPoolReapable(slot);
+}
+
+/** No open row, no held message and idle since a known time: nothing but local work could keep the seat from a row. */
+function seatPoolQuiet(slot: SeatPoolSlotView): boolean {
+  return slot.openRows === 0 && slot.heldMessages === 0 && slot.idleSince !== null;
+}
+
+/** With `busy_processes`, the seat's process read names a program or failed (T-006251): it takes no row either way. */
+function seatPoolHeldBusy(spec: SeatPoolSpec, slot: SeatPoolSlotView): boolean {
+  return !!spec.dispatchToParked?.busyProcesses?.length && !!slot.busyProcess;
+}
+
+/**
+ * Whether a free seat is held only by a `busy_processes` program the read found under its pane (an orphaned suite-flock
+ * or congelar-eval): quiet, live, in usage, and its `busyProcess` a process (seatPoolBusyFromProcess), not a failed read.
+ * These are the quiet seats the plan counts as occupied (heldBusy && !heldUnread), and the demand command is told so as
+ * `held: "busy"` (T-007527). A seat out of provider usage (`usageLimited`, or its cause) says nothing, as one with a held
+ * message, one to be reaped or one whose read failed: while the limit lasts the pool adds no seat for it anyway.
+ */
+export function seatPoolHeldByProcess(spec: SeatPoolSpec, slot: SeatPoolSlotView, facts: { usageLimited?: boolean } = {}): boolean {
+  if (facts.usageLimited || slot.cause === "usage_limit") return false;
+  return seatPoolLive(slot) && seatPoolQuiet(slot) && seatPoolHeldBusy(spec, slot) && seatPoolBusyFromProcess(slot.busyProcess);
+}
+
 /**
  * Whether a seat may receive a waiting row now, and how; null when it may not. The planner, the executor's check just
  * before the move and the slots the demand command is given (`receives`) all ask this one function.
@@ -694,12 +722,12 @@ export function planSeatPool(spec: SeatPoolSpec, state: SeatPoolState, nowMs: nu
   // this plan reaps is on its way out: it isn't counted as current either, so the same plan can add its replacement
   // (the executor checks the room again after the reap, so the add never takes the pool past `max` if the reap launched the
   // seat instead).
-  const live = present.filter((slot) => slot.phase === "live" && !(slot.adopted && slot.cause === "stopped") && !seatPoolReapable(slot));
+  const live = present.filter(seatPoolLive);
   // A seat with no row but heavy local work its runtime does not track (busyProcess, with busy_processes: T-006251)
   // takes no row, so it is not idle: it counts as occupied (the pool grows for the row it can't take, as for a parked
   // seat) and is never drained as free while its suite runs (REVISAO lente de lógica, wf_fff3f5f2).
-  const heldBusy = (slot: SeatPoolSlotView) => !!spec.dispatchToParked?.busyProcesses?.length && !!slot.busyProcess;
-  const quiet = (slot: SeatPoolSlotView) => slot.openRows === 0 && slot.heldMessages === 0 && slot.idleSince !== null;
+  const heldBusy = (slot: SeatPoolSlotView) => seatPoolHeldBusy(spec, slot);
+  const quiet = seatPoolQuiet;
   const idle = (slot: SeatPoolSlotView) => quiet(slot) && !heldBusy(slot);
   // T-006251 S6: a quiet seat held only because its processes could not be read (a timeout under load, an unreadable
   // environment, its pane not found) takes no row and is never drained, but it is no occupant either: counting it grew
