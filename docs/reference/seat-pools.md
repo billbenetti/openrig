@@ -44,6 +44,7 @@ context:
     parked_max_load_per_cpu_percent: 0   # above this load per CPU (percent) a parked seat gets no row; 0: not checked (default 0)
     refuse_gates: [congelar, suite-flock]  # a parked row whose gate contains one of these is no wait for a 2nd row (default: none)
     busy_processes: [suite-flock]   # a seat with one of these programs running under its pane gets no 2nd row (default: none)
+    max_open_rows: 4                # a seat with up to this many open rows, ALL parked on its own waits, may receive (1..20, default 1)
 ```
 
 Registration and `rig watchdog update --spec` refuse a spec with an unknown field, `max` below `min`, a relative
@@ -132,6 +133,9 @@ CI run it left in the background) may receive one row more, after the free seats
   (`allow_background_work: false` refuses that one); a seat out of usage or stopped does not receive;
 - its only open row is blocked on an `external:` gate (a row blocked on another row, on a seat or on `gate:` is not
   its own wait);
+- with `max_open_rows` above 1 (default 1: exactly one open row), it may hold up to that many open rows, as long as
+  every one of them is blocked and passes, each on its own, the checks below for the parked row; a pending or
+  in-progress row among them refuses;
 - that row's current wake is a timer of at most `max_wake_s`, still armed and live (a park timer fires once: after it
   fired, the seat stops counting as parked until it parks again);
 - the seat armed that wake itself (a note on the row by another seat doesn't change it, a wake armed by another seat

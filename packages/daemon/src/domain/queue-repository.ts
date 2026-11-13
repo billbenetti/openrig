@@ -1073,6 +1073,9 @@ export interface PoolSeatRowFacts {
   rows: Array<{ qitemId: string; state: "pending" | "in-progress" | "blocked" }>;
   /** Only when `rows` is exactly one blocked row; null otherwise. */
   parked: ParkFacts | null;
+  /** Only when asked with maxBlocked above 1 and `rows` is 2 to maxBlocked rows, all blocked: the park of each, in
+   *  `rows`' order (T-007036, dispatch_to_parked.max_open_rows). Absent otherwise. */
+  parkedRows?: ParkFacts[];
 }
 
 export class QueueRepository {
@@ -4896,13 +4899,19 @@ export class QueueRepository {
    * getStatus says whether that wake is still armed and live. The row was taken at its claim, or else at its first move
    * to in-progress by one of its destination's addresses (a seat that takes a row by update, with no claim).
    */
-  listPoolSeatRowFacts(sessionName: string): PoolSeatRowFacts {
+  listPoolSeatRowFacts(sessionName: string, maxBlocked = 1): PoolSeatRowFacts {
     const rows = this.listOpenObligations(sessionName, 500).map((row) => ({ qitemId: row.qitemId, state: row.state }));
-    if (rows.length !== 1 || rows[0]!.state !== "blocked") return { rows, parked: null };
-    const qitemId = rows[0]!.qitemId;
+    if (rows.length === 0 || rows.length > Math.max(1, maxBlocked) || rows.some((row) => row.state !== "blocked")) return { rows, parked: null };
+    if (rows.length === 1) return { rows, parked: this.poolSeatParkFacts(rows[0]!.qitemId) };
+    const parks = rows.map((row) => this.poolSeatParkFacts(row.qitemId));
+    return parks.every((park): park is ParkFacts => park !== null) ? { rows, parked: null, parkedRows: parks } : { rows, parked: null };
+  }
+
+  /** The park facts of one blocked row (listPoolSeatRowFacts); null when the row is not there. */
+  private poolSeatParkFacts(qitemId: string): ParkFacts | null {
     const item = this.db.prepare("SELECT blocked_on, claimed_at, destination_session FROM queue_items WHERE qitem_id = ?")
       .get(qitemId) as { blocked_on: string | null; claimed_at: string | null; destination_session: string } | undefined;
-    if (!item) return { rows, parked: null };
+    if (!item) return null;
     let armed: { wake_kind: string; wake_ref: string; actor_session: string | null; ts: string | null } | undefined;
     try {
       armed = this.db.prepare(
@@ -4932,7 +4941,7 @@ export class QueueRepository {
       parkedAt: armed?.ts ?? null,
       takenAt: item.claimed_at ?? firstTake?.ts ?? null,
     };
-    return { rows, parked };
+    return parked;
   }
 
   /** The open rows of a session with their claim time (listOpenObligations' rows and order): a seat pool's forced pass
