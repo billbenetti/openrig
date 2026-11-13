@@ -943,7 +943,7 @@ export class WatchdogJobsRepository {
     };
     this.db.transaction(() => {
       for (const slot of open) {
-        this.db.prepare("UPDATE seat_pool_slots SET phase = 'retired', intent = NULL, retired_at = ? WHERE id = ?").run(at, slot.id);
+        this.db.prepare("UPDATE seat_pool_slots SET phase = 'retired', intent = CASE WHEN phase IN ('adding', 'added') THEN 'never_live' ELSE NULL END, retired_at = ? WHERE id = ?").run(at, slot.id);
         if (slot.op_id === null) note("seat_pool_unlinked", { slot: slot.logical_id });
       }
       for (const left of leftRunning) note(SEAT_POOL_LEFT, { ...left });
