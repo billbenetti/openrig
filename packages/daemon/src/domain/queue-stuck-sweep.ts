@@ -933,7 +933,7 @@ export async function runStuckSweep(deps: StuckSweepDeps): Promise<StuckSweepRes
     // failed-nudge rows already surfaced in half 2; laddered rows are S01's.
     const cutoff = new Date(now.getTime() - ageMinutes * 60_000).toISOString();
     // T-007029 (#2988): a row waiting in an active seat pool's queue is the pool's to move to a seat, read once per pass.
-    const poolHolds = seatPoolQueueCustody(deps.db, now.getTime());
+    const poolHolds = seatPoolQueueCustody(deps.db, now.getTime(), (session) => deps.queueRepo.addressesOf(session));
     const unclaimedCandidate = (qitemId: string, recordSuppression: boolean): Candidate | null => {
       const row = indexed(() => deps.queueRepo.getById(qitemId, { waiting: false }));
       if (!row || isFindingRow(row)) return null;
