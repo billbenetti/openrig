@@ -8,7 +8,7 @@
 // policy itself never creates, launches, stops, removes, moves or sends anything, so one slow launch can't hold every
 // other job's evaluation.
 
-import { seatPoolBusyWrapper } from "../seat-pool-busy.js";
+import { SEAT_POOL_BUSY_ORPHAN_MAX_AGE_S, seatPoolBusyFromProcess, seatPoolBusyWrapper } from "../seat-pool-busy.js";
 import type { Policy, PolicyEvaluation, PolicyJob } from "./types.js";
 
 export const SEAT_POOL_POLICY_NAME = "seat-pool";
@@ -78,12 +78,18 @@ export interface SeatPoolDispatchToParked {
   refuseGates?: string[];
   /** `busy_processes`: program names; a seat with a live process under its pane whose program (after the usual
    *  wrappers, seatPoolBusyCommand) is one of them takes no 2nd row (SeatPoolSlotView.busyProcess). Absent (no
-   *  property) when the field is not given: processes are not read. */
+   *  property) when the field is not given: processes are not read. With it, a free seat (no open row) is held back
+   *  too (T-006251, B1): a process the seat's runtime does not track (reparented, nohup) gives the row back as well. */
   busyProcesses?: string[];
   /** `max_open_rows`: a seat may hold up to this many open rows and still receive, when ALL of them are blocked on its
    *  own `external:` waits, each passing the checks the single park passes (T-007036). Absent (no property) when the
    *  field is not given, which reads as 1: exactly one open row, the rule from before the field. */
   maxOpenRows?: number;
+  /** `busy_orphan_max_age_s`, only with `busy_processes` (default 43200, 12 h): the oldest a matching process that left
+   *  the pane's tree (found by the TMUX_PANE it inherited) may be and still hold the seat; an older one, or one started
+   *  before the pane's current occupant (its runtime, started anew by a fresh launch: seatPoolPaneOccupantMs), holds nothing
+   *  (T-006251, S2). A process still under the pane holds it whatever its age. Absent without `busy_processes`. */
+  busyOrphanMaxAgeSeconds?: number;
 }
 
 const SPEC_KEYS = new Set([
@@ -144,7 +150,11 @@ const DISPATCH_TO_PARKED_NUMBERS = {
 const DISPATCH_TO_PARKED_MAX_OPEN_ROWS = { min: 1, max: 20 } as const;
 export const DISPATCH_TO_PARKED_MAX_OPEN_ROWS_DEFAULT = 1;
 const DISPATCH_TO_PARKED_LISTS = ["refuse_gates", "busy_processes"] as const;
-const DISPATCH_TO_PARKED_KEYS = new Set([...Object.keys(DISPATCH_TO_PARKED_NUMBERS), "allow_background_work", ...DISPATCH_TO_PARKED_LISTS, "max_open_rows"]);
+/** `busy_orphan_max_age_s`: read only with `busy_processes` (it means nothing without it). */
+const BUSY_ORPHAN_MAX_AGE = { key: "busy_orphan_max_age_s", min: 60, max: 172_800, fallback: SEAT_POOL_BUSY_ORPHAN_MAX_AGE_S } as const;
+const DISPATCH_TO_PARKED_KEYS = new Set([
+  ...Object.keys(DISPATCH_TO_PARKED_NUMBERS), "allow_background_work", ...DISPATCH_TO_PARKED_LISTS, BUSY_ORPHAN_MAX_AGE.key, "max_open_rows",
+]);
 /** The most entries a `dispatch_to_parked` list may hold, and the longest entry. */
 const DISPATCH_TO_PARKED_LIST_MAX = 32;
 const DISPATCH_TO_PARKED_ENTRY_MAX = 128;
@@ -209,12 +219,23 @@ function dispatchToParked(value: unknown): SeatPoolDispatchToParked | SpecProble
     if (isProblem(list)) return list;
     lists[key] = list;
   }
+  const orphanAge = record[BUSY_ORPHAN_MAX_AGE.key];
+  const orphanField = `${DISPATCH_TO_PARKED}.${BUSY_ORPHAN_MAX_AGE.key}`;
+  if (orphanAge !== undefined && !lists.busy_processes) {
+    return { field: orphanField, message: `seat-pool: ${orphanField} is read only with ${DISPATCH_TO_PARKED}.busy_processes` };
+  }
+  if (orphanAge !== undefined
+    && (!Number.isInteger(orphanAge) || (orphanAge as number) < BUSY_ORPHAN_MAX_AGE.min || (orphanAge as number) > BUSY_ORPHAN_MAX_AGE.max)) {
+    return { field: orphanField, message: `seat-pool: ${orphanField} must be a whole number from ${BUSY_ORPHAN_MAX_AGE.min} to ${BUSY_ORPHAN_MAX_AGE.max}` };
+  }
   return {
     maxWakeSeconds: numbers["max_wake_s"]!, maxClaimAgeSeconds: numbers["max_claim_age_s"]!, allowBackgroundWork: allow ?? true,
     parkedMaxLoadPerCpuPercent: numbers["parked_max_load_per_cpu_percent"]!,
     // Only a list that was given becomes a property, so `{}` reads as it did before the lists.
     ...(lists.refuse_gates ? { refuseGates: lists.refuse_gates } : {}),
-    ...(lists.busy_processes ? { busyProcesses: lists.busy_processes } : {}),
+    ...(lists.busy_processes
+      ? { busyProcesses: lists.busy_processes, busyOrphanMaxAgeSeconds: (orphanAge as number | undefined) ?? BUSY_ORPHAN_MAX_AGE.fallback }
+      : {}),
     ...(maxOpenRows !== undefined ? { maxOpenRows: maxOpenRows as number } : {}),
   };
 }
@@ -447,8 +468,9 @@ export interface SeatPoolSlotView {
    *  most that many): the park of each (T-007036). A seat with one open row carries `parked` instead. */
   parkedRows?: ParkFacts[];
   /** Only with `dispatch_to_parked.busy_processes` in the spec, for a seat the process read looked at: why the seat
-   *  counts as busy for a 2nd row (the matching process, or that its processes could not be read), or null when no
-   *  process under its pane matches. Absent: not read, which holds nothing back. */
+   *  counts as busy for a row (the matching process, or that its processes could not be read), or null when no
+   *  process of the seat matches. It holds back a parked seat from a 2nd row and, since T-006251 (B1), a free seat from
+   *  its 1st. Absent: not read, which holds nothing back. */
   busyProcess?: string | null;
 }
 
@@ -545,7 +567,8 @@ export function seatPoolReapable(slot: SeatPoolSlotView): boolean {
  * before the move and the slots the demand command is given (`receives`) all ask this one function.
  *
  * Both ways need the pool not draining, the seat live, its node present, not to be reaped and no held message.
- * `free`: no open row and idle at its prompt (the rule from before `dispatch_to_parked`). `parked`, only with
+ * `free`: no open row and idle at its prompt (the rule from before `dispatch_to_parked`), and, with
+ * `dispatch_to_parked.busy_processes`, no such program of the seat's (`busyProcess`, T-006251). `parked`, only with
  * `dispatch_to_parked`: a seat the pool added (not adopted), at its prompt (idle, or working only through a background
  * shell, which `allow_background_work: false` refuses), whose open rows (one, or up to `max_open_rows`) are each blocked
  * on an `external:` gate with a
@@ -556,8 +579,12 @@ export function seatPoolReapable(slot: SeatPoolSlotView): boolean {
  */
 export function seatPoolCanReceive(spec: SeatPoolSpec, slot: SeatPoolSlotView, nowMs: number): SeatPoolReceiveMode | null {
   if (spec.drain || slot.phase !== "live" || !slot.nodeExists || seatPoolReapable(slot) || slot.heldMessages !== 0) return null;
-  if (slot.openRows === 0 && slot.idleSince !== null && slot.cause === "idle") return "free";
   const rule = spec.dispatchToParked;
+  if (slot.openRows === 0 && slot.idleSince !== null && slot.cause === "idle") {
+    // A free seat with heavy local work its runtime does not track (a suite-flock or congelar-eval orphaned by the shell
+    // that started it) gives the row back too, as a parked one would (T-006251, B1). Only with busy_processes.
+    return rule?.busyProcesses?.length && slot.busyProcess ? null : "free";
+  }
   if (!rule || slot.adopted) return null;
   if (slot.atPrompt !== true || (slot.cause !== "idle" && slot.cause !== "working")) return null;
   if (!rule.allowBackgroundWork && slot.backgroundWork === true) return null;
@@ -668,7 +695,18 @@ export function planSeatPool(spec: SeatPoolSpec, state: SeatPoolState, nowMs: nu
   // (the executor checks the room again after the reap, so the add never takes the pool past `max` if the reap launched the
   // seat instead).
   const live = present.filter((slot) => slot.phase === "live" && !(slot.adopted && slot.cause === "stopped") && !seatPoolReapable(slot));
-  const idle = (slot: SeatPoolSlotView) => slot.openRows === 0 && slot.heldMessages === 0 && slot.idleSince !== null;
+  // A seat with no row but heavy local work its runtime does not track (busyProcess, with busy_processes: T-006251)
+  // takes no row, so it is not idle: it counts as occupied (the pool grows for the row it can't take, as for a parked
+  // seat) and is never drained as free while its suite runs (REVISAO lente de lógica, wf_fff3f5f2).
+  const heldBusy = (slot: SeatPoolSlotView) => !!spec.dispatchToParked?.busyProcesses?.length && !!slot.busyProcess;
+  const quiet = (slot: SeatPoolSlotView) => slot.openRows === 0 && slot.heldMessages === 0 && slot.idleSince !== null;
+  const idle = (slot: SeatPoolSlotView) => quiet(slot) && !heldBusy(slot);
+  // T-006251 S6: a quiet seat held only because its processes could not be read (a timeout under load, an unreadable
+  // environment, its pane not found) takes no row and is never drained, but it is no occupant either: counting it grew
+  // the pool to `max` with no row dispatched (every seat added failed the same read). It still holds its place in the
+  // target (no seat starting is removed for it), and while rows wait undispatched it adds at most ONE seat, which takes a
+  // row when the failure was that seat's own (lens review of the volta 1).
+  const heldUnread = (slot: SeatPoolSlotView) => quiet(slot) && heldBusy(slot) && !seatPoolBusyFromProcess(slot.busyProcess);
   const usageLimited = seatPoolOutOfUsage(state);
 
   const waiting = state.pending.filter((row) => nowMs - Date.parse(row.waitingSince) >= spec.dispatchAfterSeconds * 1000);
@@ -718,7 +756,8 @@ export function planSeatPool(spec: SeatPoolSpec, state: SeatPoolState, nowMs: nu
     }
   }
 
-  const occupied = live.filter((slot) => !idle(slot) || receiving.has(slot));
+  const occupied = live.filter((slot) => (!idle(slot) && !heldUnread(slot)) || receiving.has(slot));
+  const unread = live.filter((slot) => heldUnread(slot) && !receiving.has(slot));
   const free = live.filter((slot) => idle(slot) && !receiving.has(slot) && nowMs - Date.parse(slot.idleSince!) >= spec.idleGraceSeconds * 1000);
   const current = live.length + starting.length;
   const cooling = !spec.drain && state.lastScaleAt !== null && nowMs - Date.parse(state.lastScaleAt) < spec.cooldownSeconds * 1000;
@@ -734,14 +773,15 @@ export function planSeatPool(spec: SeatPoolSpec, state: SeatPoolState, nowMs: nu
       const fresh = state.demand !== null && nowMs - Date.parse(state.demand.sampledAt) <= sampleMaxAgeMs;
       desired = fresh ? state.demand!.desired : null;
     } else {
-      desired = movable.length - dispatched.length + occupied.length;
+      desired = movable.length - dispatched.length + occupied.length
+        + (unread.length > 0 && movable.length > dispatched.length ? 1 : 0);
     }
     if (desired === null) {
       // No current answer from the demand command: keep what exists and finish what was started.
       if (!usageLimited) for (const slot of starting) intents.push({ kind: "launch", slotId: slot.slotId });
       return { intents, reason: "demand_sample_stale", target: null, current };
     }
-    target = Math.min(spec.max, Math.max(spec.min, desired, occupied.length + starting.length));
+    target = Math.min(spec.max, Math.max(spec.min, desired, occupied.length + unread.length + starting.length));
     reason = target > current ? "scale_up" : target < current ? "scale_down" : "steady";
     if (usageLimited && target > current) {
       target = current;

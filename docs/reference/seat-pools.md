@@ -44,7 +44,8 @@ context:
     allow_background_work: true     # false: a seat with a background shell does not receive (default true)
     parked_max_load_per_cpu_percent: 0   # above this load per CPU (percent) a parked seat gets no row; 0: not checked (default 0)
     refuse_gates: [congelar, suite-flock]  # a parked row whose gate contains one of these is no wait for a 2nd row (default: none)
-    busy_processes: [suite-flock]   # a seat with one of these programs running under its pane gets no 2nd row (default: none)
+    busy_processes: [suite-flock]   # a seat with one of these programs running gets no row: no 2nd row parked, and no row free either (default: none)
+    busy_orphan_max_age_s: 43200    # only with busy_processes: the oldest a process that left the pane's tree may be and still hold the seat (60..172800, default 43200)
     max_open_rows: 4                # a seat with up to this many open rows, ALL parked on its own waits, may receive (1..20, default 1)
 ```
 
@@ -52,7 +53,8 @@ Registration and `rig watchdog update --spec` refuse a spec with an unknown fiel
 `cwd_template` or one without `{slot}`, a command that isn't an argv, an `escalation_owner` that isn't a seat
 address (`<session>@<rig>`), or a `dispatch_to_parked` that isn't an object, has an unknown field or a value out of its
 range (`dispatch_to_parked: {}` turns it on with every default; `refuse_gates` and `busy_processes` are lists of at most
-32 strings of 1 to 128 characters with no whitespace, and a `busy_processes` entry has no `/`). Commands run without a shell, with the daemon's
+32 strings of 1 to 128 characters with no whitespace, and a `busy_processes` entry has no `/`; `busy_orphan_max_age_s` is
+refused without `busy_processes`). Commands run without a shell, with the daemon's
 environment plus:
 
 | Variable | Set for | Value |
@@ -62,7 +64,7 @@ environment plus:
 | `OPENRIG_SEAT_POOL_SLOT` | `prepare_cmd`, `release_cmd`, `reap_cmd`, `remove_cmd` | the seat's session name |
 | `OPENRIG_SEAT_POOL_SLOT_CWD` | `prepare_cmd` | the seat's working directory |
 | `OPENRIG_SEAT_POOL_RELEASE_REASON` | `release_cmd` | why it is asked: `idle` (a free seat drained, by `drain` or by `idle_grace_s`), `drain-deadline` (the forced pass at a drain's deadline) or `reap` (a seat whose session is gone) |
-| `OPENRIG_SEAT_POOL_SLOTS` | `demand_cmd` | JSON list of `{session, phase, receives}` for the pool's seats; `receives` is how the seat may take a waiting row now: `"free"`, `"parked"` (see [A seat parked on its own wait](#a-seat-parked-on-its-own-wait)) or `null`, as the plan reads it: a seat out of provider usage, a parked seat while the load is above `parked_max_load_per_cpu_percent`, and a parked seat with a `busy_processes` program running, say `null` |
+| `OPENRIG_SEAT_POOL_SLOTS` | `demand_cmd` | JSON list of `{session, phase, receives}` for the pool's seats; `receives` is how the seat may take a waiting row now: `"free"`, `"parked"` (see [A seat parked on its own wait](#a-seat-parked-on-its-own-wait)) or `null`, as the plan reads it: a seat out of provider usage, a parked seat while the load is above `parked_max_load_per_cpu_percent`, and a free or parked seat with a `busy_processes` program running, say `null` |
 
 A command that runs past `timeout_s` is killed and counts as failed. Each command has its own `timeout_s` (default 60),
 so a slow `release_cmd` can be given longer than `demand_cmd`; `release_cmd` runs under the seat's lifecycle lease,
@@ -159,9 +161,33 @@ CI run it left in the background) may receive one row more, after the free seats
   `timeout`, `nohup`, `python3`, `node`…), options, `NAME=value` and numbers, compared by base name: `bash /x/suite-flock
   …` and `nice -n 10 /x/congelar-eval` match `suite-flock` and `congelar-eval`, `grep suite-flock …` does not, and an
   option's value given as a separate word (`timeout -s KILL 600 …`) is a miss. A wrapper name is refused as an entry.
-  The table is read when the plan is made, again just before each parked row moves and before the demand command, only
-  for the seats that would be parked; a table or pane that cannot be read within 5 seconds, or a parked seat the read
-  left out, holds the seat back.
+  A process that left the pane's tree holds the seat only while it is younger than `busy_orphan_max_age_s` and did not
+  start before the pane's current occupant (the runtime: when the pane runs a shell, its newest child that runs
+  `claude`, `codex`, `pi` or `omp`, the native installer's versioned Claude, or Node running Claude's `cli.js`, or its
+  newest child when none does; else the pane's own process; so the orphan of the occupant
+  before a fresh launch holds nothing); one whose start can't be read holds it. A process under the pane holds it
+  whatever its age. The default ceiling, 12 h, is the longest a suite waits for the host's lock.
+  A process that left the pane's tree with no `TMUX_PANE` (a `systemd-run --user --unit=…` started outside tmux, or one
+  that cleared its environment) belongs to no seat and holds nothing: run heavy work from the seat's pane, or under it,
+  for the rule to see it.
+  The table and the server's panes (one `tmux list-panes -a`) are read when the plan is made, again just before each
+  row moves and before the demand command, for the seats that could take a row (free or parked). A table or pane list
+  that cannot be read within 5 seconds, a seat whose pane cannot be told, an environment that could not be read
+  (anything but a process gone, one with no `TMUX_PANE` or another user's; a failed stat of its owner other than "gone"
+  counts as failed), or a seat the read left out, holds the seat back. The environments are read at most 4 at a time,
+  under one deadline for the whole read; a read past it can't be cancelled, so while 4 are still running (from this
+  read, a concurrent one or an earlier one) a new one waits its turn until the deadline, and then the seats it could
+  belong to are held. The panes are read with the adapter's printable
+  field separator, so a daemon outside tmux with a non-UTF-8 locale, or tmux 3.3a/3.6, reads them too.
+
+The same `busy_processes` rule holds back a free seat (no open row, idle at its prompt): a suite or an eval it left
+running in a process its runtime does not track (reparented, `nohup`) would make it give the row back. Such a seat counts
+as holding work, as a parked one does: it is not drained, and the row it can't take is demand. A free seat held back
+only because its processes could not be read (a timeout, an unreadable environment, its pane not found) takes no row
+and is not drained either, but it is not counted as holding work: it keeps its place in the pool's target (no seat
+starting is removed for it) and, while rows wait undispatched, adds at most one seat. A failure of that seat alone (its
+pane gone) is then served by the new seat; a read failing for every seat no longer grows the pool to `max` with nothing
+dispatched.
 
 A seat with two open rows never receives, so one row more is the ceiling. The free seats get rows first, in their usual
 order, then the parked ones by id. A parked seat still counts as holding work: it is never drained, and the row it
@@ -171,7 +197,8 @@ blocked at the seat with its own timer. With `parked_max_load_per_cpu_percent` s
 (an add when there is room), and `receives` says `null` for those seats. A free seat is never checked for load. Just
 before the move the executor asks the rule again, with the provider usage and the load read then: a seat that is no
 longer parked, or whose account ran out of usage, keeps nothing (`seat_pool_dispatch_skipped`, `code: parked_changed`;
-a free seat that changed is left to the next plan with no entry), and a load that rose above the limit since the plan
+a free seat that changed is left to the next plan with no entry, but one held back by a busy process read then says so:
+`code: free_busy`, with `busyProcess`), and a load that rose above the limit since the plan
 gives the parked seat no row (`code: parked_load`), and so does a busy process read then (`code: parked_busy`, with
 `busyProcess`: the program and its pid, or why the processes could not be read). The move's note and the row's resolution say
 `<seat> was parked on <gate> (2nd row)`, and `seat_pool_dispatched` carries `mode` (`free` or `parked`) and, for a

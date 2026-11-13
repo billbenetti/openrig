@@ -162,11 +162,11 @@ import { resolveWorkflowHumanDestination } from "./domain/workflow-human-destina
 import { makeWorkflowKeepalivePolicy } from "./domain/policies/workflow-keepalive.js";
 import { makeIdleGateQitemPolicy } from "./domain/policies/idle-gate-qitem.js";
 import { makeParkedOwnerConsumerPolicy, makeRigAnchor, PARKED_OWNER_POLICY_NAME } from "./domain/policies/parked-owner-consumer.js";
-import { makeSeatPoolPolicy, parseSeatPoolSpec, seatPoolCanReceive, seatPoolOutOfUsage, type SeatPoolSpec } from "./domain/policies/seat-pool.js";
-import { readSeatPoolBusySessions } from "./domain/seat-pool-busy.js";
+import { makeSeatPoolPolicy, parseSeatPoolSpec, seatPoolOutOfUsage, type SeatPoolSpec } from "./domain/policies/seat-pool.js";
+import { readProcTmuxPane } from "./domain/seat-pool-busy.js";
 import { readProcessTable } from "./domain/process-table.js";
 import {
-  readSeatPoolState, runSeatPoolCommand, SeatPoolExecutor, SeatPoolSlots, seatPoolQueueEffects, slotMemberFragment,
+  readSeatPoolBusyCandidates, readSeatPoolState, runSeatPoolCommand, SeatPoolExecutor, SeatPoolSlots, seatPoolQueueEffects, slotMemberFragment,
 } from "./domain/seat-pool-executor.js";
 import { LaunchBudget, launchBudgetLimits, sampleHost } from "./domain/launch-budget.js";
 import { launchStatusIsRunning } from "./domain/restore-orchestrator.js";
@@ -2401,35 +2401,31 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
       // Read only for a spec with dispatch_to_parked.busy_processes: the seats busy with heavy local work (T-006090).
       busyProcess: busy ? (sessionName) => busy.get(sessionName) : undefined,
     }, job);
-    // A seat's bound pane (`%12`), or null; the pid of the process its pane runs (the bound pane, or else the session's
-    // active pane).
+    // A seat's bound pane (`%12`), or null.
     const poolPaneId = (sessionName: string): string | null => (db.prepare(
       `SELECT b.tmux_pane FROM sessions s JOIN bindings b ON b.node_id = s.node_id AND b.tmux_session = s.session_name
         WHERE s.session_name = ? ORDER BY s.id DESC LIMIT 1`,
     ).get(physicalSessionName(db, sessionName)) as { tmux_pane: string | null } | undefined)?.tmux_pane ?? null;
-    const poolPanePid = async (sessionName: string): Promise<number | null> =>
-      tmuxAdapter.getPanePid(poolPaneId(sessionName) ?? physicalSessionName(db, sessionName));
-    // The TMUX_PANE a process inherited, read from /proc (Linux); null elsewhere or when unreadable.
-    const processTmuxPane = (pid: number): string | null => {
-      if (process.platform !== "linux") return null;
-      try {
-        const found = fs.readFileSync(`/proc/${pid}/environ`, "latin1").split("\0").find((entry) => entry.startsWith("TMUX_PANE="));
-        return found ? found.slice("TMUX_PANE=".length) : null;
-      } catch {
-        return null;
-      }
+    // The TMUX_PANE a process inherited, read from /proc (Linux) off the event loop (T-006251 S1, readProcTmuxPane): null
+    // elsewhere, with none, for a process gone or another user's; any other failure rejects, which holds the seats.
+    const procEnvironmentIo = {
+      readFile: (path: string) => fs.promises.readFile(path, "latin1"),
+      ownerUid: async (path: string) => (await fs.promises.stat(path)).uid,
+      uid: process.getuid?.() ?? null,
     };
-    // For a spec with dispatch_to_parked.busy_processes: the seats the plan would give a parked 2nd row, and why each is
-    // busy with heavy local work under its pane, or null. Undefined for any other spec (nothing read).
+    const processTmuxPane = async (pid: number): Promise<string | null> =>
+      process.platform === "linux" ? readProcTmuxPane(pid, procEnvironmentIo) : null;
+    // For a spec with dispatch_to_parked.busy_processes: the seats that could take a row now (free or parked), and why
+    // each is busy with heavy local work, or null. Undefined for any other spec (nothing read).
     const busyPoolSessions = async (
       job: { jobId: string; targetSession: string; spec: SeatPoolSpec }, usageLimited?: ReadonlySet<string>,
     ): Promise<ReadonlyMap<string, string | null> | undefined> => {
-      const programs = job.spec.dispatchToParked?.busyProcesses;
-      if (!programs?.length) return undefined;
-      const nowMs = Date.now();
-      const candidates = readPoolState(job, usageLimited).slots.filter((slot) => seatPoolCanReceive(job.spec, slot, nowMs) === "parked");
-      return readSeatPoolBusySessions(candidates.map((slot) => slot.sessionName), programs, {
-        panePid: poolPanePid, paneId: poolPaneId, processPane: processTmuxPane, processes: readProcessTable,
+      if (!job.spec.dispatchToParked?.busyProcesses?.length) return undefined;
+      return readSeatPoolBusyCandidates(job.spec, readPoolState(job, usageLimited).slots, Date.now(), {
+        panes: () => tmuxAdapter.listAllPanePids(),
+        paneOf: (sessionName) => ({ paneId: poolPaneId(sessionName), tmuxSession: physicalSessionName(db, sessionName) }),
+        processPane: processTmuxPane,
+        processes: readProcessTable,
       });
     };
     // The seats whose provider account is out of usage, as the wake ladder reads them: the plan reads them, and the run
