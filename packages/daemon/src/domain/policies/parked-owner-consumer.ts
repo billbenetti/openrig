@@ -21,6 +21,11 @@ import type { Policy, PolicyJob, PolicyEvaluation } from "./types.js";
 import { BACKGROUND_SHELL_GRACE_MINUTES } from "../queue-pickup.js";
 import { deliveryReachedSeat, type WatchdogHistoryEntry } from "../watchdog-history-log.js";
 
+/** The nudge result the fork's parked-owner recorded when a queue-only seat's wake stayed in its queue (T-006631).
+ *  The upstream hold (#3076) records no nudge result; rows written before it may still carry this one, and the wake
+ *  ladder reads it as the seat's own choice, not as an unknown outcome, so such a row never enters the ladder. */
+export const QUEUE_ONLY_SKIP_RESULT_PREFIX = "skipped:queue-only-seat";
+
 /** Structural view of the shipped SeatParkedDiagnosis (parked-query.ts). */
 export interface ParkedSeatDiagnosisView {
   sessionName: string;
