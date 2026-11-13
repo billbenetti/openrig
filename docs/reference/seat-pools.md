@@ -183,7 +183,13 @@ CI run it left in the background) may receive one row more, after the free seats
   keeps its first 15 bytes), and matches `busy_processes` by that name when the name is the program's own (a binary, or
   a script whose shebang names the interpreter's absolute path). A script run through `#!/usr/bin/env` keeps the
   interpreter's name (`[bash]`): such a process under the seat's pane that matches nothing is a failed read, which holds
-  the seat. The panes are read with the adapter's printable
+  the seat. Outside every pane's tree (reparented by `nohup` or `setsid`), a shell listed that way (`[bash]`, `[sh]`,
+  `[dash]`, `[zsh]`) has its environment read too when it is younger than `busy_orphan_max_age_s` (or its start can't
+  be read), after the matching processes, within the same 2 reads at a time and the same deadline, and its
+  `TMUX_PANE` holds that seat the same way (a failed read, not an
+  occupant, if it did not start before the pane's occupant). The limit: when that shell's environment can't be read
+  either, it holds no seat, since nothing says it is any seat's work, and a suite left that way frees its seat. The
+  panes are read with the adapter's printable
   field separator, so a daemon outside tmux with a non-UTF-8 locale, or tmux 3.3a/3.6, reads them too.
 
 The same `busy_processes` rule holds back a free seat (no open row, idle at its prompt): a suite or an eval it left
