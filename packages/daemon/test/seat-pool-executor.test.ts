@@ -327,6 +327,57 @@ describe("seat-pool executor", () => {
     expect(slots.get(slot.slotId)).toMatchObject({ phase: "retired", nodeId: "node-7" });
   });
 
+  // T-007545 (SD2 and the cross review): every removal of a seat that ran marks on its slot when it stopped, before the
+  // node (and its sessions) go, and a relaunch that works clears it: the stuck sweep's grace counts from the real stop.
+  const stoppedSince = (slotId: number) =>
+    (db.prepare("SELECT stopped_since FROM seat_pool_slots WHERE id = ?").get(slotId) as { stopped_since: string | null }).stopped_since;
+
+  it("T-007545: the drain's removal marks when the seat stopped before its node goes", async () => {
+    jobSpec = spec({ release_cmd: { argv: ["release"] } });
+    const executor = makeExecutor();
+    await run(executor, [{ kind: "add", count: 1 }]);
+    const [slot] = slots.listOpen(JOB);
+    expect(stoppedSince(slot!.slotId)).toBeNull();
+    await run(executor, [drainOf(slot!.slotId)]);
+    expect(slots.listOpen(JOB)).toEqual([]);
+    expect(stoppedSince(slot!.slotId)).not.toBeNull();
+  });
+
+  it("T-007545: the removal a restart cut short (draining, intent remove, its session gone) marks it too", async () => {
+    const executor = makeExecutor();
+    await run(executor, [{ kind: "add", count: 1 }]);
+    const [slot] = slots.listOpen(JOB);
+    db.prepare("UPDATE seat_pool_slots SET phase = 'draining', intent = 'remove' WHERE id = ?").run(slot!.slotId);
+    world.nodes.get(slot!.nodeId!)!.session = "stopped";
+    await run(executor, [drainOf(slot!.slotId)]);
+    expect(slots.listOpen(JOB)).toEqual([]);
+    expect(stoppedSince(slot!.slotId)).not.toBeNull();
+  });
+
+  it("T-007545: a relaunch that works clears the slot's 'stopped since' (a crash before the next sweep starts afresh)", async () => {
+    const executor = makeExecutor();
+    await run(executor, [{ kind: "add", count: 1 }]);
+    const [slot] = slots.listOpen(JOB);
+    db.prepare("UPDATE seat_pool_slots SET stopped_since = '2026-11-13T10:00:00.000Z' WHERE id = ?").run(slot!.slotId);
+    world.nodes.get(slot!.nodeId!)!.session = "stopped";
+    world.relaunchResult = { ok: true };
+    await run(executor, [{ kind: "relaunch", seat: "dev-impl-s1@r", nodeId: slot!.nodeId! }]);
+    expect(world.calls).toContain("relaunch dev.impl-s1");
+    expect(stoppedSince(slot!.slotId)).toBeNull();
+  });
+
+  it("T-007545: a relaunch that fails keeps the slot's 'stopped since' (the seat is still stopped)", async () => {
+    const executor = makeExecutor();
+    await run(executor, [{ kind: "add", count: 1 }]);
+    const [slot] = slots.listOpen(JOB);
+    db.prepare("UPDATE seat_pool_slots SET stopped_since = '2026-11-13T10:00:00.000Z' WHERE id = ?").run(slot!.slotId);
+    world.nodes.get(slot!.nodeId!)!.session = "stopped";
+    world.relaunchResult = { ok: false, code: "resume_failed", error: "no resumable session" };
+    await run(executor, [{ kind: "relaunch", seat: "dev-impl-s1@r", nodeId: slot!.nodeId! }]);
+    expect(world.calls).toContain("relaunch dev.impl-s1");
+    expect(stoppedSince(slot!.slotId)).toBe("2026-11-13T10:00:00.000Z");
+  });
+
   it("drains a free seat under one lease: release, checked stop, then removal with the same expected", async () => {
     jobSpec = spec({ release_cmd: { argv: ["release"] } });
     const executor = makeExecutor();
@@ -835,6 +886,17 @@ describe("seat-pool executor", () => {
         slot: "dev.impl-s1",
         rows: ["q-1", "q-2", "q-3"].map((qitemId) => ({ qitemId, to: "dev-impl@r" })),
       } }]);
+    });
+
+    it("T-007545: the reap marks when the seat stopped before it removes the node (no later than the retirement)", async () => {
+      const executor = makeExecutor();
+      const dead = await seat(executor, { session: "stopped", idle: false });
+      await run(executor, [{ kind: "reap", slotId: dead.slotId }]);
+      const row = db.prepare("SELECT stopped_since, retired_at FROM seat_pool_slots WHERE id = ?").get(dead.slotId) as
+        { stopped_since: string | null; retired_at: string | null };
+      expect(row.stopped_since).not.toBeNull();
+      expect(row.retired_at).not.toBeNull();
+      expect(Date.parse(row.stopped_since!)).toBeLessThanOrEqual(Date.parse(row.retired_at!));
     });
 
     it("runs remove_cmd after a reap removed the seat's node", async () => {
@@ -1479,6 +1541,14 @@ describe("seat-pool executor", () => {
       expect(repo.getById(first.qitemId)).toMatchObject({ destinationSession: MODEL.sessionName, state: "pending" });
       expect(repo.getById(arrived!)).toMatchObject({ destinationSession: MODEL.sessionName, state: "pending" });
       expect(slots.get(slot.slotId)?.retiredAt).not.toBeNull();
+    });
+
+    it("T-007545: the forced pass's removal marks when the seat stopped before its node goes", async () => {
+      const slot = liveSeat();
+      await toDeadline(executorWith(world.effects()));
+      expect(slots.get(slot.slotId)?.retiredAt).not.toBeNull();
+      expect((db.prepare("SELECT stopped_since FROM seat_pool_slots WHERE id = ?").get(slot.slotId) as { stopped_since: string | null })
+        .stopped_since).not.toBeNull();
     });
 
     // S1: a seat the pass already stopped (intent stop, its session gone) whose stop fails again is not put back in
