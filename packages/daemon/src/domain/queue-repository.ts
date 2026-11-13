@@ -4819,6 +4819,12 @@ export class QueueRepository {
     return rows.map((r) => ({ qitemId: r.qitem_id, state: r.state, summary: r.summary ?? null }));
   }
 
+  /** Every address a session's rows may be addressed to (its canonical session and its aliases), as the queue reads
+   *  them: what a seat pool's dispatch reads for its model (T-007029). */
+  addressesOf(sessionName: string): string[] {
+    return this.resolveSessionAddresses(sessionName);
+  }
+
   /**
    * A seat pool's read of one seat's open rows (listOpenObligations' rows, order and limit) and, when the only open row
    * is blocked, the facts of its park (ParkFacts): the current wake (the latest armed record, the one getStatus reads)
@@ -4826,12 +4832,6 @@ export class QueueRepository {
    * getStatus says whether that wake is still armed and live. The row was taken at its claim, or else at its first move
    * to in-progress by one of its destination's addresses (a seat that takes a row by update, with no claim).
    */
-  /** Every address a session's rows may be addressed to (its canonical session and its aliases), as the queue reads
-   *  them: what a seat pool's dispatch reads for its model (T-007029). */
-  addressesOf(sessionName: string): string[] {
-    return this.resolveSessionAddresses(sessionName);
-  }
-
   listPoolSeatRowFacts(sessionName: string, maxBlocked = 1): PoolSeatRowFacts {
     const rows = this.listOpenObligations(sessionName, 500).map((row) => ({ qitemId: row.qitemId, state: row.state }));
     if (rows.length === 0 || rows.length > Math.max(1, maxBlocked) || rows.some((row) => row.state !== "blocked")) return { rows, parked: null };

@@ -55,7 +55,8 @@ export interface SeatPoolSpec {
   /** Where an escalation about a seat of the pool goes (a needs-input escalation, and a row a reap moves a second
    *  time), in place of the model's escalation owner. Null: the model's escalation owner, as without the field. */
   escalationOwner: string | null;
-  /** A seat whose only open row it parked itself on a wait of its own may receive one row more (seatPoolCanReceive).
+  /** A seat whose open rows (one, or up to `max_open_rows`) it parked itself on waits of its own may receive one row
+   *  more (seatPoolCanReceive).
    *  Absent (no such property) when the key is not in the context: the rule is off, as before the key. */
   dispatchToParked?: SeatPoolDispatchToParked;
 }
@@ -546,11 +547,12 @@ export function seatPoolReapable(slot: SeatPoolSlotView): boolean {
  * Both ways need the pool not draining, the seat live, its node present, not to be reaped and no held message.
  * `free`: no open row and idle at its prompt (the rule from before `dispatch_to_parked`). `parked`, only with
  * `dispatch_to_parked`: a seat the pool added (not adopted), at its prompt (idle, or working only through a background
- * shell, which `allow_background_work: false` refuses), whose only open row is blocked on an `external:` gate with a
+ * shell, which `allow_background_work: false` refuses), whose open rows (one, or up to `max_open_rows`) are each blocked
+ * on an `external:` gate with a
  * timer of at most `max_wake_s` still armed and live, armed by the seat itself, after it took the row (by claim or by
  * update) no more than `max_claim_age_s` ago, on a gate that contains none of `refuse_gates`, and with no
- * `busy_processes` program under its pane (`busyProcess`). A seat with two open rows never receives: one row more is the
- * ceiling.
+ * `busy_processes` program under its pane (`busyProcess`). A seat with more open rows than `max_open_rows` (default 1),
+ * or with one that is pending or in progress, never receives: one row more is the ceiling (T-007036).
  */
 export function seatPoolCanReceive(spec: SeatPoolSpec, slot: SeatPoolSlotView, nowMs: number): SeatPoolReceiveMode | null {
   if (spec.drain || slot.phase !== "live" || !slot.nodeExists || seatPoolReapable(slot) || slot.heldMessages !== 0) return null;
