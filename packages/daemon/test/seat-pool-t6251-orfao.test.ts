@@ -714,3 +714,86 @@ describe("T-007205: S12 (half of libuv's pool), S13 (the turn passed on past a d
       .toBe("congelar-eval (pid 500, TMUX_PANE %24)");
   });
 });
+
+describe("T-007477: S16 (an orphan [bash]/[sh] whose command line could not be read, outside the pane)", () => {
+  // The suite-flock reparented to 1 (nohup, setsid) with its command line unreadable is `[bash]`: the environment of a
+  // young orphan interpreter is read too, inside the same ceiling of reads and the same deadline (S12), and its
+  // TMUX_PANE holds that seat as a failed read (held, not an occupant).
+  const unreadOrphan = (cmd = "[bash]", ageS = 3600) => {
+    const { rows, deps } = scene({ occupantAgoS: 7200, orphanAgoS: ageS });
+    return { rows: rows.map((r) => (r.pid === 500 ? { ...r, command: cmd } : r)), deps };
+  };
+
+  it("a young orphan [bash] with the seat's TMUX_PANE holds it as a failed read, not as an occupant", async () => {
+    for (const cmd of ["[bash]", "[sh]", "[dash]", "[zsh]"]) {
+      const { rows, deps } = unreadOrphan(cmd);
+      const read = await readSeatPoolBusySessions(["qa-s7@r"], PROGRAMS, { ...deps, processes: async () => rows });
+      expect(read.get("qa-s7@r")).toBe(`command line of pid 500 not read (${cmd}, TMUX_PANE %24)`);
+      expect(seatPoolBusyFromProcess(read.get("qa-s7@r"))).toBe(false);
+    }
+  });
+
+  it("an orphan [bash] of another pane, with no TMUX_PANE, older than the ceiling or before the occupant holds nothing", async () => {
+    const { rows, deps } = unreadOrphan();
+    const other = await readSeatPoolBusySessions(["qa-s7@r"], PROGRAMS, { ...deps, processes: async () => rows, processPane: async (pid) => (pid === 500 ? "%31" : null) });
+    expect(other.get("qa-s7@r")).toBeNull();
+    const none = await readSeatPoolBusySessions(["qa-s7@r"], PROGRAMS, { ...deps, processes: async () => rows, processPane: async () => null });
+    expect(none.get("qa-s7@r")).toBeNull();
+    const old = unreadOrphan("[bash]", 50_000);
+    expect((await readSeatPoolBusySessions(["qa-s7@r"], PROGRAMS, { ...old.deps, processes: async () => old.rows })).get("qa-s7@r")).toBeNull();
+    const before = unreadOrphan("[bash]", 7300); // started before the occupant (7200 s ago)
+    expect((await readSeatPoolBusySessions(["qa-s7@r"], PROGRAMS, { ...before.deps, processes: async () => before.rows })).get("qa-s7@r")).toBeNull();
+  });
+
+  it("an orphan [bash] whose environment can't be read holds no seat (it may be no seat's work), unlike a matching orphan", async () => {
+    const { rows, deps } = unreadOrphan();
+    const failing = { ...deps, processes: async () => rows, processPane: async () => { throw Object.assign(new Error("EIO"), { code: "EIO" }); } };
+    expect((await readSeatPoolBusySessions(["qa-s7@r"], PROGRAMS, failing)).get("qa-s7@r")).toBeNull();
+    // the matching orphan with an unreadable environment still holds every seat it could belong to (S1)
+    const { rows: named } = scene({ occupantAgoS: 7200, orphanAgoS: 3600 });
+    expect((await readSeatPoolBusySessions(["qa-s7@r"], PROGRAMS, { ...failing, processes: async () => named })).get("qa-s7@r"))
+      .toMatch(/^environment of pid 500 not read/);
+  });
+
+  it("a named orphan wins over an unread one, and the unread orphans share the S12 ceiling of reads", async () => {
+    const { rows, deps } = unreadOrphan();
+    const both = [...rows, { pid: 502, ppid: 1, command: "suite-flock nice -n 10 y", startedAt: agoS(60) }];
+    const pane = async (pid: number) => (pid === 500 || pid === 502 ? "%24" : null);
+    expect((await readSeatPoolBusySessions(["qa-s7@r"], PROGRAMS, { ...deps, processes: async () => both, processPane: pane })).get("qa-s7@r"))
+      .toBe("suite-flock (pid 502, TMUX_PANE %24)");
+    let calls = 0;
+    const stuck = (): Promise<string | null> => { calls += 1; return new Promise<never>(() => {}); };
+    const many = [...rows.filter((r) => r.pid !== 500), ...[601, 602, 603, 604].map((pid) => ({ pid, ppid: 1, command: "[bash]", startedAt: agoS(60) }))];
+    await readSeatPoolBusySessions(["qa-s7@r"], PROGRAMS, { ...deps, processes: async () => many, processPane: stuck }, { timeoutMs: 20 });
+    expect(calls).toBe(SEAT_POOL_BUSY_ENV_CONCURRENCY);
+  });
+
+  it("the named orphans are read before the unread shells, whatever their pids", async () => {
+    const { deps } = scene({ occupantAgoS: 7200, orphanAgoS: 3600 });
+    const order: number[] = [];
+    const rows: BusyProcessRow[] = [
+      { pid: 100, ppid: 1, command: "/bin/bash -l", startedAt: agoS(90_000) },
+      { pid: 101, ppid: 100, command: "claude", startedAt: agoS(7200) },
+      ...[300, 301, 302].map((pid) => ({ pid, ppid: 1, command: "[bash]", startedAt: agoS(60) })),
+      { pid: 9000, ppid: 1, command: "bash /x/suite-flock nice -n 10 y", startedAt: agoS(60) },
+    ];
+    const read = await readSeatPoolBusySessions(["qa-s7@r"], PROGRAMS, { ...deps, processes: async () => rows,
+      processPane: async (pid) => { order.push(pid); return pid === 9000 ? "%24" : null; } });
+    expect(order[0]).toBe(9000);
+    expect(read.get("qa-s7@r")).toBe("suite-flock (pid 9000, TMUX_PANE %24)");
+  });
+
+  it("an orphan of a program that is not an interpreter ([kworker/0:1], [sleep]) has no environment read", async () => {
+    const seen: number[] = [];
+    const { deps } = scene({ occupantAgoS: 7200, orphanAgoS: 3600 });
+    const rows: BusyProcessRow[] = [
+      { pid: 100, ppid: 1, command: "/bin/bash -l", startedAt: agoS(90_000) },
+      { pid: 101, ppid: 100, command: "claude", startedAt: agoS(7200) },
+      { pid: 700, ppid: 2, command: "[kworker/0:1]", startedAt: agoS(60) },
+      { pid: 701, ppid: 1, command: "[sleep]", startedAt: agoS(60) },
+      { pid: 702, ppid: 1, command: "[bash] <defunct>", startedAt: agoS(60) },
+    ];
+    await readSeatPoolBusySessions(["qa-s7@r"], PROGRAMS, { ...deps, processes: async () => rows, processPane: async (pid) => { seen.push(pid); return null; } });
+    expect(seen).toEqual([]);
+  });
+});
