@@ -19,6 +19,17 @@ import { ulid } from "ulid";
  * reason (and whether text may have landed) is in `evaluationNotes`. */
 export type WatchdogOutcome = "sent" | "refused" | "failed" | "skipped" | "terminal";
 
+/** The delivery status of a reminder that became a cold row in a queue-only seat's queue: nothing was typed (T-006857). */
+export const QUEUED_AS_ROW = "queued_as_row";
+/** The delivery status of a parked row's own wake timer at a queue-only seat: recorded on that row, which already sits
+ *  in the seat's queue; no row was created and nothing was typed (T-006857, SH-1). */
+export const NOTED_ON_PARKED_ROW = "noted_on_parked_row";
+/** A positive delivery: typed into the seat ("ok"), queued as its row, or noted on the parked row. Every reader that
+ *  meant "ok" means this. */
+export function deliveryReachedSeat(status: string | null | undefined): boolean {
+  return status === "ok" || status === QUEUED_AS_ROW || status === NOTED_ON_PARKED_ROW;
+}
+
 export interface WatchdogHistoryRecordInput {
   jobId: string;
   evaluatedAt: string;
