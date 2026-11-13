@@ -56,7 +56,7 @@ import { seatLaunchAdditionsReport } from "./seat-launch-additions.js";
 import { seatSkillPaths } from "./seat-skill-storage.js";
 import { resolveSeatKind, seatProcessOwner } from "./seat-kinds.js";
 import { recordedProcessStillRunning } from "./reconciler.js";
-import { readProcessTable, type ProcessTableRow } from "./process-table.js";
+import { invalidateProcessTable, readProcessTable, type ProcessTableRow } from "./process-table.js";
 
 /**
  * S5 (OPR.0.5.4.7) — the seat-lifecycle verb surface: set-model, single-seat stop,
@@ -1100,7 +1100,21 @@ export class SeatLifecycleService {
   }
 
   /** Stop one managed seat; an explicit expected tuple activates strict identity checks. */
+  /** A launch, stop, clean or restart changes which processes run: the process table read before it is dropped,
+   *  however the change ends (upstream #3146: the table is cached for a short TTL). */
+  private async changesSeat<T>(change: () => Promise<T>): Promise<T> {
+    try {
+      return await change();
+    } finally {
+      invalidateProcessTable();
+    }
+  }
+
   async stopSeat(input: { seatRef: string; reason: string; operator?: string | null; expected?: unknown }): Promise<StopSeatResult> {
+    return this.changesSeat(() => this.stopSeatNow(input));
+  }
+
+  private async stopSeatNow(input: { seatRef: string; reason: string; operator?: string | null; expected?: unknown }): Promise<StopSeatResult> {
     const required = this.requireReason(input.reason);
     if (required) return required;
     if ("expected" in input) {
@@ -1188,6 +1202,10 @@ export class SeatLifecycleService {
   }
 
   async cleanSeat(input: { seatRef: string; reason: string; operator?: string | null }): Promise<CleanSeatResult> {
+    return this.changesSeat(() => this.cleanSeatNow(input));
+  }
+
+  private async cleanSeatNow(input: { seatRef: string; reason: string; operator?: string | null }): Promise<CleanSeatResult> {
     const required = this.requireReason(input.reason);
     if (required) return required;
     const resolved = this.resolveSeat(input.seatRef);
@@ -1543,6 +1561,16 @@ export class SeatLifecycleService {
     stop?: boolean;
     operator?: string | null;
   }): Promise<LaunchFreshResult> {
+    return this.changesSeat(() => this.launchFreshNow(input));
+  }
+
+  private async launchFreshNow(input: {
+    seatRef: string;
+    fresh: boolean;
+    reason: string;
+    stop?: boolean;
+    operator?: string | null;
+  }): Promise<LaunchFreshResult> {
     const required = this.requireReason(input.reason);
     if (required) return required;
     if (input.fresh !== true) {
@@ -1869,6 +1897,10 @@ export class SeatLifecycleService {
    * guard, adopted sessions, unreadable tmux and settings drift are named refusals before any signal.
    */
   async restartInPlace(input: { seatRef: string; reason?: string; plan?: boolean; operator?: string | null }): Promise<RestartInPlaceResult> {
+    return input.plan ? this.restartInPlaceNow(input) : this.changesSeat(() => this.restartInPlaceNow(input));
+  }
+
+  private async restartInPlaceNow(input: { seatRef: string; reason?: string; plan?: boolean; operator?: string | null }): Promise<RestartInPlaceResult> {
     if (!input.plan) {
       const required = this.requireReason(input.reason ?? "");
       if (required) return required;

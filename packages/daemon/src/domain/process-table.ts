@@ -19,24 +19,70 @@ export interface ProcessTableRow {
   argv?: string[] | null;
 }
 
-let inFlight: Promise<ProcessTableRow[]> | null = null;
+/**
+ * How long a sampled table serves later callers, in ms (upstream #3146): the daemon asked for the whole table about
+ * once a second from several observers (the attention reconciler's idle proofs, native identity, resume metadata), and
+ * each ask walked /proc again, taking seconds under I/O pressure. A table read less than this long ago is reused.
+ * `OPENRIG_PROCESS_TABLE_TTL_MS` overrides it; 0 turns the cache off (the test setup does, since its scenarios rewrite
+ * their /proc between reads).
+ */
+export const PROCESS_TABLE_TTL_MS = 750;
+
+function ttlMs(): number {
+  const raw = process.env.OPENRIG_PROCESS_TABLE_TTL_MS;
+  const value = raw === undefined || raw.trim() === "" ? NaN : Number(raw);
+  return Number.isFinite(value) && value >= 0 ? value : PROCESS_TABLE_TTL_MS;
+}
+
+/** A read and when it started (performance.now()): a table is as old as the moment its walk began. */
+interface Sample { startedAt: number; rows: Promise<ProcessTableRow[]> }
+
+let inFlight: Sample | null = null;
+let last: { startedAt: number; rows: ProcessTableRow[] } | null = null;
+let generation = 0;
+let reads = 0;
 let procRoot = "/proc";
 
 /**
  * The OS process table, every observer's one source: read from /proc on Linux, where a `ps` would cost the daemon a
- * fork of its whole process, and from one `ps` elsewhere. Callers asking while a read is in flight share it; a later
- * call reads again, so two samples taken one after the other stay two observations. Rejects when the table cannot be
- * read.
+ * fork of its whole process, and from one `ps` elsewhere. A table that started less than the TTL ago is reused, and
+ * callers asking while a read is in flight share it. A caller that needs a read starting after some moment (the idle
+ * proof's second sample, a seat change) calls invalidateProcessTable() first. The rows are shared among callers: never
+ * mutate them. Rejects when the table cannot be read.
  */
 export function readProcessTable(): Promise<ProcessTableRow[]> {
-  inFlight ??= (process.platform === "linux" ? readProcTable(procRoot) : readPsTable()).finally(() => { inFlight = null; });
-  return inFlight;
+  const now = performance.now();
+  if (last && now - last.startedAt < ttlMs()) return Promise.resolve(last.rows);
+  if (inFlight) return inFlight.rows;
+  const gen = generation;
+  const rows = (process.platform === "linux" ? readProcTable(procRoot) : readPsTable()).then((table) => {
+    // Kept only when no seat changed during the walk and no newer table is kept already.
+    if (gen === generation && (!last || now >= last.startedAt)) last = { startedAt: now, rows: table };
+    return table;
+  }).finally(() => { if (inFlight?.rows === rows) inFlight = null; });
+  inFlight = { startedAt: now, rows };
+  reads += 1;
+  return rows;
+}
+
+/** Drops the cached table and stops sharing the read in flight: a seat was launched, stopped or replaced, so a table
+ *  sampled before that no longer says which processes run. The next caller reads again. */
+export function invalidateProcessTable(): void {
+  generation += 1;
+  last = null;
+  inFlight = null;
+}
+
+/** How many table reads were started (the cache's own count, for tests and measurements). */
+export function processTableReadsForTest(): number {
+  return reads;
 }
 
 /** Points the Linux read at a /proc of a test's own, so a scenario's processes reach the observers through it; no
- *  argument puts the real /proc back. */
+ *  argument puts the real /proc back. A table of the previous root is never served for the new one. */
 export function setProcRootForTest(root = "/proc"): void {
   procRoot = root;
+  invalidateProcessTable();
 }
 
 const PS_ROW = /^(\d+)\s+(\d+)\s+(-?\d+)\s+(-?\d+)\s+(.+?)\s+(\w{3}\s+\w{3}\s+\d+\s+\d{2}:\d{2}:\d{2}\s+\d{4})\s+(.+)$/;

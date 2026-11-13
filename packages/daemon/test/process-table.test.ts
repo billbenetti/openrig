@@ -3,10 +3,16 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { readProcessTable, readProcTable } from "../src/domain/process-table.js";
+import { invalidateProcessTable, processTableReadsForTest, readProcessTable, readProcTable } from "../src/domain/process-table.js";
 import { claudeCommandSessionToken, listNativeProcesses, processArgv, verifyCodexPaneProcess, verifyPaneIdleShell } from "../src/domain/native-process-lineage.js";
 import { defaultListProcessesStrict } from "../src/domain/resume-metadata-refresher.js";
 import { restoreProc, serveProcRoot, writeFakeProc } from "./helpers/fake-proc.js";
+import { createFullTestDb } from "./helpers/test-app.js";
+import { RigRepository } from "../src/domain/rig-repository.js";
+import { SessionRegistry } from "../src/domain/session-registry.js";
+import { EventBus } from "../src/domain/event-bus.js";
+import { SeatLifecycleService } from "../src/domain/seat-lifecycle-service.js";
+import { defaultListProcesses } from "../src/adapters/codex-runtime-adapter.js";
 
 let scratch: string | undefined;
 afterEach(() => {
@@ -172,6 +178,116 @@ describe("readProcessTable", () => {
     const second = readProcessTable();
     expect(second).not.toBe(first);
     await second;
+  });
+
+  describe("the short cache (upstream #3146)", () => {
+    const shell = (pid: number, child?: number) => fakeProc(0, {
+      [pid]: { stat: stat(pid, "bash", "S", 1, pid, child ?? pid, 0), cmdline: "-bash\0" },
+      ...(child ? { [child]: { stat: stat(child, "sleep", "S", pid, child, child, 0), cmdline: "sleep\x00600\x00" } } : {}),
+    });
+
+    it("serves one read to the callers of the same cycle, and reads again past the TTL", async () => {
+      vi.stubEnv("OPENRIG_PROCESS_TABLE_TTL_MS", "60000");
+      serveProcRoot(shell(51));
+      const before = processTableReadsForTest();
+      const first = await readProcessTable();
+      for (let i = 0; i < 9; i++) expect(await readProcessTable()).toBe(first);
+      // 10 asks, 1 walk of /proc (before the cache: 10)
+      expect(processTableReadsForTest() - before).toBe(1);
+    });
+
+    it("reads again once the cached table is older than the TTL (the cache on)", async () => {
+      vi.stubEnv("OPENRIG_PROCESS_TABLE_TTL_MS", "1000");
+      serveProcRoot(shell(57));
+      let clock = 5_000_000;
+      const now = vi.spyOn(performance, "now").mockImplementation(() => clock);
+      try {
+        const before = processTableReadsForTest();
+        const first = await readProcessTable();
+        clock += 999;
+        expect(await readProcessTable()).toBe(first);
+        clock += 2;
+        expect(await readProcessTable()).not.toBe(first);
+        expect(processTableReadsForTest() - before).toBe(2);
+      } finally {
+        now.mockRestore();
+      }
+    });
+
+    it("counts its reads: 10 back-to-back listers cost 10 walks without the cache and 1 with it", async () => {
+      serveProcRoot(shell(52));
+      const walks = async (ttl: string) => {
+        vi.stubEnv("OPENRIG_PROCESS_TABLE_TTL_MS", ttl);
+        invalidateProcessTable();
+        const before = processTableReadsForTest();
+        for (let i = 0; i < 10; i++) await listNativeProcesses();
+        return processTableReadsForTest() - before;
+      };
+      expect(await walks("0")).toBe(10);
+      expect(await walks("60000")).toBe(1);
+    });
+
+    it("after invalidateProcessTable() the next caller never gets the cached table", async () => {
+      vi.stubEnv("OPENRIG_PROCESS_TABLE_TTL_MS", "60000");
+      const root = shell(53);
+      serveProcRoot(root);
+      const cached = await readProcessTable();
+      fs.rmSync(path.join(root, "53"), { recursive: true });
+      expect(await readProcessTable()).toBe(cached); // still the cached table, with 53
+      invalidateProcessTable();
+      expect((await readProcessTable()).some((row) => row.pid === 53)).toBe(false);
+    });
+
+    it("a seat stop, clean or launch drops the cached table, however it ends (a refusal included)", async () => {
+      vi.stubEnv("OPENRIG_PROCESS_TABLE_TTL_MS", "60000");
+      serveProcRoot(shell(56));
+      const db = createFullTestDb();
+      const service = new SeatLifecycleService({ db, rigRepo: new RigRepository(db), sessionRegistry: new SessionRegistry(db),
+        eventBus: new EventBus(db), tmuxAdapter: {} as never });
+      try {
+        for (const change of [() => service.stopSeat({ seatRef: "x", reason: "" }), () => service.cleanSeat({ seatRef: "x", reason: "" }),
+          () => service.launchFresh({ seatRef: "x", fresh: true, reason: "" })]) {
+          await readProcessTable();
+          const before = processTableReadsForTest();
+          await readProcessTable();
+          expect(processTableReadsForTest()).toBe(before); // cached
+          expect(await change()).toMatchObject({ ok: false });
+          await readProcessTable();
+          expect(processTableReadsForTest()).toBe(before + 1); // the change dropped it
+        }
+      } finally {
+        db.close();
+      }
+    });
+
+    it("the idle proof still takes two observations with the cache warm: a child started after the cached table shows", async () => {
+      vi.stubEnv("OPENRIG_PROCESS_TABLE_TTL_MS", "60000");
+      const root = shell(54);
+      serveProcRoot(root);
+      const tmux = { getPanePid: async () => 54 };
+      expect(await verifyPaneIdleShell({ target: "%1", tmux })).toBe(true);
+      await readProcessTable(); // the idle table is cached
+      fs.mkdirSync(path.join(root, "55"));
+      fs.writeFileSync(path.join(root, "55", "stat"), stat(55, "sleep", "S", 54, 55, 55, 0));
+      fs.writeFileSync(path.join(root, "55", "cmdline"), "sleep\x00600\x00");
+      fs.writeFileSync(path.join(root, "54", "stat"), stat(54, "bash", "S", 1, 54, 55, 0));
+      // the 1st sample is the cached idle table, the 2nd a fresh read with the child in the foreground: not idle
+      expect(await verifyPaneIdleShell({ target: "%1", tmux })).toBe(false);
+    });
+
+    it("the idle proof reads twice through a caller's own lister too (the Codex adapter's default one)", async () => {
+      vi.stubEnv("OPENRIG_PROCESS_TABLE_TTL_MS", "60000");
+      const root = shell(58);
+      serveProcRoot(root);
+      const tmux = { getPanePid: async () => 58 };
+      expect(await verifyPaneIdleShell({ target: "%1", tmux, listProcesses: defaultListProcesses })).toBe(true);
+      await defaultListProcesses(); // the idle table is cached
+      fs.mkdirSync(path.join(root, "59"));
+      fs.writeFileSync(path.join(root, "59", "stat"), stat(59, "sleep", "S", 58, 59, 59, 0));
+      fs.writeFileSync(path.join(root, "59", "cmdline"), "sleep\x00600\x00");
+      fs.writeFileSync(path.join(root, "58", "stat"), stat(58, "bash", "S", 1, 58, 59, 0));
+      expect(await verifyPaneIdleShell({ target: "%1", tmux, listProcesses: defaultListProcesses })).toBe(false);
+    });
   });
 
   it.runIf(process.platform === "linux")("spawns no ps for either lister on Linux", async () => {

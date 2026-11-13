@@ -61,6 +61,9 @@ for (const key of [
 // A suite run from a Rex block must not make the CLI and TUI pick Rex, or reach the person's Rex server.
 for (const key of ["REX_SESSION", "REX_BLOCK", "REX_SERVER", "REX_BIN_DIR", "REX_CLIENT"]) delete process.env[key];
 if (process.env["TERM_PROGRAM"] === "rex") delete process.env["TERM_PROGRAM"];
+// The process table's short cache (upstream #3146) is off in the suites: their scenarios rewrite a fake /proc and read
+// it again at once. Its own tests turn it on with vi.stubEnv.
+process.env["OPENRIG_PROCESS_TABLE_TTL_MS"] = "0";
 
 // (2) FORCE a fixture-scoped home — BEFORE importing openrig-compat (whose
 // OPENRIG_HOME const is eager). Node builtins above do not load it; the dynamic

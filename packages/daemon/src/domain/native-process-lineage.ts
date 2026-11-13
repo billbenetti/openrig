@@ -4,7 +4,7 @@ import { isClaudePluginChannel } from "./claude-plugin-channels.js";
 import { runAsyncSite } from "./sync-site-wrap.js";
 import { readNativeExecutablePaths } from "./native-process-executable.js";
 import { readNativeProcessArguments } from "./native-process-arguments.js";
-import { readProcessTable } from "./process-table.js";
+import { invalidateProcessTable, readProcessTable } from "./process-table.js";
 
 export interface NativeProcessRow {
   pid: number;
@@ -991,7 +991,12 @@ export async function verifyPaneIdleShell(input: {
     } catch { return null; }
   };
   const first = await sample();
-  return first !== null && await sample() === first;
+  if (first === null) return false;
+  // The first sample may be a table read moments ago (upstream #3146: the table is cached for a short TTL). Dropping it
+  // here makes the second sample a read that starts after the first, whatever lister the caller passed (the adapters'
+  // listers read the cached table too), so the proof still compares two observations.
+  invalidateProcessTable();
+  return await sample() === first;
 }
 
 export interface ClaudeDeliveryObservation {
