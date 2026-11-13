@@ -704,8 +704,11 @@ export function planSeatPool(spec: SeatPoolSpec, state: SeatPoolState, nowMs: nu
   // T-006251 S6: a quiet seat held only because its processes could not be read (a timeout under load, an unreadable
   // environment, its pane not found) takes no row and is never drained, but it is no occupant either: counting it grew
   // the pool to `max` with no row dispatched (every seat added failed the same read). It still holds its place in the
-  // target (no seat starting is removed for it), and while rows wait undispatched it adds at most ONE seat, which takes a
-  // row when the failure was that seat's own (lens review of the volta 1).
+  // target (no seat starting is removed for it), and while rows wait undispatched the pool asks ONE seat more than the
+  // healthy plan (the rows waiting plus the occupied seats), which takes a row when the failure was that seat's own (lens
+  // review of the volta 1). Without demand_cmd it grows to the rows waiting + the occupied seats + 1 (R + 1 when no seat
+  // holds work; up to `max`), never by one per failed read: a read failing for every free seat, with more rows waiting
+  // than seats, still reaches that with nothing dispatched (T-007205 S14).
   const heldUnread = (slot: SeatPoolSlotView) => quiet(slot) && heldBusy(slot) && !seatPoolBusyFromProcess(slot.busyProcess);
   const usageLimited = seatPoolOutOfUsage(state);
 

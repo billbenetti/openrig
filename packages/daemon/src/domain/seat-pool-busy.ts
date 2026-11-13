@@ -40,9 +40,27 @@ export function seatPoolBusyWrapper(name: string): boolean {
  * (`timeout -s KILL 600 …`) is taken for the program: a miss, not a false match.
  */
 export function seatPoolBusyCommand(command: string, programs: readonly string[]): string | null {
+  // T-007205 S15: on Linux, a process whose command line could not be read (EIO, EMFILE) is in the table as ps shows
+  // it, its task name in brackets (the kernel keeps 15 bytes): it matches by that name when that name is the program's
+  // own (a binary, or a script whose shebang names the interpreter's absolute path, as congelar-eval's). A script run
+  // through `#!/usr/bin/env bash` (suite-flock) keeps the interpreter's name, `[bash]`: no match here, and
+  // seatPoolUnreadInTree holds its seat instead. From 15 bytes on, the name is a prefix and may stand for another
+  // program sharing it: the seat is held, the reason names the first program of the list. A zombie
+  // (`[name] <defunct>`) holds nothing.
+  const bracketed = BRACKETED_NAME.exec(command.trim());
+  if (bracketed) {
+    const name = bracketed[1]!;
+    return programs.find((program) => program === name
+      || (Buffer.byteLength(name) >= TASK_NAME_BYTES && program.startsWith(name))) ?? null;
+  }
   const program = firstProgram(command);
   return program && programs.includes(program.base) ? program.base : null;
 }
+
+/** ps's command (Linux) for a process with no readable command line: its task name in brackets. */
+const BRACKETED_NAME = /^\[([^\]\s]+)\]$/;
+/** The kernel keeps 15 bytes of a task's name (TASK_COMM_LEN 16, with the NUL). */
+const TASK_NAME_BYTES = 15;
 
 /** The program `command` runs, after the wrappers, options, assignments and numbers: its word and its base name. */
 function firstProgram(command: string): { token: string; base: string } | null {
@@ -84,6 +102,34 @@ export function seatPoolBusyProcess(rows: readonly BusyProcessRow[], panePid: nu
   return `${matches[0]!.program} (pid ${matches[0]!.pid})`;
 }
 
+/**
+ * T-007205 S15: a process under `panePid` whose command line could not be read (`[name]`, not a zombie) and whose name
+ * matches none of `programs` might still be one of them (a script run through `#!/usr/bin/env` keeps the interpreter's
+ * name): a failed read, which holds the seat without counting it as an occupant. The lowest pid, as
+ * `command line of pid <n> not read ([name])`; null when every process under the pane was read.
+ */
+export function seatPoolUnreadInTree(rows: readonly BusyProcessRow[], panePid: number, programs: readonly string[]): string | null {
+  const children = new Map<number, BusyProcessRow[]>();
+  for (const row of rows) {
+    if (row.pid === row.ppid) continue;
+    const list = children.get(row.ppid);
+    if (list) list.push(row);
+    else children.set(row.ppid, [row]);
+  }
+  const seen = new Set<number>([panePid]);
+  const queue = [...(children.get(panePid) ?? [])];
+  let first: BusyProcessRow | null = null;
+  while (queue.length > 0) {
+    const row = queue.shift()!;
+    if (seen.has(row.pid)) continue;
+    seen.add(row.pid);
+    if (BRACKETED_NAME.test(row.command.trim()) && !seatPoolBusyCommand(row.command, programs)
+      && (first === null || row.pid < first.pid)) first = row;
+    queue.push(...(children.get(row.pid) ?? []));
+  }
+  return first ? `command line of pid ${first.pid} not read (${first.command.trim()})` : null;
+}
+
 /** One pane of the tmux server, as `tmux list-panes -a` prints it. */
 export interface SeatPoolPane {
   paneId: string;
@@ -118,9 +164,13 @@ export interface SeatPoolBusyReadDeps {
 
 /** How long one read (the table, the panes, an environment) may take before it counts as failed. */
 export const SEAT_POOL_BUSY_READ_TIMEOUT_MS = 5000;
-/** How many environments are read at once: the reads run on libuv's shared pool (4 threads by default), which the
- *  daemon's other async fs and dns calls use too. */
-export const SEAT_POOL_BUSY_ENV_CONCURRENCY = 4;
+/** How many environments are read at once. The reads run on libuv's shared pool (4 threads; the daemon's unit does not
+ *  set UV_THREADPOOL_SIZE), which the daemon's other async fs, dns.lookup and zlib calls use too, and a read stuck in
+ *  the kernel (D-state on /proc/<pid>/environ) keeps its thread past the deadline: half the pool at most, so stuck
+ *  reads never stall the rest of the daemon (T-007205 S12). */
+export const SEAT_POOL_BUSY_ENV_CONCURRENCY = 2;
+/** libuv's default thread pool, which SEAT_POOL_BUSY_ENV_CONCURRENCY must stay under. */
+export const LIBUV_DEFAULT_THREADPOOL_SIZE = 4;
 
 /** What readProcTmuxPane reads with: the daemon's fs.promises, a test's fakes. */
 export interface ProcEnvironmentIo {
@@ -312,11 +362,18 @@ export async function readSeatPoolBusySessions(
         try {
           await within(turn, left, "a turn");
         } catch {
-          inFlight.waiters.splice(inFlight.waiters.indexOf(release), 1);
+          // N13: the turn may have been handed over in the same tick the wait ran out; then it's no longer queued
+          const queued = inFlight.waiters.indexOf(release);
+          if (queued >= 0) inFlight.waiters.splice(queued, 1);
         }
       }
       const left = deadline - Date.now();
-      if (left <= 0) return { pid: row.pid, error: `the environments took over ${timeoutMs} ms` };
+      if (left <= 0) {
+        // T-007205 S13: woken (or freed) past this call's deadline, the read gives up without starting; the turn it
+        // was handed goes on to the next waiter, which would otherwise wait out its own deadline with a thread free.
+        if (inFlight.count < SEAT_POOL_BUSY_ENV_CONCURRENCY) inFlight.waiters.shift()?.();
+        return { pid: row.pid, error: `the environments took over ${timeoutMs} ms` };
+      }
       try {
         const started = deps.processPane!(row.pid);
         inFlight.count += 1;
@@ -324,6 +381,8 @@ export async function readSeatPoolBusySessions(
         started.then(done, done);
         return { pid: row.pid, pane: await within(started, left, `the environment of pid ${row.pid}`) };
       } catch (error) {
+        // A processPane that throws before its read starts (synchronously) frees the turn it was handed (lens, T-007205)
+        if (inFlight.count < SEAT_POOL_BUSY_ENV_CONCURRENCY) inFlight.waiters.shift()?.();
         return { pid: row.pid, error: reason(error) };
       }
     }), SEAT_POOL_BUSY_ENV_CONCURRENCY);
@@ -372,7 +431,7 @@ export async function readSeatPoolBusySessions(
       busy.set(session, `${seatPoolBusyCommand(byPid.get(left)!.command, programs)} (pid ${left}, TMUX_PANE ${pane.paneId})`);
       continue;
     }
-    busy.set(session, unread);
+    busy.set(session, unread ?? seatPoolUnreadInTree(rows, pane.panePid, programs));
   }
   return busy;
 }

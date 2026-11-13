@@ -22,7 +22,11 @@ import { readSeatPoolBusyCandidates } from "../src/domain/seat-pool-executor.js"
 import {
   readSeatPoolBusySessions,
   readProcTmuxPane,
+  LIBUV_DEFAULT_THREADPOOL_SIZE,
+  SEAT_POOL_BUSY_ENV_CONCURRENCY,
   SEAT_POOL_BUSY_ORPHAN_MAX_AGE_S,
+  seatPoolBusyCommand,
+  seatPoolUnreadInTree,
   seatPoolBusyFromProcess,
   seatPoolPaneOccupantMs,
   type BusyProcessRow,
@@ -162,7 +166,7 @@ describe("T-006251 S1: the environment read off the event loop, failure apart fr
     expect(read.get("qa-s7@r")).toBe("environment of pid 500 not read: the environment of pid 500 took over 20 ms");
   });
 
-  it("environments that never answer: at most 4 pending, no new read after the one deadline, and the seat held (RC delta)", async () => {
+  it("environments that never answer: at most the limit pending, no new read after the one deadline, and the seat held (RC delta)", async () => {
     const { rows, deps } = scene({ occupantAgoS: 7200, orphanAgoS: 3600 });
     const orphans: BusyProcessRow[] = Array.from({ length: 10 }, (_, i) => ({ pid: 600 + i, ppid: 1, command: "bash /x/suite-flock true", startedAt: agoS(60) }));
     let started = 0;
@@ -171,7 +175,7 @@ describe("T-006251 S1: the environment read off the event loop, failure apart fr
       ...deps, processes: async () => [...rows.filter((r) => r.pid !== 500), ...orphans],
       processPane: () => { started += 1; return new Promise<never>(() => {}); },
     }, { timeoutMs: 40 });
-    expect(started).toBe(4);
+    expect(started).toBe(SEAT_POOL_BUSY_ENV_CONCURRENCY);
     expect(Date.now() - t0).toBeLessThan(400);
     expect(read.get("qa-s7@r")).toMatch(/^environment of pid 600 not read: /);
   });
@@ -485,7 +489,7 @@ describe("T-006251 volta 1: B3, S6, S9, S10 and the S11 boundaries", () => {
     expect(single).toMatchObject({ reason: "scale_up", target: 2, current: 1 });
   });
 
-  it("S9: a read waits its turn while 4 environment reads are running (a concurrent read is served once they end)", async () => {
+  it("S9: a read waits its turn while the limit of environment reads is running (a concurrent read is served once they end)", async () => {
     const { deps } = scene({ occupantAgoS: 7200, orphanAgoS: 3600 });
     const rows: BusyProcessRow[] = [
       { pid: 100, ppid: 1, command: "/bin/bash -l" }, { pid: 101, ppid: 100, command: "claude" },
@@ -504,12 +508,12 @@ describe("T-006251 volta 1: B3, S6, S9, S10 and the S11 boundaries", () => {
       readSeatPoolBusySessions(["qa-s7@r"], PROGRAMS, base, { timeoutMs: 2000 }),
       readSeatPoolBusySessions(["qa-s7@r"], PROGRAMS, base, { timeoutMs: 2000 }),
     ]);
-    expect(most).toBe(4);
+    expect(most).toBe(SEAT_POOL_BUSY_ENV_CONCURRENCY);
     expect(a.get("qa-s7@r")).toBe("suite-flock (pid 501, TMUX_PANE %24)");
     expect(b.get("qa-s7@r")).toBe("suite-flock (pid 501, TMUX_PANE %24)");
   });
 
-  it("S9: environment reads past the deadline of one read still count against the next read: no new read starts while 4 are pending", async () => {
+  it("S9: environment reads past the deadline of one read still count against the next read: no new read starts while the limit is pending", async () => {
     const { deps } = scene({ occupantAgoS: 7200, orphanAgoS: 3600 });
     const rows: BusyProcessRow[] = [
       { pid: 100, ppid: 1, command: "/bin/bash -l" }, { pid: 101, ppid: 100, command: "claude" },
@@ -520,9 +524,9 @@ describe("T-006251 volta 1: B3, S6, S9, S10 and the S11 boundaries", () => {
     const base = { ...deps, processes: async () => rows, processPane: hang };
     const first = await readSeatPoolBusySessions(["qa-s7@r"], PROGRAMS, base, { timeoutMs: 20 });
     expect(first.get("qa-s7@r")).toMatch(/not read/);
-    expect(calls).toBe(4);
+    expect(calls).toBe(SEAT_POOL_BUSY_ENV_CONCURRENCY);
     const second = await readSeatPoolBusySessions(["qa-s7@r"], PROGRAMS, base, { timeoutMs: 20 });
-    expect(calls).toBe(4);
+    expect(calls).toBe(SEAT_POOL_BUSY_ENV_CONCURRENCY);
     expect(second.get("qa-s7@r")).toMatch(/still pending/);
     expect(seatPoolBusyFromProcess(second.get("qa-s7@r"))).toBe(false);
   });
@@ -558,5 +562,155 @@ describe("T-006251 volta 1: B3, S6, S9, S10 and the S11 boundaries", () => {
     expect(await at(3600, 3600, 43_200)).toMatch(/^suite-flock/); // started with the occupant: held
     expect(await at(3600, 3601, 43_200)).toBeNull(); // one second before the occupant: free
     expect(await at(3599, 3600, 43_200)).toBeNull(); // the occupant one second newer: free
+  });
+});
+
+describe("T-007205: S12 (half of libuv's pool), S13 (the turn passed on past a deadline), S14 (R + 1) and S15 ([comm])", () => {
+  it("S12: the environment reads never take more than half of libuv's default thread pool, even with every read stuck", async () => {
+    const { deps } = scene({ occupantAgoS: 7200, orphanAgoS: 3600 });
+    const rows: BusyProcessRow[] = [
+      { pid: 100, ppid: 1, command: "/bin/bash -l" }, { pid: 101, ppid: 100, command: "claude" },
+      ...[601, 602, 603, 604, 605].map((pid) => ({ pid, ppid: 1, command: "suite-flock nice x" })),
+    ];
+    let calls = 0;
+    const stuck = (): Promise<string | null> => { calls += 1; return new Promise<never>(() => {}); };
+    const base = { ...deps, processes: async () => rows, processPane: stuck };
+    await readSeatPoolBusySessions(["qa-s7@r"], PROGRAMS, base, { timeoutMs: 20 });
+    await readSeatPoolBusySessions(["qa-s7@r"], PROGRAMS, base, { timeoutMs: 20 });
+    expect(calls).toBe(SEAT_POOL_BUSY_ENV_CONCURRENCY);
+    expect(calls * 2).toBeLessThanOrEqual(LIBUV_DEFAULT_THREADPOOL_SIZE);
+  });
+
+  it("S13: a waiter woken past its own deadline hands its turn on, so the next waiter reads now instead of at its deadline", async () => {
+    const { deps } = scene({ occupantAgoS: 7200, orphanAgoS: 3600 });
+    const holders: BusyProcessRow[] = [701, 702].map((pid) => ({ pid, ppid: 1, command: "suite-flock nice x" }));
+    const base: BusyProcessRow[] = [{ pid: 100, ppid: 1, command: "/bin/bash -l" }, { pid: 101, ppid: 100, command: "claude" }];
+    const finish: Array<() => void> = [];
+    const pane = (pid: number): Promise<string | null> => {
+      if (pid === 701 || pid === 702) return new Promise((resolve) => { finish.push(() => resolve(null)); });
+      return Promise.resolve(pid === 800 ? "%24" : null);
+    };
+    const at = (rows: BusyProcessRow[], timeoutMs: number) =>
+      readSeatPoolBusySessions(["qa-s7@r"], PROGRAMS, { ...deps, processes: async () => [...base, ...rows], processPane: pane }, { timeoutMs });
+    // The two holders take every turn; then a short call waits first in line and a long one behind it.
+    const holding = at(holders, 10_000);
+    await vi.waitFor(() => expect(finish).toHaveLength(SEAT_POOL_BUSY_ENV_CONCURRENCY));
+    const short = at([{ pid: 799, ppid: 1, command: "suite-flock nice y" }], 100);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    const long = at([{ pid: 800, ppid: 1, command: "suite-flock nice z" }], 5_000);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    // A holder ends just as the short call's deadline has passed, before its own timer runs: its turn goes to the short
+    // call, which can no longer read and must hand the turn on.
+    const realNow = Date.now.bind(Date);
+    const clock = vi.spyOn(Date, "now").mockImplementation(() => realNow() + 1_000);
+    const started = realNow();
+    let read: Map<string, string | null>;
+    try {
+      finish.shift()!();
+      read = await long;
+    } finally {
+      clock.mockRestore();
+    }
+    expect(read.get("qa-s7@r")).toBe("suite-flock (pid 800, TMUX_PANE %24)");
+    expect(realNow() - started).toBeLessThan(1_000);
+    expect((await short).get("qa-s7@r")).toMatch(/not read/);
+    for (const end of finish) end();
+    await holding;
+  });
+
+  it("N13: a waiter whose wait runs out in the same tick its turn is handed over does not drop the turn (fake timers)", async () => {
+    vi.useFakeTimers();
+    try {
+      const { deps } = scene({ occupantAgoS: 7200, orphanAgoS: 3600 });
+      const base: BusyProcessRow[] = [{ pid: 100, ppid: 1, command: "/bin/bash -l" }, { pid: 101, ppid: 100, command: "claude" }];
+      const started: number[] = [];
+      const pane = (pid: number): Promise<string | null> => {
+        started.push(pid);
+        if (pid === 701) return new Promise((resolve) => setTimeout(() => resolve(null), 100));
+        if (pid === 702) return new Promise<never>(() => {});
+        return Promise.resolve(pid === 800 ? "%24" : null);
+      };
+      const at = (pids: number[], timeoutMs: number) => readSeatPoolBusySessions(["qa-s7@r"], PROGRAMS,
+        { ...deps, processes: async () => [...base, ...pids.map((pid) => ({ pid, ppid: 1, command: "suite-flock nice x" }))], processPane: pane },
+        { timeoutMs });
+      const flush = async () => { for (let k = 0; k < 20; k += 1) await Promise.resolve(); };
+      void at([701, 702], 10_000);
+      await flush();
+      const w = at([799], 100);
+      await flush();
+      const x = at([800], 60_000);
+      await flush();
+      // 701's read ends and w's wait runs out in the same synchronous advance: the turn 701 frees goes to w, whose own
+      // timer then rejects; w must not drop it, and x reads.
+      vi.advanceTimersByTime(100);
+      await flush();
+      expect(started).toContain(800);
+      expect((await x).get("qa-s7@r")).toBe("suite-flock (pid 800, TMUX_PANE %24)");
+      expect((await w).get("qa-s7@r")).toMatch(/not read/);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("S14: with every read failing and more rows waiting than seats (R > N + 1), the pool asks R + 1 seats, up to max, with nothing dispatched", () => {
+    const sp = (parseSeatPoolSpec({ max: 20, min: 0, cwd_template: "/w/{slot}", cooldown_s: 0, idle_grace_s: 60, dispatch_after_s: 60,
+      dispatch_to_parked: { busy_processes: PROGRAMS } }) as { spec: SeatPoolSpec }).spec;
+    const failed = "environment of pid 500 not read: the environments took over 5000 ms";
+    const state = (seats: number, rows: number): SeatPoolState => ({
+      model: { rigId: "rig-1", rigName: "r", podNamespace: "dev", memberId: "impl", logicalId: "dev.impl", nodeId: "model", sessionName: "dev-impl@r" },
+      modelCause: "working", restoring: false, adoptable: [], demand: null, lastScaleAt: null,
+      slots: Array.from({ length: seats }, (_, i) => ({
+        slotId: i + 1, logicalId: `dev.impl-s${i + 1}`, sessionName: `dev-impl-s${i + 1}@r`, nodeId: `node-${i + 1}`, phase: "live" as const,
+        adopted: false, nodeExists: true, openRows: 0, heldMessages: 0, idleSince: new Date(NOW - 3_600_000).toISOString(), cause: "idle" as const,
+        atPrompt: true, backgroundWork: false, busyProcess: failed,
+      })),
+      pending: Array.from({ length: rows }, (_, i) => ({
+        qitemId: `q${i}`, destination: "dev-impl@r", waitingSince: new Date(NOW - 120_000).toISOString(), tags: ["tarefa-nova"],
+      })),
+    });
+    const eight = planSeatPool(sp, state(2, 8), NOW, 120_000);
+    expect(eight.intents.filter((i) => i.kind === "dispatch" || i.kind === "drain")).toEqual([]);
+    expect(eight).toMatchObject({ reason: "scale_up", target: 9, current: 2 });
+    const nineteen = planSeatPool(sp, state(2, 19), NOW, 120_000);
+    expect(nineteen.intents.filter((i) => i.kind === "dispatch" || i.kind === "drain")).toEqual([]);
+    expect(nineteen).toMatchObject({ reason: "scale_up", target: 20, current: 2 });
+    // A seat holding a row (O = 1) adds itself: rows + occupied + 1 (R + O + 1), not R + 1.
+    const withRow = state(3, 4);
+    withRow.slots[0] = { ...withRow.slots[0]!, openRows: 1, idleSince: null, cause: "working", busyProcess: null };
+    expect(planSeatPool(sp, withRow, NOW, 120_000)).toMatchObject({ reason: "scale_up", target: 6, current: 3 });
+    // Once grown, the pool holds: the seats added fail the same read and ask nothing more.
+    expect(planSeatPool(sp, state(9, 8), NOW, 120_000)).toMatchObject({ reason: "steady", target: 9, current: 9 });
+  });
+
+  it("S15: a process whose command line could not be read ([comm], as ps shows it on Linux): its own name matches, an interpreter's name under the pane is a failed read", async () => {
+    expect(seatPoolBusyCommand("[congelar-eval]", PROGRAMS)).toBe("congelar-eval");
+    expect(seatPoolBusyCommand("[suite-flock]", PROGRAMS)).toBe("suite-flock");
+    // The kernel keeps 15 bytes of the name: a longer program matches by its first 15.
+    expect(seatPoolBusyCommand("[hillclimb-avali]", ["hillclimb-avaliador"])).toBe("hillclimb-avaliador");
+    expect(seatPoolBusyCommand("[hillclimb]", ["hillclimb-avaliador"])).toBeNull();
+    expect(seatPoolBusyCommand("[congelar-eval] <defunct>", PROGRAMS)).toBeNull();
+    expect(seatPoolBusyCommand("[kworker/0:1]", PROGRAMS)).toBeNull();
+    expect(seatPoolBusyCommand("[bash]", PROGRAMS)).toBeNull();
+    // On the VM (measured by the lens of T-007205), suite-flock is `#!/usr/bin/env bash`: its task name is `bash`, so with
+    // its command line unreadable it is `[bash]`. Under the seat's pane, that is a failed read: held, not an occupant.
+    const { rows, deps } = scene({ occupantAgoS: 7200, orphanAgoS: 3600 });
+    const noOrphan = rows.filter((r) => r.pid !== 500);
+    const with_ = (row: BusyProcessRow) => ({ ...deps, processes: async () => [...noOrphan, row] });
+    const unreadable = await readSeatPoolBusySessions(["qa-s7@r"], PROGRAMS, with_({ pid: 501, ppid: 101, command: "[bash]", startedAt: agoS(60) }));
+    expect(unreadable.get("qa-s7@r")).toBe("command line of pid 501 not read ([bash])");
+    expect(seatPoolBusyFromProcess(unreadable.get("qa-s7@r"))).toBe(false);
+    const direct = await readSeatPoolBusySessions(["qa-s7@r"], PROGRAMS, with_({ pid: 501, ppid: 101, command: "[congelar-eval]", startedAt: agoS(60) }));
+    expect(direct.get("qa-s7@r")).toBe("congelar-eval (pid 501)");
+    const zombie = await readSeatPoolBusySessions(["qa-s7@r"], PROGRAMS, with_({ pid: 501, ppid: 101, command: "[bash] <defunct>", startedAt: agoS(60) }));
+    expect(zombie.get("qa-s7@r")).toBeNull();
+    // A real process under the pane still wins over an unreadable one.
+    const both = [...noOrphan, { pid: 501, ppid: 101, command: "[bash]" }, { pid: 502, ppid: 101, command: "suite-flock nice -n 10 x" }];
+    expect((await readSeatPoolBusySessions(["qa-s7@r"], PROGRAMS, { ...deps, processes: async () => both })).get("qa-s7@r"))
+      .toBe("suite-flock (pid 502)");
+    expect(seatPoolUnreadInTree(both, 100, PROGRAMS)).toBe("command line of pid 501 not read ([bash])");
+    // An orphan (outside the pane) whose own name matches still holds by its TMUX_PANE.
+    const orphan = rows.map((r) => (r.pid === 500 ? { ...r, command: "[congelar-eval]" } : r));
+    expect((await readSeatPoolBusySessions(["qa-s7@r"], PROGRAMS, { ...deps, processes: async () => orphan })).get("qa-s7@r"))
+      .toBe("congelar-eval (pid 500, TMUX_PANE %24)");
   });
 });
