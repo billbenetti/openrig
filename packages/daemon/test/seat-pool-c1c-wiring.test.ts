@@ -43,6 +43,7 @@ describe("c1c wiring pin: startup gives the seat pool the host's load and the us
     const fn = block("const usageLimitedSessions = async (", "\n    };");
     expect(fn).toMatch(/deps\.providerService\.getReadModel\(\)/);
     expect(fn).toMatch(/deriveUsageLimitPools\(/);
-    expect(fn).toMatch(/pool\.seatSessions/);
+    // The pools read now go through the memory that keeps a seat limited until its stated reset (#2917, 0.7.13).
+    expect(fn).toMatch(/seatPoolUsageLimitMemory\.limited\(pools, /);
   });
 });
