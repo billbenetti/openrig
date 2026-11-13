@@ -224,25 +224,58 @@ describe("stuck sweep: rows waiting in an active seat pool's queue (T-007029, #2
     expect(db.prepare("SELECT stopped_since FROM seat_pool_slots WHERE pool_job_id = ?").get(jobId)).toEqual({ stopped_since: null });
   });
 
-  // SD2: a retired seat counts as one the pool had until it stopped running, not until its reap. The crash loop: the
-  // launch works, the session dies before a sweep sees it, the reap removes it (its node and sessions go) and the add
-  // of the next one starts: the grace doesn't start again at each reap.
-  it("SD2: the crash loop (launch ok, the session dies, reap, add): the grace counts from when it stopped, not the reap", async () => {
+  // B1 of the REVISAO-T-007545 (SD2): the crash loop through the reap's real path. The launch works (the slot goes live,
+  // the pool records its start), the session dies on its own and stays 'running' in sessions (nothing records the death
+  // at runtime), and the reap marks the stop and then cleans the seat, which writes its session exited now
+  // (SessionRegistry.updateStatus, as cleanSeat does), takes the node and retires the slot; the next add starts. Three
+  // turns two minutes apart, shorter than the grace: no seat ever ran a sweep period, so the grace is not renewed and the
+  // finding comes within no_seat_grace_s of the first death.
+  // The same loop through the executor's own reap is in seat-pool-executor.test.ts; this one runs it to the stuck sweep's
+  // finding, with the session written exited by the method cleanSeat uses.
+  it("B1: the crash loop in the reap's order, 3 turns shorter than the grace: the sweep's finding comes within the grace", async () => {
     const { SeatPoolSlots } = await import("../src/domain/seat-pool-executor.js");
+    const { SessionRegistry } = await import("../src/domain/session-registry.js");
     const jobId = pool({});
-    const rig = rigs.listRigs().find((r) => r.name === "dev") ?? rigs.createRig("dev");
-    const node = rigs.addNode(rig.id, "impl-crash", { runtime: "claude-code" });
-    db.prepare("INSERT INTO sessions (id, node_id, session_name, status, last_seen_at) VALUES ('s-crash', ?, 'impl-crash@dev', 'exited', datetime('now', '-40 minutes'))")
-      .run(node.id);
     const slots = new SeatPoolSlots(db);
-    const crashed = slots.insert({ poolJobId: jobId, logicalId: "impl-crash", nodeId: node.id, phase: "live", intent: null, opId: "op-1", at: minutesAgo(45) });
-    slots.markStopped(crashed.slotId, minutesAgo(5));   // the reap, before it removes the node
-    db.prepare("DELETE FROM nodes WHERE id = ?").run(node.id);
-    slots.retire(crashed.slotId, minutesAgo(5));
-    slots.insert({ poolJobId: jobId, logicalId: "impl-next", nodeId: null, phase: "adding", intent: "add", opId: "op-2", at: minutesAgo(4) });
+    const sessions = new SessionRegistry(db);
+    const rig = rigs.listRigs().find((r) => r.name === "dev") ?? rigs.createRig("dev");
+    const row = await work();
+    const iso = (ms: number) => new Date(ms).toISOString();
+    const t0 = Date.now() - 40 * 60_000;
+    for (let turn = 0; turn < 3; turn++) {
+      const t = t0 + turn * 2 * 60_000;
+      const node = rigs.addNode(rig.id, `impl-loop${turn}`, { runtime: "claude-code" });
+      const added = slots.insert({ poolJobId: jobId, logicalId: `impl-loop${turn}`, nodeId: node.id, phase: "added", intent: null, opId: `op-${turn}`, at: iso(t) });
+      // the launch works at t + 20 s: live, with its start recorded (SeatPoolSlots.markLive)
+      slots.update(added.slotId, { phase: "live" });
+      db.prepare("UPDATE seat_pool_slots SET live_at = ? WHERE id = ?").run(iso(t + 20_000), added.slotId);
+      db.prepare("INSERT INTO sessions (id, node_id, session_name, status) VALUES (?, ?, ?, 'running')").run(`s-loop${turn}`, node.id, `impl-loop${turn}@dev`);
+      // it dies at t + 30 s with no record; the reap at t + 90 s marks the stop, then the clean writes the session exited
+      slots.markStopped(added.slotId, iso(t + 90_000));
+      sessions.updateStatus(`s-loop${turn}`, "exited");
+      db.prepare("DELETE FROM nodes WHERE id = ?").run(node.id);
+      slots.retire(added.slotId, iso(t + 95_000));
+    }
+    await sweep(new Date(t0 + 30_000 + 30 * 60_000));   // the first death plus the grace
+    expect(findingFor(row)).toBe(true);
+  });
+
+  it("B1: a pool seat that stopped a minute after its start (not reaped yet) doesn't hold the queue either", async () => {
+    const jobId = pool({});
+    slot(jobId, { live: true, session: "exited" });
+    db.prepare("UPDATE seat_pool_slots SET live_at = ? WHERE pool_job_id = ?").run(minutesAgo(1), jobId);
     const row = await work();
     await sweep();
     expect(findingFor(row)).toBe(true);
+  });
+
+  it("B1: a pool seat that ran longer than a sweep period and then stopped holds the queue for the grace, as before", async () => {
+    const jobId = pool({});
+    slot(jobId, { live: true, session: "exited" });
+    db.prepare("UPDATE seat_pool_slots SET live_at = ? WHERE pool_job_id = ?").run(minutesAgo(45), jobId);
+    const row = await work();
+    await sweep();
+    expect(findingFor(row)).toBe(false);
   });
 
   it("SD2: a seat reaped while it still ran counts until its reap, as before", async () => {
@@ -253,6 +286,7 @@ describe("stuck sweep: rows waiting in an active seat pool's queue (T-007029, #2
     db.prepare("INSERT INTO sessions (id, node_id, session_name, status) VALUES ('s-ok', ?, 'impl-ok@dev', 'running')").run(node.id);
     const slots = new SeatPoolSlots(db);
     const live = slots.insert({ poolJobId: jobId, logicalId: "impl-ok", nodeId: node.id, phase: "live", intent: null, opId: "op-1", at: minutesAgo(45) });
+    db.prepare("UPDATE seat_pool_slots SET live_at = ? WHERE id = ?").run(minutesAgo(44), live.slotId);   // it ran 39 min
     slots.markStopped(live.slotId, minutesAgo(5));
     db.prepare("DELETE FROM nodes WHERE id = ?").run(node.id);
     slots.retire(live.slotId, minutesAgo(5));
