@@ -5,10 +5,12 @@ import { nodeExecutorConfirmedStopped } from "./node-inventory.js";
 import { SeatPoolSlots } from "./seat-pool-executor.js";
 
 /** T-007545 (B1 of its review): a seat the pool started counts as one the pool had only once it ran this long from its
- *  start (live_at), a sweep period (the stuck sweep runs every 300 s): a crash loop (the launch works, the session dies
- *  within a minute or two, the reap, the next add) never renews the grace, however often it turns. A seat started
- *  before live_at was kept, and an adopted one, count as before. */
-export const SEAT_POOL_MIN_RUN_MS = 5 * 60_000;
+ *  start (live_at) to its stop as seen (stopped_since: the first sweep that saw it stopped, or its reap, which marks
+ *  before it cleans). Two sweep periods (the stuck sweep runs every 300 s): the stop is seen up to a sweep period after
+ *  the death (sooner when the reap comes first), so a seat that dies within ~5 min of its start never counts, and a
+ *  crash loop (the launch works, the session dies, the reap, the next add) never renews the grace, however often it
+ *  turns. A seat started before live_at was kept, and an adopted one, count as before. */
+export const SEAT_POOL_MIN_RUN_MS = 10 * 60_000;
 
 /** What the stuck sweep reads of one active seat pool to tell whether a row waiting for its model is the pool's to move. */
 interface PoolQueueFacts {
@@ -61,13 +63,14 @@ export function seatPoolQueueCustody(
       // SeatPoolSlots.retire: an add or a launch that failed) or before it got a node. The slot's own row, not the job's
       // history (whose retention keeps only the newest evaluations), so the grace holds as long as the row does.
       // T-007545 (SD2): it counts until it stopped running (stopped_since), not until its reap, when that came first;
-      // and (B1) a seat the pool started counts only when it ran for SEAT_POOL_MIN_RUN_MS from its start.
+      // and (B1) a seat the pool started counts only when it ran for SEAT_POOL_MIN_RUN_MS from its start (less 1 ms:
+      // julianday is a double, so a run of exactly SEAT_POOL_MIN_RUN_MS can come out a fraction of a ms short).
       const stopOf = "CASE WHEN s.stopped_since IS NOT NULL AND s.stopped_since < s.retired_at THEN s.stopped_since ELSE s.retired_at END";
       const lastRetired = db.prepare(
         `SELECT MAX(${stopOf}) AS at FROM seat_pool_slots s
           WHERE s.pool_job_id = ? AND s.retired_at IS NOT NULL
             AND (s.op_id IS NULL OR (s.node_id IS NOT NULL AND COALESCE(s.intent, '') <> 'never_live'))
-            AND (s.op_id IS NULL OR s.live_at IS NULL OR (julianday(${stopOf}) - julianday(s.live_at)) * 86400000.0 >= ?)`,
+            AND (s.op_id IS NULL OR s.live_at IS NULL OR (julianday(${stopOf}) - julianday(s.live_at)) * 86400000.0 >= ? - 1)`,
       );
       for (const job of jobs) {
         const parsed = parseYaml(job.spec_yaml) as { context?: unknown } | null;
