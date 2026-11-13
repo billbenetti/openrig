@@ -193,9 +193,10 @@ export class SeatPoolSlots {
 
   /** T-007545 (SD1, SD2): marks when a live seat stopped running, once (a later call keeps the first): the stop the
    *  node's latest session recorded (its status no longer running, idle or unknown, at its last_seen_at), else `at`.
-   *  The stuck sweep calls it the first time it sees the seat stopped, and the removal before it takes the node (whose
-   *  sessions go with it), so the grace over the pool's queue survives a restart and a retired seat counts until it
-   *  stopped running, not until its reap. */
+   *  The stuck sweep calls it the first time it sees the seat stopped, a drain before it removes the node (whose
+   *  sessions go with it) and the reap before it cleans the seat (which writes its sessions exited now), so the grace
+   *  over the pool's queue survives a restart and a retired seat counts until its stop was first seen or recorded
+   *  (the sweep, the drain or the reap), not after it. */
   markStopped(slotId: number, at: string): void {
     this.db.prepare(`
       UPDATE seat_pool_slots SET stopped_since = COALESCE(stopped_since, (
@@ -210,10 +211,16 @@ export class SeatPoolSlots {
     this.db.prepare("UPDATE seat_pool_slots SET stopped_since = NULL WHERE id = ? AND stopped_since IS NOT NULL").run(slotId);
   }
 
-  /** T-007545 (cross review S2): the same, for the open slot of a seat a relaunch brought back (by its logical id). */
-  clearStoppedFor(poolJobId: string, logicalId: string): void {
-    this.db.prepare(`UPDATE seat_pool_slots SET stopped_since = NULL
-                      WHERE pool_job_id = ? AND logical_id = ? AND retired_at IS NULL AND stopped_since IS NOT NULL`).run(poolJobId, logicalId);
+  /** T-007545 (B1 of its review): the pool started the seat (its launch or relaunch worked) at `at`: it counts as a seat
+   *  the pool had only once it ran for a sweep period from then, and its next stop starts afresh. */
+  markLive(slotId: number, at: string): void {
+    this.db.prepare("UPDATE seat_pool_slots SET live_at = ?, stopped_since = NULL WHERE id = ?").run(at, slotId);
+  }
+
+  /** The same, for the open slot of a seat a relaunch brought back (by its logical id; T-007545 cross review S2). */
+  markLiveFor(poolJobId: string, logicalId: string, at: string): void {
+    this.db.prepare("UPDATE seat_pool_slots SET live_at = ?, stopped_since = NULL WHERE pool_job_id = ? AND logical_id = ? AND retired_at IS NULL")
+      .run(at, poolJobId, logicalId);
   }
 
   /** Retires a seat. One retired before it was ever live (still adding or added) keeps `intent = 'never_live'`, so a
@@ -1334,6 +1341,7 @@ export class SeatPoolExecutor {
       }
     }
     this.setIntent(slotId, null, "live");
+    this.deps.slots.markLive(slotId, this.at());   // T-007545 (B1): when the pool started it
     this.record(jobId, false, "seat_pool_launched", { slot: slot.logicalId, nodeId });
     return true;
   }
@@ -1539,6 +1547,9 @@ export class SeatPoolExecutor {
         }
       }
       this.setIntent(slotId, "reap");
+      // T-007545 (B1 of its review): when it stopped running, before the clean writes its sessions exited now (a seat
+      // that died on its own is still 'running' in sessions until then) and before the node goes
+      this.deps.slots.markStopped(slotId, this.at());
       const cleaned = await this.deps.effects.cleanSlot({ sessionName });
       if (!cleaned.ok && cleaned.code !== "nothing_to_clean") return failed("clean", { code: cleaned.code, error: cleaned.error });
       if (inLease.spec.reapCmd) {
@@ -1567,8 +1578,6 @@ export class SeatPoolExecutor {
         else if (!ROW_MOVED_ON.has(moved.code)) return failed("move", { qitemId: row.qitemId, code: moved.code, error: moved.error });
       }
       this.setIntent(slotId, "remove");
-      // T-007545 (SD2): when it stopped running, before the node (and its sessions) go: a retired seat counts until then
-      this.deps.slots.markStopped(slotId, this.at());
       const removed = await this.deps.effects.removeSlot({ rigId: inLease.model.rigId, nodeId, expected });
       if (!removed.ok && removed.code !== "node_not_found") return failed("remove", { code: removed.code, error: removed.error, rows });
       return { stop: false, reason: "seat_pool_reaped", notes: { rows }, removed: true };
@@ -1760,8 +1769,9 @@ export class SeatPoolExecutor {
       this.record(jobId, true, "seat_pool_relaunch_failed", { seat, code: launched.code, error: launched.error, ...notes });
       return "failed";
     }
-    // T-007545 (cross review S2): the seat runs again, so its next stop starts afresh even when it comes before a sweep
-    this.deps.slots.clearStoppedFor(jobId, logicalId);
+    // T-007545 (cross review S2, B1): the seat runs again from now, so its next stop starts afresh even when it comes
+    // before a sweep, and it counts as a seat the pool had only once it ran for a sweep period from now
+    this.deps.slots.markLiveFor(jobId, logicalId, this.at());
     this.record(jobId, false, "seat_pool_relaunched", { seat, ...notes });
     return "launched";
   }
