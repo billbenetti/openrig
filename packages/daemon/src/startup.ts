@@ -172,6 +172,7 @@ import { LaunchBudget, launchBudgetLimits, sampleHost } from "./domain/launch-bu
 import { launchStatusIsRunning } from "./domain/restore-orchestrator.js";
 import { resolveEscalationOwner } from "./domain/escalation-owner.js";
 import { deriveUsageLimitPools } from "./domain/provider/provider-signals.js";
+import { SeatPoolUsageLimitMemory } from "./domain/seat-pool-usage-limit.js";
 import { resolveWakeRetryIntervalSeconds } from "./domain/queue-wake-ladder.js";
 import { SeatLifecycleService } from "./domain/seat-lifecycle-service.js";
 import { reserveOperation } from "./domain/operation-correlation.js";
@@ -2432,19 +2433,23 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
       });
     };
     // The seats whose provider account is out of usage, as the wake ladder reads them: the plan reads them, and the run
-    // again just before each add, launch and relaunch.
+    // again just before each add, launch and relaunch. A seat stays limited until the reset it stated (#2917), which the
+    // ladder parks it for, though the provider's signal is fresh for 5 minutes only (SeatPoolUsageLimitMemory).
+    const seatPoolUsageLimitMemory = new SeatPoolUsageLimitMemory();
     const usageLimitedSessions = async (): Promise<ReadonlySet<string>> => {
       if (!deps.providerService) return new Set();
+      const now = new Date();
       try {
         const pools = deriveUsageLimitPools({
           ...(await deps.providerService.getReadModel()),
-          now: new Date(),
+          now,
           fallbackSeconds: resolveWakeRetryIntervalSeconds(),
           claudeHomeOf: (seatSession) => seatRuntimeHomeBySession(db, seatSession, "claude-code"),
         });
-        return new Set(pools.flatMap((pool) => pool.seatSessions));
+        return seatPoolUsageLimitMemory.limited(pools, now.getTime());
       } catch {
-        return new Set();
+        // An unreadable read model reads no new limit; the limits already remembered still hold.
+        return seatPoolUsageLimitMemory.limited([], now.getTime());
       }
     };
     // One budget for every pool of this daemon; its limits are the daemon's settings, read at each launch. The
