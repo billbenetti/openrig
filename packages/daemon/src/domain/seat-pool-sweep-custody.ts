@@ -8,8 +8,8 @@ interface PoolQueueFacts {
   /** A seat of the pool is live, with its node present. A seat still being added doesn't count: an add that keeps
    *  failing would hold the queue forever. */
   hasSeat: boolean;
-  /** When the pool last had a seat: the latest retirement of a seat that got its node or was adopted, or else its
-   *  registration. A seat retired before its node was added never counts. */
+  /** When the pool last had a seat: the latest retirement of a seat that was live (or adopted), or else its
+   *  registration. A seat retired before it was ever live never counts. */
   lastSeatMs: number;
   graceMs: number;
 }
@@ -36,12 +36,13 @@ export function seatPoolQueueCustody(
         `SELECT 1 FROM seat_pool_slots s JOIN nodes n ON n.id = s.node_id
           WHERE s.pool_job_id = ? AND s.retired_at IS NULL AND s.phase = 'live' LIMIT 1`,
       );
-      // A retired seat counts as one the pool had only if it was adopted (op_id null) or got its node (node_id stays on
-      // the retired row): an add that failed before its node never had a seat. The slot's own row, not the job's history
-      // (whose retention keeps only the newest evaluations), so the grace holds as long as the row does.
+      // A retired seat counts as one the pool had unless it was retired before it was ever live (intent 'never_live',
+      // SeatPoolSlots.retire: an add or a launch that failed) or before it got a node. The slot's own row, not the job's
+      // history (whose retention keeps only the newest evaluations), so the grace holds as long as the row does.
       const lastRetired = db.prepare(
         `SELECT MAX(s.retired_at) AS at FROM seat_pool_slots s
-          WHERE s.pool_job_id = ? AND s.retired_at IS NOT NULL AND (s.op_id IS NULL OR s.node_id IS NOT NULL)`,
+          WHERE s.pool_job_id = ? AND s.retired_at IS NOT NULL
+            AND (s.op_id IS NULL OR (s.node_id IS NOT NULL AND COALESCE(s.intent, '') <> 'never_live'))`,
       );
       for (const job of jobs) {
         const parsed = parseYaml(job.spec_yaml) as { context?: unknown } | null;
