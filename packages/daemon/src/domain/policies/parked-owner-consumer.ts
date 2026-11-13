@@ -19,7 +19,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import type { Policy, PolicyJob, PolicyEvaluation } from "./types.js";
 import { BACKGROUND_SHELL_GRACE_MINUTES } from "../queue-pickup.js";
-import type { WatchdogHistoryEntry } from "../watchdog-history-log.js";
+import { deliveryReachedSeat, type WatchdogHistoryEntry } from "../watchdog-history-log.js";
 
 /** The nudge result the parked-owner records when a queue-only seat's wake stays in its queue (T-006631). The wake
  *  ladder reads it as the seat's own choice, not as an unknown outcome, so the row never enters the ladder. */
@@ -224,7 +224,7 @@ export function makeParkedOwnerConsumerPolicy(deps: ParkedOwnerConsumerDeps): Po
         const primary = typeof n["primaryRow"] === "string" ? n["primaryRow"] : null;
         if (!key || !primary || latestRows.has(primary)) continue;
         latestRows.add(primary);
-        if (e.deliveryStatus === "ok") {
+        if (deliveryReachedSeat(e.deliveryStatus)) {
           try {
             if (!deps.rows.listTransitions(primary).some(t => t.transitionNote === `${DELIVERED_PREFIX} ${key}`))
               deps.rows.appendNote(primary, `${DELIVERED_PREFIX} ${key}`);

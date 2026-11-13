@@ -101,6 +101,7 @@ import {
   type ParkWakeStatus,
 } from "./queue-wake-repository.js";
 import { WatchdogJobsRepository } from "./watchdog-jobs-repository.js";
+import { NOTED_ON_PARKED_ROW, QUEUED_AS_ROW } from "./watchdog-history-log.js";
 import type { ParkFacts } from "./policies/seat-pool.js";
 import { parse as parseYaml } from "yaml";
 import { armQueueWait, backOffQueueWait, refreshQueueWaits, evaluateQueueWait, retargetQueueWait, isQueueWait } from "./queue-wait-backoff.js";
@@ -4132,7 +4133,7 @@ export class QueueRepository {
   /** Called by the watchdog engine after the delivery attempt is durably
    *  audited. The queue transition records that attempt independently of
    *  whether the HELD row's owner consumed it. */
-  recordWatchdogWakeAttempt(jobId: string, deliveryStatus: string, retryAt?: string): void {
+  recordWatchdogWakeAttempt(jobId: string, deliveryStatus: string, retryAt?: string, queuedQitemId?: string): void {
     const bindings = this.wakeRepo.findBlockedQitemsByWatchdog(jobId);
     if (bindings.length === 0) return;
     // Both receipt ownership and timer lifecycle follow the current park.
@@ -4144,6 +4145,10 @@ export class QueueRepository {
         actorSession: "watchdog@system",
         transitionNote: retryAt ? `park wake failed: watchdog ${jobId}; delivery=${deliveryStatus}; occurrence remains owed; retry at ${retryAt}` : deliveryStatus === "retained"
           ? `park wake retained: watchdog ${jobId}; not delivered; blocked work unchanged`
+          : deliveryStatus === QUEUED_AS_ROW
+            ? `park wake queued as row: watchdog ${jobId}; delivery=${QUEUED_AS_ROW}${queuedQitemId ? ` ${queuedQitemId}` : ""}; nothing typed; awaiting owner consumption`
+          : deliveryStatus === NOTED_ON_PARKED_ROW
+            ? `park wake noted on this row: watchdog ${jobId}; delivery=${NOTED_ON_PARKED_ROW}; nothing typed; awaiting owner consumption`
           : `park wake fired: watchdog ${jobId}; delivery=${deliveryStatus}; awaiting owner consumption`,
       });
       if (!retryAt) this.wakeRepo.record({

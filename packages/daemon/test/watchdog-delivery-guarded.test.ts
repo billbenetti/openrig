@@ -99,7 +99,8 @@ function scheduled(f: ReturnType<typeof fixture>, { withoutPreview = false } = {
   const history = new WatchdogHistoryLog(f.db);
   const engine = new WatchdogPolicyEngine({ jobsRepo: jobs, historyLog: history, eventBus: bus, deliver: f.deliver,
     resolvePreDeliveryTerminalReason: ({ jobId }) => repo.resolveWatchdogPreDeliveryTerminalReason(jobId),
-    onWakeAttempt: ({ jobId, deliveryStatus }) => repo.recordWatchdogWakeAttempt(jobId, deliveryStatus),
+    onWakeAttempt: ({ jobId, deliveryStatus, retryAt, queuedQitemId }: { jobId: string; deliveryStatus: string; retryAt?: string; queuedQitemId?: string }) =>
+      repo.recordWatchdogWakeAttempt(jobId, deliveryStatus, retryAt, queuedQitemId),
     ...(withoutPreview ? {} : { resolveDigestEntry: ({ jobId, message }: { jobId: string; message: string }) => repo.parkReminderDigestEntry(jobId, message) }),
   });
   const scheduler = new WatchdogScheduler({ jobsRepo: jobs, policyEngine: engine });
@@ -414,21 +415,21 @@ describe("watchdog positive no-input outcomes", () => {
     expect(sends).toHaveBeenCalledTimes(1);
   });
 
-  it("T-006631: a queue-only seat gets each wake timer as one cold queue row, never typed", async () => {
+  it("T-006631: at a queue-only seat, a reminder with no parked row of origin is one cold queue row, never typed", async () => {
     const sends = vi.fn().mockResolvedValue({ ok: true });
     const rows: Array<{ qitemId: string; destinationSession: string; body: string; summary: string; tags: string[] }> = [];
     const deliver = makeWatchdogDeliver({ sessionTransport: { send: sends }, isQueueOnlySeat: s => s === seat,
       createQueueRow: async row => { if (!rows.some(r => r.qitemId === row.qitemId)) rows.push(row); } });
     const wake = { jobId: "wake-1", policy: "periodic-reminder", occurrenceId: "occ-1" };
-    expect(await deliver({ targetSession: seat, message: "Wake timer fired for parked qitem fc-1." }, wake)).toMatchObject({ status: "ok" });
-    expect(await deliver({ targetSession: seat, message: "Wake timer fired for parked qitem fc-1." }, wake)).toMatchObject({ status: "ok" });
+    expect(await deliver({ targetSession: seat, message: "Check the deploy." }, wake)).toMatchObject({ status: "ok", code: "queued_as_row" });
+    expect(await deliver({ targetSession: seat, message: "Check the deploy." }, wake)).toMatchObject({ status: "ok", code: "queued_as_row" });
     const digest = { jobId: "digest", policy: "periodic-reminder", members: [{ jobId: "a", occurrenceId: "o-a" }, { jobId: "b", occurrenceId: "o-b" }] };
     expect(await deliver({ targetSession: seat, message: "Two reminders" }, digest)).toMatchObject({ status: "ok" });
     expect(sends).not.toHaveBeenCalled();
     expect(rows).toHaveLength(2);
     expect(rows[0]).toMatchObject({ destinationSession: seat, tags: ["watchdog", "queue-only", "policy:periodic-reminder"] });
     expect(rows[0]!.body).toContain("[OpenRig watchdog scheduler · policy: periodic-reminder · job: wake-1]");
-    expect(rows[0]!.body).toContain("Wake timer fired for parked qitem fc-1.");
+    expect(rows[0]!.body).toContain("Check the deploy.");
     // Another seat is unchanged: typed as before.
     expect(await deliver({ targetSession: "other@test", message: "Typed" }, { jobId: "x", policy: "periodic-reminder", occurrenceId: "o-x" })).toMatchObject({ status: "ok" });
     expect(sends).toHaveBeenCalledTimes(1);
@@ -437,8 +438,80 @@ describe("watchdog positive no-input outcomes", () => {
     expect(await failing({ targetSession: seat, message: "m" }, { jobId: "f", policy: "periodic-reminder", occurrenceId: "o-f" }))
       .toMatchObject({ status: "failed", sent: false, inputPhase: "not_reached" });
   });
+
+  it("T-006857: a queue-only seat's park timer is recorded on the parked row, with no second wd- row", async () => {
+    const f = fixture();
+    let repo!: QueueRepository;
+    const deliver = makeWatchdogDeliver({ sessionTransport: f.transport, outbox: f.outbox, isQueueOnlySeat: name => name === seat,
+      createQueueRow: row => repo.create({ qitemId: row.qitemId, sourceSession: "watchdog@system", destinationSession: row.destinationSession,
+        body: row.body, summary: row.summary, tags: row.tags, nudge: false } as never).then(() => {}) });
+    const s = scheduled({ ...f, deliver });
+    repo = s.repo;
+    const wdRows = () => (f.db.prepare("SELECT qitem_id FROM queue_items WHERE qitem_id LIKE 'wd-%'").all() as Array<{ qitem_id: string }>).map(r => r.qitem_id);
+    // One parked row alone, then two parked rows in one pass (the digest): each timer is its row's own reminder.
+    const a = await s.park("A's wait");
+    s.due(a.jobId);
+    await s.scheduler.runTickNow();
+    const b = await s.park("B's wait");
+    const c = await s.park("C's wait");
+    s.due(b.jobId);
+    s.due(c.jobId);
+    await s.scheduler.runTickNow();
+    expect(wdRows()).toEqual([]);
+    for (const { qitemId, jobId } of [a, b, c]) {
+      expect(s.repo.getById(qitemId)!.state).toBe("blocked");
+      const notes = s.repo.listTransitions(qitemId).map(t => t.transitionNote ?? "");
+      expect(notes.some(n => n.includes(`park wake noted on this row: watchdog ${jobId}; delivery=noted_on_parked_row; nothing typed`))).toBe(true);
+      expect(notes.some(n => n.includes("delivery=ok"))).toBe(false);
+      expect(s.repo.getParkWakeStatus(qitemId)).toMatchObject({ deliveryStatus: "noted_on_parked_row", unconsumed: true });
+      expect(s.history.listForJob(jobId, 1)[0]).toMatchObject({ outcome: "sent", deliveryStatus: "noted_on_parked_row" });
+      expect(s.jobs.getByIdOrThrow(jobId).state).toBe("terminal");
+    }
+    // The outbox closes custody for each occurrence (no retry, never indeterminate) and says it was noted on the row.
+    const receipts = f.db.prepare("SELECT delivery_state, guard_delivery FROM outbox_entries WHERE outbox_id LIKE 'watchdog-occurrence-%'").all() as Array<{ delivery_state: string; guard_delivery: string }>;
+    expect(receipts.length).toBeGreaterThan(0);
+    for (const r of receipts) {
+      expect(r.delivery_state).toBe("delivered");
+      expect(JSON.parse(r.guard_delivery).watchdog).toMatchObject({ notedOnParkedRow: true });
+    }
+    expect(f.pastes).toEqual([]);
+    expect(f.submissions).toEqual([]);
+  });
 });
 
+
+describe("T-006857 SH-2: a queue-only reminder is recorded as the row it became", () => {
+  it("records queued_as_row with the row id in the outbox receipt and the history, never ok", async () => {
+    const f = fixture();
+    let repo!: QueueRepository;
+    const deliver = makeWatchdogDeliver({ sessionTransport: f.transport, outbox: f.outbox, isQueueOnlySeat: s => s === seat,
+      createQueueRow: row => repo.create({ qitemId: row.qitemId, sourceSession: "watchdog@system", destinationSession: row.destinationSession,
+        body: row.body, summary: row.summary, tags: row.tags, nudge: false } as never).then(() => {}) });
+    const s = scheduled({ ...f, deliver });
+    repo = s.repo;
+    // A reminder with no parked row of origin: the one case that still becomes a wd- row after SH-1.
+    const job = s.jobs.register({ policy: "periodic-reminder", targetSession: seat, intervalSeconds: 600, registeredBySession: "orch@test",
+      specYaml: `policy: periodic-reminder\ntarget:\n  session: ${JSON.stringify(seat)}\nmessage: "Check the deploy"\n` });
+    s.due(job.jobId);
+    await s.scheduler.runTickNow();
+    expect(f.pastes).toEqual([]);
+    expect(f.submissions).toEqual([]);
+    const last = s.history.listForJob(job.jobId, 1)[0]!;
+    expect(last).toMatchObject({ outcome: "sent", deliveryStatus: "queued_as_row",
+      evaluationNotes: expect.objectContaining({ deliveryCode: "queued_as_row" }) });
+    const wd = (last.evaluationNotes as { queuedQitemId: string }).queuedQitemId;
+    expect(wd).toMatch(/^wd-/);
+    expect(s.repo.getById(wd)).toMatchObject({ destinationSession: seat, state: "pending" });
+    expect(s.repo.getById(wd)!.body).toContain("Check the deploy");
+    const receipt = f.db.prepare("SELECT delivery_state, guard_delivery FROM outbox_entries WHERE outbox_id LIKE 'watchdog-occurrence-%'").get() as { delivery_state: string; guard_delivery: string };
+    expect(receipt.delivery_state).toBe("delivered");
+    expect(JSON.parse(receipt.guard_delivery).watchdog).toMatchObject({ queuedAs: wd });
+    // The fired event names the row too.
+    const fired = (f.db.prepare("SELECT payload FROM events WHERE type = 'watchdog.evaluation_fired'").all() as Array<{ payload: string }>)
+      .map(e => JSON.parse(e.payload)).filter(e => e.jobId === job.jobId);
+    expect(fired.at(-1)).toMatchObject({ deliveryStatus: "queued_as_row", queuedQitemId: wd });
+  });
+});
 
 describe("blocked parked-owner no-input recovery on the real repository", () => {
   it.each(["quota", "terminal"].flatMap(kind => ["before", "after"].map(noteTiming => ({ kind, noteTiming }))))("keeps $kind recovery across another seat note $noteTiming creation", async ({ kind, noteTiming }) => {

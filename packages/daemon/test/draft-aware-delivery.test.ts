@@ -1210,6 +1210,26 @@ describe("T-006631: a draft typed between the guard's read and the paste", () =>
     expect(f.submissions).toEqual([]);
   });
 
+  it("SH-3: a key during the composer capture right before the paste holds it (the activity is read again after the capture)", async () => {
+    const f = fixture(undefined, { runtime: "claude-code" });
+    await f.enable();
+    const real = f.tmux.captureComposerSnapshot.getMockImplementation()!;
+    let reads = 0;
+    let keyAt: number | null = null;
+    activity(f, async () => { reads++; return keyAt; });
+    // The person presses a key while tmux captures the composer after the second activity read; the TUI hasn't redrawn
+    // the key yet, so that capture still shows an empty input. Only the activity read after the capture sees the key.
+    vi.spyOn(f.tmux, "captureComposerSnapshot").mockImplementation(async (name: string) => {
+      if (reads === 2 && keyAt === null) keyAt = Date.now();
+      return real(name);
+    });
+    const result = await f.send("key-during-capture", "Wake timer fired.", { openrigNotice: true, verify: false });
+    expect(result).toMatchObject({ outcome: "retained", sent: false, reason: "draft_input_busy" });
+    expect(reads).toBe(3);
+    expect(pastes(f)).toEqual([]);
+    expect(f.submissions).toEqual([]);
+  });
+
   it("B2: tmux reports whole seconds, so a key reported 3.5 s ago (up to 2.5 s ago in fact) still holds; 4.1 s ago delivers", async () => {
     const f = fixture(undefined, { runtime: "claude-code" });
     await f.enable();

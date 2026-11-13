@@ -520,8 +520,9 @@ export class SeatDeliveryGuard {
     }
   }
 
-  /** No key from a tmux client of the seat in the last seconds, read before and again after a short wait, and the input
-   *  still empty when read after it. A key time tmux can't report holds the paste, as an unreadable input does. */
+  /** No key from a tmux client of the seat in the last seconds, read before and again after a short wait, the input
+   *  still empty when read after it, and still no key after that read. A key time tmux can't report holds the paste, as
+   *  an unreadable input does. */
   private async quietBeforePaste(target: GuardTarget, read: () => Promise<ComposerInput | null>,
     unknown: () => DeliveryGuardError): Promise<ComposerInput> {
     const typing = async () => {
@@ -539,6 +540,8 @@ export class SeatDeliveryGuard {
     const again = await read();
     if (!again || again.state === "unknown") throw unknown();
     if (again.state !== "empty") throw new DeliveryGuardError("draft_input_busy", "The input changed just before the paste. Automatic delivery is held; nothing was pasted.");
+    // A key during that capture may not be drawn in it yet: the activity is read once more, last, before the paste.
+    await typing();
     return again;
   }
 
