@@ -535,9 +535,10 @@ Between off (always interrupt) and hold (full quiet):
   sends-only      deliberate sends from people and agents type; OpenRig's own
                   notices are held. A terminal member defaults to this.
   queue-only      deliberate sends type as draft-aware (never over a draft);
-                  watchdog reminders and wake timers become queue rows with no
-                  nudge, the parked-owner reminder is skipped (the open rows
-                  already are the reminder), and other OpenRig notices are held.
+                  watchdog reminders become queue rows with no nudge, a parked
+                  row's own wake timer is recorded on that row and the
+                  parked-owner reminder is skipped (the open rows already are
+                  the reminder), and other OpenRig notices are held.
 What openrig-urgent and urgent-only let through never types over a draft.
 sends-only types like off: a terminal member's typing isn't protected, as today
 (its shell input can't be read). Everything else is held, the sender is told, and

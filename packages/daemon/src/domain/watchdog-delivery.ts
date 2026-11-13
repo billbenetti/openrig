@@ -20,7 +20,8 @@ export function makeWatchdogDeliver(deps: {
   hasPendingPostCompactStage?: (sessionName: string) => boolean;
   isTerminalSeat?: (sessionName: string) => boolean;
   createContinuityAction?: (action: NonNullable<DeliveryRequest["continuityAction"]>) => Promise<void>;
-  /** The seat's typing guard is at queue-only: OpenRig's reminders reach it as queue rows, never typed (T-006631). */
+  /** The seat's typing guard is at queue-only: OpenRig's reminders reach it as queue rows, or a parked row's own wake
+   *  timer as a note on that row, never typed (T-006631, T-006857). */
   isQueueOnlySeat?: (sessionName: string) => boolean;
   /** Creates the reminder's queue row with no nudge; an existing id is the same row (a retried occurrence). */
   createQueueRow?: (row: { qitemId: string; destinationSession: string; body: string; summary: string; tags: string[] }) => Promise<void>;
@@ -38,6 +39,12 @@ export function makeWatchdogDeliver(deps: {
         continuityActionCompleted = true;
       }
       if (deps.isQueueOnlySeat?.(targetSession) && deps.createQueueRow) {
+        // A park timer of a row still parked is that row's own reminder: the row already sits in this seat's queue, and
+        // the engine records the attempt on it (onWakeAttempt: the park's "wake fired" transition). A wd- row would be a
+        // second assignment of the same obligation that nothing closes (T-006857, SH-1).
+        if (source.parkedQitemIds?.length) {
+          return { status: "ok", code: "noted_on_parked_row", continuityActionCompleted, sentMessage: message };
+        }
         // Nothing types into this seat's terminal (a person's own, as the orchestrator's): the reminder is a cold row
         // in its queue, with an id fixed by the occurrence so a retry finds the same row.
         const occurrences = source.members?.map(m => m.occurrenceId) ?? (source.occurrenceId ? [source.occurrenceId] : []);
@@ -53,7 +60,8 @@ export function makeWatchdogDeliver(deps: {
           // No row and no input: the occurrence stays owed and retries.
           return { status: "failed", sent: false, inputPhase: "not_reached", error: err instanceof Error ? err.message : String(err), continuityActionCompleted };
         }
-        return { status: "ok", continuityActionCompleted, sentMessage: message };
+        // Positive custody (the occurrence is done), but recorded as what it is: a row, not typed input.
+        return { status: "ok", code: "queued_as_row", queuedQitemId: qitemId, continuityActionCompleted, sentMessage: message };
       }
       const warning = deps.outbox && source.policy === "periodic-reminder" ? "" : "Delivery may repeat after an unconfirmed attempt.\n";
       const payload = formatWatchdogDeliveryMessage(source, warning + message);
