@@ -21,6 +21,10 @@ import type { Policy, PolicyJob, PolicyEvaluation } from "./types.js";
 import { BACKGROUND_SHELL_GRACE_MINUTES } from "../queue-pickup.js";
 import type { WatchdogHistoryEntry } from "../watchdog-history-log.js";
 
+/** The nudge result the parked-owner records when a queue-only seat's wake stays in its queue (T-006631). The wake
+ *  ladder reads it as the seat's own choice, not as an unknown outcome, so the row never enters the ladder. */
+export const QUEUE_ONLY_SKIP_RESULT_PREFIX = "skipped:queue-only-seat";
+
 /** Structural view of the shipped SeatParkedDiagnosis (parked-query.ts). */
 export interface ParkedSeatDiagnosisView {
   sessionName: string;
@@ -398,7 +402,7 @@ export function makeParkedOwnerConsumerPolicy(deps: ParkedOwnerConsumerDeps): Po
           // The rows are in the seat's queue already; a person reads that terminal, so nothing is typed into it.
           const reason = "The seat takes OpenRig's reminders only in its queue (typing guard queue-only); its open rows are the reminder. No input was written.";
           try { deps.rows.appendNote(primaryRow, `${FAILED_PREFIX} ${episodeKey}${QUEUE_ONLY_NO_INPUT} ${reason}`); } catch { /* the row stays open and listed */ }
-          try { deps.rows.recordNudgeResult(primaryRow, `skipped:queue-only-seat: ${reason}`); } catch { /* no reporting failure permits input */ }
+          try { deps.rows.recordNudgeResult(primaryRow, `${QUEUE_ONLY_SKIP_RESULT_PREFIX}: ${reason}`); } catch { /* no reporting failure permits input */ }
           skipped.push({ seat: seat.sessionName, why: "queue-only-seat" });
           continue;
         }
