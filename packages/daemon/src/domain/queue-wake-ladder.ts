@@ -9,7 +9,7 @@ import { quietHoldCustody } from "./quiet-hold-custody.js";
 import { latestHookMovedOn, latestHookPermissionPending, latestHookWaitsOnPerson } from "./agent-activity-store.js";
 import type { AgentActivity } from "./types.js";
 import type { OperatorDeliveryEngine } from "./gateway/operator-delivery-engine.js";
-import { openPromptRefusals, CLOSE_PREFIX, PARKED_OWNER_POLICY_NAME, REFUSED_PREFIX } from "./policies/parked-owner-consumer.js";
+import { openPromptRefusals, CLOSE_PREFIX, PARKED_OWNER_POLICY_NAME, QUEUE_ONLY_SKIP_RESULT_PREFIX, REFUSED_PREFIX } from "./policies/parked-owner-consumer.js";
 import { findQueueRecovery, recoveryTag } from "./queue-recovery.js";
 import { lastMeaningfulTransition, type WaitingView } from "./queue-waiting.js";
 import { readWakeOutcome } from "./connection-contract.js";
@@ -387,6 +387,10 @@ function classifyWakeResult(lastNudgeResult: string | null): WakeMode | null {
   // A claimed row's unconfirmed result is presented as `claimed` (presentedNudgeResult): the claim is pickup, which
   // outranks any wake outcome.
   if (lastNudgeResult === "claimed") return null;
+  // A queue-only seat's wake stays in its queue by the seat's own level (T-006631): nothing was typed and nothing is
+  // owed; the row waits there for the seat to read. It never enters the ladder, as before 0.7.13 read an unrecognised
+  // result as unknown (#3011).
+  if (lastNudgeResult?.startsWith(QUEUE_ONLY_SKIP_RESULT_PREFIX)) return null;
   const outcome = readWakeOutcome(lastNudgeResult);
   if (!outcome) return null;
   switch (outcome.fact) {
