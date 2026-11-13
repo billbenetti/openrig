@@ -30,6 +30,10 @@ export interface SeatPoolSpec {
   dispatchTag: string | null;
   /** True empties the pool as its seats become free, and adds none: the kill switch. */
   drain: boolean;
+  /** `no_seat_grace_s`: how long the pool may go without a live seat while the stuck sweep still leaves its queue (the
+   *  model's rows carrying dispatch_tag) to it (T-007029). Absent (no property) when not given: 1800 s
+   *  (SEAT_POOL_NO_SEAT_GRACE_DEFAULT_SECONDS). */
+  noSeatGraceSeconds?: number;
   /** How long a drain waits for the pool's seats to become free before the executor takes the rest out (the forced
    *  pass): their open rows go back to the model, their sessions stop and their nodes are removed. 0: no deadline. */
   drainDeadlineSeconds: number;
@@ -82,7 +86,7 @@ export interface SeatPoolDispatchToParked {
 }
 
 const SPEC_KEYS = new Set([
-  "min", "max", "cooldown_s", "idle_grace_s", "dispatch_after_s", "dispatch_tag", "drain", "drain_deadline_s", "adopt", "cwd_template",
+  "min", "max", "cooldown_s", "idle_grace_s", "dispatch_after_s", "dispatch_tag", "drain", "drain_deadline_s", "no_seat_grace_s", "adopt", "cwd_template",
   "demand_cmd", "release_cmd", "prepare_cmd", "reap_cmd", "remove_cmd", "escalation_owner", "dispatch_to_parked",
 ]);
 const DEFAULT_COOLDOWN_SECONDS = 60;
@@ -123,6 +127,10 @@ function command(value: unknown, field: string): SeatPoolCommand | null | SpecPr
   }
   return { argv: argv as string[], timeoutSeconds: timeout as number };
 }
+
+/** `no_seat_grace_s`: its bounds, and the value when it is not given (T-007029). */
+const NO_SEAT_GRACE = { min: 60, max: 86_400 } as const;
+export const SEAT_POOL_NO_SEAT_GRACE_DEFAULT_SECONDS = 1800;
 
 const DISPATCH_TO_PARKED = "dispatch_to_parked";
 /** The fields of `dispatch_to_parked`: the bounds of each whole number, and its default. */
@@ -236,6 +244,11 @@ export function parseSeatPoolSpec(context: Record<string, unknown>): { spec: Sea
   }
   const drain = context["drain"] ?? false;
   if (typeof drain !== "boolean") return { problem: { field: "drain", message: "seat-pool: drain must be true or false" } };
+  const noSeatGrace = context["no_seat_grace_s"];
+  if (noSeatGrace !== undefined
+    && (!Number.isInteger(noSeatGrace) || (noSeatGrace as number) < NO_SEAT_GRACE.min || (noSeatGrace as number) > NO_SEAT_GRACE.max)) {
+    return { problem: { field: "no_seat_grace_s", message: `seat-pool: no_seat_grace_s must be a whole number from ${NO_SEAT_GRACE.min} to ${NO_SEAT_GRACE.max}` } };
+  }
   const adopt = context["adopt"] ?? [];
   if (!Array.isArray(adopt) || adopt.some((id) => typeof id !== "string" || !id.trim())) {
     return { problem: { field: "adopt", message: "seat-pool: adopt must be a list of logical ids" } };
@@ -270,6 +283,7 @@ export function parseSeatPoolSpec(context: Record<string, unknown>): { spec: Sea
       demandCmd: commands["demand_cmd"]!, releaseCmd: commands["release_cmd"]!, prepareCmd: commands["prepare_cmd"]!,
       reapCmd: commands["reap_cmd"]!, removeCmd: commands["remove_cmd"]!, escalationOwner: escalationOwner as string | null,
       ...(parkedRule ? { dispatchToParked: parkedRule } : {}),
+      ...(noSeatGrace !== undefined ? { noSeatGraceSeconds: noSeatGrace as number } : {}),
     },
   };
 }
