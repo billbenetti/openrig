@@ -77,6 +77,9 @@ class World {
   restoring = false;
   exit: Record<string, number> = {};
   launchResult: SeatPoolEffectResult = { ok: true };
+  /** T-007545 (B1, the lenses on 00f93b4ae): a launch whose readiness fails after the harness came up leaves its session
+   *  recorded running, as the daemon's launch does (the startup failure writes only the startup status). */
+  launchLeavesRunning = false;
   stopResult: SeatPoolEffectResult = { ok: true };
   /** Called inside the lease, before the release command: a test can deliver work there. */
   onLease: () => void = () => {};
@@ -112,7 +115,10 @@ class World {
       launchSlot: async ({ nodeId }) => {
         this.calls.push(`launch ${this.nodes.get(nodeId)!.logicalId}`);
         if (this.launchGate) await this.launchGate;
-        if (!this.launchResult.ok) return this.launchResult;
+        if (!this.launchResult.ok) {
+          if (this.launchLeavesRunning) Object.assign(this.nodes.get(nodeId)!, { session: "running", sessionId: `sess-${++this.seq}`, idle: true });
+          return this.launchResult;
+        }
         Object.assign(this.nodes.get(nodeId)!, { session: "running", sessionId: `sess-${++this.seq}`, idle: true });
         return { ok: true };
       },
@@ -365,6 +371,16 @@ describe("seat-pool executor", () => {
     await run(executor, [{ kind: "add", count: 1 }]);
     const [slot] = slots.listOpen(JOB);
     expect(slot!.phase).toBe("live");
+    expect(liveAt(slot!.slotId)).not.toBeNull();
+  });
+
+  it("T-007545 (B1): a launch that failed whose session runs after all is a live seat with its start recorded", async () => {
+    world.launchResult = { ok: false, code: "startup_failed", error: "readiness timed out" };
+    world.launchLeavesRunning = true;
+    await run(makeExecutor(), [{ kind: "add", count: 1 }]);
+    const [slot] = slots.listOpen(JOB);
+    expect(slot!.phase).toBe("live");
+    expect(reasons()).toEqual(["seat_pool_launch_failed", "seat_pool_launched"]);
     expect(liveAt(slot!.slotId)).not.toBeNull();
   });
 

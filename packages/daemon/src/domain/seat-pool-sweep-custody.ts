@@ -9,7 +9,8 @@ import { SeatPoolSlots } from "./seat-pool-executor.js";
  *  before it cleans). Two sweep periods (the stuck sweep runs every 300 s): the stop is seen up to a sweep period after
  *  the death (sooner when the reap comes first), so a seat that dies within ~5 min of its start never counts, and a
  *  crash loop (the launch works, the session dies, the reap, the next add) never renews the grace, however often it
- *  turns. A seat started before live_at was kept, and an adopted one, count as before. */
+ *  turns. A seat without live_at (started before it was kept) is measured from its add (created_at), so no path that
+ *  leaves it unset can renew the grace either; an adopted one counts as before. */
 export const SEAT_POOL_MIN_RUN_MS = 10 * 60_000;
 
 /** What the stuck sweep reads of one active seat pool to tell whether a row waiting for its model is the pool's to move. */
@@ -47,7 +48,7 @@ export function seatPoolQueueCustody(
       const jobs = db.prepare("SELECT job_id, spec_yaml, target_session, registered_at FROM watchdog_jobs WHERE policy = 'seat-pool' AND state = 'active'")
         .all() as Array<{ job_id: string; spec_yaml: string; target_session: string; registered_at: string }>;
       const liveSlots = db.prepare(
-        `SELECT s.id, s.node_id, s.op_id, s.live_at FROM seat_pool_slots s JOIN nodes n ON n.id = s.node_id
+        `SELECT s.id, s.node_id, s.op_id, s.live_at, s.created_at FROM seat_pool_slots s JOIN nodes n ON n.id = s.node_id
           WHERE s.pool_job_id = ? AND s.retired_at IS NULL AND s.phase = 'live'`,
       );
       const latestStatus = db.prepare("SELECT status FROM sessions WHERE node_id = ? ORDER BY id DESC LIMIT 1");
@@ -70,7 +71,7 @@ export function seatPoolQueueCustody(
         `SELECT MAX(${stopOf}) AS at FROM seat_pool_slots s
           WHERE s.pool_job_id = ? AND s.retired_at IS NOT NULL
             AND (s.op_id IS NULL OR (s.node_id IS NOT NULL AND COALESCE(s.intent, '') <> 'never_live'))
-            AND (s.op_id IS NULL OR s.live_at IS NULL OR (julianday(${stopOf}) - julianday(s.live_at)) * 86400000.0 >= ? - 1)`,
+            AND (s.op_id IS NULL OR (julianday(${stopOf}) - julianday(COALESCE(s.live_at, s.created_at))) * 86400000.0 >= ? - 1)`,
       );
       for (const job of jobs) {
         const parsed = parseYaml(job.spec_yaml) as { context?: unknown } | null;
@@ -81,7 +82,7 @@ export function seatPoolQueueCustody(
         const registered = Date.parse(job.registered_at);
         let hasSeat = false;
         let lastStoppedMs = -Infinity;
-        for (const slot of liveSlots.all(job.job_id) as Array<{ id: number; node_id: string; op_id: string | null; live_at: string | null }>) {
+        for (const slot of liveSlots.all(job.job_id) as Array<{ id: number; node_id: string; op_id: string | null; live_at: string | null; created_at: string }>) {
           // A seat seen stopped that runs again starts afresh the next time it stops.
           if (running(slot.node_id)) { hasSeat = true; slots.clearStopped(slot.id); continue; }
           // T-007545 (SD1): kept on the slot the first time (from the session's record of the stop when there is one),
@@ -90,7 +91,7 @@ export function seatPoolQueueCustody(
           const since = Date.parse((stoppedSince.get(slot.id) as { stopped_since: string | null } | undefined)?.stopped_since ?? "");
           const stopMs = Number.isFinite(since) ? since : nowMs;
           // T-007545 (B1): a seat the pool started that stopped before it ran for SEAT_POOL_MIN_RUN_MS never counts
-          const liveAt = slot.op_id !== null && slot.live_at ? Date.parse(slot.live_at) : NaN;
+          const liveAt = slot.op_id !== null ? Date.parse(slot.live_at ?? slot.created_at) : NaN;
           if (Number.isFinite(liveAt) && stopMs - liveAt < SEAT_POOL_MIN_RUN_MS) continue;
           lastStoppedMs = Math.max(lastStoppedMs, stopMs);
         }
