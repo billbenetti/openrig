@@ -6,7 +6,8 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { readProcessTable } from "../src/domain/process-table.js";
-import { observeClaudeDelivery, verifyClaudePaneProcess, verifyClaudePaneRuntime, verifyCodexPaneProcess } from "../src/domain/native-process-lineage.js";
+import { claudeHookFromLaunchedProcess, observeClaudeDelivery, verifyClaudePaneProcess, verifyClaudePaneRuntime, verifyCodexPaneProcess } from "../src/domain/native-process-lineage.js";
+import { CodexRuntimeAdapter } from "../src/adapters/codex-runtime-adapter.js";
 import { restoreProc, serveProcRoot } from "./helpers/fake-proc.js";
 
 const TOKEN = "00000000-0000-7000-8000-00000000000a";
@@ -85,6 +86,55 @@ describe("two-sample proofs with the process-table cache on", () => {
     });
     const result = await observeClaudeDelivery({ target: "%1", tmux }, { unknownKeepsIdle: false });
     expect(result.state).not.toBe("idle_shell");
+  });
+
+  it("captureForkIdentity: the fork child replaced while its thread id is read is not taken", async () => {
+    const PARENT = "00000000-0000-7000-8000-00000000000b";
+    const CHILD = "00000000-0000-7000-8000-00000000000c";
+    put(80, stat(80, "bash", 1, 80, 81), "-bash\0");
+    put(81, stat(81, "codex", 80, 81, 81, 100), `codex\0fork\0${PARENT}\0`);
+    await readProcessTable(); // the table with child 81 is cached
+    const adapter = new CodexRuntimeAdapter({ tmux: { getPanePid: async () => 80 } as never,
+      readThreadIdByPid: () => {
+        // between the two observations: child 81 exits and child 82 takes the foreground
+        del(81);
+        put(82, stat(82, "codex", 80, 82, 82, 200), `codex\0fork\0${PARENT}\0`);
+        fs.writeFileSync(path.join(root, "80", "stat"), stat(80, "bash", 1, 80, 82));
+        return CHILD;
+      } });
+    expect(await adapter.captureForkIdentity({ tmuxPane: "%1", tmuxSession: "s" } as never, PARENT)).toBeNull();
+  });
+
+  it("captureForkIdentity control: the same child before and after the read is taken", async () => {
+    const PARENT = "00000000-0000-7000-8000-00000000000b";
+    const CHILD = "00000000-0000-7000-8000-00000000000c";
+    put(85, stat(85, "bash", 1, 85, 86), "-bash\0");
+    put(86, stat(86, "codex", 85, 86, 86, 100), `codex\0fork\0${PARENT}\0`);
+    const adapter = new CodexRuntimeAdapter({ tmux: { getPanePid: async () => 85 } as never, readThreadIdByPid: () => CHILD });
+    expect(await adapter.captureForkIdentity({ tmuxPane: "%1", tmuxSession: "s" } as never, PARENT))
+      .toEqual({ resumeToken: CHILD, resumeType: "codex_id" });
+  });
+
+  it("a one-call verify reads after it began (SH-A): a Codex that took the pane after the cached table is seen", async () => {
+    put(90, stat(90, "bash", 1, 90, 91), "-bash\0");
+    put(91, stat(91, "codex", 90, 91, 91, 100), `codex\0resume\0${TOKEN}\0`);
+    await readProcessTable(); // cached: Codex 91
+    del(91);
+    put(92, stat(92, "codex", 90, 92, 92, 200), `codex\0resume\0${TOKEN}\0`);
+    fs.writeFileSync(path.join(root, "90", "stat"), stat(90, "bash", 1, 90, 92));
+    const verified = await verifyCodexPaneProcess({ target: "%1", tmux: pane(90, () => {}), expectedToken: TOKEN, requireResume: true });
+    expect(verified?.process.pid).toBe(92); // never the cached Codex 91, which has exited
+  });
+
+  it("the SessionStart hook reads after it arrived (SH-A): a Claude born after the cached table is its launched process", async () => {
+    put(95, stat(95, "bash", 1, 95, 95), "-bash\0");
+    await readProcessTable(); // cached before the Claude was born
+    put(96, stat(96, "claude", 95, 96, 96, 100), `claude\0--resume\0${TOKEN}\0`);
+    put(97, stat(97, "bash", 96, 96, 96, 110), "/bin/sh\0-c\0hook\0");
+    fs.writeFileSync(path.join(root, "95", "stat"), stat(95, "bash", 1, 95, 96));
+    const launched = await claudeHookFromLaunchedProcess({ target: "%1", tmux: { getPanePid: async () => 95 },
+      launchToken: TOKEN, hookPid: 97 });
+    expect(launched?.pid).toBe(96);
   });
 
   it("control: nothing changes between the samples, and the Codex is verified", async () => {

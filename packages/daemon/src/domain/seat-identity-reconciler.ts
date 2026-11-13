@@ -1,5 +1,5 @@
 import { observeClaudePaneProcess, observeClaudePaneRuntime, observeCodexPaneProcess, listNativeProcesses, type NativeProcessLister, type NativeProcessObservation } from "./native-process-lineage.js";
-import { invalidateProcessTable } from "./process-table.js";
+import { readingFromNow } from "./process-table.js";
 import { isShellForeground } from "./shell-classifier.js";
 import { claudeResumeRotation } from "./session-registry.js";
 import { randomUUID } from "node:crypto";
@@ -259,8 +259,7 @@ export class SeatIdentityReconciler {
     const first = await sample(panes);
     if (generation !== this.generation) return;
     // The second snapshot is a read that starts after the first (upstream #3146: the table is cached for a short TTL).
-    if (nativeSeats.length > 0) invalidateProcessTable();
-    const second = nativeSeats.length > 0 ? await sample(await readPanes()) : [];
+    const second = nativeSeats.length > 0 ? await readingFromNow(async () => sample(await readPanes())) : [];
     if (generation !== this.generation) return;
     const nativeProofs = new Map(nativeSeats.map((seat, index) => [seat.node_id,
       first[index] && first[index]?.fingerprint === second[index]?.fingerprint ? second[index]! : null]));

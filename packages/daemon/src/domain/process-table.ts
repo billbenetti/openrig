@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from "node:async_hooks";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { Worker } from "node:worker_threads";
@@ -34,10 +35,15 @@ function ttlMs(): number {
   return Number.isFinite(value) && value >= 0 ? value : PROCESS_TABLE_TTL_MS;
 }
 
-/** A read and when it started (performance.now()): a table is as old as the moment its walk began. */
-interface Sample { startedAt: number; rows: Promise<ProcessTableRow[]> }
+/** A read: its rows and when its walk began (performance.now()); a table is as old as that moment. A walk queued behind
+ *  another has not begun (null), so it serves any caller that asks before it begins. */
+interface Sample { startedAt: number | null; rows: Promise<ProcessTableRow[]> }
 
 let inFlight: Sample | null = null;
+/** The newest walk, begun or queued, settled either way: the next walk begins only after it, so walks never overlap. */
+let walking: Promise<void> | null = null;
+/** The moment the reads inside readingAfter() must start at or after (performance.now()). */
+const readFloor = new AsyncLocalStorage<number>();
 let last: { startedAt: number; rows: ProcessTableRow[] } | null = null;
 let generation = 0;
 let reads = 0;
@@ -46,26 +52,63 @@ let procRoot = "/proc";
 /**
  * The OS process table, every observer's one source: read from /proc on Linux, where a `ps` would cost the daemon a
  * fork of its whole process, and from one `ps` elsewhere. A table that started less than the TTL ago is reused, and
- * callers asking while a read is in flight share it. A caller that needs a read starting after some moment (the idle
- * proof's second sample, a seat change) calls invalidateProcessTable() first. The rows are shared among callers: never
- * mutate them. Rejects when the table cannot be read.
+ * callers asking while a read is in flight share it. One walk runs at a time; a walk asked for while another runs
+ * waits its turn, and the callers asking meanwhile share it. A caller that needs a read starting after some moment (a
+ * proof's samples, a hook) reads inside readingAfter(); a seat change calls invalidateProcessTable(). The rows are
+ * shared among callers: never mutate them. Rejects when the table cannot be read.
  */
 export function readProcessTable(): Promise<ProcessTableRow[]> {
   const now = performance.now();
   const ttl = ttlMs();
-  // A clock that went back (fake timers restart near 0) makes the age negative: such a table is never served.
-  if (last && now >= last.startedAt && now - last.startedAt < ttl) return Promise.resolve(last.rows);
-  if (inFlight) return inFlight.rows;
+  const after = readFloor.getStore();
+  // A clock that went back (fake timers restart near 0) makes the age negative: such a table is never served. Inside
+  // readingAfter() the kept table serves only when its walk started at or after that moment, whatever the TTL says.
+  if (last && now >= last.startedAt && (after === undefined ? now - last.startedAt < ttl : last.startedAt >= after)) {
+    return Promise.resolve(last.rows);
+  }
+  // The read in flight serves when it began at or after that moment, or has not begun yet (queued): it will begin later.
+  if (inFlight && (after === undefined || inFlight.startedAt === null || inFlight.startedAt >= after)) return inFlight.rows;
   const gen = generation;
-  const rows = (process.platform === "linux" ? readProcTable(procRoot) : readPsTable()).then((table) => {
+  const sample: Sample = { startedAt: null, rows: Promise.resolve([]) };
+  const walk = (): Promise<ProcessTableRow[]> => {
+    sample.startedAt = performance.now();
+    return process.platform === "linux" ? readProcTable(procRoot) : readPsTable();
+  };
+  const rows = (walking ? walking.then(walk) : walk()).then((table) => {
     // Kept only when no seat changed during the walk and no newer table is kept already.
     // With the cache off (TTL 0) nothing is kept, so no later clock can make a table look fresh.
-    if (ttl > 0 && gen === generation && (!last || now >= last.startedAt)) last = { startedAt: now, rows: table };
+    const began = sample.startedAt!;
+    if (ttl > 0 && gen === generation && (!last || began >= last.startedAt)) last = { startedAt: began, rows: table };
     return table;
-  }).finally(() => { if (inFlight?.rows === rows) inFlight = null; });
-  inFlight = { startedAt: now, rows };
+  }).finally(() => { if (inFlight === sample) inFlight = null; });
+  sample.rows = rows;
+  const settled: Promise<void> = rows.then(() => undefined, () => undefined)
+    .finally(() => { if (walking === settled) walking = null; });
+  walking = settled;
+  inFlight = sample;
   reads += 1;
   return rows;
+}
+
+/** The process table's clock (performance.now()): the moment a later read must start at or after, for readingAfter(). */
+export function processTableClock(): number {
+  return performance.now();
+}
+
+/**
+ * Runs `observe` so that every process-table read inside it (through any lister that reads this table) is a table whose
+ * walk started at `after` or later: the kept table or the read in flight when it started then or later, else a new
+ * walk. A proof reads its samples so (the second one after the first, the first one after the proof began), and a hook
+ * after it arrived, so a table read before the process it looks for was born, or before the first sample, never stands
+ * in for an observation. Nothing is dropped for the other callers: they keep sharing the newest read.
+ */
+export function readingAfter<T>(after: number, observe: () => T): T {
+  return readFloor.run(after, observe);
+}
+
+/** observe() reading only tables whose walk starts from now on (readingAfter(processTableClock(), observe)). */
+export function readingFromNow<T>(observe: () => T): T {
+  return readFloor.run(performance.now(), observe);
 }
 
 /** Drops the cached table and stops sharing the read in flight: a seat was launched, stopped or replaced, so a table

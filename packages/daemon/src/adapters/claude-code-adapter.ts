@@ -20,6 +20,7 @@ import { assessNativeResumeProbe, hasClaudeDrawnInput } from "../domain/native-r
 import { resumeProbeEvidence } from "../domain/native-resume-probe-evidence.js";
 import { resolveReadinessTimeoutMs } from "../domain/readiness-timeout.js";
 import { subtreeNamesClaudeExecutable, claudeCommandSessionToken, listNativeProcesses, observeClaudeDelivery, observeClaudePaneProcess, observeClaudePaneRuntime, observeCodexPaneProcess, verifyClaudePaneProcess, verifyCodexPaneProcess, verifyPaneIdleShell, type ClaudeLaunchedProcess, type NativeProcessLister } from "../domain/native-process-lineage.js";
+import { readingFromNow } from "../domain/process-table.js";
 import { isPerSeatRoleGuidance, perSeatRoleSkipWarning, DEFAULT_CLAUDE_MANAGED_BLOCK_FILE, type ClaudeManagedBlockFile } from "../domain/managed-blocks.js";
 import { writeManagedGuidanceBlock, type ManagedBlockRecords } from "../domain/managed-block-records.js";
 import { claudeResumeLaunchEnv, claudeResumeLaunchPrefix } from "./claude-resume-launch.js";
@@ -610,7 +611,8 @@ export class ClaudeCodeAdapter implements RuntimeAdapter {
       const observation = { target: binding.tmuxPane, tmux: this.tmux,
         listProcesses: this.listProcesses, expectedToken: launch.token, selectedExecutable: launch.executable,
         scriptLaunch: launch.scriptLaunch };
-      const first = await observeClaudePaneProcess(observation);
+      // Both samples read tables whose walk starts from then on (#3146: the table is cached for a short TTL).
+      const first = await readingFromNow(() => observeClaudePaneProcess(observation));
       if (!first) return probe;
       // Pin the first exact process for this launch; retries cannot adopt a replacement. It is also
       // the launch's record of the process it started (#1077). A process found through a script launch
@@ -622,7 +624,7 @@ export class ClaudeCodeAdapter implements RuntimeAdapter {
       };
       if (!launch.fingerprint && !first.afterScript) pin();
       if (launch.fingerprint !== undefined && first.fingerprint !== launch.fingerprint) return probe;
-      const native = await observeClaudePaneProcess(observation);
+      const native = await readingFromNow(() => observeClaudePaneProcess(observation));
       if (native?.fingerprint !== first.fingerprint) return probe;
       const currentPanes = await this.tmux.listPanes(binding.tmuxSession);
       if (this.autoLaunches.get(binding.nodeId) !== launch || currentPanes.length !== 1

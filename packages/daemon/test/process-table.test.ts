@@ -3,7 +3,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { invalidateProcessTable, processTableReadsForTest, readProcessTable, readProcTable } from "../src/domain/process-table.js";
+import { invalidateProcessTable, processTableClock, processTableReadsForTest, readingAfter, readingFromNow, readProcessTable, readProcTable } from "../src/domain/process-table.js";
 import { claudeCommandSessionToken, listNativeProcesses, processArgv, verifyCodexPaneProcess, verifyPaneIdleShell } from "../src/domain/native-process-lineage.js";
 import { defaultListProcessesStrict } from "../src/domain/resume-metadata-refresher.js";
 import { restoreProc, serveProcRoot, writeFakeProc } from "./helpers/fake-proc.js";
@@ -283,6 +283,35 @@ describe("readProcessTable", () => {
       } finally {
         now.mockRestore();
       }
+    });
+
+    it("inside readingAfter(t) the kept table serves only when its walk began at t or later (SH-B)", async () => {
+      vi.stubEnv("OPENRIG_PROCESS_TABLE_TTL_MS", "60000");
+      serveProcRoot(shell(63));
+      const t = processTableClock();
+      const kept = await readProcessTable(); // began after t
+      let before = processTableReadsForTest();
+      expect(await readingAfter(t, () => readProcessTable())).toBe(kept);
+      expect(processTableReadsForTest()).toBe(before); // served, no walk
+      before = processTableReadsForTest();
+      const fresh = await readingFromNow(() => readProcessTable()); // the kept table began before now
+      expect(fresh).not.toBe(kept);
+      expect(processTableReadsForTest()).toBe(before + 1);
+      expect(await readProcessTable()).toBe(fresh); // the plain callers share the newest table
+    });
+
+    it("proofs asking while a walk runs share one walk queued behind it, and so do the plain callers (SH-B)", async () => {
+      vi.stubEnv("OPENRIG_PROCESS_TABLE_TTL_MS", "60000");
+      serveProcRoot(shell(64));
+      const before = processTableReadsForTest();
+      const running = readProcessTable(); // begun: a proof from now on cannot use it
+      const proofs = Array.from({ length: 5 }, () => readingFromNow(() => readProcessTable()));
+      const plain = readProcessTable();
+      for (const proof of proofs) expect(proof).toBe(proofs[0]);
+      expect(proofs[0]).not.toBe(running);
+      expect(plain).toBe(proofs[0]);
+      expect(processTableReadsForTest() - before).toBe(2); // the running walk and one queued (with invalidate: 6)
+      await Promise.all([running, ...proofs, plain]);
     });
 
     it("a seat stop, clean, launch or restart drops the cached table, however it ends (a refusal included)", async () => {

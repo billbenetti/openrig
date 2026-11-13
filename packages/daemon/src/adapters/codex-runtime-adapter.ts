@@ -70,7 +70,7 @@ const codexHookTrust = createRequire(import.meta.url)("../../assets/plugins/open
 };
 
 import { listNativeProcesses, observeCodexPaneProcess, observeCodexForkProcess, verifyCodexPaneProcess, verifyPaneIdleShell, type NativeProcessRow } from "../domain/native-process-lineage.js";
-import { invalidateProcessTable } from "../domain/process-table.js";
+import { readingFromNow } from "../domain/process-table.js";
 import { recordUnchangedSeatSkillFollowing, recordSeatSkillFollowing, recordSeatSkillWrite, seatPluginSkillsLossNote, seatProjectionComplete, seatSkillWriteRefusal, SEAT_SKILLS_BOOTSTRAP_BLOCK_ID } from "../domain/seat-skill-storage.js";
 import { codexPluginContentHash, planOwnedCodexContentApproval, recordOwnedCodexApproval } from "../domain/codex-owned-plugin-trust.js";
 import { findTomlTable, opensTomlTable, parseTomlRoot, tomlArrayTableHeaderPath, tomlDefines, tomlTableHeaderPath } from "../domain/toml-tables.js";
@@ -1323,13 +1323,14 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
     const target = binding.tmuxPane ?? binding.tmuxSession;
     if (!target || !this.tmux.getPanePid) return null;
     const input = { target, tmux: this.tmux, listProcesses: this.listProcesses, parentToken };
-    const before = await observeCodexForkProcess(input);
+    // Both observations read tables whose walk starts from then on (#3146: the table is cached for a short TTL).
+    const before = await readingFromNow(() => observeCodexForkProcess(input));
     if (!before || lstartToMinTs(before.process.startedAt) === undefined) return null;
     // Gate PID logs by process start time, then re-observe the whole foreground
     // chain. Neither a reused PID nor a replacement pane proves this child.
     const child = (await this.readThreadIdForSeat(binding, before.process.pid, before.process.startedAt))?.trim();
     if (!child || child === parentToken) return null;
-    const after = await observeCodexForkProcess(input);
+    const after = await readingFromNow(() => observeCodexForkProcess(input));
     return after?.fingerprint === before.fingerprint ? { resumeToken: child, resumeType: "codex_id" } : null;
   }
 
@@ -1397,7 +1398,8 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
   private async observeMenuProcess(target: string, paneCommand: string | null): Promise<string | null> {
     // tmux may name the shell wrapper; native ancestry and foreground group decide identity.
     if (!paneCommand) return null;
-    const observation = await observeCodexPaneProcess({ target, tmux: this.tmux, listProcesses: this.listProcesses });
+    // Its two calls are the menu's identity and its recheck: each reads from now on (#3146: the table is cached).
+    const observation = await readingFromNow(() => observeCodexPaneProcess({ target, tmux: this.tmux, listProcesses: this.listProcesses }));
     return observation ? JSON.stringify([paneCommand, observation.fingerprint]) : null;
   }
 
@@ -1802,7 +1804,7 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
     if (Date.now() >= deadline) return { kind: "unknown", reason: "the resume window ended", windowEnded: true };
     const input = { target: tmuxSession, tmux: this.tmux as { getPanePid(target: string): Promise<number | null> },
       listProcesses: this.listProcesses as never, expectedToken: resumeToken, requireResume: true };
-    const before = await this.beforeResumeDeadline(() => observeCodexPaneProcess(input), deadline);
+    const before = await this.beforeResumeDeadline(() => readingFromNow(() => observeCodexPaneProcess(input)), deadline);
     if (!before && Date.now() >= deadline) return { kind: "unknown", reason: "the resume window ended", windowEnded: true };
     if (!before) return { kind: "unknown", reason: "no single Codex process resuming this conversation was observed in the pane" };
     if (lstartToMinTs(before.process.startedAt) === undefined) {
@@ -1816,8 +1818,7 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
     }
     if (!evidence) return { kind: "unknown", reason: "reading Codex's records didn't finish inside the resume window", windowEnded: true };
     // The recheck is a read that starts after the first (upstream #3146: the table is cached for a short TTL).
-    invalidateProcessTable();
-    const after = await this.beforeResumeDeadline(() => observeCodexPaneProcess(input), deadline);
+    const after = await this.beforeResumeDeadline(() => readingFromNow(() => observeCodexPaneProcess(input)), deadline);
     if (!after && Date.now() >= deadline) return { kind: "unknown", reason: "the resume window ended", windowEnded: true };
     if (after?.fingerprint !== before.fingerprint) {
       return { kind: "unknown", reason: "the resumed Codex process changed during the check" };

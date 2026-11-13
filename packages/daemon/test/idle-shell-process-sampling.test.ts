@@ -2,7 +2,7 @@ import { beforeEach, expect, it, vi } from "vitest";
 import type { ProcessTableRow } from "../src/domain/process-table.js";
 
 const { table, paths, argv } = vi.hoisted(() => ({ table: vi.fn(), paths: vi.fn(), argv: vi.fn() }));
-vi.mock("../src/domain/process-table.js", () => ({ readProcessTable: table, invalidateProcessTable: vi.fn() }));
+vi.mock("../src/domain/process-table.js", () => ({ readProcessTable: table, invalidateProcessTable: vi.fn(), readingFromNow: (observe: () => unknown) => observe() }));
 vi.mock("../src/domain/native-process-executable.js", () => ({ readNativeExecutablePaths: paths }));
 vi.mock("../src/domain/native-process-arguments.js", () => ({ readNativeProcessArguments: argv }));
 import { verifyPaneIdleShell } from "../src/domain/native-process-lineage.js";

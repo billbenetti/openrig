@@ -20,7 +20,7 @@ import { runAsyncSite } from "./sync-site-wrap.js";
 import { isClaudeSidecarFromEarlierProcess, type ResumeTokenCaptureDeps } from "./resume-token-capture.js";
 import { observeClaudePaneRuntime, type NativeProcessLister } from "./native-process-lineage.js";
 import { validateResumeToken } from "./resume-token-validation.js";
-import { readProcessTable } from "./process-table.js";
+import { readingFromNow, readProcessTable } from "./process-table.js";
 import type { HomeRuntime } from "./seat-runtime-home.js";
 import { readSeatClaudeMcp, type ClaudeMcp } from "./claude-mcp.js";
 
@@ -270,7 +270,8 @@ export class ResumeMetadataRefresher {
   private async captureClaudeSessionId(session: ResumeRefreshSession): Promise<string | undefined> {
     try {
       const input = { target: session.sessionName, tmux: this.tmuxAdapter, listProcesses: this.listClaudeProcesses };
-      const first = await observeClaudePaneRuntime(input);
+      // Both observations read tables whose walk starts from then on (#3146: the table is cached for a short TTL).
+      const first = await readingFromNow(() => observeClaudePaneRuntime(input));
       if (!first) return undefined;
       const started = Date.parse(first.process.startedAt ?? "");
       if (!Number.isFinite(started)) return undefined;
@@ -288,7 +289,7 @@ export class ResumeMetadataRefresher {
       if (record?.name !== session.sessionName) return undefined;
       const valid = validateResumeToken("claude-code", record.sessionId);
       if (!valid.ok) return undefined;
-      const final = await observeClaudePaneRuntime(input);
+      const final = await readingFromNow(() => observeClaudePaneRuntime(input));
       return final?.fingerprint === first.fingerprint ? valid.token : undefined;
     } catch { return undefined; }
   }

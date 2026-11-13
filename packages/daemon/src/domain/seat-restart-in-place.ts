@@ -21,7 +21,7 @@ import type { RunningCodexLaunch } from "../adapters/codex-runtime-adapter.js";
 import { emittedEffortFromArgv } from "./seat-effort.js";
 import { CODEX_NETWORK_DEFAULT_OVERRIDE } from "./codex-network-default.js";
 import { CODEX_NON_LOGIN_SHELL_OVERRIDE } from "./native-resume-probe.js";
-import { invalidateProcessTable } from "./process-table.js";
+import { readingFromNow } from "./process-table.js";
 
 /**
  * OPR.0.7.0.5 — restart ONE Codex seat in place so it reads its Codex home's current account: the same
@@ -621,8 +621,7 @@ export class CodexInPlaceRestart {
     const gone = async (): Promise<boolean | null> => {
       // Each poll reads after the signal and after the previous poll (upstream #3146: the table is cached for a short
       // TTL), so the exit is seen when it happens and the timeout keeps its whole length.
-      invalidateProcessTable();
-      const rows = await this.listProcesses();
+      const rows = await readingFromNow(() => this.listProcesses());
       if (rows.length === 0) return null;
       if (rows.some((row) => (row.pid === pid && (row.startedAt ?? null) === startedAt)
         || (row.pid === native.pid && (row.startedAt ?? null) === native.startedAt))) return false;
@@ -642,8 +641,7 @@ export class CodexInPlaceRestart {
     };
     await this.deps.tmux.signalPid(pid, "TERM");
     if (await wait()) return "stopped";
-    invalidateProcessTable();
-    const launcherLive = (await this.listProcesses()).some((row) => row.pid === pid && (row.startedAt ?? null) === startedAt);
+    const launcherLive = (await readingFromNow(() => this.listProcesses())).some((row) => row.pid === pid && (row.startedAt ?? null) === startedAt);
     if (launcherLive) await this.deps.tmux.signalPid(pid, "KILL");
     const last = await wait();
     return last ? "stopped" : last === null ? "unknown" : "running";
@@ -654,15 +652,15 @@ export class CodexInPlaceRestart {
     // observations, never the launch. The budget counts yields, not observation I/O.
     const polls = Math.max(1, Math.ceil(this.timing.timeoutMs / this.timing.pollMs));
     for (let attempt = 0; ; attempt++) {
-      invalidateProcessTable(); // each attempt sees the processes of now, not a table read before the launch (#3146)
-      const identity = await rebindAndVerifyPaneIdentity({
+      // Each attempt sees the processes of now, not a table read before the launch (#3146).
+      const identity = await readingFromNow(() => rebindAndVerifyPaneIdentity({
         db: this.deps.db, sessionRegistry: this.deps.sessionRegistry, tmux: this.deps.tmux,
         nodeId: target.seat.nodeId, sessionName: target.sessionName, runtime: "codex",
         expectedResumeToken: report.conversationId, requireExactResumeLineage: true, listProcesses: this.listProcesses,
         // The check repeats up to 31 times; only the final attempt, whose text the report shows, pays the extra read.
         explainFailure: attempt >= polls,
-      });
-      const now = await this.observeCodex(report.pane, report.conversationId);
+      }));
+      const now = await readingFromNow(() => this.observeCodex(report.pane, report.conversationId));
       if (!identity.ok || !now) {
         if (attempt < polls) {
           await this.timing.sleep(this.timing.pollMs);

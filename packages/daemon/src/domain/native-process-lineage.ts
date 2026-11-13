@@ -4,7 +4,7 @@ import { isClaudePluginChannel } from "./claude-plugin-channels.js";
 import { runAsyncSite } from "./sync-site-wrap.js";
 import { readNativeExecutablePaths } from "./native-process-executable.js";
 import { readNativeProcessArguments } from "./native-process-arguments.js";
-import { invalidateProcessTable, readProcessTable } from "./process-table.js";
+import { readingFromNow, readProcessTable } from "./process-table.js";
 
 export interface NativeProcessRow {
   pid: number;
@@ -840,12 +840,11 @@ export async function observeCodexForkProcess(input: {
 }
 
 export async function verifyCodexPaneProcess(input: Parameters<typeof observeCodexPaneProcess>[0]): Promise<CodexProcessObservation | null> {
-  const first = await observeCodexPaneProcess(input);
+  // Each sample reads a table whose walk starts from then on (upstream #3146: the table is cached for a short TTL, and
+  // the callers' listers read it too): the first never predates the proof, the second never predates the first.
+  const first = await readingFromNow(() => observeCodexPaneProcess(input));
   if (!first) return null;
-  // Two samples prove only when the second is read after the first (upstream #3146: the table is cached for a short
-  // TTL, and the callers' listers read the cached table too): drop it first.
-  invalidateProcessTable();
-  const second = await observeCodexPaneProcess(input);
+  const second = await readingFromNow(() => observeCodexPaneProcess(input));
   return second?.fingerprint === first.fingerprint ? second : null;
 }
 
@@ -864,7 +863,8 @@ export async function claudeHookFromLaunchedProcess(input: {
   try {
     const panePid = await input.tmux.getPanePid(input.target);
     if (!panePid) return null;
-    const rows = await (input.listProcesses ?? listNativeProcesses)();
+    // A table read before the hook arrived may predate the process that sent it (#3146: the table is cached): read on.
+    const rows = await readingFromNow(() => (input.listProcesses ?? listNativeProcesses)());
     const launched = selectNativeProcess(rows, panePid, input.launchToken, false, "claude-code");
     if (!launched) return null;
     const byPid = new Map(rows.map((row) => [row.pid, row]));
@@ -902,12 +902,9 @@ export async function observeClaudePaneProcess(input: Parameters<typeof observeN
 }
 
 export async function verifyClaudePaneProcess(input: Parameters<typeof observeNativePaneProcess>[0]): Promise<NativeProcessObservation | null> {
-  const first = await observeClaudePaneProcess(input);
+  const first = await readingFromNow(() => observeClaudePaneProcess(input)); // samples read from now on (#3146)
   if (!first) return null;
-  // Two samples prove only when the second is read after the first (upstream #3146: the table is cached for a short
-  // TTL, and the callers' listers read the cached table too): drop it first.
-  invalidateProcessTable();
-  const second = await observeClaudePaneProcess(input);
+  const second = await readingFromNow(() => observeClaudePaneProcess(input));
   return second?.fingerprint === first.fingerprint ? second : null;
 }
 
@@ -925,12 +922,9 @@ export async function observeClaudePaneRuntime(input: Omit<Parameters<typeof obs
 
 /** Stable runtime occupancy only; never a substitute for exact resume proof. */
 export async function verifyClaudePaneRuntime(input: Parameters<typeof observeClaudePaneRuntime>[0]): Promise<NativeProcessObservation | null> {
-  const first = await observeClaudePaneRuntime(input);
+  const first = await readingFromNow(() => observeClaudePaneRuntime(input)); // samples read from now on (#3146)
   if (!first) return null;
-  // Two samples prove only when the second is read after the first (upstream #3146: the table is cached for a short
-  // TTL, and the callers' listers read the cached table too): drop it first.
-  invalidateProcessTable();
-  const second = await observeClaudePaneRuntime(input);
+  const second = await readingFromNow(() => observeClaudePaneRuntime(input));
   return second?.fingerprint === first.fingerprint ? second : null;
 }
 
@@ -999,13 +993,12 @@ export async function verifyPaneIdleShell(input: {
       return root ? JSON.stringify(root) : null;
     } catch { return null; }
   };
-  const first = await sample();
+  // Each sample reads a table whose walk starts from then on (upstream #3146: the table is cached for a short TTL),
+  // whatever lister the caller passed (the adapters' listers read the cached table too), so the proof still compares
+  // two observations, the first one made after the proof began.
+  const first = await readingFromNow(sample);
   if (first === null) return false;
-  // The first sample may be a table read moments ago (upstream #3146: the table is cached for a short TTL). Dropping it
-  // here makes the second sample a read that starts after the first, whatever lister the caller passed (the adapters'
-  // listers read the cached table too), so the proof still compares two observations.
-  invalidateProcessTable();
-  return await sample() === first;
+  return await readingFromNow(sample) === first;
 }
 
 export interface ClaudeDeliveryObservation {
@@ -1074,11 +1067,8 @@ export async function observeClaudeDelivery(
       return unknown;
     } catch { return unknown; }
   };
-  const first = await sample();
-  // Two samples prove only when the second is read after the first (upstream #3146: the table is cached for a short
-  // TTL, and the callers' listers read the cached table too): drop it first.
-  invalidateProcessTable();
-  const second = await sample();
+  const first = await readingFromNow(sample); // samples read from now on (#3146)
+  const second = await readingFromNow(sample);
   if (first.state === "conflict") return first;
   if (second.state === "conflict") return second;
   // An unavailable sample cannot erase a positive idle-shell refusal (delivery only; see unknownKeepsIdle).
