@@ -506,6 +506,10 @@ describe("T-006857 SH-2: a queue-only reminder is recorded as the row it became"
     const receipt = f.db.prepare("SELECT delivery_state, guard_delivery FROM outbox_entries WHERE outbox_id LIKE 'watchdog-occurrence-%'").get() as { delivery_state: string; guard_delivery: string };
     expect(receipt.delivery_state).toBe("delivered");
     expect(JSON.parse(receipt.guard_delivery).watchdog).toMatchObject({ queuedAs: wd });
+    // The fired event names the row too.
+    const fired = (f.db.prepare("SELECT payload FROM events WHERE type = 'watchdog.evaluation_fired'").all() as Array<{ payload: string }>)
+      .map(e => JSON.parse(e.payload)).filter(e => e.jobId === job.jobId);
+    expect(fired.at(-1)).toMatchObject({ deliveryStatus: "queued_as_row", queuedQitemId: wd });
   });
 });
 

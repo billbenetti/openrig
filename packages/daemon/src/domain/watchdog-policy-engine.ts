@@ -859,6 +859,7 @@ export class WatchdogPolicyEngine {
       policy: job.policy,
       targetSession: outcome.target.session,
       deliveryStatus: deliveryStatusLabel(delivery),
+      ...(delivery.queuedQitemId ? { queuedQitemId: delivery.queuedQitemId } : {}),
     });
     if (!delivery.occurrenceTracked) accountWake();
     this.jobsRepo.deliveryAccounted(job.jobId);
