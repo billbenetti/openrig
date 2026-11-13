@@ -1623,9 +1623,11 @@ export class TmuxAdapter {
 
   /** Every pane of the server in one `tmux list-panes -a` (T-006251 S3: the seat pool's busy read asks once, not once
    *  per seat): its id, the pid it runs, its session and whether it is the one a session target resolves to (the active
-   *  pane of the active window). No server: none. Any other failure rejects. */
+   *  pane of the active window). The fields go by the adapter's printable separator, as every adapter-owned format
+   *  (T-006251 B2: outside tmux with a non-UTF-8 locale, and on 3.3a/3.6, a tab comes out as `_`); the session name is
+   *  last, so one holding the separator stays whole. No server: none. Any other failure rejects. */
   async listAllPanePids(): Promise<Array<{ paneId: string; panePid: number; session: string; active: boolean }>> {
-    const format = "#{pane_id}\t#{pane_pid}\t#{window_active}#{pane_active}\t#{session_name}";
+    const format = ["#{pane_id}", "#{pane_pid}", "#{window_active}#{pane_active}", "#{session_name}"].join(TMUX_FIELD_SEPARATOR);
     let output: string;
     try {
       output = await this.run(["tmux", "list-panes", "-a", "-F", format], `tmux list-panes -a -F ${shellQuote(format)}`);
@@ -1634,10 +1636,10 @@ export class TmuxAdapter {
       throw err;
     }
     return output.split("\n").flatMap((line) => {
-      const [paneId, pid, active, ...session] = line.split("\t");
+      const [paneId, pid, active, ...session] = line.split(TMUX_FIELD_SEPARATOR);
       const panePid = Number(pid);
       return paneId && /^%\d+$/.test(paneId) && Number.isInteger(panePid) && panePid > 0 && session.length > 0
-        ? [{ paneId, panePid, session: session.join("\t"), active: active === "11" }] : [];
+        ? [{ paneId, panePid, session: session.join(TMUX_FIELD_SEPARATOR), active: active === "11" }] : [];
     });
   }
 

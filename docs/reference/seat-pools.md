@@ -45,7 +45,7 @@ context:
     parked_max_load_per_cpu_percent: 0   # above this load per CPU (percent) a parked seat gets no row; 0: not checked (default 0)
     refuse_gates: [congelar, suite-flock]  # a parked row whose gate contains one of these is no wait for a 2nd row (default: none)
     busy_processes: [suite-flock]   # a seat with one of these programs running gets no row: no 2nd row parked, and no row free either (default: none)
-    busy_orphan_max_age_s: 21600    # only with busy_processes: the oldest a process that left the pane's tree may be and still hold the seat (60..172800, default 21600)
+    busy_orphan_max_age_s: 43200    # only with busy_processes: the oldest a process that left the pane's tree may be and still hold the seat (60..172800, default 43200)
     max_open_rows: 4                # a seat with up to this many open rows, ALL parked on its own waits, may receive (1..20, default 1)
 ```
 
@@ -162,18 +162,28 @@ CI run it left in the background) may receive one row more, after the free seats
   …` and `nice -n 10 /x/congelar-eval` match `suite-flock` and `congelar-eval`, `grep suite-flock …` does not, and an
   option's value given as a separate word (`timeout -s KILL 600 …`) is a miss. A wrapper name is refused as an entry.
   A process that left the pane's tree holds the seat only while it is younger than `busy_orphan_max_age_s` and did not
-  start before the pane's current occupant (the runtime: the pane's newest child when the pane runs a shell, else the
-  pane's own process; so the orphan of the occupant before a fresh launch holds nothing); one whose start can't be read
-  holds it. A process under the pane holds it whatever its age.
+  start before the pane's current occupant (the runtime: when the pane runs a shell, its newest child that runs
+  `claude` or `codex`, or its newest child when none does; else the pane's own process; so the orphan of the occupant
+  before a fresh launch holds nothing); one whose start can't be read holds it. A process under the pane holds it
+  whatever its age. The default ceiling, 12 h, is the longest a suite waits for the host's lock.
+  A process that left the pane's tree with no `TMUX_PANE` (a `systemd-run --user --unit=…` started outside tmux, or one
+  that cleared its environment) belongs to no seat and holds nothing: run heavy work from the seat's pane, or under it,
+  for the rule to see it.
   The table and the server's panes (one `tmux list-panes -a`) are read when the plan is made, again just before each
   row moves and before the demand command, for the seats that could take a row (free or parked). A table or pane list
   that cannot be read within 5 seconds, a seat whose pane cannot be told, an environment that could not be read
-  (anything but a process gone, one with no `TMUX_PANE` or another user's), or a seat the read left out, holds the seat
-  back.
+  (anything but a process gone, one with no `TMUX_PANE` or another user's; a failed stat of its owner other than "gone"
+  counts as failed), or a seat the read left out, holds the seat back. The environments are read at most 4 at a time,
+  under one deadline for the whole read; a read past it can't be cancelled, so while 4 are still running from an earlier
+  read no new one starts, and the seats they could belong to are held. The panes are read with the adapter's printable
+  field separator, so a daemon outside tmux with a non-UTF-8 locale, or tmux 3.3a/3.6, reads them too.
 
 The same `busy_processes` rule holds back a free seat (no open row, idle at its prompt): a suite or an eval it left
 running in a process its runtime does not track (reparented, `nohup`) would make it give the row back. Such a seat counts
-as holding work, as a parked one does: it is not drained, and the row it can't take is demand.
+as holding work, as a parked one does: it is not drained, and the row it can't take is demand. A free seat held back
+only because its processes could not be read (a timeout, an unreadable environment, its pane not found) takes no row
+and is not drained either, but it is not counted as holding work: a read failing for every seat leaves the pool as it
+is instead of growing it to `max` with nothing dispatched.
 
 A seat with two open rows never receives, so one row more is the ceiling. The free seats get rows first, in their usual
 order, then the parked ones by id. A parked seat still counts as holding work: it is never drained, and the row it
