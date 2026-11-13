@@ -56,8 +56,11 @@ export interface DeliveryRequest {
 
 export interface DeliveryOutcome {
   status: "ok" | "failed" | "retained";
-  /** Typed admission refusal, kept independently of human-readable error text. */
-  code?: "retained_quota_full" | "terminal_seat";
+  /** Typed admission refusal, kept independently of human-readable error text. On an ok at a queue-only seat, nothing
+   *  was typed (T-006857): `queued_as_row`, the reminder became the cold row `queuedQitemId`; `noted_on_parked_row`, a
+   *  parked row's own wake timer was recorded on that row (SH-1). */
+  code?: "retained_quota_full" | "terminal_seat" | "queued_as_row" | "noted_on_parked_row";
+  queuedQitemId?: string;
   outboxIds?: string[];
   /** The existing transport's actual input boundary; failure never means no input by itself. */
   inputPhase?: "not_reached" | "attempted" | "written";
@@ -85,12 +88,22 @@ export interface DeliveryOutcome {
   fact?: ReturnType<typeof readSendOutcome>;
 }
 
+/** The status a delivery is recorded under: at a queue-only seat, `queued_as_row` or `noted_on_parked_row`, never a
+ *  typed "ok". */
+export function deliveryStatusLabel(delivery: Pick<DeliveryOutcome, "status" | "code">): string {
+  return delivery.status === "ok" && (delivery.code === "queued_as_row" || delivery.code === "noted_on_parked_row")
+    ? delivery.code : delivery.status;
+}
+
 export interface WatchdogDeliverySource {
   occurrenceId?: string;
   jobId: string;
   policy: string;
   /** A digest's members, when one send carries several reminders: each job and the occurrence it was due for. */
   members?: Array<{ jobId: string; occurrenceId: string }>;
+  /** The parked rows this send reminds about, when every reminder in it is an ordinary park timer of a row still
+   *  parked (the digest entry). Absent for any other reminder. */
+  parkedQitemIds?: string[];
 }
 
 export type DeliveryFn = ((
@@ -175,7 +188,7 @@ interface WatchdogPolicyEngineDeps {
   /** Queue-side observer for a wake attempt. It appends resume evidence to
    *  every HELD row armed to this job; delivery outcome is preserved. */
   resolveQueueWait?: (input: { jobId: string }) => PolicyEvaluation | null | undefined;
-  onWakeAttempt?: (attempt: { jobId: string; deliveryStatus: string; retryAt?: string }) => void;
+  onWakeAttempt?: (attempt: { jobId: string; deliveryStatus: string; retryAt?: string; queuedQitemId?: string }) => void;
   /** The parked row a due reminder is about, when it may share one message with other reminders due for the same
    *  seat in the same scheduler pass. Null, or absent, keeps the reminder's own send. */
   resolveDigestEntry?: (input: { jobId: string; message: string }) => ParkReminderEntry | null;
@@ -295,7 +308,7 @@ export class WatchdogPolicyEngine {
   private readonly resolveContextUsage?: WatchdogPolicyEngineDeps["resolveContextUsage"];
   private readonly resolvePreDeliveryTerminalReason?: (input: { jobId: string }) => string | null;
   private readonly resolveQueueWait?: WatchdogPolicyEngineDeps["resolveQueueWait"];
-  private readonly onWakeAttempt?: (attempt: { jobId: string; deliveryStatus: string; retryAt?: string }) => void;
+  private readonly onWakeAttempt?: (attempt: { jobId: string; deliveryStatus: string; retryAt?: string; queuedQitemId?: string }) => void;
   private readonly resolveDigestEntry?: WatchdogPolicyEngineDeps["resolveDigestEntry"];
 
   constructor(deps: WatchdogPolicyEngineDeps) {
@@ -668,7 +681,7 @@ export class WatchdogPolicyEngine {
         message,
         ...(continuityAction ? { continuityAction } : {}),
       },
-      { jobId: job.jobId, policy: job.policy, occurrenceId },
+      { jobId: job.jobId, policy: job.policy, occurrenceId, ...(digestEntry ? { parkedQitemIds: [digestEntry.qitemId] } : {}) },
     );
     if (
       isContextUsageThreshold &&
@@ -780,7 +793,7 @@ export class WatchdogPolicyEngine {
     ].join("\n");
     const delivery = await this.deliver(
       { targetSession: seat, message },
-      { jobId: digestId, policy: "periodic-reminder", occurrenceId: digestId, members },
+      { jobId: digestId, policy: "periodic-reminder", occurrenceId: digestId, members, parkedQitemIds: digest.map(({ entry }) => entry.qitemId) },
     );
     digest.forEach((held, i) => this.recordAttempt({
       ...held, deliverySchedule: schedules[i]!, delivery: delivery.memberOutcomes?.[held.job.jobId] ?? delivery, isContextUsageThreshold: false,
@@ -796,7 +809,7 @@ export class WatchdogPolicyEngine {
     const message = entry ? withContinuationPreview(held.outcome.message, entry.qitemId, entry.continuation) : held.outcome.message;
     const delivery = await this.deliver(
       { targetSession: seat, message },
-      { jobId: held.job.jobId, policy: held.job.policy, occurrenceId: held.occurrenceId },
+      { jobId: held.job.jobId, policy: held.job.policy, occurrenceId: held.occurrenceId, ...(entry ? { parkedQitemIds: [entry.qitemId] } : {}) },
     );
     this.recordAttempt({ ...held, deliverySchedule: schedule, delivery, isContextUsageThreshold: false, sentMessage: message });
   }
@@ -830,7 +843,8 @@ export class WatchdogPolicyEngine {
     const deliveryNotes = delivery.inputPhase === undefined && delivery.code === undefined && delivery.fact === undefined ? notes
       : { ...(notes ?? {}), ...(delivery.inputPhase === undefined ? {} : { deliveryInputPhase: delivery.inputPhase }),
         ...(delivery.code === undefined ? {} : { deliveryCode: delivery.code }),
-        ...(delivery.fact === undefined ? {} : { deliveryFact: delivery.fact.fact, ...(delivery.fact.renderVerified ? { deliveryRenderVerified: true } : {}) }) };
+        ...(delivery.fact === undefined ? {} : { deliveryFact: delivery.fact.fact, ...(delivery.fact.renderVerified ? { deliveryRenderVerified: true } : {}) }),
+        ...(delivery.queuedQitemId === undefined ? {} : { queuedQitemId: delivery.queuedQitemId }) };
     const receiptNotes = delivery.retryAt || delivery.nextAction || delivery.occurrenceTracked
       ? { ...(deliveryNotes ?? {}), ...(delivery.retryAt ? { retryAt: delivery.retryAt } : {}),
         ...(delivery.nextAction ? { nextAction: delivery.nextAction } : {}),
@@ -842,7 +856,7 @@ export class WatchdogPolicyEngine {
         : isRefusedInteractive(delivery.error) ? "refused" : "failed",
       skipReason: delivery.reconciled ? "delivery_receipt_reconciled" : delivery.status === "retained" ? "typing_guard_retained" : null,
       deliveryTargetSession: outcome.target.session,
-      deliveryStatus: delivery.status,
+      deliveryStatus: deliveryStatusLabel(delivery),
       deliveryMessage: digest?.line ?? delivery.sentMessage ?? sentMessage ?? outcome.message,
       // OPR.0.5.6.24 — the delivery error/reason string survives into the
       // durable record so a policy can distinguish an interactive-prompt
@@ -858,8 +872,9 @@ export class WatchdogPolicyEngine {
       if (current.state === "active" && this.jobsRepo.scheduleUnchanged(current, deliverySchedule)
         && (isContextUsageThreshold || current.lastEvaluationAt === evaluatedAt
           || (retryPending && current.lastEvaluationAt === deliverySchedule.lastEvaluationAt))) {
-        this.onWakeAttempt?.({ jobId: job.jobId, deliveryStatus: delivery.status,
-          ...(retryPending && delivery.retryAt ? { retryAt: delivery.retryAt } : {}) });
+        this.onWakeAttempt?.({ jobId: job.jobId, deliveryStatus: deliveryStatusLabel(delivery),
+          ...(retryPending && delivery.retryAt ? { retryAt: delivery.retryAt } : {}),
+          ...(delivery.queuedQitemId ? { queuedQitemId: delivery.queuedQitemId } : {}) });
       }
       if (delivery.terminalReason) this.jobsRepo.markTerminal(job.jobId, delivery.terminalReason);
     };
@@ -889,7 +904,7 @@ export class WatchdogPolicyEngine {
       jobId: job.jobId,
       policy: job.policy,
       targetSession: outcome.target.session,
-      deliveryStatus: delivery.status,
+      deliveryStatus: deliveryStatusLabel(delivery),
     });
     if (!delivery.occurrenceTracked) accountWake();
     this.jobsRepo.deliveryAccounted(job.jobId);
