@@ -91,6 +91,8 @@ class World {
   escalations: string[] = [];
   escalationOwner: string | null = "lead@r";
   cleanResult: SeatPoolEffectResult = { ok: true };
+  /** T-007545 (B1): called as the clean starts, so a test can read what the reap wrote before it. */
+  onClean: (() => void) | null = null;
   private seq = 0;
 
   effects(): SeatPoolEffects {
@@ -142,6 +144,7 @@ class World {
       },
       cleanSlot: async ({ sessionName }) => {
         this.calls.push(`clean ${sessionName}`);
+        this.onClean?.();
         return this.cleanResult;
       },
       openRows: (sessionName) => [...this.rows].filter(([, row]) => row.destination === sessionName)
@@ -354,16 +357,28 @@ describe("seat-pool executor", () => {
     expect(stoppedSince(slot!.slotId)).not.toBeNull();
   });
 
-  it("T-007545: a relaunch that works clears the slot's 'stopped since' (a crash before the next sweep starts afresh)", async () => {
+  const liveAt = (slotId: number) =>
+    (db.prepare("SELECT live_at FROM seat_pool_slots WHERE id = ?").get(slotId) as { live_at: string | null }).live_at;
+
+  it("T-007545 (B1): a launch that works records when the pool started the seat", async () => {
     const executor = makeExecutor();
     await run(executor, [{ kind: "add", count: 1 }]);
     const [slot] = slots.listOpen(JOB);
-    db.prepare("UPDATE seat_pool_slots SET stopped_since = '2026-11-13T10:00:00.000Z' WHERE id = ?").run(slot!.slotId);
+    expect(slot!.phase).toBe("live");
+    expect(liveAt(slot!.slotId)).not.toBeNull();
+  });
+
+  it("T-007545: a relaunch that works clears the slot's 'stopped since' and records the new start (B1)", async () => {
+    const executor = makeExecutor();
+    await run(executor, [{ kind: "add", count: 1 }]);
+    const [slot] = slots.listOpen(JOB);
+    db.prepare("UPDATE seat_pool_slots SET stopped_since = '2026-11-13T10:00:00.000Z', live_at = '2026-11-13T09:00:00.000Z' WHERE id = ?").run(slot!.slotId);
     world.nodes.get(slot!.nodeId!)!.session = "stopped";
     world.relaunchResult = { ok: true };
     await run(executor, [{ kind: "relaunch", seat: "dev-impl-s1@r", nodeId: slot!.nodeId! }]);
     expect(world.calls).toContain("relaunch dev.impl-s1");
     expect(stoppedSince(slot!.slotId)).toBeNull();
+    expect(liveAt(slot!.slotId)).not.toBe("2026-11-13T09:00:00.000Z");
   });
 
   it("T-007545: a relaunch that fails keeps the slot's 'stopped since' (the seat is still stopped)", async () => {
@@ -891,12 +906,52 @@ describe("seat-pool executor", () => {
     it("T-007545: the reap marks when the seat stopped before it removes the node (no later than the retirement)", async () => {
       const executor = makeExecutor();
       const dead = await seat(executor, { session: "stopped", idle: false });
+      // B1 of the review: the mark comes before the clean, which writes the seat's sessions exited now
+      let markedBeforeClean: boolean | null = null;
+      world.onClean = () => { markedBeforeClean = stoppedSince(dead.slotId) !== null; };
       await run(executor, [{ kind: "reap", slotId: dead.slotId }]);
+      expect(markedBeforeClean).toBe(true);
       const row = db.prepare("SELECT stopped_since, retired_at FROM seat_pool_slots WHERE id = ?").get(dead.slotId) as
         { stopped_since: string | null; retired_at: string | null };
       expect(row.stopped_since).not.toBeNull();
       expect(row.retired_at).not.toBeNull();
       expect(Date.parse(row.stopped_since!)).toBeLessThanOrEqual(Date.parse(row.retired_at!));
+    });
+
+    // B1 of the REVISAO-T-007545 (SD2): the crash loop through the executor's own reap. Each turn the pool adds a seat
+    // (the launch works: live, its start recorded), the seat's session dies on its own 30 s later, and the reap marks the
+    // stop, cleans the seat, removes its node and retires the slot; the next turn starts 2 minutes after the last. No
+    // seat ran a sweep period, so the stuck sweep's custody (the real one, over this database) doesn't hold the pool's
+    // tagged row once the grace from the first death has passed: the grace was not renewed by the turns.
+    it("B1: the crash loop through the reap (3 turns 2 min apart): the custody's grace is not renewed by the turns", async () => {
+      const { seatPoolQueueCustody } = await import("../src/domain/seat-pool-sweep-custody.js");
+      let clock = T0;
+      const executor: SeatPoolExecutor = new SeatPoolExecutor({
+        slots,
+        readJob: () => ({ active, targetSession: MODEL.sessionName, spec: jobSpec }),
+        readState: () => world.state(slots, executor, jobSpec),
+        effects: world.effects(),
+        record: (_jobId, entry) => { history.push(entry); },
+        now: () => new Date(clock),
+      });
+      db.prepare(`INSERT INTO watchdog_jobs (job_id, policy, spec_yaml, target_session, interval_seconds, state, registered_by_session, registered_at)
+                  VALUES (?, 'seat-pool', ?, ?, 60, 'active', 'lead@r', ?)`)
+        .run(JOB, 'context:\n  max: 4\n  cwd_template: "/w/{slot}"\n  dispatch_tag: "pool-work"\n', MODEL.sessionName,
+          new Date(T0 - 10 * 3_600_000).toISOString());
+      for (let turn = 0; turn < 3; turn++) {
+        clock = T0 + turn * 2 * 60_000;
+        await run(executor, [{ kind: "add", count: 1 }]);
+        const [added] = slots.listOpen(JOB).slice(-1);
+        clock += 30_000;   // it dies on its own
+        Object.assign(world.nodes.get(added!.nodeId!)!, { session: "stopped", idle: false });
+        clock += 60_000;   // the reap
+        await run(executor, [{ kind: "reap", slotId: added!.slotId }]);
+        expect(slots.listOpen(JOB).some((s) => s.slotId === added!.slotId)).toBe(false);
+      }
+      expect(reasons().filter((r) => r === "seat_pool_reaped")).toHaveLength(3);
+      const firstDeath = T0 + 30_000;
+      const holds = seatPoolQueueCustody(db, firstDeath + 1_800_000 + 1_000)({ destinationSession: MODEL.sessionName, tags: ["pool-work"] });
+      expect(holds).toBe(false);
     });
 
     it("runs remove_cmd after a reap removed the seat's node", async () => {
