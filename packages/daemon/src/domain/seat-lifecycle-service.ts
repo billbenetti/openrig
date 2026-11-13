@@ -1099,7 +1099,6 @@ export class SeatLifecycleService {
     return { contract: "seat-stop.v1", expected: { nodeId: resolved.nodeId, sessionId: this.latestSession(resolved.nodeId)?.id ?? null } };
   }
 
-  /** Stop one managed seat; an explicit expected tuple activates strict identity checks. */
   /** A launch, stop, clean or restart changes which processes run: the process table read before it is dropped,
    *  however the change ends (upstream #3146: the table is cached for a short TTL). */
   private async changesSeat<T>(change: () => Promise<T>): Promise<T> {
@@ -1110,6 +1109,7 @@ export class SeatLifecycleService {
     }
   }
 
+  /** Stop one managed seat; an explicit expected tuple activates strict identity checks. */
   async stopSeat(input: { seatRef: string; reason: string; operator?: string | null; expected?: unknown }): Promise<StopSeatResult> {
     return this.changesSeat(() => this.stopSeatNow(input));
   }

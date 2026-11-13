@@ -842,6 +842,9 @@ export async function observeCodexForkProcess(input: {
 export async function verifyCodexPaneProcess(input: Parameters<typeof observeCodexPaneProcess>[0]): Promise<CodexProcessObservation | null> {
   const first = await observeCodexPaneProcess(input);
   if (!first) return null;
+  // Two samples prove only when the second is read after the first (upstream #3146: the table is cached for a short
+  // TTL, and the callers' listers read the cached table too): drop it first.
+  invalidateProcessTable();
   const second = await observeCodexPaneProcess(input);
   return second?.fingerprint === first.fingerprint ? second : null;
 }
@@ -901,6 +904,9 @@ export async function observeClaudePaneProcess(input: Parameters<typeof observeN
 export async function verifyClaudePaneProcess(input: Parameters<typeof observeNativePaneProcess>[0]): Promise<NativeProcessObservation | null> {
   const first = await observeClaudePaneProcess(input);
   if (!first) return null;
+  // Two samples prove only when the second is read after the first (upstream #3146: the table is cached for a short
+  // TTL, and the callers' listers read the cached table too): drop it first.
+  invalidateProcessTable();
   const second = await observeClaudePaneProcess(input);
   return second?.fingerprint === first.fingerprint ? second : null;
 }
@@ -921,6 +927,9 @@ export async function observeClaudePaneRuntime(input: Omit<Parameters<typeof obs
 export async function verifyClaudePaneRuntime(input: Parameters<typeof observeClaudePaneRuntime>[0]): Promise<NativeProcessObservation | null> {
   const first = await observeClaudePaneRuntime(input);
   if (!first) return null;
+  // Two samples prove only when the second is read after the first (upstream #3146: the table is cached for a short
+  // TTL, and the callers' listers read the cached table too): drop it first.
+  invalidateProcessTable();
   const second = await observeClaudePaneRuntime(input);
   return second?.fingerprint === first.fingerprint ? second : null;
 }
@@ -1066,6 +1075,9 @@ export async function observeClaudeDelivery(
     } catch { return unknown; }
   };
   const first = await sample();
+  // Two samples prove only when the second is read after the first (upstream #3146: the table is cached for a short
+  // TTL, and the callers' listers read the cached table too): drop it first.
+  invalidateProcessTable();
   const second = await sample();
   if (first.state === "conflict") return first;
   if (second.state === "conflict") return second;

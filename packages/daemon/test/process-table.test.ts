@@ -238,7 +238,54 @@ describe("readProcessTable", () => {
       expect((await readProcessTable()).some((row) => row.pid === 53)).toBe(false);
     });
 
-    it("a seat stop, clean or launch drops the cached table, however it ends (a refusal included)", async () => {
+    it("a read that started before invalidateProcessTable() reaches its callers but is never kept (M4)", async () => {
+      vi.stubEnv("OPENRIG_PROCESS_TABLE_TTL_MS", "60000");
+      const root = shell(60);
+      serveProcRoot(root);
+      const early = readProcessTable();
+      invalidateProcessTable();
+      const table = await early;
+      expect(table.some((row) => row.pid === 60)).toBe(true);
+      fs.rmSync(path.join(root, "60"), { recursive: true });
+      const before = processTableReadsForTest();
+      const next = await readProcessTable();
+      expect(processTableReadsForTest()).toBe(before + 1); // the early table was not kept
+      expect(next.some((row) => row.pid === 60)).toBe(false);
+    });
+
+    it("after invalidateProcessTable() a caller does not join the read already in flight (M5)", async () => {
+      vi.stubEnv("OPENRIG_PROCESS_TABLE_TTL_MS", "60000");
+      serveProcRoot(shell(61));
+      const before = processTableReadsForTest();
+      const early = readProcessTable();
+      invalidateProcessTable();
+      const late = readProcessTable();
+      expect(late).not.toBe(early);
+      expect(processTableReadsForTest() - before).toBe(2);
+      await Promise.all([early, late]);
+    });
+
+    it("a clock that goes back never serves the kept table, and with the cache off nothing is kept (SH-3)", async () => {
+      serveProcRoot(shell(62));
+      let clock = 5_000;
+      const now = vi.spyOn(performance, "now").mockImplementation(() => clock);
+      try {
+        for (const ttl of ["1000", "0"]) {
+          vi.stubEnv("OPENRIG_PROCESS_TABLE_TTL_MS", ttl);
+          invalidateProcessTable();
+          clock = 5_000;
+          const first = await readProcessTable();
+          clock = 10; // fake timers restart the clock near 0
+          const before = processTableReadsForTest();
+          expect(await readProcessTable()).not.toBe(first);
+          expect(processTableReadsForTest()).toBe(before + 1);
+        }
+      } finally {
+        now.mockRestore();
+      }
+    });
+
+    it("a seat stop, clean, launch or restart drops the cached table, however it ends (a refusal included)", async () => {
       vi.stubEnv("OPENRIG_PROCESS_TABLE_TTL_MS", "60000");
       serveProcRoot(shell(56));
       const db = createFullTestDb();
@@ -246,7 +293,8 @@ describe("readProcessTable", () => {
         eventBus: new EventBus(db), tmuxAdapter: {} as never });
       try {
         for (const change of [() => service.stopSeat({ seatRef: "x", reason: "" }), () => service.cleanSeat({ seatRef: "x", reason: "" }),
-          () => service.launchFresh({ seatRef: "x", fresh: true, reason: "" })]) {
+          () => service.launchFresh({ seatRef: "x", fresh: true, reason: "" }),
+          () => service.restartInPlace({ seatRef: "x", reason: "" })]) {
           await readProcessTable();
           const before = processTableReadsForTest();
           await readProcessTable();

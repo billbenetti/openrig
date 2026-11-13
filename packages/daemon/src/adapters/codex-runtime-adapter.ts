@@ -70,6 +70,7 @@ const codexHookTrust = createRequire(import.meta.url)("../../assets/plugins/open
 };
 
 import { listNativeProcesses, observeCodexPaneProcess, observeCodexForkProcess, verifyCodexPaneProcess, verifyPaneIdleShell, type NativeProcessRow } from "../domain/native-process-lineage.js";
+import { invalidateProcessTable } from "../domain/process-table.js";
 import { recordUnchangedSeatSkillFollowing, recordSeatSkillFollowing, recordSeatSkillWrite, seatPluginSkillsLossNote, seatProjectionComplete, seatSkillWriteRefusal, SEAT_SKILLS_BOOTSTRAP_BLOCK_ID } from "../domain/seat-skill-storage.js";
 import { codexPluginContentHash, planOwnedCodexContentApproval, recordOwnedCodexApproval } from "../domain/codex-owned-plugin-trust.js";
 import { findTomlTable, opensTomlTable, parseTomlRoot, tomlArrayTableHeaderPath, tomlDefines, tomlTableHeaderPath } from "../domain/toml-tables.js";
@@ -1814,6 +1815,8 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
       return { kind: "unknown", reason: `Codex's records couldn't be read (${(err as Error).message})` };
     }
     if (!evidence) return { kind: "unknown", reason: "reading Codex's records didn't finish inside the resume window", windowEnded: true };
+    // The recheck is a read that starts after the first (upstream #3146: the table is cached for a short TTL).
+    invalidateProcessTable();
     const after = await this.beforeResumeDeadline(() => observeCodexPaneProcess(input), deadline);
     if (!after && Date.now() >= deadline) return { kind: "unknown", reason: "the resume window ended", windowEnded: true };
     if (after?.fingerprint !== before.fingerprint) {

@@ -52,12 +52,15 @@ let procRoot = "/proc";
  */
 export function readProcessTable(): Promise<ProcessTableRow[]> {
   const now = performance.now();
-  if (last && now - last.startedAt < ttlMs()) return Promise.resolve(last.rows);
+  const ttl = ttlMs();
+  // A clock that went back (fake timers restart near 0) makes the age negative: such a table is never served.
+  if (last && now >= last.startedAt && now - last.startedAt < ttl) return Promise.resolve(last.rows);
   if (inFlight) return inFlight.rows;
   const gen = generation;
   const rows = (process.platform === "linux" ? readProcTable(procRoot) : readPsTable()).then((table) => {
     // Kept only when no seat changed during the walk and no newer table is kept already.
-    if (gen === generation && (!last || now >= last.startedAt)) last = { startedAt: now, rows: table };
+    // With the cache off (TTL 0) nothing is kept, so no later clock can make a table look fresh.
+    if (ttl > 0 && gen === generation && (!last || now >= last.startedAt)) last = { startedAt: now, rows: table };
     return table;
   }).finally(() => { if (inFlight?.rows === rows) inFlight = null; });
   inFlight = { startedAt: now, rows };
