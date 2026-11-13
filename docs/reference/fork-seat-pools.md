@@ -174,10 +174,16 @@ CI run it left in the background) may receive one row more, after the free seats
   row moves and before the demand command, for the seats that could take a row (free or parked). A table or pane list
   that cannot be read within 5 seconds, a seat whose pane cannot be told, an environment that could not be read
   (anything but a process gone, one with no `TMUX_PANE` or another user's; a failed stat of its owner other than "gone"
-  counts as failed), or a seat the read left out, holds the seat back. The environments are read at most 4 at a time,
-  under one deadline for the whole read; a read past it can't be cancelled, so while 4 are still running (from this
-  read, a concurrent one or an earlier one) a new one waits its turn until the deadline, and then the seats it could
-  belong to are held. The panes are read with the adapter's printable
+  counts as failed), or a seat the read left out, holds the seat back. The environments are read at most 2 at a time,
+  half of libuv's default thread pool (4), which the daemon's other async file, DNS and zlib calls share, under one
+  deadline for the whole read; a read past it can't be cancelled, so while 2 are still running (from this read, a
+  concurrent one or an earlier one) a new one waits its turn until the deadline, and then the seats it could belong to
+  are held. A read whose turn comes past its own deadline hands the turn on to the next one waiting. On Linux, a
+  process whose command line could not be read is listed by its task name in brackets, as `ps` shows it (the kernel
+  keeps its first 15 bytes), and matches `busy_processes` by that name when the name is the program's own (a binary, or
+  a script whose shebang names the interpreter's absolute path). A script run through `#!/usr/bin/env` keeps the
+  interpreter's name (`[bash]`): such a process under the seat's pane that matches nothing is a failed read, which holds
+  the seat. The panes are read with the adapter's printable
   field separator, so a daemon outside tmux with a non-UTF-8 locale, or tmux 3.3a/3.6, reads them too.
 
 The same `busy_processes` rule holds back a free seat (no open row, idle at its prompt): a suite or an eval it left
@@ -185,9 +191,11 @@ running in a process its runtime does not track (reparented, `nohup`) would make
 as holding work, as a parked one does: it is not drained, and the row it can't take is demand. A free seat held back
 only because its processes could not be read (a timeout, an unreadable environment, its pane not found) takes no row
 and is not drained either, but it is not counted as holding work: it keeps its place in the pool's target (no seat
-starting is removed for it) and, while rows wait undispatched, adds at most one seat. A failure of that seat alone (its
-pane gone) is then served by the new seat; a read failing for every seat no longer grows the pool to `max` with nothing
-dispatched.
+starting is removed for it) and, while rows wait undispatched, a pool without `demand_cmd` asks one seat more than it
+would with every read working (the rows waiting plus the seats holding work), up to `max`. A failure of that seat alone
+(its pane gone) is then served by the new seat. A read failing for every free seat no longer grows the pool by one seat
+per failed read, but with R rows waiting and no seat holding work it still reaches R + 1 seats (or `max`) with nothing
+dispatched; the extra seat drains at `idle_grace_s` once the reads work again.
 
 A seat with two open rows never receives, so one row more is the ceiling. The free seats get rows first, in their usual
 order, then the parked ones by id. A parked seat still counts as holding work: it is never drained, and the row it
