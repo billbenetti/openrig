@@ -281,7 +281,7 @@ describe("stuck sweep: rows waiting in an active seat pool's queue (T-007029, #2
   // The edges of SEAT_POOL_MIN_RUN_MS (10 min from the start to the stop as seen; the stop is seen up to a sweep period
   // after the death). A retired seat of the pool, its slot created long before its start (the start is live_at, not
   // created_at), started at `liveAt` and seen stopped (and reaped) at `stoppedAt`.
-  function retiredPoolSeat(jobId: string, at: { createdAt: string; liveAt: string; stoppedAt: string }): void {
+  function retiredPoolSeat(jobId: string, at: { createdAt: string; liveAt: string | null; stoppedAt: string }): void {
     const n = ++nodeSeq;
     db.prepare(`INSERT INTO seat_pool_slots (pool_job_id, node_id, logical_id, phase, intent, op_id, created_at, live_at, stopped_since, retired_at)
                 VALUES (?, ?, ?, 'retired', NULL, 'op', ?, ?, ?, ?)`).run(jobId, `node-gone-${n}`, `impl-s${n}`, at.createdAt, at.liveAt, at.stoppedAt, at.stoppedAt);
@@ -334,6 +334,25 @@ describe("stuck sweep: rows waiting in an active seat pool's queue (T-007029, #2
     const row = await work();
     await sweep();
     expect(findingFor(row)).toBe(false);
+  });
+
+  // The lenses on 00f93b4ae (L1): a seat of the pool whose start was never recorded (a path that leaves live_at unset)
+  // is measured from its add, so a crash loop through such a path doesn't renew the grace either.
+  it("B1: a pool seat without live_at, added 7 min before it was seen stopped and reaped: doesn't count", async () => {
+    const jobId = pool({});
+    retiredPoolSeat(jobId, { createdAt: minutesAgo(11), liveAt: null, stoppedAt: minutesAgo(4) });
+    const row = await work();
+    await sweep();
+    expect(findingFor(row)).toBe(true);
+  });
+
+  it("B1: a live pool seat without live_at, added 3 min ago and seen stopped: doesn't count", async () => {
+    const jobId = pool({});
+    slot(jobId, { live: true, session: "exited" });
+    db.prepare("UPDATE seat_pool_slots SET created_at = ?, live_at = NULL WHERE pool_job_id = ?").run(minutesAgo(3), jobId);
+    const row = await work();
+    await sweep();
+    expect(findingFor(row)).toBe(true);
   });
 
   it("B1: a live seat of the pool seen stopped 8 min after its start (not reaped yet) doesn't count", async () => {
