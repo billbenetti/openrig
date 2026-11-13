@@ -59,6 +59,8 @@ export function seatPoolBusyCommand(command: string, programs: readonly string[]
 
 /** ps's command (Linux) for a process with no readable command line: its task name in brackets. */
 const BRACKETED_NAME = /^\[([^\]\s]+)\]$/;
+/** T-007477 S16: an unreadable shell (`[bash]`): a script run through `#!/usr/bin/env bash`, suite-flock's own form. */
+const BRACKETED_SHELL = /^\[(?:bash|sh|dash|zsh)\]$/;
 /** The kernel keeps 15 bytes of a task's name (TASK_COMM_LEN 16, with the NUL). */
 const TASK_NAME_BYTES = 15;
 
@@ -329,10 +331,10 @@ export async function readSeatPoolBusySessions(
   // pane's, found by seatPoolBusyProcess), with the pane each inherited, read once for every seat, a few at a time,
   // each within the timeout. A process gone or with no TMUX_PANE belongs to no seat; one whose environment could not be
   // read could be any seat's (S1).
-  let byPane: Promise<{ byPane: Map<string, number[]>; unread: string | null }> | null = null;
+  let byPane: Promise<{ byPane: Map<string, number[]>; unread: string | null; unreadShells: Map<string, number[]> }> | null = null;
   const matchingByPane = () => byPane ??= (async () => {
     const found = new Map<string, number[]>();
-    if (!deps.processPane) return { byPane: found, unread: null };
+    if (!deps.processPane) return { byPane: found, unread: null, unreadShells: new Map<string, number[]>() };
     const underPanes = new Set<number>();
     const children = new Map<number, number[]>();
     for (const row of rows) if (row.pid !== row.ppid) children.set(row.ppid, [...(children.get(row.ppid) ?? []), row.pid]);
@@ -343,7 +345,20 @@ export async function readSeatPoolBusySessions(
       underPanes.add(pid);
       queue.push(...(children.get(pid) ?? []));
     }
-    const matching = rows.filter((row) => !underPanes.has(row.pid) && seatPoolBusyCommand(row.command, programs));
+    const named = (row: BusyProcessRow) => seatPoolBusyCommand(row.command, programs) !== null;
+    // T-007477 S16: a young orphan shell whose command line could not be read (`[bash]`) may be a suite-flock left in
+    // the background: its environment is read too, in the same ceiling of reads and under the same deadline (S12). Its
+    // TMUX_PANE holds that seat as a failed read (not an occupant); an environment of it that can't be read holds no seat,
+    // since nothing says it is any seat's work (reading it as "any seat's", as S1 does for a matching process, would
+    // hold every seat for every unreadable shell on the host). Its age counts as for a matching one.
+    const unreadShell = (row: BusyProcessRow) => {
+      if (!BRACKETED_SHELL.test(row.command.trim())) return false;
+      const started = startedMs(row);
+      return started === null || nowMs - started <= orphanMaxAgeSeconds * 1000;
+    };
+    // The named ones first: an unread shell only takes a turn after every matching process had its own (lens, T-007477)
+    const matching = [...rows.filter((row) => !underPanes.has(row.pid) && named(row)),
+      ...rows.filter((row) => !underPanes.has(row.pid) && !named(row) && unreadShell(row))];
     // One deadline for all the environments (RC delta, Sol): a read past it can't be cancelled, so once it passes no
     // new read starts and the rest count as not read; at most SEAT_POOL_BUSY_ENV_CONCURRENCY reads stay pending, and
     // the whole read takes at most `timeoutMs`.
@@ -387,18 +402,22 @@ export async function readSeatPoolBusySessions(
       }
     }), SEAT_POOL_BUSY_ENV_CONCURRENCY);
     let unread: string | null = null;
+    const unreadShells = new Map<string, number[]>();
     for (const entry of read.sort((a, b) => a.pid - b.pid)) {
+      const shell = !named(byPid.get(entry.pid)!);
       if ("error" in entry) {
+        if (shell) continue; // S16: an unreadable shell whose environment can't be read holds no seat
         const why = String(entry.error);
         unread ??= `environment of pid ${entry.pid} not read: ${why}`;
         continue;
       }
       if (!entry.pane) continue;
-      const list = found.get(entry.pane);
+      const into = shell ? unreadShells : found;
+      const list = into.get(entry.pane);
       if (list) list.push(entry.pid);
-      else found.set(entry.pane, [entry.pid]);
+      else into.set(entry.pane, [entry.pid]);
     }
-    return { byPane: found, unread };
+    return { byPane: found, unread, unreadShells };
   })();
   for (const session of sessions) {
     let pane: SeatPoolPane | undefined;
@@ -420,15 +439,21 @@ export async function readSeatPoolBusySessions(
       busy.set(session, under);
       continue;
     }
-    const { byPane: found, unread } = await matchingByPane();
+    const { byPane: found, unread, unreadShells } = await matchingByPane();
     const occupantMs = seatPoolPaneOccupantMs(rows, pane.panePid);
-    const left = (found.get(pane.paneId) ?? []).find((pid) => {
+    const holds = (pid: number) => {
       const started = startedMs(byPid.get(pid));
       if (started === null) return true;
       return nowMs - started <= orphanMaxAgeSeconds * 1000 && (occupantMs === null || started >= occupantMs);
-    });
+    };
+    const left = (found.get(pane.paneId) ?? []).find(holds);
     if (left !== undefined) {
       busy.set(session, `${seatPoolBusyCommand(byPid.get(left)!.command, programs)} (pid ${left}, TMUX_PANE ${pane.paneId})`);
+      continue;
+    }
+    const shell = (unreadShells.get(pane.paneId) ?? []).find(holds);
+    if (shell !== undefined) {
+      busy.set(session, `command line of pid ${shell} not read (${byPid.get(shell)!.command.trim()}, TMUX_PANE ${pane.paneId})`);
       continue;
     }
     busy.set(session, unread ?? seatPoolUnreadInTree(rows, pane.panePid, programs));
