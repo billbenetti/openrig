@@ -4,6 +4,7 @@ import { seatPoolQueueCustody } from "./seat-pool-sweep-custody.js";
 import { createRecoveryLookup, recoveryId, recoveryTag } from "./queue-recovery.js";
 import { quietHoldCustody } from "./quiet-hold-custody.js";
 import { queueWaitNotice } from "./queue-wait-backoff.js";
+import { deliveryReachedSeat } from "./watchdog-history-log.js";
 import { lastMeaningfulTransition, pendingSince } from "./queue-waiting.js";
 import { resolvePickupThresholdMinutes } from "./queue-pickup.js";
 // S02 (OPR.0.5.5.2) — STANDING STUCK SWEEP. `queue overdue` and `queue undelivered` are the
@@ -825,7 +826,7 @@ export async function runStuckSweep(deps: StuckSweepDeps): Promise<StuckSweepRes
       const response = lastMeaningfulTransition(deps.db, row.qitemId);
       if (response && Date.parse(response.at) > Date.parse(notice.at)) return null;
       const ownerActivity = deps.queueRepo.ownerActivity(row.destinationSession);
-      if (ownerActivity?.activity === "working" && !ownerActivity.needsInput.count && notice.deliveryStatus === "ok") return null;
+      if (ownerActivity?.activity === "working" && !ownerActivity.needsInput.count && deliveryReachedSeat(notice.deliveryStatus)) return null;
       return { kind: "unconsumed-wait", row, route: resolveOrch(row.destinationSession, row) ?? row.sourceSession,
         ageMinutes: minutesSince(notice.at, now), evidenceAt: notice.at, jobId,
         why: `wait notice delivery=${notice.deliveryStatus}; no later owner response; activity=${ownerActivity?.activity ?? "unknown"}; inspect exact blocker ${row.blockedOn}` };
