@@ -44,6 +44,7 @@ import {
 import type { Policy, PolicyJob } from "../src/domain/policies/types.js";
 import { readSeatPoolBusySessions, seatPoolBusyCommand, seatPoolBusyProcess, type BusyProcessRow } from "../src/domain/seat-pool-busy.js";
 import {
+  seatPoolHeldByProcess,
   seatPoolReceives,
   seatPoolSpecProblem,
   type ParkFacts,
@@ -104,13 +105,15 @@ class Harness {
   host: HostSample = { cpuCount: 4, load1: 0.4, freeMemoryBytes: 1e10 };
   demandDesired = 0;
   /** Every OPENRIG_SEAT_POOL_SLOTS the demand command was given, parsed. */
-  demandSlots: Array<Array<{ session: string; phase: string; receives?: string | null }>> = [];
+  demandSlots: Array<Array<{ session: string; phase: string; receives?: string | null; held?: string }>> = [];
   /** T-006090: why each seat is busy as the process read sees it (absent: not read), and whether that read throws. */
   readonly busy = new Map<string, string | null>();
   busyThrows = false;
   /** Seats the read leaves out, as one that was not parked when the read picked its seats. */
   readonly busyLeftOut = new Set<string>();
   busyReads = 0;
+  /** T-007527: the sessions the provider read says are out of usage (the executor's usageLimited). */
+  readonly usageLimited = new Set<string>();
   executor!: SeatPoolExecutor;
   policy!: Policy;
 
@@ -268,6 +271,7 @@ class Harness {
       readState: (job) => this.readState(job, false),
       effects: this.effects(),
       hostSample: () => this.host,
+      usageLimited: async () => this.usageLimited,
       // As startup.ts's busyPoolSessions (readSeatPoolBusyCandidates): the seats that could take a row now, free or
       // parked (T-006251), each with why it is busy or null.
       busySessions: async (job) => {
@@ -837,5 +841,136 @@ describe("T-006090: the daemon's wiring (startup.ts, read as text as seat-pool-c
     expect(startup).not.toContain("readFileSync(`/proc/${pid}/environ`");
     // The executor's own reader has no busy map: its recheck reads through busySessions.
     expect(startup).toMatch(/new SeatPoolExecutor\(\{[\s\S]*?readState: readPoolState,[\s\S]*?busySessions: async \(job\) =>/);
+  });
+});
+
+// ---------------------------------------------------------------------------------------------------------------
+// T-007527 (option A of T-007207, decided by the lead): the demand command is told which seat is held by a process
+// the read found (`held: "busy"`), so it counts only that one as occupied; `receives: null` alone says nothing more.
+// The five cases of the s16 diagnosis: only the free seat held by a read process says "busy".
+// ---------------------------------------------------------------------------------------------------------------
+describe("T-007527: seatPoolHeldByProcess, the free seat held by a process the read found", () => {
+  const free = (overrides: Partial<SeatPoolSlotView> = {}): SeatPoolSlotView => parkedSlot("external:x", {
+    openRows: 0, heldMessages: 0, idleSince: ago(600), cause: "idle", atPrompt: true, backgroundWork: false, parked: undefined, ...overrides,
+  });
+  const heavy = spec(HEAVY);
+
+  it("held busy: a free seat with a busy_processes program read under its pane", () => {
+    expect(seatPoolHeldByProcess(heavy, free({ busyProcess: "suite-flock (pid 1)" }))).toBe(true);
+    expect(seatPoolHeldByProcess(heavy, free({ busyProcess: "congelar-eval (pid 77, TMUX_PANE %9)" }))).toBe(true);
+  });
+
+  it("the processes could not be read (heldUnread): not held", () => {
+    expect(seatPoolHeldByProcess(heavy, free({ busyProcess: "busy processes not read: no /proc" }))).toBe(false);
+    expect(seatPoolHeldByProcess(heavy, free({ busyProcess: "busy processes not read for this seat" }))).toBe(false);
+  });
+
+  it("a held message: not held, even with a process read", () => {
+    expect(seatPoolHeldByProcess(heavy, free({ heldMessages: 1, busyProcess: "suite-flock (pid 1)" }))).toBe(false);
+  });
+
+  it("a seat to be reaped (live, node present, session stopped): not held, even with a process read", () => {
+    expect(seatPoolHeldByProcess(heavy, free({ cause: "stopped", busyProcess: "suite-flock (pid 1)" }))).toBe(false);
+  });
+
+  it("out of provider usage: not held, with no process (receives null for the usage alone) and with one read", () => {
+    const limited = free({ busyProcess: null });
+    expect(seatPoolReceives(heavy, limited, NOW, { usageLimited: true })).toBeNull();
+    expect(seatPoolHeldByProcess(heavy, limited, { usageLimited: true })).toBe(false);
+    const busy = free({ busyProcess: "suite-flock (pid 1)" });
+    expect(seatPoolHeldByProcess(heavy, busy)).toBe(true);
+    expect(seatPoolHeldByProcess(heavy, busy, { usageLimited: true })).toBe(false);
+    expect(seatPoolHeldByProcess(heavy, free({ cause: "usage_limit", busyProcess: "suite-flock (pid 1)" }))).toBe(false);
+  });
+
+  it("controls: a seat with a row, no process, or a spec without busy_processes is not held", () => {
+    expect(seatPoolHeldByProcess(heavy, free({ openRows: 1, busyProcess: "suite-flock (pid 1)" }))).toBe(false);
+    expect(seatPoolHeldByProcess(heavy, free({ idleSince: null, busyProcess: "suite-flock (pid 1)" }))).toBe(false);
+    expect(seatPoolHeldByProcess(heavy, free({ busyProcess: null }))).toBe(false);
+    expect(seatPoolHeldByProcess(heavy, free())).toBe(false);
+    expect(seatPoolHeldByProcess(spec(ON), free({ busyProcess: "suite-flock (pid 1)" }))).toBe(false);
+  });
+
+  it("the planner counts as occupied exactly the free seats it says are held (one row waiting, one seat more)", () => {
+    const held = free({ busyProcess: "suite-flock (pid 1)" });
+    const unread = free({ busyProcess: "busy processes not read: no /proc" });
+    const s = spec({ ...HEAVY, idle_grace_s: 86400 });
+    const plan = (slots: SeatPoolSlotView[]) => planSeatPool(s, poolState(slots, pendingRows(1)), NOW, 120_000);
+    // The held seat takes no row, so the row is demand on top of it: 2 seats wanted.
+    expect(plan([held]).target).toBe(2);
+    expect(seatPoolHeldByProcess(s, held)).toBe(true);
+    // A failed read is not held: the pool grows at most one seat for it (T-006251 S6), never counting it occupied.
+    expect(seatPoolHeldByProcess(s, unread)).toBe(false);
+  });
+});
+
+describe("T-007527: the demand command's slots carry held: \"busy\" only for the seat a read process holds", () => {
+  let h: Harness;
+
+  beforeEach(() => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    h = new Harness();
+  });
+  afterEach(async () => {
+    await h.executor.stop();
+    h.db.close();
+    vi.useRealTimers();
+  });
+
+  const slotOf = (session: string) => h.demandSlots.at(-1)!.find((x) => x.session === session)!;
+
+  it("a free seat with an orphaned suite-flock says held busy; a quiet one says nothing", async () => {
+    h.register({ ...BASE, max: 2, ...HEAVY, demand_cmd: { argv: ["demand"] } });
+    const busy = h.poolSeat("dev.impl-s1", "idle");
+    const quiet = h.poolSeat("dev.impl-s2", "idle");
+    h.busy.set(busy.session, "suite-flock (pid 781461, TMUX_PANE %24)");
+    h.busy.set(quiet.session, null);
+    await h.tickAt(1);
+    expect(slotOf(busy.session)).toEqual({ session: busy.session, phase: "live", receives: null, held: "busy" });
+    expect(slotOf(quiet.session)).toEqual({ session: quiet.session, phase: "live", receives: "free" });
+  });
+
+  it("a read that throws holds every seat back (receives null) and says held for none", async () => {
+    h.register({ ...BASE, max: 2, ...HEAVY, demand_cmd: { argv: ["demand"] } });
+    const a = h.poolSeat("dev.impl-s1", "idle");
+    h.busy.set(a.session, "suite-flock (pid 8)");
+    h.busyThrows = true;
+    await h.tickAt(1);
+    expect(slotOf(a.session).receives).toBeNull();
+    expect(slotOf(a.session)).not.toHaveProperty("held");
+  });
+
+  it("a seat out of provider usage says receives null and no held, with or without a process read", async () => {
+    h.register({ ...BASE, max: 2, ...HEAVY, demand_cmd: { argv: ["demand"] } });
+    const a = h.poolSeat("dev.impl-s1", "idle");
+    const b = h.poolSeat("dev.impl-s2", "idle");
+    h.busy.set(a.session, null);
+    h.busy.set(b.session, "suite-flock (pid 8)");
+    h.usageLimited.add(a.session);
+    h.usageLimited.add(b.session);
+    await h.tickAt(1);
+    for (const seat of [a, b]) {
+      expect(slotOf(seat.session).receives).toBeNull();
+      expect(slotOf(seat.session)).not.toHaveProperty("held");
+    }
+  });
+
+  it("a seat parked on its own wait with a busy program is not a free seat held: no held", async () => {
+    h.register({ ...BASE, max: 2, ...HEAVY, demand_cmd: { argv: ["demand"] } });
+    const p = h.poolSeat("dev.impl-s1", "background");
+    await h.park(p, { gate: "external:ci-a" });
+    h.busy.set(p.session, "congelar-eval (pid 8)");
+    await h.tickAt(1);
+    expect(slotOf(p.session).receives).toBeNull();
+    expect(slotOf(p.session)).not.toHaveProperty("held");
+  });
+
+  it("without busy_processes no process is read and no seat says held", async () => {
+    h.register({ ...BASE, max: 2, ...ON, demand_cmd: { argv: ["demand"] } });
+    const a = h.poolSeat("dev.impl-s1", "idle");
+    h.busy.set(a.session, "suite-flock (pid 8)");
+    await h.tickAt(1);
+    expect(h.busyReads).toBe(0);
+    expect(slotOf(a.session)).toEqual({ session: a.session, phase: "live", receives: "free" });
   });
 });
