@@ -163,7 +163,8 @@ CI run it left in the background) may receive one row more, after the free seats
   option's value given as a separate word (`timeout -s KILL 600 …`) is a miss. A wrapper name is refused as an entry.
   A process that left the pane's tree holds the seat only while it is younger than `busy_orphan_max_age_s` and did not
   start before the pane's current occupant (the runtime: when the pane runs a shell, its newest child that runs
-  `claude` or `codex`, or its newest child when none does; else the pane's own process; so the orphan of the occupant
+  `claude`, `codex`, `pi` or `omp`, the native installer's versioned Claude, or Node running Claude's `cli.js`, or its
+  newest child when none does; else the pane's own process; so the orphan of the occupant
   before a fresh launch holds nothing); one whose start can't be read holds it. A process under the pane holds it
   whatever its age. The default ceiling, 12 h, is the longest a suite waits for the host's lock.
   A process that left the pane's tree with no `TMUX_PANE` (a `systemd-run --user --unit=…` started outside tmux, or one
@@ -174,16 +175,19 @@ CI run it left in the background) may receive one row more, after the free seats
   that cannot be read within 5 seconds, a seat whose pane cannot be told, an environment that could not be read
   (anything but a process gone, one with no `TMUX_PANE` or another user's; a failed stat of its owner other than "gone"
   counts as failed), or a seat the read left out, holds the seat back. The environments are read at most 4 at a time,
-  under one deadline for the whole read; a read past it can't be cancelled, so while 4 are still running from an earlier
-  read no new one starts, and the seats they could belong to are held. The panes are read with the adapter's printable
+  under one deadline for the whole read; a read past it can't be cancelled, so while 4 are still running (from this
+  read, a concurrent one or an earlier one) a new one waits its turn until the deadline, and then the seats it could
+  belong to are held. The panes are read with the adapter's printable
   field separator, so a daemon outside tmux with a non-UTF-8 locale, or tmux 3.3a/3.6, reads them too.
 
 The same `busy_processes` rule holds back a free seat (no open row, idle at its prompt): a suite or an eval it left
 running in a process its runtime does not track (reparented, `nohup`) would make it give the row back. Such a seat counts
 as holding work, as a parked one does: it is not drained, and the row it can't take is demand. A free seat held back
 only because its processes could not be read (a timeout, an unreadable environment, its pane not found) takes no row
-and is not drained either, but it is not counted as holding work: a read failing for every seat leaves the pool as it
-is instead of growing it to `max` with nothing dispatched.
+and is not drained either, but it is not counted as holding work: it keeps its place in the pool's target (no seat
+starting is removed for it) and, while rows wait undispatched, adds at most one seat. A failure of that seat alone (its
+pane gone) is then served by the new seat; a read failing for every seat no longer grows the pool to `max` with nothing
+dispatched.
 
 A seat with two open rows never receives, so one row more is the ceiling. The free seats get rows first, in their usual
 order, then the parked ones by id. A parked seat still counts as holding work: it is never drained, and the row it
