@@ -278,6 +278,73 @@ describe("stuck sweep: rows waiting in an active seat pool's queue (T-007029, #2
     expect(findingFor(row)).toBe(false);
   });
 
+  // The edges of SEAT_POOL_MIN_RUN_MS (10 min from the start to the stop as seen; the stop is seen up to a sweep period
+  // after the death). A retired seat of the pool, its slot created long before its start (the start is live_at, not
+  // created_at), started at `liveAt` and seen stopped (and reaped) at `stoppedAt`.
+  function retiredPoolSeat(jobId: string, at: { createdAt: string; liveAt: string; stoppedAt: string }): void {
+    const n = ++nodeSeq;
+    db.prepare(`INSERT INTO seat_pool_slots (pool_job_id, node_id, logical_id, phase, intent, op_id, created_at, live_at, stopped_since, retired_at)
+                VALUES (?, ?, ?, 'retired', NULL, 'op', ?, ?, ?, ?)`).run(jobId, `node-gone-${n}`, `impl-s${n}`, at.createdAt, at.liveAt, at.stoppedAt, at.stoppedAt);
+  }
+
+  it("B1: a database that already applied 159_seat_pool_slots_stopped_since gets live_at from its own migration", () => {
+    const old = new Database(join(dir, "old.sqlite"));
+    try {
+      // the daemon of 4fda421f7: every migration up to 159_seat_pool_slots_stopped_since, which then added only stopped_since
+      migrate(old, ALL_MIGRATIONS.filter((m) => m.name.localeCompare("159_seat_pool_slots_stopped_since.sql") < 0 && m.name !== "159_seat_pool_slots_live_at.sql"));
+      old.exec("ALTER TABLE seat_pool_slots ADD COLUMN stopped_since TEXT");
+      old.prepare("INSERT INTO schema_migrations (name) VALUES ('159_seat_pool_slots_stopped_since.sql')").run();
+      migrate(old, ALL_MIGRATIONS);
+      const columns = (old.prepare("PRAGMA table_info(seat_pool_slots)").all() as Array<{ name: string }>).map((c) => c.name);
+      expect(columns).toEqual(expect.arrayContaining(["stopped_since", "live_at"]));
+    } finally {
+      old.close();
+    }
+  });
+
+  it("B1: a seat that died 4 min after its start, its reap 4 min later (8 min from the start): doesn't count", async () => {
+    const jobId = pool({});
+    retiredPoolSeat(jobId, { createdAt: minutesAgo(60), liveAt: minutesAgo(12), stoppedAt: minutesAgo(4) });
+    const row = await work();
+    await sweep();
+    expect(findingFor(row)).toBe(true);
+  });
+
+  it("B1: a seat that ran 11 min before it was seen stopped counts, and holds the queue for the grace", async () => {
+    const jobId = pool({});
+    retiredPoolSeat(jobId, { createdAt: minutesAgo(60), liveAt: minutesAgo(21), stoppedAt: minutesAgo(10) });
+    const row = await work();
+    await sweep();
+    expect(findingFor(row)).toBe(false);
+  });
+
+  it("B1: a seat seen stopped exactly SEAT_POOL_MIN_RUN_MS after its start counts", async () => {
+    const { SEAT_POOL_MIN_RUN_MS } = await import("../src/domain/seat-pool-sweep-custody.js");
+    const jobId = pool({});
+    const iso = (ms: number) => new Date(ms).toISOString();
+    // A stop about 5 min ago whose run of exactly SEAT_POOL_MIN_RUN_MS julianday makes a fraction of a ms short (about 1
+    // in 9 such pairs): the case the 1 ms tolerance is for.
+    const runMs = db.prepare("SELECT (julianday(?) - julianday(?)) * 86400000.0 AS ms");
+    let stop = Date.now() - 5 * 60_000;
+    for (let i = 0; (runMs.get(iso(stop), iso(stop - SEAT_POOL_MIN_RUN_MS)) as { ms: number }).ms >= SEAT_POOL_MIN_RUN_MS; i++) {
+      if (i > 10_000) throw new Error("no stop whose run julianday makes short");
+      stop -= 7;
+    }
+    retiredPoolSeat(jobId, { createdAt: minutesAgo(60), liveAt: iso(stop - SEAT_POOL_MIN_RUN_MS), stoppedAt: iso(stop) });
+    const row = await work();
+    await sweep();
+    expect(findingFor(row)).toBe(false);
+  });
+
+  it("B1: a live seat of the pool seen stopped 8 min after its start (not reaped yet) doesn't count", async () => {
+    const jobId = pool({});
+    slot(jobId, { live: true, session: "exited" });
+    db.prepare("UPDATE seat_pool_slots SET live_at = ? WHERE pool_job_id = ?").run(minutesAgo(8), jobId);
+    const row = await work();
+    await sweep();
+    expect(findingFor(row)).toBe(true);
+  });
+
   it("SD2: a seat reaped while it still ran counts until its reap, as before", async () => {
     const { SeatPoolSlots } = await import("../src/domain/seat-pool-executor.js");
     const jobId = pool({});
