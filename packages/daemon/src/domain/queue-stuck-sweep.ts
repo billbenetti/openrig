@@ -1,5 +1,6 @@
 import { currentParkedOwnerNoInputFailure } from "./policies/parked-owner-consumer.js";
 import { resolveEscalationOwner, ESCALATION_HOP_TAG, hasConsumedEscalationHop } from "./escalation-owner.js";
+import { seatPoolQueueCustody } from "./seat-pool-sweep-custody.js";
 import { createRecoveryLookup, recoveryId, recoveryTag } from "./queue-recovery.js";
 import { quietHoldCustody } from "./quiet-hold-custody.js";
 import { queueWaitNotice } from "./queue-wait-backoff.js";
@@ -931,6 +932,8 @@ export async function runStuckSweep(deps: StuckSweepDeps): Promise<StuckSweepRes
     // the config-keyed age. Parks (state=blocked) legitimately wait and never appear here;
     // failed-nudge rows already surfaced in half 2; laddered rows are S01's.
     const cutoff = new Date(now.getTime() - ageMinutes * 60_000).toISOString();
+    // T-007029 (#2988): a row waiting in an active seat pool's queue is the pool's to move to a seat, read once per pass.
+    const poolHolds = seatPoolQueueCustody(deps.db, now.getTime());
     const unclaimedCandidate = (qitemId: string, recordSuppression: boolean): Candidate | null => {
       const row = indexed(() => deps.queueRepo.getById(qitemId, { waiting: false }));
       if (!row || isFindingRow(row)) return null;
@@ -957,6 +960,9 @@ export async function runStuckSweep(deps: StuckSweepDeps): Promise<StuckSweepRes
       // The seat's typing guard or interruption level held its wake on purpose: it's held and readable at the seat, not
       // stuck. (A handed-off baton's one held notice is the wake ladder's.)
       if (row.lastNudgeResult === "retained:typing_guard") return null;
+      // A row waiting in an active seat pool's queue (to the pool's model, with its dispatch_tag) is the pool's to move,
+      // while the pool has a seat or had one within no_seat_grace_s; a draining or seatless pool's rows are findings.
+      if (poolHolds(row)) return null;
       // The ladder check runs LAST here too: a row the ladder alone would have stopped is
       // ladder-suppressed, and its finding stays open (#1419).
       if (hasLiveLadder(deps.db, row.qitemId, now, suppressionMinutes)) {
