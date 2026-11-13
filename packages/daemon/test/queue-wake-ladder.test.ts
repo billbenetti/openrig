@@ -300,6 +300,16 @@ describe("S01 wake-or-escalate — retry ladder, named rungs, derived suspension
     expect(markersOf(claimed.qitemId, LADDER_RUNG_PREFIX)).toHaveLength(0);
   });
 
+  it("A QUEUE-ONLY SEAT'S HELD WAKE NEVER ENTERS (T-006631 on 0.7.13): the parked-owner's skipped:queue-only-seat result is the seat's own choice to read the queue, not an unknown outcome", async () => {
+    const baton = await mkBaton();
+    setNudgeResult(baton.qitemId, "skipped:queue-only-seat: the seat's typing guard is queue-only; the row waits in its queue", 45);
+    ageCreated(baton.qitemId, 45);
+    await tick();
+    expect(calls).toHaveLength(0);
+    expect(markersOf(baton.qitemId, LADDER_ATTEMPT_PREFIX)).toHaveLength(0);
+    expect(markersOf(baton.qitemId, LADDER_RUNG_PREFIX)).toHaveLength(0);
+  });
+
   it("KNOWN OUTCOMES KEEP THEIR PATH: a verified wake, a hosted trigger's accepted ring and an unroutable address never enter the ladder", async () => {
     const batons = [];
     for (const [idx, result] of ["verified", "wake-accepted:webhook (hook) answered 202; pickup is the member's claim on this row",
