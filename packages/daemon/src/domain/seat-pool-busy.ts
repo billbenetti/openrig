@@ -126,9 +126,10 @@ export interface ProcEnvironmentIo {
 
 /**
  * The TMUX_PANE a process inherited, from `<root>/<pid>/environ` (T-006251 S1): null when it has none, when the process
- * is gone (ENOENT, ESRCH) or when it is another user's (EACCES or EPERM on a process whose owner is not the daemon's
- * user: no seat runs as one); any other failure rejects, the daemon's own process unreadable (EACCES, EMFILE…) included,
- * which holds the seats it could belong to.
+ * is gone (ENOENT, ESRCH, of the environment or of the owner's stat) or when it is another user's (EACCES or EPERM on a
+ * process whose owner is not the daemon's user: no seat runs as one); any other failure rejects, the daemon's own
+ * process unreadable (EACCES, EMFILE…) and an owner's stat that fails otherwise (B3) included, which holds the seats it
+ * could belong to.
  */
 export async function readProcTmuxPane(pid: number, io: ProcEnvironmentIo, root = "/proc"): Promise<string | null> {
   try {
@@ -138,12 +139,33 @@ export async function readProcTmuxPane(pid: number, io: ProcEnvironmentIo, root 
     const code = (error as { code?: string }).code;
     if (code === "ENOENT" || code === "ESRCH") return null;
     if (code === "EACCES" || code === "EPERM") {
-      const owner = await io.ownerUid(`${root}/${pid}`).catch(() => null);
-      if (owner === null) return null; // gone between the two reads
+      let owner: number;
+      try {
+        owner = await io.ownerUid(`${root}/${pid}`);
+      } catch (statError) {
+        // T-006251 B3: only "gone between the two reads" frees the seat; any other failure of the stat (EIO, EMFILE…)
+        // is a failed read, which holds it, as the environment's own failure does.
+        const statCode = (statError as { code?: string }).code;
+        if (statCode === "ENOENT" || statCode === "ESRCH") return null;
+        throw error;
+      }
       if (io.uid !== null && owner !== io.uid) return null;
     }
     throw error;
   }
+}
+
+/** The environment reads still running, per reader (the daemon has one): a read past its deadline can't be cancelled
+ *  and keeps a libuv thread, so it counts against the next read too (T-006251 S9). */
+const pendingReads = new WeakMap<object, { count: number }>();
+
+/**
+ * Whether a busy reason names a process the read found (`<program> (pid <n>)` or `<program> (pid <n>, TMUX_PANE <p>)`)
+ * rather than a failure to read (the table, the panes, the seat's pane, an environment, pending reads). The planner
+ * counts only the first as occupied (T-006251 S6): a failed read holds the seat back from a row but grows nothing.
+ */
+export function seatPoolBusyFromProcess(reason: string | null | undefined): boolean {
+  return !!reason && /^[^\s()]+ \(pid \d+(, TMUX_PANE [^()]+)?\)$/.test(reason);
 }
 
 /** Runs `tasks` with at most `limit` at once, keeping their order. */
@@ -154,8 +176,9 @@ async function limited<T>(tasks: ReadonlyArray<() => Promise<T>>, limit: number)
   await Promise.all(Array.from({ length: Math.min(limit, tasks.length) }, lane));
   return out;
 }
-/** The default ceiling on the age of a process that left the pane's tree (dispatch_to_parked.busy_orphan_max_age_s). */
-export const SEAT_POOL_BUSY_ORPHAN_MAX_AGE_S = 21_600;
+/** The default ceiling on the age of a process that left the pane's tree (dispatch_to_parked.busy_orphan_max_age_s):
+ *  12 h, the longest a suite-flock waits for its slot (T-006251 S8: at 6 h a slot was let go with its work still queued). */
+export const SEAT_POOL_BUSY_ORPHAN_MAX_AGE_S = 43_200;
 
 function within<T>(promise: Promise<T>, ms: number, what: string): Promise<T> {
   let timer: ReturnType<typeof setTimeout> | undefined;
@@ -174,18 +197,24 @@ function startedMs(row: BusyProcessRow | undefined): number | null {
 
 /** Login and plain shells: a pane that runs one hosts its runtime as a child; any other pane process is the runtime. */
 const PANE_SHELLS: ReadonlySet<string> = new Set(["bash", "sh", "dash", "zsh", "fish", "ksh"]);
+/** The agent runtimes a launch starts in a shell pane (by the program the command runs, after the wrappers). */
+const PANE_RUNTIMES: readonly string[] = ["claude", "codex"];
 
 /**
  * When the pane's current occupant started, in ms (null when unknown): the runtime a launch starts in the pane. A pane
  * that runs a shell (`/bin/bash -l`, `-bash`) hosts the runtime as a child, and a fresh launch starts a new one in the
- * same shell: the newest child. A pane that runs anything else runs the runtime itself, whose own children are tool
- * shells (a newer one says nothing of the occupant, T-006251 RC S1): the pane's process.
+ * same shell: its newest runtime child (claude, codex; T-006251 S10: a newer sibling the shell started, a `sleep`, is
+ * not the occupant), or its newest child when none is a runtime. A pane that runs anything else runs the runtime
+ * itself, whose own children are tool shells (a newer one says nothing of the occupant, T-006251 RC S1): the pane's
+ * process.
  */
 export function seatPoolPaneOccupantMs(rows: readonly BusyProcessRow[], panePid: number): number | null {
   const pane = rows.find((row) => row.pid === panePid);
   const first = (pane?.command.split(/\s+/).find(Boolean) ?? "").replace(/^-/, "");
   if (!pane || !PANE_SHELLS.has(first.slice(first.lastIndexOf("/") + 1))) return startedMs(pane);
-  return rows.filter((row) => row.ppid === panePid).map(startedMs)
+  const children = rows.filter((row) => row.ppid === panePid);
+  const runtimes = children.filter((row) => seatPoolBusyCommand(row.command, PANE_RUNTIMES) !== null);
+  return (runtimes.length > 0 ? runtimes : children).map(startedMs)
     .reduce<number | null>((max, ms) => ms !== null && (max === null || ms > max) ? ms : max, startedMs(pane));
 }
 
@@ -253,18 +282,33 @@ export async function readSeatPoolBusySessions(
     // new read starts and the rest count as not read; at most SEAT_POOL_BUSY_ENV_CONCURRENCY reads stay pending, and
     // the whole read takes at most `timeoutMs`.
     const deadline = Date.now() + timeoutMs;
+    let pending = pendingReads.get(deps.processPane);
+    if (!pending) pendingReads.set(deps.processPane, pending = { count: 0 });
+    const inFlight = pending;
     const read = await limited(matching.map((row) => async () => {
       const left = deadline - Date.now();
       if (left <= 0) return { pid: row.pid, error: `the environments took over ${timeoutMs} ms` };
+      // S9: the reads an earlier call left running still hold libuv threads: past the limit no new one starts.
+      if (inFlight.count >= SEAT_POOL_BUSY_ENV_CONCURRENCY) {
+        return { pid: row.pid, error: `environment reads still pending from an earlier read (${inFlight.count})` };
+      }
       try {
-        return { pid: row.pid, pane: await within(deps.processPane!(row.pid), left, `the environment of pid ${row.pid}`) };
+        const started = deps.processPane!(row.pid);
+        inFlight.count += 1;
+        const done = () => { inFlight.count -= 1; };
+        started.then(done, done);
+        return { pid: row.pid, pane: await within(started, left, `the environment of pid ${row.pid}`) };
       } catch (error) {
         return { pid: row.pid, error: reason(error) };
       }
     }), SEAT_POOL_BUSY_ENV_CONCURRENCY);
     let unread: string | null = null;
     for (const entry of read.sort((a, b) => a.pid - b.pid)) {
-      if ("error" in entry) { unread ??= `environment of pid ${entry.pid} not read: ${entry.error}`; continue; }
+      if ("error" in entry) {
+        const why = String(entry.error);
+        unread ??= why.startsWith("environment reads still pending") ? why : `environment of pid ${entry.pid} not read: ${why}`;
+        continue;
+      }
       if (!entry.pane) continue;
       const list = found.get(entry.pane);
       if (list) list.push(entry.pid);

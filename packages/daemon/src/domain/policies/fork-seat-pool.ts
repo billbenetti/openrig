@@ -8,7 +8,7 @@
 // policy itself never creates, launches, stops, removes, moves or sends anything, so one slow launch can't hold every
 // other job's evaluation.
 
-import { seatPoolBusyWrapper } from "../seat-pool-busy.js";
+import { SEAT_POOL_BUSY_ORPHAN_MAX_AGE_S, seatPoolBusyFromProcess, seatPoolBusyWrapper } from "../seat-pool-busy.js";
 import type { Policy, PolicyEvaluation, PolicyJob } from "./types.js";
 
 export const SEAT_POOL_POLICY_NAME = "seat-pool";
@@ -85,7 +85,7 @@ export interface SeatPoolDispatchToParked {
    *  own `external:` waits, each passing the checks the single park passes (T-007036). Absent (no property) when the
    *  field is not given, which reads as 1: exactly one open row, the rule from before the field. */
   maxOpenRows?: number;
-  /** `busy_orphan_max_age_s`, only with `busy_processes` (default 21600, 6 h): the oldest a matching process that left
+  /** `busy_orphan_max_age_s`, only with `busy_processes` (default 43200, 12 h): the oldest a matching process that left
    *  the pane's tree (found by the TMUX_PANE it inherited) may be and still hold the seat; an older one, or one started
    *  before the pane's current occupant (its runtime, started anew by a fresh launch: seatPoolPaneOccupantMs), holds nothing
    *  (T-006251, S2). A process still under the pane holds it whatever its age. Absent without `busy_processes`. */
@@ -151,7 +151,7 @@ const DISPATCH_TO_PARKED_MAX_OPEN_ROWS = { min: 1, max: 20 } as const;
 export const DISPATCH_TO_PARKED_MAX_OPEN_ROWS_DEFAULT = 1;
 const DISPATCH_TO_PARKED_LISTS = ["refuse_gates", "busy_processes"] as const;
 /** `busy_orphan_max_age_s`: read only with `busy_processes` (it means nothing without it). */
-const BUSY_ORPHAN_MAX_AGE = { key: "busy_orphan_max_age_s", min: 60, max: 172_800, fallback: 21_600 } as const;
+const BUSY_ORPHAN_MAX_AGE = { key: "busy_orphan_max_age_s", min: 60, max: 172_800, fallback: SEAT_POOL_BUSY_ORPHAN_MAX_AGE_S } as const;
 const DISPATCH_TO_PARKED_KEYS = new Set([
   ...Object.keys(DISPATCH_TO_PARKED_NUMBERS), "allow_background_work", ...DISPATCH_TO_PARKED_LISTS, BUSY_ORPHAN_MAX_AGE.key, "max_open_rows",
 ]);
@@ -699,7 +699,12 @@ export function planSeatPool(spec: SeatPoolSpec, state: SeatPoolState, nowMs: nu
   // takes no row, so it is not idle: it counts as occupied (the pool grows for the row it can't take, as for a parked
   // seat) and is never drained as free while its suite runs (REVISAO lente de lógica, wf_fff3f5f2).
   const heldBusy = (slot: SeatPoolSlotView) => !!spec.dispatchToParked?.busyProcesses?.length && !!slot.busyProcess;
-  const idle = (slot: SeatPoolSlotView) => slot.openRows === 0 && slot.heldMessages === 0 && slot.idleSince !== null && !heldBusy(slot);
+  const quiet = (slot: SeatPoolSlotView) => slot.openRows === 0 && slot.heldMessages === 0 && slot.idleSince !== null;
+  const idle = (slot: SeatPoolSlotView) => quiet(slot) && !heldBusy(slot);
+  // T-006251 S6: a quiet seat held only because its processes could not be read (a timeout under load, an unreadable
+  // environment) takes no row and is never drained, but it is no occupant either: counting it grew the pool to `max`
+  // with no row dispatched. Only a process the read found makes a quiet seat occupied.
+  const heldUnread = (slot: SeatPoolSlotView) => quiet(slot) && heldBusy(slot) && !seatPoolBusyFromProcess(slot.busyProcess);
   const usageLimited = seatPoolOutOfUsage(state);
 
   const waiting = state.pending.filter((row) => nowMs - Date.parse(row.waitingSince) >= spec.dispatchAfterSeconds * 1000);
@@ -749,7 +754,7 @@ export function planSeatPool(spec: SeatPoolSpec, state: SeatPoolState, nowMs: nu
     }
   }
 
-  const occupied = live.filter((slot) => !idle(slot) || receiving.has(slot));
+  const occupied = live.filter((slot) => (!idle(slot) && !heldUnread(slot)) || receiving.has(slot));
   const free = live.filter((slot) => idle(slot) && !receiving.has(slot) && nowMs - Date.parse(slot.idleSince!) >= spec.idleGraceSeconds * 1000);
   const current = live.length + starting.length;
   const cooling = !spec.drain && state.lastScaleAt !== null && nowMs - Date.parse(state.lastScaleAt) < spec.cooldownSeconds * 1000;

@@ -10,16 +10,20 @@
 // - S3: the server's panes in one read; a seat whose pane cannot be told is held alone, not the whole pool; the
 //   composition the daemon runs (readSeatPoolBusyCandidates) is tested here instead of only as text.
 
-import { describe, it, expect, vi } from "vitest";
-import { readFileSync } from "node:fs";
+import { describe, it, expect, vi, afterEach } from "vitest";
+import { execFileSync } from "node:child_process";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { TmuxAdapter } from "../src/adapters/tmux.js";
+import { execArgvCommand, execCommand } from "../src/adapters/tmux-exec.js";
 import { readSeatPoolBusyCandidates } from "../src/domain/seat-pool-executor.js";
 import {
   readSeatPoolBusySessions,
   readProcTmuxPane,
   SEAT_POOL_BUSY_ORPHAN_MAX_AGE_S,
+  seatPoolBusyFromProcess,
   seatPoolPaneOccupantMs,
   type BusyProcessRow,
   type SeatPoolBusyReadDeps,
@@ -72,9 +76,9 @@ describe("T-006251 S2: the age of a process that left the pane's tree", () => {
   it("an orphan older than busy_orphan_max_age_s holds nothing (the real: suite-flock left 4 h 50 in a slot's queue)", async () => {
     const { deps } = scene({ occupantAgoS: 30_000, orphanAgoS: 17_400 });
     expect((await readSeatPoolBusySessions(["qa-s7@r"], PROGRAMS, deps, { orphanMaxAgeSeconds: 14_400 })).get("qa-s7@r")).toBeNull();
-    // The same orphan under a higher ceiling (the default, 6 h) still holds it.
+    // The same orphan under a higher ceiling (the default, 12 h since S8) still holds it.
     expect((await readSeatPoolBusySessions(["qa-s7@r"], PROGRAMS, deps)).get("qa-s7@r")).toBe("suite-flock (pid 500, TMUX_PANE %24)");
-    expect(SEAT_POOL_BUSY_ORPHAN_MAX_AGE_S).toBe(21_600);
+    expect(SEAT_POOL_BUSY_ORPHAN_MAX_AGE_S).toBe(43_200);
   });
 
   it("an orphan of the occupant before a fresh launch (started before the pane's current runtime) holds nothing", async () => {
@@ -125,12 +129,13 @@ describe("T-006251 S2: the age of a process that left the pane's tree", () => {
       .toBe("suite-flock (pid 500, TMUX_PANE %24)");
   });
 
-  it("busy_orphan_max_age_s: read only with busy_processes, default 21600, bounds 60..172800; {} reads as before", () => {
+  it("busy_orphan_max_age_s: read only with busy_processes, default 43200 (S8: the suite-flock waits up to 12 h), bounds 60..172800; {} reads as before", () => {
     const parse = (inner: Record<string, unknown>) => parseSeatPoolSpec({ max: 2, cwd_template: "/w/{slot}", dispatch_to_parked: inner });
     const specOf = (inner: Record<string, unknown>) => (parse(inner) as { spec: SeatPoolSpec }).spec.dispatchToParked;
     expect(specOf({})).not.toHaveProperty("busyOrphanMaxAgeSeconds");
     expect(specOf({ refuse_gates: ["congelar"] })).not.toHaveProperty("busyOrphanMaxAgeSeconds");
-    expect(specOf({ busy_processes: PROGRAMS })).toMatchObject({ busyProcesses: PROGRAMS, busyOrphanMaxAgeSeconds: 21_600 });
+    expect(specOf({ busy_processes: PROGRAMS })).toMatchObject({ busyProcesses: PROGRAMS, busyOrphanMaxAgeSeconds: 43_200 });
+    expect(SEAT_POOL_BUSY_ORPHAN_MAX_AGE_S).toBe(43_200);
     expect(specOf({ busy_processes: PROGRAMS, busy_orphan_max_age_s: 3600 })).toMatchObject({ busyOrphanMaxAgeSeconds: 3600 });
     for (const bad of [59, 172_801, 1.5, "3600", null]) {
       expect(seatPoolSpecProblem({ context: { max: 2, cwd_template: "/w/{slot}", dispatch_to_parked: { busy_processes: PROGRAMS, busy_orphan_max_age_s: bad } } }))
@@ -267,16 +272,17 @@ describe("T-006251 S3: one pane read; a seat that cannot be told is held alone",
     expect(read.get("qa-s7@r")).toBe("suite-flock (pid 500, TMUX_PANE %24)");
   });
 
-  it("listAllPanePids: one `tmux list-panes -a` for the whole server, parsed by tab; no server reads as none", async () => {
+  it("listAllPanePids: one `tmux list-panes -a` for the whole server, parsed by the adapter's printable separator (B2); a `|` in the session name stays; no server reads as none", async () => {
     const seen: string[][] = [];
-    const out = "%0\t2620\t11\tadvisor-lead@kernel\n%310\t2214571\t11\tbuild-dev-1-s6@fabrica\n%311\t2214600\t10\tbuild-dev-1-s6@fabrica\nlixo\n";
+    const out = "%0|2620|11|advisor-lead@kernel\n%310|2214571|11|build-dev-1-s6@fabrica\n%311|2214600|10|build-dev-1-s6@fabrica\n%312|7|11|a|b\nlixo\n%0_2620_11_x\n";
     const adapter = new TmuxAdapter(async () => "", undefined, async (argv) => { seen.push(argv); return out; });
     expect(await adapter.listAllPanePids()).toEqual([
       { paneId: "%0", panePid: 2620, session: "advisor-lead@kernel", active: true },
       { paneId: "%310", panePid: 2214571, session: "build-dev-1-s6@fabrica", active: true },
       { paneId: "%311", panePid: 2214600, session: "build-dev-1-s6@fabrica", active: false },
+      { paneId: "%312", panePid: 7, session: "a|b", active: true },
     ]);
-    expect(seen).toEqual([["tmux", "list-panes", "-a", "-F", "#{pane_id}\t#{pane_pid}\t#{window_active}#{pane_active}\t#{session_name}"]]);
+    expect(seen).toEqual([["tmux", "list-panes", "-a", "-F", "#{pane_id}|#{pane_pid}|#{window_active}#{pane_active}|#{session_name}"]]);
     const none = new TmuxAdapter(async () => "", undefined, async () => { throw new Error("no server running on /tmp/tmux-1000/default"); });
     expect(await none.listAllPanePids()).toEqual([]);
     const broken = new TmuxAdapter(async () => "", undefined, async () => { throw new Error("permission denied"); });
@@ -354,5 +360,139 @@ describe("T-006251: the daemon's composition (readSeatPoolBusyCandidates, as sta
       nowMs: () => NOW,
     });
     expect(read!.get("qualidade-qa-s8@fabrica")).toBe(`suite-flock (pid ${o.process.pid}, TMUX_PANE ${o.tmuxPane})`);
+  });
+});
+
+const nativeTmux = process.platform !== "win32" && (() => {
+  try { execFileSync("tmux", ["-V"], { stdio: "ignore" }); return true; } catch { return false; }
+})();
+
+describe.skipIf(!nativeTmux)("T-006251 B2: listAllPanePids against a real tmux server, outside tmux, with LC_ALL=C", { timeout: 30_000 }, () => {
+  let root = "";
+  afterEach(() => {
+    if (root) {
+      try { execFileSync("tmux", ["-S", join(root, "s.sock"), "kill-server"], { stdio: "ignore" }); } catch { /* not started */ }
+      rmSync(root, { recursive: true, force: true });
+      root = "";
+    }
+    vi.unstubAllEnvs();
+  });
+
+  it("reads the pane of each session (a non-UTF-8 locale turns a tab into `_`, which dropped every pane)", async () => {
+    root = mkdtempSync(join(tmpdir(), "t"));
+    const sock = join(root, "s.sock");
+    // The daemon's systemd --user unit may run without a UTF-8 locale and outside tmux: then tmux sanitizes a literal tab
+    // in -F output (as 3.3a and 3.6 always do).
+    vi.stubEnv("LC_ALL", "C");
+    vi.stubEnv("LC_CTYPE", "C");
+    vi.stubEnv("LANG", "C");
+    vi.stubEnv("TMUX", undefined);
+    vi.stubEnv("TMUX_PANE", undefined);
+    vi.stubEnv("SHELL", "/bin/sh");
+    execFileSync("tmux", ["-S", sock, "-f", "/dev/null", "new-session", "-d", "-s", "pool-seat@r", "sleep 120"], { stdio: "ignore" });
+    const pid = Number(execFileSync("tmux", ["-S", sock, "display-message", "-p", "-t", "=pool-seat@r:", "#{pane_pid}"], { encoding: "utf8" }).trim());
+    const adapter = new TmuxAdapter(execCommand, undefined, execArgvCommand, ["-S", sock]);
+    const panes = await adapter.listAllPanePids();
+    expect(panes).toEqual([expect.objectContaining({ session: "pool-seat@r", panePid: pid, active: true })]);
+    expect(panes[0]!.paneId).toMatch(/^%\d+$/);
+  });
+});
+
+describe("T-006251 volta 1: B3, S6, S9, S10 and the S11 boundaries", () => {
+  const err = (code: string) => Object.assign(new Error(`${code}: x`), { code });
+
+  it("B3: the owner's stat failing with anything but ENOENT/ESRCH is a failed read (it rejects, which holds the seat), not 'gone'", async () => {
+    const io = (owner: () => Promise<number>) => ({ readFile: async (): Promise<string> => { throw err("EACCES"); }, ownerUid: owner, uid: 1000 });
+    await expect(readProcTmuxPane(9, io(async () => { throw err("EIO"); }))).rejects.toThrow(/EACCES/);
+    await expect(readProcTmuxPane(9, io(async () => { throw err("EMFILE"); }))).rejects.toThrow(/EACCES/);
+    expect(await readProcTmuxPane(9, io(async () => { throw err("ENOENT"); }))).toBeNull();
+    expect(await readProcTmuxPane(9, io(async () => { throw err("ESRCH"); }))).toBeNull();
+  });
+
+  it("B3 (the negative case): a free seat whose orphan's environ is unreadable (EACCES, not dumpable) and whose stat fails (EIO) is held", async () => {
+    const { deps } = scene({ occupantAgoS: 7200, orphanAgoS: 3600 });
+    const io = { readFile: async (): Promise<string> => { throw err("EACCES"); }, ownerUid: async (): Promise<number> => { throw err("EIO"); }, uid: 1000 };
+    const read = await readSeatPoolBusySessions(["qa-s7@r"], PROGRAMS, { ...deps, processPane: (pid) => readProcTmuxPane(pid, io) });
+    expect(read.get("qa-s7@r")).toBe("environment of pid 500 not read: EACCES: x");
+  });
+
+  it("seatPoolBusyFromProcess: only the read's process reasons are a process; every failure the read writes is not", () => {
+    for (const reason of ["suite-flock (pid 9)", "congelar-eval (pid 77, TMUX_PANE %9)", "suite-flock (pid 781461, TMUX_PANE %24)"]) {
+      expect(seatPoolBusyFromProcess(reason)).toBe(true);
+    }
+    for (const reason of ["pane not found", "pane not read: db", "panes not read: x", "process table not read: EACCES",
+      "environment of pid 500 not read: EMFILE: x", "busy processes not read: no /proc", "busy processes not read for this seat",
+      "environment reads still pending from an earlier read (4)", null, undefined, ""]) {
+      expect(seatPoolBusyFromProcess(reason)).toBe(false);
+    }
+  });
+
+  it("S6: a free seat held only because its processes could not be read takes no row, is not drained, and does not grow the pool", () => {
+    const sp = (parseSeatPoolSpec({ max: 8, min: 0, cwd_template: "/w/{slot}", cooldown_s: 0, idle_grace_s: 60, dispatch_after_s: 60,
+      dispatch_to_parked: { busy_processes: PROGRAMS } }) as { spec: SeatPoolSpec }).spec;
+    const slot = (slotId: number, busyProcess: string | null): SeatPoolSlotView => ({
+      slotId, logicalId: `dev.impl-s${slotId}`, sessionName: `dev-impl-s${slotId}@r`, nodeId: `node-${slotId}`, phase: "live", adopted: false,
+      nodeExists: true, openRows: 0, heldMessages: 0, idleSince: new Date(NOW - 3_600_000).toISOString(), cause: "idle", atPrompt: true,
+      backgroundWork: false, busyProcess,
+    });
+    const state = (reasons: Array<string | null>): SeatPoolState => ({
+      model: { rigId: "rig-1", rigName: "r", podNamespace: "dev", memberId: "impl", logicalId: "dev.impl", nodeId: "model", sessionName: "dev-impl@r" },
+      modelCause: "working", restoring: false, adoptable: [], demand: null, lastScaleAt: null,
+      slots: reasons.map((reason, i) => slot(i + 1, reason)),
+      pending: ["q1", "q2"].map((qitemId) => ({ qitemId, destination: "dev-impl@r", waitingSince: new Date(NOW - 120_000).toISOString(), tags: ["tarefa-nova"] })),
+    });
+    // The lens's simulation: max 8, 2 pending, both seats unreadable. Before: 2 -> 4 -> 6 -> 8 with no dispatch.
+    const unread = planSeatPool(sp, state(["environment of pid 500 not read: the environments took over 5000 ms", "pane not found"]), NOW, 120_000);
+    expect(unread.intents.filter((i) => i.kind === "dispatch" || i.kind === "drain" || i.kind === "add")).toEqual([]);
+    expect(unread).toMatchObject({ reason: "steady", target: 2, current: 2 });
+    // A real process still counts as occupied: the pool grows for the rows it can't take (T-006251 B1).
+    const real = planSeatPool(sp, state(["suite-flock (pid 9, TMUX_PANE %24)", "congelar-eval (pid 7)"]), NOW, 120_000);
+    expect(real.intents.filter((i) => i.kind === "dispatch" || i.kind === "drain")).toEqual([]);
+    expect(real).toMatchObject({ reason: "scale_up", target: 4, current: 2 });
+  });
+
+  it("S9: environment reads past the deadline of one read still count against the next read: no new read starts while 4 are pending", async () => {
+    const { deps } = scene({ occupantAgoS: 7200, orphanAgoS: 3600 });
+    const rows: BusyProcessRow[] = [
+      { pid: 100, ppid: 1, command: "/bin/bash -l" }, { pid: 101, ppid: 100, command: "claude" },
+      ...[501, 502, 503, 504, 505].map((pid) => ({ pid, ppid: 1, command: "suite-flock nice x" })),
+    ];
+    let calls = 0;
+    const hang = (): Promise<string | null> => { calls += 1; return new Promise<never>(() => {}); };
+    const base = { ...deps, processes: async () => rows, processPane: hang };
+    const first = await readSeatPoolBusySessions(["qa-s7@r"], PROGRAMS, base, { timeoutMs: 20 });
+    expect(first.get("qa-s7@r")).toMatch(/not read/);
+    expect(calls).toBe(4);
+    const second = await readSeatPoolBusySessions(["qa-s7@r"], PROGRAMS, base, { timeoutMs: 20 });
+    expect(calls).toBe(4);
+    expect(second.get("qa-s7@r")).toMatch(/still pending/);
+    expect(seatPoolBusyFromProcess(second.get("qa-s7@r"))).toBe(false);
+  });
+
+  it("S10: the occupant of a shell pane is its runtime (claude), not a newer sibling the shell started; an orphan of this runtime holds", async () => {
+    const rows: BusyProcessRow[] = [
+      { pid: 100, ppid: 1, command: "/bin/bash -l", startedAt: agoS(90_000) },
+      { pid: 101, ppid: 100, command: "/home/bruno/.local/bin/claude --dangerously-skip-permissions", startedAt: agoS(7200) },
+      { pid: 102, ppid: 100, command: "sleep 100", startedAt: agoS(60) },
+      { pid: 500, ppid: 1, command: "bash /home/bruno/.local/bin/suite-flock nice -n 10 python3 -I t.py", startedAt: agoS(3600) },
+    ];
+    expect(seatPoolPaneOccupantMs(rows, 100)).toBe(Date.parse(agoS(7200)));
+    const { deps } = scene({ occupantAgoS: 7200, orphanAgoS: 3600 });
+    const read = await readSeatPoolBusySessions(["qa-s7@r"], PROGRAMS, { ...deps, processes: async () => rows });
+    expect(read.get("qa-s7@r")).toBe("suite-flock (pid 500, TMUX_PANE %24)");
+    // With no runtime among the children, the newest child, as before.
+    expect(seatPoolPaneOccupantMs(rows.filter((r) => r.pid !== 101), 100)).toBe(Date.parse(agoS(60)));
+  });
+
+  it("S11: the boundaries of the ceiling and of the occupant (each comparison, both sides)", async () => {
+    const at = async (occupantAgoS: number, orphanAgoS: number, ceiling: number) => {
+      const { deps } = scene({ occupantAgoS, orphanAgoS });
+      return (await readSeatPoolBusySessions(["qa-s7@r"], PROGRAMS, deps, { orphanMaxAgeSeconds: ceiling })).get("qa-s7@r");
+    };
+    expect(await at(50_000, 3600, 3600)).toMatch(/^suite-flock/); // exactly the ceiling: held
+    expect(await at(50_000, 3601, 3600)).toBeNull(); // one second older: free
+    expect(await at(3600, 3600, 43_200)).toMatch(/^suite-flock/); // started with the occupant: held
+    expect(await at(3600, 3601, 43_200)).toBeNull(); // one second before the occupant: free
+    expect(await at(3599, 3600, 43_200)).toBeNull(); // the occupant one second newer: free
   });
 });
