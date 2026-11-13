@@ -40,11 +40,18 @@ export function seatPoolBusyWrapper(name: string): boolean {
  * (`timeout -s KILL 600 …`) is taken for the program: a miss, not a false match.
  */
 export function seatPoolBusyCommand(command: string, programs: readonly string[]): string | null {
-  for (const token of command.split(/\s+/)) {
-    if (!token || token.startsWith("-") || ENV_ASSIGNMENT.test(token) || NUMBER.test(token)) continue;
-    const base = token.slice(token.lastIndexOf("/") + 1).replace(/^['"]|['"]$/g, "");
+  const program = firstProgram(command);
+  return program && programs.includes(program.base) ? program.base : null;
+}
+
+/** The program `command` runs, after the wrappers, options, assignments and numbers: its word and its base name. */
+function firstProgram(command: string): { token: string; base: string } | null {
+  for (const raw of command.split(/\s+/)) {
+    if (!raw || raw.startsWith("-") || ENV_ASSIGNMENT.test(raw) || NUMBER.test(raw)) continue;
+    const token = raw.replace(/^['"]|['"]$/g, "");
+    const base = token.slice(token.lastIndexOf("/") + 1);
     if (seatPoolBusyWrapper(base)) continue;
-    return programs.includes(base) ? base : null;
+    return { token, base };
   }
   return null;
 }
@@ -157,7 +164,7 @@ export async function readProcTmuxPane(pid: number, io: ProcEnvironmentIo, root 
 
 /** The environment reads still running, per reader (the daemon has one): a read past its deadline can't be cancelled
  *  and keeps a libuv thread, so it counts against the next read too (T-006251 S9). */
-const pendingReads = new WeakMap<object, { count: number }>();
+const pendingReads = new WeakMap<object, { count: number; waiters: Array<() => void> }>();
 
 /**
  * Whether a busy reason names a process the read found (`<program> (pid <n>)` or `<program> (pid <n>, TMUX_PANE <p>)`)
@@ -165,7 +172,8 @@ const pendingReads = new WeakMap<object, { count: number }>();
  * counts only the first as occupied (T-006251 S6): a failed read holds the seat back from a row but grows nothing.
  */
 export function seatPoolBusyFromProcess(reason: string | null | undefined): boolean {
-  return !!reason && /^[^\s()]+ \(pid \d+(, TMUX_PANE [^()]+)?\)$/.test(reason);
+  // The program is one word (a busy_processes entry has no whitespace, parentheses allowed): `run(1) (pid 9)` is a process.
+  return !!reason && /^\S+ \(pid \d+(, TMUX_PANE \S+)?\)$/.test(reason);
 }
 
 /** Runs `tasks` with at most `limit` at once, keeping their order. */
@@ -197,13 +205,21 @@ function startedMs(row: BusyProcessRow | undefined): number | null {
 
 /** Login and plain shells: a pane that runs one hosts its runtime as a child; any other pane process is the runtime. */
 const PANE_SHELLS: ReadonlySet<string> = new Set(["bash", "sh", "dash", "zsh", "fish", "ksh"]);
-/** The agent runtimes a launch starts in a shell pane (by the program the command runs, after the wrappers). */
-const PANE_RUNTIMES: readonly string[] = ["claude", "codex"];
+/** The agent runtimes a launch starts in a shell pane, by the program the command runs after the wrappers: the
+ *  runtimes by name, the native installer's versioned Claude, and Node running the npm package's cli.js. */
+const PANE_RUNTIMES: ReadonlySet<string> = new Set(["claude", "codex", "pi", "omp"]);
+function paneRuntime(command: string): boolean {
+  const program = firstProgram(command);
+  if (!program) return false;
+  return PANE_RUNTIMES.has(program.base)
+    || /\/@anthropic-ai\/claude-code\/cli\.m?js$/.test(program.token)
+    || /\/\.local\/share\/claude\/versions\/\d+\.\d+\.\d+(?:[-+][\w.-]+)?$/.test(program.token);
+}
 
 /**
  * When the pane's current occupant started, in ms (null when unknown): the runtime a launch starts in the pane. A pane
  * that runs a shell (`/bin/bash -l`, `-bash`) hosts the runtime as a child, and a fresh launch starts a new one in the
- * same shell: its newest runtime child (claude, codex; T-006251 S10: a newer sibling the shell started, a `sleep`, is
+ * same shell: its newest runtime child (claude, codex, pi, omp, Node running Claude's cli.js; T-006251 S10: a newer sibling the shell started, a `sleep`, is
  * not the occupant), or its newest child when none is a runtime. A pane that runs anything else runs the runtime
  * itself, whose own children are tool shells (a newer one says nothing of the occupant, T-006251 RC S1): the pane's
  * process.
@@ -213,7 +229,7 @@ export function seatPoolPaneOccupantMs(rows: readonly BusyProcessRow[], panePid:
   const first = (pane?.command.split(/\s+/).find(Boolean) ?? "").replace(/^-/, "");
   if (!pane || !PANE_SHELLS.has(first.slice(first.lastIndexOf("/") + 1))) return startedMs(pane);
   const children = rows.filter((row) => row.ppid === panePid);
-  const runtimes = children.filter((row) => seatPoolBusyCommand(row.command, PANE_RUNTIMES) !== null);
+  const runtimes = children.filter((row) => paneRuntime(row.command));
   return (runtimes.length > 0 ? runtimes : children).map(startedMs)
     .reduce<number | null>((max, ms) => ms !== null && (max === null || ms > max) ? ms : max, startedMs(pane));
 }
@@ -283,19 +299,28 @@ export async function readSeatPoolBusySessions(
     // the whole read takes at most `timeoutMs`.
     const deadline = Date.now() + timeoutMs;
     let pending = pendingReads.get(deps.processPane);
-    if (!pending) pendingReads.set(deps.processPane, pending = { count: 0 });
+    if (!pending) pendingReads.set(deps.processPane, pending = { count: 0, waiters: [] });
     const inFlight = pending;
     const read = await limited(matching.map((row) => async () => {
+      // S9: the reads still running (this call's, a concurrent call's, or an earlier call's past its deadline) hold
+      // libuv threads: past the limit a new read waits its turn until the deadline, and then counts as not read.
+      while (inFlight.count >= SEAT_POOL_BUSY_ENV_CONCURRENCY) {
+        const left = deadline - Date.now();
+        if (left <= 0) return { pid: row.pid, error: `environment reads still pending (${inFlight.count}) at the deadline` };
+        let release: () => void = () => {};
+        const turn = new Promise<void>((resolve) => { release = resolve; inFlight.waiters.push(resolve); });
+        try {
+          await within(turn, left, "a turn");
+        } catch {
+          inFlight.waiters.splice(inFlight.waiters.indexOf(release), 1);
+        }
+      }
       const left = deadline - Date.now();
       if (left <= 0) return { pid: row.pid, error: `the environments took over ${timeoutMs} ms` };
-      // S9: the reads an earlier call left running still hold libuv threads: past the limit no new one starts.
-      if (inFlight.count >= SEAT_POOL_BUSY_ENV_CONCURRENCY) {
-        return { pid: row.pid, error: `environment reads still pending from an earlier read (${inFlight.count})` };
-      }
       try {
         const started = deps.processPane!(row.pid);
         inFlight.count += 1;
-        const done = () => { inFlight.count -= 1; };
+        const done = () => { inFlight.count -= 1; inFlight.waiters.shift()?.(); };
         started.then(done, done);
         return { pid: row.pid, pane: await within(started, left, `the environment of pid ${row.pid}`) };
       } catch (error) {
@@ -306,7 +331,7 @@ export async function readSeatPoolBusySessions(
     for (const entry of read.sort((a, b) => a.pid - b.pid)) {
       if ("error" in entry) {
         const why = String(entry.error);
-        unread ??= why.startsWith("environment reads still pending") ? why : `environment of pid ${entry.pid} not read: ${why}`;
+        unread ??= `environment of pid ${entry.pid} not read: ${why}`;
         continue;
       }
       if (!entry.pane) continue;

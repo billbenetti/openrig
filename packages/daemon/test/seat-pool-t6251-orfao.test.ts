@@ -417,17 +417,17 @@ describe("T-006251 volta 1: B3, S6, S9, S10 and the S11 boundaries", () => {
   });
 
   it("seatPoolBusyFromProcess: only the read's process reasons are a process; every failure the read writes is not", () => {
-    for (const reason of ["suite-flock (pid 9)", "congelar-eval (pid 77, TMUX_PANE %9)", "suite-flock (pid 781461, TMUX_PANE %24)"]) {
+    for (const reason of ["suite-flock (pid 9)", "congelar-eval (pid 77, TMUX_PANE %9)", "suite-flock (pid 781461, TMUX_PANE %24)", "run(1) (pid 9)"]) {
       expect(seatPoolBusyFromProcess(reason)).toBe(true);
     }
     for (const reason of ["pane not found", "pane not read: db", "panes not read: x", "process table not read: EACCES",
       "environment of pid 500 not read: EMFILE: x", "busy processes not read: no /proc", "busy processes not read for this seat",
-      "environment reads still pending from an earlier read (4)", null, undefined, ""]) {
+      "environment of pid 5 not read: environment reads still pending (4) at the deadline", "panes not read: boom (pid 3)", null, undefined, ""]) {
       expect(seatPoolBusyFromProcess(reason)).toBe(false);
     }
   });
 
-  it("S6: a free seat held only because its processes could not be read takes no row, is not drained, and does not grow the pool", () => {
+  it("S6: a free seat held only because its processes could not be read takes no row, is not drained, holds its place and grows the pool by one seat at most", () => {
     const sp = (parseSeatPoolSpec({ max: 8, min: 0, cwd_template: "/w/{slot}", cooldown_s: 0, idle_grace_s: 60, dispatch_after_s: 60,
       dispatch_to_parked: { busy_processes: PROGRAMS } }) as { spec: SeatPoolSpec }).spec;
     const slot = (slotId: number, busyProcess: string | null): SeatPoolSlotView => ({
@@ -441,14 +441,72 @@ describe("T-006251 volta 1: B3, S6, S9, S10 and the S11 boundaries", () => {
       slots: reasons.map((reason, i) => slot(i + 1, reason)),
       pending: ["q1", "q2"].map((qitemId) => ({ qitemId, destination: "dev-impl@r", waitingSince: new Date(NOW - 120_000).toISOString(), tags: ["tarefa-nova"] })),
     });
-    // The lens's simulation: max 8, 2 pending, both seats unreadable. Before: 2 -> 4 -> 6 -> 8 with no dispatch.
-    const unread = planSeatPool(sp, state(["environment of pid 500 not read: the environments took over 5000 ms", "pane not found"]), NOW, 120_000);
-    expect(unread.intents.filter((i) => i.kind === "dispatch" || i.kind === "drain" || i.kind === "add")).toEqual([]);
-    expect(unread).toMatchObject({ reason: "steady", target: 2, current: 2 });
+    // The lens's simulation: max 8, 2 pending, both seats unreadable. Before: 2 -> 4 -> 6 -> 8 with no dispatch. Now one
+    // seat more (it takes a row when the failure was the seat's own), and a seat added that fails the same read grows
+    // nothing more.
+    const failed = "environment of pid 500 not read: the environments took over 5000 ms";
+    const unread = planSeatPool(sp, state([failed, "pane not found"]), NOW, 120_000);
+    expect(unread.intents.filter((i) => i.kind === "dispatch" || i.kind === "drain")).toEqual([]);
+    expect(unread).toMatchObject({ reason: "scale_up", target: 3, current: 2 });
+    expect(unread.intents).toContainEqual({ kind: "add", count: 1 });
+    const next = planSeatPool(sp, state([failed, "pane not found", failed]), NOW, 120_000);
+    expect(next.intents.filter((i) => i.kind === "dispatch" || i.kind === "drain" || i.kind === "add")).toEqual([]);
+    expect(next).toMatchObject({ reason: "steady", target: 3, current: 3 });
+    // No rows waiting: nothing grows, and the unread seats are neither drained nor counted away.
+    const quietPool = planSeatPool(sp, { ...state([failed, failed]), pending: [] }, NOW, 120_000);
+    expect(quietPool.intents.filter((i) => i.kind === "drain" || i.kind === "add" || i.kind === "remove")).toEqual([]);
+    expect(quietPool).toMatchObject({ target: 2, current: 2 });
     // A real process still counts as occupied: the pool grows for the rows it can't take (T-006251 B1).
     const real = planSeatPool(sp, state(["suite-flock (pid 9, TMUX_PANE %24)", "congelar-eval (pid 7)"]), NOW, 120_000);
     expect(real.intents.filter((i) => i.kind === "dispatch" || i.kind === "drain")).toEqual([]);
     expect(real).toMatchObject({ reason: "scale_up", target: 4, current: 2 });
+  });
+
+  it("S6 (lens review): a seat starting is not removed when a seat's read flips from a process to a failure", () => {
+    const sp = (parseSeatPoolSpec({ max: 8, min: 0, cwd_template: "/w/{slot}", cooldown_s: 0, idle_grace_s: 60, dispatch_after_s: 60,
+      dispatch_to_parked: { busy_processes: PROGRAMS } }) as { spec: SeatPoolSpec }).spec;
+    const view = (slotId: number, over: Partial<SeatPoolSlotView>): SeatPoolSlotView => ({
+      slotId, logicalId: `dev.impl-s${slotId}`, sessionName: `dev-impl-s${slotId}@r`, nodeId: `node-${slotId}`, phase: "live", adopted: false,
+      nodeExists: true, openRows: 0, heldMessages: 0, idleSince: new Date(NOW - 3_600_000).toISOString(), cause: "idle", atPrompt: true,
+      backgroundWork: false, ...over,
+    });
+    const state = (slots: SeatPoolSlotView[]): SeatPoolState => ({
+      model: { rigId: "rig-1", rigName: "r", podNamespace: "dev", memberId: "impl", logicalId: "dev.impl", nodeId: "model", sessionName: "dev-impl@r" },
+      modelCause: "working", restoring: false, adoptable: [], demand: null, lastScaleAt: null, slots,
+      pending: [{ qitemId: "q1", destination: "dev-impl@r", waitingSince: new Date(NOW - 120_000).toISOString(), tags: ["tarefa-nova"] }],
+    });
+    const starting = view(2, { phase: "added", idleSince: null, cause: "idle" });
+    const flipped = planSeatPool(sp, state([view(1, { busyProcess: "environment of pid 9 not read: x" }), starting]), NOW, 120_000);
+    expect(flipped.intents.some((i) => i.kind === "remove")).toBe(false);
+    expect(flipped.intents).toContainEqual({ kind: "launch", slotId: 2 });
+    expect(flipped).toMatchObject({ target: 2, current: 2 });
+    // A failure of one seat only (its pane gone): the pool adds a seat, which takes the row.
+    const single = planSeatPool(sp, state([view(1, { busyProcess: "pane not found" })]), NOW, 120_000);
+    expect(single).toMatchObject({ reason: "scale_up", target: 2, current: 1 });
+  });
+
+  it("S9: a read waits its turn while 4 environment reads are running (a concurrent read is served once they end)", async () => {
+    const { deps } = scene({ occupantAgoS: 7200, orphanAgoS: 3600 });
+    const rows: BusyProcessRow[] = [
+      { pid: 100, ppid: 1, command: "/bin/bash -l" }, { pid: 101, ppid: 100, command: "claude" },
+      ...[501, 502, 503, 504].map((pid) => ({ pid, ppid: 1, command: "suite-flock nice x" })),
+    ];
+    let running = 0;
+    let most = 0;
+    const slow = async (pid: number): Promise<string | null> => {
+      running += 1; most = Math.max(most, running);
+      await new Promise((resolve) => setTimeout(resolve, 30));
+      running -= 1;
+      return pid === 501 ? "%24" : null;
+    };
+    const base = { ...deps, processes: async () => rows, processPane: slow };
+    const [a, b] = await Promise.all([
+      readSeatPoolBusySessions(["qa-s7@r"], PROGRAMS, base, { timeoutMs: 2000 }),
+      readSeatPoolBusySessions(["qa-s7@r"], PROGRAMS, base, { timeoutMs: 2000 }),
+    ]);
+    expect(most).toBe(4);
+    expect(a.get("qa-s7@r")).toBe("suite-flock (pid 501, TMUX_PANE %24)");
+    expect(b.get("qa-s7@r")).toBe("suite-flock (pid 501, TMUX_PANE %24)");
   });
 
   it("S9: environment reads past the deadline of one read still count against the next read: no new read starts while 4 are pending", async () => {
@@ -482,6 +540,12 @@ describe("T-006251 volta 1: B3, S6, S9, S10 and the S11 boundaries", () => {
     expect(read.get("qa-s7@r")).toBe("suite-flock (pid 500, TMUX_PANE %24)");
     // With no runtime among the children, the newest child, as before.
     expect(seatPoolPaneOccupantMs(rows.filter((r) => r.pid !== 101), 100)).toBe(Date.parse(agoS(60)));
+    // Claude run by Node from the npm package (Sol on the delta) and the native installer's versioned file are runtimes.
+    for (const command of ["node /usr/lib/node_modules/@anthropic-ai/claude-code/cli.js --resume x",
+      "/home/u/.local/share/claude/versions/2.1.3 --dangerously-skip-permissions", "codex resume abc"]) {
+      const viaNode = rows.map((r) => (r.pid === 101 ? { ...r, command } : r));
+      expect(seatPoolPaneOccupantMs(viaNode, 100)).toBe(Date.parse(agoS(7200)));
+    }
   });
 
   it("S11: the boundaries of the ceiling and of the occupant (each comparison, both sides)", async () => {

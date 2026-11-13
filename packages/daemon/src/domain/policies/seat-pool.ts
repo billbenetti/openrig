@@ -702,8 +702,10 @@ export function planSeatPool(spec: SeatPoolSpec, state: SeatPoolState, nowMs: nu
   const quiet = (slot: SeatPoolSlotView) => slot.openRows === 0 && slot.heldMessages === 0 && slot.idleSince !== null;
   const idle = (slot: SeatPoolSlotView) => quiet(slot) && !heldBusy(slot);
   // T-006251 S6: a quiet seat held only because its processes could not be read (a timeout under load, an unreadable
-  // environment) takes no row and is never drained, but it is no occupant either: counting it grew the pool to `max`
-  // with no row dispatched. Only a process the read found makes a quiet seat occupied.
+  // environment, its pane not found) takes no row and is never drained, but it is no occupant either: counting it grew
+  // the pool to `max` with no row dispatched (every seat added failed the same read). It still holds its place in the
+  // target (no seat starting is removed for it), and while rows wait undispatched it adds at most ONE seat, which takes a
+  // row when the failure was that seat's own (lens review of the volta 1).
   const heldUnread = (slot: SeatPoolSlotView) => quiet(slot) && heldBusy(slot) && !seatPoolBusyFromProcess(slot.busyProcess);
   const usageLimited = seatPoolOutOfUsage(state);
 
@@ -755,6 +757,7 @@ export function planSeatPool(spec: SeatPoolSpec, state: SeatPoolState, nowMs: nu
   }
 
   const occupied = live.filter((slot) => (!idle(slot) && !heldUnread(slot)) || receiving.has(slot));
+  const unread = live.filter((slot) => heldUnread(slot) && !receiving.has(slot));
   const free = live.filter((slot) => idle(slot) && !receiving.has(slot) && nowMs - Date.parse(slot.idleSince!) >= spec.idleGraceSeconds * 1000);
   const current = live.length + starting.length;
   const cooling = !spec.drain && state.lastScaleAt !== null && nowMs - Date.parse(state.lastScaleAt) < spec.cooldownSeconds * 1000;
@@ -770,14 +773,15 @@ export function planSeatPool(spec: SeatPoolSpec, state: SeatPoolState, nowMs: nu
       const fresh = state.demand !== null && nowMs - Date.parse(state.demand.sampledAt) <= sampleMaxAgeMs;
       desired = fresh ? state.demand!.desired : null;
     } else {
-      desired = movable.length - dispatched.length + occupied.length;
+      desired = movable.length - dispatched.length + occupied.length
+        + (unread.length > 0 && movable.length > dispatched.length ? 1 : 0);
     }
     if (desired === null) {
       // No current answer from the demand command: keep what exists and finish what was started.
       if (!usageLimited) for (const slot of starting) intents.push({ kind: "launch", slotId: slot.slotId });
       return { intents, reason: "demand_sample_stale", target: null, current };
     }
-    target = Math.min(spec.max, Math.max(spec.min, desired, occupied.length + starting.length));
+    target = Math.min(spec.max, Math.max(spec.min, desired, occupied.length + unread.length + starting.length));
     reason = target > current ? "scale_up" : target < current ? "scale_down" : "steady";
     if (usageLimited && target > current) {
       target = current;
