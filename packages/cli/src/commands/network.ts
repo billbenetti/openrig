@@ -1,6 +1,6 @@
 import { Command } from "commander";
 import { lstatSync, readFileSync } from "node:fs";
-import { DaemonClient, operatorAuthHeaders } from "../client.js";
+import { DaemonClient, withOperatorBearerRetry } from "../client.js";
 import { getDaemonStatus, getDaemonUrl, daemonStatusGuard, type LifecycleDeps } from "../daemon-lifecycle.js";
 import { realDeps } from "./daemon.js";
 
@@ -83,8 +83,9 @@ export function networkCommand(depsOverride?: NetworkDeps): Command {
     .action(async (code: string, opts: { site: string; allowHttp?: boolean; replace?: boolean; json?: boolean }) => {
       const daemon = await client();
       if (!daemon) return;
-      const res = await daemon.post<Record<string, unknown>>("/api/network/installations", { code, site: opts.site, allowHttp: opts.allowHttp === true, replace: opts.replace === true },
-        { headers: operatorAuthHeaders(), timeoutMs: ACCOUNT_WRITE_TIMEOUT_MS });
+      const res = await withOperatorBearerRetry(undefined, (headers) => daemon.post<Record<string, unknown>>("/api/network/installations",
+        { code, site: opts.site, allowHttp: opts.allowHttp === true, replace: opts.replace === true },
+        { headers, timeoutMs: ACCOUNT_WRITE_TIMEOUT_MS }), { fallback: "terminal" });
       finish(res.status, res.data, opts.json, (i) => {
         const replaced = (i as { replaced?: { endedBindings?: Array<{ id: string; localSession: string; participantName: string | null }>; problems?: string[] } }).replaced;
         const ended = replaced?.endedBindings ?? [];
@@ -125,7 +126,8 @@ export function networkCommand(depsOverride?: NetworkDeps): Command {
       }
       const daemon = await client();
       if (!daemon) return;
-      const res = await daemon.post<Record<string, unknown>>("/api/network/bindings", body, { headers: operatorAuthHeaders(), timeoutMs: ACCOUNT_WRITE_TIMEOUT_MS });
+      const res = await withOperatorBearerRetry(undefined, (headers) => daemon.post<Record<string, unknown>>("/api/network/bindings", body,
+        { headers, timeoutMs: ACCOUNT_WRITE_TIMEOUT_MS }), { fallback: "terminal" });
       finish(res.status, res.data, opts.json, (b) => `Connected ${line(b as unknown as Binding)}\nWork for ${(b as unknown as Binding).hubSeat} reaches ${seat} once the connector runs; rig network status shows its last contact.`);
     });
 
@@ -151,8 +153,9 @@ export function networkCommand(depsOverride?: NetworkDeps): Command {
     .action(async (ref: string, opts: { reason?: string; json?: boolean }) => {
       const daemon = await client();
       if (!daemon) return;
-      const res = await daemon.post<Record<string, unknown>>(`/api/network/bindings/${encodeURIComponent(ref)}/disconnect`, { reason: opts.reason },
-        { headers: operatorAuthHeaders(), timeoutMs: ACCOUNT_WRITE_TIMEOUT_MS });
+      const res = await withOperatorBearerRetry(undefined, (headers) => daemon.post<Record<string, unknown>>(
+        `/api/network/bindings/${encodeURIComponent(ref)}/disconnect`, { reason: opts.reason },
+        { headers, timeoutMs: ACCOUNT_WRITE_TIMEOUT_MS }), { fallback: "terminal" });
       finish(res.status, res.data, opts.json, (raw) => {
         const b = raw as unknown as Binding;
         if (b.accountRemoval === "confirmed") return `Disconnected ${line(b)}\nThe account stopped listing ${b.participantName}, which revokes it there.`;

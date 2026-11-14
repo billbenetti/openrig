@@ -3,7 +3,7 @@ import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { Command } from "commander";
 import { Hono } from "hono";
 import Database from "better-sqlite3";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { networkCommand, type NetworkDeps } from "../src/commands/network.js";
@@ -158,6 +158,22 @@ it("enrolls with the account page's code, connects a seat by name through it, an
   // Every network write waits past the daemon's 30 s account deadline, so the account's own answer is what's shown.
   expect(posts.map((p) => p.url)).toEqual(["/api/network/installations", "/api/network/bindings", expect.stringMatching(/^\/api\/network\/bindings\/.+\/disconnect$/)]);
   for (const p of posts) expect(p.timeoutMs).toBeGreaterThanOrEqual(45_000);
+});
+
+it("an env bearer rotated away (T-007930): connect and disconnect retry once with the operator bearer file and go through", async () => {
+  app = routesWith("op-secret");
+  const out = vi.spyOn(console, "log").mockImplementation(() => {});
+  const err = vi.spyOn(console, "error").mockImplementation(() => {});
+  writeFileSync(join(home, "bearer"), "op-secret\n", { mode: 0o600 });
+  vi.stubEnv("OPENRIG_AUTH_BEARER_FILE", join(home, "bearer"));
+  vi.stubEnv("OPENRIG_AUTH_BEARER_TOKEN", "rotated-away");
+  await cli({ "/tok": "tok-abc" }).parseAsync(["node", "rig", "network", "connect", "dev-impl@lab", "--hub", "https://hub.example/mcp", "--as", "alex@team", "--token-file", "/tok"]);
+  expect(process.exitCode).toBeUndefined();
+  expect(String(out.mock.calls.at(-1)?.[0])).toMatch(/^Connected netb-/);
+  await cli().parseAsync(["node", "rig", "network", "disconnect", "dev-impl@lab"]);
+  expect(process.exitCode).toBeUndefined();
+  expect(String(out.mock.calls.at(-1)?.[0])).toMatch(/^Disconnected netb-/);
+  expect([...out.mock.calls, ...err.mock.calls].flat().join("\n")).not.toMatch(/op-secret|rotated-away/);
 });
 
 it("sends the operator bearer on its writes, so a daemon with one configured takes them", async () => {

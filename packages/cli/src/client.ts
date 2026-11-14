@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import { assessLocalDaemonOwner, ForeignLocalDaemonError, type LocalDaemonOwner } from "./local-daemon-owner.js";
 export { ForeignLocalDaemonError } from "./local-daemon-owner.js";
+import os from "node:os";
 import path from "node:path";
 import { ConfigStore } from "./config-store.js";
 import { getOpenRigHome, readOpenRigEnv, readOpenRigUrl } from "./openrig-compat.js";
@@ -18,6 +19,41 @@ export function terminalAuthHeaders(): Record<string, string> {
 export function operatorAuthHeaders(bearer?: string): Record<string, string> {
   const token = bearer?.trim() || process.env.OPENRIG_AUTH_BEARER_TOKEN?.trim();
   return token ? { Authorization: `Bearer ${token}` } : terminalAuthHeaders();
+}
+
+/** Where an operator-gated write re-reads the operator bearer after a 401: OPENRIG_AUTH_BEARER_FILE, else
+ *  ~/.config/setup/openrig-bearer.token. A seat keeps the env it started with, so after the daemon's bearer rotates its
+ *  OPENRIG_AUTH_BEARER_TOKEN (or the --bearer it was told) is stale; the file holds the current one. */
+export function operatorBearerFilePath(): string {
+  return process.env.OPENRIG_AUTH_BEARER_FILE?.trim() || path.join(os.homedir(), ".config", "setup", "openrig-bearer.token");
+}
+
+function readOperatorBearerFile(): string | null {
+  try {
+    return fs.readFileSync(operatorBearerFilePath(), "utf-8").trim() || null;
+  } catch {
+    return null;
+  }
+}
+
+/** Sends an operator-gated write with the bearer from `explicit` (--bearer), else OPENRIG_AUTH_BEARER_TOKEN, and on a 401
+ *  sends it once more with the bearer read from operatorBearerFilePath(), only when that file holds a different value. The
+ *  daemon's bearer gate answers 401 before any handler runs, so the refused request wrote nothing. Never more than two
+ *  requests; a 403 or any other status is returned as it came; nothing is printed (the value never reaches output). With
+ *  neither --bearer nor the env, the request goes with `fallback` (none, or the terminal credential as operatorAuthHeaders
+ *  does) and is not retried. */
+export async function withOperatorBearerRetry<T>(
+  explicit: string | undefined,
+  send: (headers: Record<string, string>) => Promise<DaemonResponse<T>>,
+  opts: { fallback?: "none" | "terminal" } = {},
+): Promise<DaemonResponse<T>> {
+  const sent = explicit?.trim() || process.env.OPENRIG_AUTH_BEARER_TOKEN?.trim();
+  if (!sent) return send(opts.fallback === "terminal" ? terminalAuthHeaders() : {});
+  const first = await send({ Authorization: `Bearer ${sent}` });
+  if (first.status !== 401) return first;
+  const current = readOperatorBearerFile();
+  if (!current || current === sent) return first;
+  return send({ Authorization: `Bearer ${current}` });
 }
 
 /** The header carrying the caller's seat identity, derived ONCE at the transport chokepoint. */
