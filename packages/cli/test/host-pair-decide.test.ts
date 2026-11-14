@@ -188,7 +188,7 @@ describe("rig host approve against the real pairing route, with distinct credent
     try {
       const { out, err, exitCode } = await run(["approve", pair.code]);
       expect(exitCode).toBeUndefined();
-      expect(out).toContain(`Approved pairing ${pair.code} from requester@far-host, as operator-agent@kernel.`);
+      expect(out).toContain(`Approved pairing ${pair.code} from "requester@far-host", as operator-agent@kernel.`);
       expect(`${out}\n${err}`).not.toMatch(/synthetic-rotated-away-bearer|synthetic-operator-bearer/);
       expect(await poll(pair.pairId)).toEqual({ status: "approved", token: AUTH });
     } finally {
