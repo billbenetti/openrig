@@ -25,7 +25,7 @@ import { addHumanFragment, loadHumanRegistry } from "../../daemon/src/domain/gat
 import { setDefaultPerson } from "../../daemon/src/domain/gateway/participants.js";
 import { makeQueuePorts } from "../../daemon/src/domain/gateway/slack/queue-access.js";
 import { buildOutboundMessage } from "../../daemon/src/domain/gateway/slack/message.js";
-import { createHash } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { addGrant, McpHttpConfigError, readGrantServiceHeader, startMcpHttpServer } from "../src/mcp-http.js";
 import { mcpCommand } from "../src/commands/mcp.js";
 
@@ -54,6 +54,8 @@ describe("rig mcp serve --http --grant-service on the daemon's routes", () => {
   let daemon: ServerType;
   let daemonUrl: string;
   let setup: ReturnType<typeof createTestApp>;
+  /** The daemon app's deps, so a test can serve a second app on the same database with one more (a bearer). */
+  let appDeps: Record<string, unknown>;
   let service: http.Server;
   let serviceUrl: string;
   /** What the fake authority answers next: [HTTP status, body or raw text]. */
@@ -75,7 +77,8 @@ describe("rig mcp serve --http --grant-service on the daemon's routes", () => {
     repo = new QueueRepository(db, bus, { validateRig: () => true });
     // Steering's own write path, so a person's answer through an assistant goes where Steering's does.
     const missionControlWriteContract = new MissionControlWriteContract({ db, eventBus: bus, queueRepo: repo, actionLog: new MissionControlActionLog(db) });
-    setup = createTestApp(db, { appDeps: { queueRepo: repo, missionControlWriteContract, filesAllowlist: [{ name: "proof", canonicalPath: shared }] } });
+    appDeps = { queueRepo: repo, missionControlWriteContract, filesAllowlist: [{ name: "proof", canonicalPath: shared }] };
+    setup = createTestApp(db, { appDeps });
     broken = undefined;
     const fetchRoute = (...args: Parameters<typeof setup.app.fetch>) => broken?.(args[0]) ?? setup.app.fetch(...args);
     daemon = await new Promise<ServerType>((resolve) => { const s = serve({ fetch: fetchRoute, port: 0, hostname: "127.0.0.1" }, () => resolve(s)); });
@@ -718,6 +721,70 @@ describe("rig mcp serve --http --grant-service on the daemon's routes", () => {
       expect(changed.structured).toMatchObject({ ok: false, code: "not_waiting_on_person", state: "done", answered: { layout: "b" } });
       expect(replies(row.qitemId)).toBe(1);
       expect(audit(row.qitemId)).toHaveLength(1);
+    });
+
+    it("T-008454: answers through a daemon whose operator routes need a bearer: the Authorization goes only on the answer, and its value reaches no reply nor log", async () => {
+      // A daemon on the same database whose operator gate takes only TOKEN (as one started with OPENRIG_AUTH_BEARER_TOKEN);
+      // the values are made at run time, and only whether a request carried an Authorization is recorded.
+      const TOKEN = `fake-${randomBytes(12).toString("hex")}`;
+      const OTHER = `fake-${randomBytes(12).toString("hex")}`;
+      const gated = createTestApp(db, { appDeps: { ...appDeps, missionControlBearerToken: TOKEN } });
+      const carried: Array<[string, string, boolean]> = [];
+      const gatedDaemon = await new Promise<ServerType>((resolve) => {
+        const s = serve({ fetch: (...args: Parameters<typeof gated.app.fetch>) => {
+          carried.push([args[0].method, new URL(args[0].url).pathname, args[0].headers.has("authorization")]);
+          return gated.app.fetch(...args);
+        }, port: 0, hostname: "127.0.0.1" }, () => resolve(s));
+      });
+      closers.push(() => new Promise<void>((resolve) => gatedDaemon.close(() => resolve())));
+      daemonUrl = `http://127.0.0.1:${(gatedDaemon.address() as AddressInfo).port}`;
+      // The bearer file of the retry is never the real one of this home.
+      vi.stubEnv("OPENRIG_AUTH_BEARER_FILE", path.join(home, "absent-openrig-bearer.token"));
+      const printed: string[] = [];
+      for (const m of ["log", "error", "warn", "info"] as const) {
+        vi.spyOn(console, m).mockImplementation((...a: unknown[]) => { printed.push(a.map(String).join(" ")); });
+      }
+      const results: unknown[] = [];
+      try {
+        register(PERSON, true);
+        answer = () => [200, grantFor(PERSON)];
+        const asPerson = await connect((await listen()).url);
+        const row = await ask(`${PERSON}@external`);
+        const listed = await asPerson("rig_question_list");
+        const item = listed.structured.items.find((entry: any) => entry.qitemId === row.qitemId);
+        const choose = async () => {
+          const r = await asPerson("rig_question_answer", { qitemId: row.qitemId, revision: item.revision, choices: [{ questionId: "layout", optionId: "b" }] });
+          results.push(r);
+          return r;
+        };
+        // authz negative: another bearer is refused by the gate and nothing is recorded
+        vi.stubEnv("OPENRIG_AUTH_BEARER_TOKEN", OTHER);
+        expect((await choose()).structured).toMatchObject({ ok: false, code: "unauthorized" });
+        // a malformed bearer is no bearer: refused for the missing header, never echoed
+        vi.stubEnv("OPENRIG_AUTH_BEARER_TOKEN", `${TOKEN}\nx`);
+        expect((await choose()).structured).toMatchObject({ ok: false, code: "unauthorized" });
+        expect(repo.getById(row.qitemId)!.state).not.toBe("done");
+        expect(repo.getById(row.qitemId)!.humanAnswers ?? null).toBeNull();
+        expect(audit(row.qitemId)).toEqual([]);
+        // the operator bearer of this process: the answer is recorded, as the person
+        vi.stubEnv("OPENRIG_AUTH_BEARER_TOKEN", TOKEN);
+        const answered = await choose();
+        expect(answered.structured).toMatchObject({ ok: true, outcome: "answered", submitted: [{ questionId: "layout", optionId: "b" }] });
+        expect(repo.getById(row.qitemId)).toMatchObject({ state: "done", humanAnswers: { layout: "b" } });
+        expect(audit(row.qitemId)).toEqual([expect.objectContaining({ actor: `${PERSON}@external` })]);
+        // the bearer rode only on the answer's writes, never on the reads of the seat or of the person
+        const withAuth = carried.filter(([, , auth]) => auth).map(([method, pathname]) => `${method} ${pathname}`);
+        expect(new Set(withAuth)).toEqual(new Set(["POST /api/mission-control/action"]));
+        expect(carried.filter(([, , auth]) => !auth).length).toBeGreaterThan(0);
+        // and an answer without it is still refused by the gate
+        const bare = await fetch(`${daemonUrl}/api/mission-control/action`, { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
+        expect(bare.status).toBe(401);
+      } finally {
+        vi.unstubAllEnvs();
+        vi.restoreAllMocks();
+      }
+      const everything = JSON.stringify(results) + printed.join("\n");
+      for (const value of [TOKEN, OTHER]) expect(everything).not.toContain(value);
     });
 
     it("answers several questions in one call, and records the person's own words exactly", async () => {

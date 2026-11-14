@@ -77,6 +77,21 @@ describe("withOperatorBearerRetry: one retry on a 401 with the bearer from the f
     expect(g.seen).toEqual([`Bearer ${OLD}`, `Bearer ${NEW}`]);
   });
 
+  it("T-008454: a malformed bearer in the env or --bearer (a line break, a blank inside) is no bearer: sent without Authorization, once, and never echoed", async () => {
+    writeFile(NEW);
+    for (const bad of [`${OLD}\nx`, `${OLD} x`, `${OLD}\u0007`]) {
+      process.env.OPENRIG_AUTH_BEARER_TOKEN = bad;
+      const g = gate(NEW);
+      const res = await withOperatorBearerRetry(LOCAL, undefined, g.send);
+      expect(res.status).toBe(401);
+      expect(g.seen).toEqual([undefined]);
+      delete process.env.OPENRIG_AUTH_BEARER_TOKEN;
+      const h = gate(NEW);
+      expect((await withOperatorBearerRetry(LOCAL, bad, h.send)).status).toBe(401);
+      expect(h.seen).toEqual([undefined]);
+    }
+  });
+
   it("no file: the original 401, one request", async () => {
     process.env.OPENRIG_AUTH_BEARER_TOKEN = OLD;
     const g = gate(NEW);
