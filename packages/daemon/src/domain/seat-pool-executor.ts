@@ -23,6 +23,7 @@ import {
   seatPoolParkedLoadOver,
   seatPoolHeldByProcess,
   seatPoolReceives,
+  seatPoolRefusedCooldown,
   seatPoolDrainEpisode,
   seatPoolReapable,
   seatPoolRoom,
@@ -306,6 +307,8 @@ export interface SeatPoolStateReaderDeps {
   /** Why a seat is busy with heavy local work (readSeatPoolBusySessions), null when it is not, undefined when it was not
    *  read. Asked only for a spec whose `dispatch_to_parked` sets `busy_processes`; absent, no seat is held back. */
   busyProcess?(sessionName: string): string | null | undefined;
+  /** The clock the parked refusal is read against (`refused_cooldown_s`). Absent: Date.now. */
+  now?(): number;
 }
 
 /** load1 per CPU, in percent; null when the host gives no reading. */
@@ -313,26 +316,170 @@ export function hostLoadPerCpuPercent(host: HostSample): number | null {
   return host.load1 === null ? null : host.load1 / host.cpuCount * 100;
 }
 
+/** How far back the job's history is read for the pool's moves (seat_pool_dispatched): a day, the shortest retention
+ *  the settings allow (MAX_DRAIN_DEADLINE_SECONDS) and the longest `refused_cooldown_s`. */
+const POOL_MOVES_HISTORY_SECONDS = 86_400;
+
+/** One of the pool's moves of a row to a seat, as `seat_pool_dispatched` recorded it. */
+interface PoolMove {
+  to: string;
+  qitemId: string;
+  /** `parked` or `free` (null: a record from before dispatch_to_parked, which says no mode). */
+  mode: string | null;
+  /** The seat's parks when the row was moved to it (parkedQitemIds, or the single parkedQitemId); null: not recorded. */
+  openRowIds: string[] | null;
+}
+
+/** The pool's moves in the last POOL_MOVES_HISTORY_SECONDS, newest first, from the job's history; empty without a
+ *  history table. Read once per state read, for every seat and row. */
+function readPoolMoves(db: Database.Database, jobId: string, nowMs: number): PoolMove[] {
+  if (!db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'watchdog_history'").get()) return [];
+  const since = new Date(nowMs - POOL_MOVES_HISTORY_SECONDS * 1000).toISOString();
+  const rows = db.prepare(
+    `SELECT evaluation_notes FROM watchdog_history
+      WHERE job_id = ? AND skip_reason = 'seat_pool_dispatched' AND evaluated_at >= ?
+      ORDER BY evaluated_at DESC, rowid DESC`,
+  ).all(jobId, since) as Array<{ evaluation_notes: string | null }>;
+  const moves: PoolMove[] = [];
+  for (const row of rows) {
+    let notes: Record<string, unknown>;
+    try {
+      notes = row.evaluation_notes ? JSON.parse(row.evaluation_notes) as Record<string, unknown> : {};
+    } catch {
+      continue;
+    }
+    if (typeof notes["to"] !== "string" || typeof notes["qitemId"] !== "string") continue;
+    const ids = Array.isArray(notes["parkedQitemIds"]) && notes["parkedQitemIds"].every((id) => typeof id === "string")
+      ? notes["parkedQitemIds"] as string[]
+      : typeof notes["parkedQitemId"] === "string" ? [notes["parkedQitemId"]] : null;
+    moves.push({ to: notes["to"], qitemId: notes["qitemId"], mode: typeof notes["mode"] === "string" ? notes["mode"] : null, openRowIds: ids });
+  }
+  return moves;
+}
+
+/**
+ * When a seat gave a row the pool moved to it straight back: the time of its handoff, made by one of `addresses`,
+ * after the latest move of the row by the queue's fallback actor (the pool's move) with no move to in-progress in
+ * between (a claim, or an update by the seat); null otherwise. A row the seat took and then handed on is no refusal.
+ * (claimed_at can't say it: an unclaim clears it.) The caller knows from the job's history that the pool moved the row
+ * to that seat.
+ */
+function refusedUntakenAt(db: Database.Database, qitemId: string, addresses: readonly string[]): string | null {
+  if (addresses.length === 0) return null;
+  const table = transitionsTableOf(db, qitemId);
+  const move = db.prepare(`SELECT MAX(transition_id) AS id FROM ${table} WHERE qitem_id = ? AND actor_session = ?`)
+    .get(qitemId, FALLBACK_ACTOR) as { id: number | null };
+  if (move.id === null) return null;
+  const taken = db.prepare(`SELECT 1 FROM ${table} WHERE qitem_id = ? AND transition_id > ? AND state = 'in-progress' LIMIT 1`)
+    .get(qitemId, move.id);
+  if (taken) return null;
+  const back = db.prepare(
+    `SELECT ts FROM ${table}
+      WHERE qitem_id = ? AND transition_id > ? AND state = 'handed-off' AND actor_session IN (${addresses.map(() => "?").join(",")})
+      ORDER BY transition_id DESC LIMIT 1`,
+  ).get(qitemId, move.id, ...addresses) as { ts: string } | undefined;
+  return back?.ts ?? null;
+}
+
+/** Where a row's transitions are: the live log, or the archive the retention sweep moves a closed row's transitions to
+ *  once they age (all of a row's at once, in one transaction: queue-retention.ts, archiveAgedTerminalTransitions). */
+function transitionsTableOf(db: Database.Database, qitemId: string): "queue_transitions" | "queue_transitions_archive" {
+  if (db.prepare("SELECT 1 FROM queue_transitions WHERE qitem_id = ? LIMIT 1").get(qitemId)) return "queue_transitions";
+  const archive = db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'queue_transitions_archive'").get();
+  return archive ? "queue_transitions_archive" : "queue_transitions";
+}
+
+/**
+ * A seat's parked refusal (SeatPoolSlotView.parkedRefusal): the pool's latest move of a row to the seat (`moves`,
+ * newest first) was made as parked, and the seat gave that row straight back (refusedUntakenAt) less than
+ * `cooldownSeconds` ago. Only the latest move counts: a row the seat took since ends the refusal before it. Read from the
+ * job's history and the queue, so a restart of the daemon keeps it. Null: no such refusal.
+ */
+function parkedRefusalOf(
+  deps: SeatPoolStateReaderDeps, moves: readonly PoolMove[], sessionName: string, cooldownSeconds: number, nowMs: number,
+): { at: string; openRowIds: string[] | null } | null {
+  const latest = moves.find((move) => move.to === sessionName);
+  if (!latest || latest.mode !== "parked") return null;
+  const at = refusedUntakenAt(deps.db, latest.qitemId, deps.sessionAddresses(sessionName));
+  if (at === null || !(nowMs - Date.parse(at) < cooldownSeconds * 1000)) return null;
+  return { at, openRowIds: latest.openRowIds };
+}
+
+/** The reason a dispatch gives the queue's move (the transition note reads `fallback-routed: <from> → <to> (<reason>)`):
+ *  the job, who had the row and why the seat could take it. seatPoolParkedMoveTo reads it back. */
+function seatPoolMoveReason(jobId: string, from: string, to: string, parkedOn: string | null): string {
+  return `seat pool ${jobId}: ${from} had not taken it; ${to} ${parkedOn !== null ? `was parked on ${parkedOn} (2nd row)` : "was free"}`;
+}
+
+/** The seat this pool's latest move of the row went to, when that move was a dispatch to a parked seat (the note
+ *  seatPoolMoveReason wrote, on the queue's own transition, live or archived: it lives as long as the row does, past the
+ *  job's history);
+ *  null for any other move, or none. */
+function seatPoolParkedMoveTo(db: Database.Database, qitemId: string, jobId: string): { seat: string; transitionId: number } | null {
+  const move = db.prepare(
+    `SELECT transition_id, transition_note FROM ${transitionsTableOf(db, qitemId)} WHERE qitem_id = ? AND actor_session = ? ORDER BY transition_id DESC LIMIT 1`,
+  ).get(qitemId, FALLBACK_ACTOR) as { transition_id: number; transition_note: string | null } | undefined;
+  const note = move?.transition_note ?? "";
+  const match = /^fallback-routed: .+? → (\S+) \(seat pool (\S+): .+ was parked on .+ \(2nd row\)\)$/.exec(note);
+  return move && match && match[2] === jobId ? { seat: match[1]!, transitionId: move.transition_id } : null;
+}
+
+/** The pool's seats that gave this row, or a row it succeeds by handoff (its chain of record), straight back untaken
+ *  after this pool moved it to them as parked (seatPoolParkedMoveTo, refusedUntakenAt). Read from the queue alone, so it
+ *  holds for the row's whole lineage. */
+function readRefusedBy(
+  deps: SeatPoolStateReaderDeps, jobId: string, chain: string | null, poolSeats: ReadonlySet<string>, addresses: (seat: string) => string[],
+): string[] {
+  if (!chain || poolSeats.size === 0) return [];
+  let ids: unknown;
+  try {
+    ids = JSON.parse(chain);
+  } catch {
+    return [];
+  }
+  if (!Array.isArray(ids)) return [];
+  const refused = new Set<string>();
+  for (const id of ids) {
+    if (typeof id !== "string") continue;
+    const moved = seatPoolParkedMoveTo(deps.db, id, jobId);
+    if (!moved || !poolSeats.has(moved.seat) || refused.has(moved.seat)) continue;
+    if (refusedUntakenAt(deps.db, id, addresses(moved.seat)) !== null) refused.add(moved.seat);
+  }
+  return [...refused];
+}
+
 /** Pending rows addressed to any of `sessions` (in any of their addresses), longest waiting first. A row waits from its
  *  latest reroute, or from its creation. Only pending rows: a claimed, blocked or closed row is never the pool's to
- *  move. */
-function readPendingRows(deps: SeatPoolStateReaderDeps, sessions: string[]): SeatPoolPendingRow[] {
+ *  move. With `refusal` (read only with `refused_cooldown_s` above 0: the job and the pool's seats), each row says
+ *  which of those seats gave it, or a row it succeeds, straight back (refusedBy). */
+function readPendingRows(
+  deps: SeatPoolStateReaderDeps, sessions: string[], refusal: { jobId: string; seats: ReadonlySet<string> } | null = null,
+): SeatPoolPendingRow[] {
   const sessionOf = new Map<string, string>();
   for (const session of sessions) {
     for (const address of deps.sessionAddresses(session)) if (!sessionOf.has(address)) sessionOf.set(address, session);
   }
   if (sessionOf.size === 0) return [];
   const rows = deps.db.prepare(
-    `SELECT q.qitem_id, q.destination_session, q.tags,
+    `SELECT q.qitem_id, q.destination_session, q.tags, q.chain_of_record,
             COALESCE((SELECT MAX(t.ts) FROM queue_transitions t WHERE t.qitem_id = q.qitem_id AND t.actor_session = ?), q.ts_created) AS since
        FROM queue_items q
       WHERE q.state = 'pending' AND q.destination_session IN (${[...sessionOf.keys()].map(() => "?").join(",")})
       ORDER BY since, q.qitem_id`,
-  ).all(FALLBACK_ACTOR, ...sessionOf.keys()) as Array<{ qitem_id: string; destination_session: string; tags: string | null; since: string }>;
-  return rows.map((row) => ({
-    qitemId: row.qitem_id, destination: sessionOf.get(row.destination_session)!, waitingSince: row.since,
-    tags: row.tags ? JSON.parse(row.tags) as string[] : [],
-  }));
+  ).all(FALLBACK_ACTOR, ...sessionOf.keys()) as Array<{ qitem_id: string; destination_session: string; tags: string | null; chain_of_record: string | null; since: string }>;
+  const seatAddresses = new Map<string, string[]>();
+  const addresses = (seat: string) => {
+    if (!seatAddresses.has(seat)) seatAddresses.set(seat, deps.sessionAddresses(seat));
+    return seatAddresses.get(seat)!;
+  };
+  return rows.map((row) => {
+    const refusedBy = refusal ? readRefusedBy(deps, refusal.jobId, row.chain_of_record, refusal.seats, addresses) : [];
+    return {
+      qitemId: row.qitem_id, destination: sessionOf.get(row.destination_session)!, waitingSince: row.since,
+      tags: row.tags ? JSON.parse(row.tags) as string[] : [],
+      ...(refusedBy.length > 0 ? { refusedBy } : {}),
+    };
+  });
 }
 
 /** The view's `busyProcess`, only when it was read. */
@@ -389,12 +536,18 @@ export function readSeatPoolState(deps: SeatPoolStateReaderDeps, job: { jobId: s
   const parkedRule = job.spec.dispatchToParked !== undefined;
   const maxOpenRows = job.spec.dispatchToParked?.maxOpenRows ?? 1;
   const busyRule = parkedRule && (job.spec.dispatchToParked?.busyProcesses?.length ?? 0) > 0 && deps.busyProcess;
+  // refused_cooldown_s above 0: each seat's parked refusal and each waiting row's refusing seats (T-008296).
+  const refusedCooldown = seatPoolRefusedCooldown(job.spec);
+  const nowMs = deps.now?.() ?? Date.now();
+  const poolMoves = refusedCooldown > 0 ? readPoolMoves(db, job.jobId, nowMs) : [];
   const slots = deps.slots.listOpen(job.jobId).map((slot): SeatPoolSlotView => {
     const present = slot.nodeId !== null && nodeExists(slot.nodeId);
     const state = present ? deps.seatState(slot.nodeId!) : null;
     const idle = state?.activity === "idle-at-prompt" && state.needsInput.count === 0 && !state.backgroundWork;
     const sessionName = seatSessionName(slot.logicalId, model.rigName);
     const facts = present && parkedRule && deps.rowFacts ? deps.rowFacts(sessionName, maxOpenRows) : null;
+    const refusal = present && refusedCooldown > 0 && slot.opId !== null
+      ? parkedRefusalOf(deps, poolMoves, sessionName, refusedCooldown, nowMs) : null;
     return {
       slotId: slot.slotId,
       logicalId: slot.logicalId,
@@ -415,6 +568,7 @@ export function readSeatPoolState(deps: SeatPoolStateReaderDeps, job: { jobId: s
       ...(facts?.parked ? { parked: facts.parked } : {}),
       ...(facts?.parkedRows ? { parkedRows: facts.parkedRows } : {}),
       ...busyOf(busyRule && present ? deps.busyProcess!(sessionName) : undefined),
+      ...(refusal ? { parkedRefusal: refusal } : {}),
     };
   });
   const adoptable = job.spec.adopt.flatMap((logicalId) => {
@@ -429,7 +583,10 @@ export function readSeatPoolState(deps: SeatPoolStateReaderDeps, job: { jobId: s
     restoring: deps.restoring(model.rigId),
     slots,
     adoptable,
-    pending: readPendingRows(deps, [model.sessionName, ...slots.map((slot) => slot.sessionName), ...retired]),
+    pending: readPendingRows(
+      deps, [model.sessionName, ...slots.map((slot) => slot.sessionName), ...retired],
+      refusedCooldown > 0 ? { jobId: job.jobId, seats: new Set(slots.map((slot) => slot.sessionName)) } : null,
+    ),
     demand: job.spec.demandCmd ? deps.demand(job.jobId) : null,
     lastScaleAt: deps.slots.lastScaleAt(job.jobId),
     ...(readLoad ? { hostLoadPerCpuPercent: hostLoadPerCpuPercent(deps.hostSample!()) } : {}),
@@ -1622,6 +1779,11 @@ export class SeatPoolExecutor {
     const limited = usageLimited.has(slot.sessionName);
     const mode = seatPoolReceives(ctx.spec, slot, nowMs, { usageLimited: limited });
     const base = { qitemId: intent.qitemId, from: intent.from, to: slot.sessionName };
+    // A row the seat gave straight back untaken (T-008296): the plan leaves it out; this catches a give-back since.
+    if (ctx.state.pending.find((row) => row.qitemId === intent.qitemId)?.refusedBy?.includes(slot.sessionName)) {
+      this.record(jobId, false, "seat_pool_dispatch_skipped", { ...base, code: "refused_row" });
+      return true;
+    }
     if (intent.mode !== "parked") {
       if (mode !== "free") {
         // Free as the plan read it, but busy with heavy local work it does not track (T-006251, B1): said once here.
@@ -1633,6 +1795,11 @@ export class SeatPoolExecutor {
     } else if (mode === null && slot.busyProcess && seatPoolReceives(ctx.spec, { ...read, busyProcess: null }, nowMs, { usageLimited: limited }) === "parked") {
       // Parked as the plan read it, but busy with heavy local work under its pane (T-006090).
       this.record(jobId, false, "seat_pool_dispatch_skipped", { ...base, code: "parked_busy", busyProcess: slot.busyProcess });
+      return true;
+    } else if (mode === null && slot.parkedRefusal
+      && seatPoolReceives(ctx.spec, { ...slot, parkedRefusal: undefined }, nowMs, { usageLimited: limited }) === "parked") {
+      // Parked as the plan read it, but it gave a row it got as parked straight back since (T-008296).
+      this.record(jobId, false, "seat_pool_dispatch_skipped", { ...base, code: "parked_refused" });
       return true;
     } else if (mode === null) {
       this.record(jobId, false, "seat_pool_dispatch_skipped", { ...base, code: "parked_changed" });
@@ -1656,10 +1823,11 @@ export class SeatPoolExecutor {
       ...base,
       ...(ctx.spec.dispatchToParked ? { mode } : {}),
       ...(park ? { parkedQitemId: park.qitemId } : {}),
-      ...(mode === "parked" && (slot.parkedRows?.length ?? 0) > 1 ? { parkedRows: slot.parkedRows!.length } : {}),
+      // Every park, so a give-back of this row can be told apart from a seat whose waits changed (parkedRefusal).
+      ...(mode === "parked" && (slot.parkedRows?.length ?? 0) > 1
+        ? { parkedRows: slot.parkedRows!.length, parkedQitemIds: slot.parkedRows!.map((p) => p.qitemId) } : {}),
     };
-    const why = park ? `was parked on ${park.blockedOn} (2nd row)` : "was free";
-    const moved = this.deps.effects.moveRow({ ...base, reason: `seat pool ${jobId}: ${intent.from} had not taken it; ${slot.sessionName} ${why}` });
+    const moved = this.deps.effects.moveRow({ ...base, reason: seatPoolMoveReason(jobId, intent.from, slot.sessionName, park ? park.blockedOn : null) });
     if (moved.ok) this.record(jobId, false, "seat_pool_dispatched", notes);
     else if (ROW_MOVED_ON.has(moved.code)) this.record(jobId, false, "seat_pool_dispatch_skipped", { ...notes, code: moved.code });
     else this.record(jobId, true, "seat_pool_dispatch_failed", { ...notes, code: moved.code, error: moved.error });
