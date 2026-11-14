@@ -45,6 +45,8 @@ for (const key of [
   "WORKSPACE_CATALOG_PATH", "TOPOLOGY_ROOT", "CONTEXT_ROOT", "CONTEXT_PACKS_ROOT",
   "SKILLS_ROOT", "SHARED_DOCS_ROOT", "FILES_ALLOWLIST", "PROGRESS_SCAN_ROOTS",
   "SESSION_NAME", "NODE_ID", "RIG_ID", "OCCUPANT_GENERATION", "AUTH_BEARER_TOKEN", "TERMINAL_BEARER_TOKEN",
+  // T-007930: the operator bearer file a 401 is retried with; a test must never read the real HOME default.
+  "AUTH_BEARER_FILE",
   // Slice 15: a seat with compact output on must not change what the suite prints.
   "OUTPUT_COMPACT",
   // Slice 01: a seat with usage windows on must not change what the suite reads.

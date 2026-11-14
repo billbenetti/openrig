@@ -960,7 +960,7 @@ export function hostCommand(doctorDepsOverride?: DoctorDeps): Command {
         try {
           // T-007930: a stale operator bearer is retried once with the bearer file; with none, the terminal credential.
           const client = new DaemonClient();
-          res = await withOperatorBearerRetry(opts.bearer, (headers) => client.post<Decided>("/api/hosts/pair-decision",
+          res = await withOperatorBearerRetry(client.baseUrl, opts.bearer, (headers) => client.post<Decided>("/api/hosts/pair-decision",
             { request: request.trim(), decision }, { headers }), { fallback: "terminal" });
         } catch (err) {
           console.error((err as Error).message);
@@ -970,7 +970,7 @@ export function hostCommand(doctorDepsOverride?: DoctorDeps): Command {
         if (opts.json) console.log(JSON.stringify(res.data));
         if (res.status !== 200 || !res.data?.ok) {
           if (!opts.json) console.error(res.status === 401
-            ? `This daemon refused the decision without its operator bearer token. Set OPENRIG_AUTH_BEARER_TOKEN to the token this daemon runs with, or pass --bearer <token>. Nothing was decided.`
+            ? `This daemon refused the decision without its operator bearer token. Set OPENRIG_AUTH_BEARER_TOKEN to the token this daemon runs with, put it in the file OPENRIG_AUTH_BEARER_FILE names, or pass --bearer <token>. Nothing was decided.`
             : res.data?.message ?? res.data?.error ?? `the pairing decision failed (HTTP ${res.status})`);
           process.exitCode = 1;
           return;
