@@ -181,6 +181,11 @@ interface WatchdogPolicyEngineDeps {
   /** The parked row a due reminder is about, when it may share one message with other reminders due for the same
    *  seat in the same scheduler pass. Null, or absent, keeps the reminder's own send. */
   resolveDigestEntry?: (input: { jobId: string; message: string }) => ParkReminderEntry | null;
+  /** The live parked rows of the reminder's own target this job is the current wake of, whatever its message, policy or
+   *  cadence (a custom message, a workflow's park, a repeating wait, a shared --wake-watchdog). A queue-only seat gets
+   *  the fire as a note on those rows, not a second row (T-007715, SH-A of the REVISAO-openrig-5). Empty, or absent,
+   *  keeps the reminder's own send. */
+  resolveParkedRows?: (input: { jobId: string; targetSession: string }) => string[];
 }
 
 /** The parked row an ordinary park reminder is about, with the current park's recorded continuation for its preview. */
@@ -297,6 +302,7 @@ export class WatchdogPolicyEngine {
   private readonly resolveQueueWait?: WatchdogPolicyEngineDeps["resolveQueueWait"];
   private readonly onWakeAttempt?: (attempt: { jobId: string; deliveryStatus: string; retryAt?: string; queuedQitemId?: string }) => void;
   private readonly resolveDigestEntry?: WatchdogPolicyEngineDeps["resolveDigestEntry"];
+  private readonly resolveParkedRows?: WatchdogPolicyEngineDeps["resolveParkedRows"];
 
   constructor(deps: WatchdogPolicyEngineDeps) {
     this.jobsRepo = deps.jobsRepo;
@@ -309,6 +315,7 @@ export class WatchdogPolicyEngine {
     this.onWakeAttempt = deps.onWakeAttempt;
     this.resolveQueueWait = deps.resolveQueueWait;
     this.resolveDigestEntry = deps.resolveDigestEntry;
+    this.resolveParkedRows = deps.resolveParkedRows;
     this.parseSpec = deps.parseSpec ?? parseWatchdogSpec;
     this.now = deps.now ?? (() => new Date());
     this.policies = new Map();
@@ -643,7 +650,8 @@ export class WatchdogPolicyEngine {
         message,
         ...(continuityAction ? { continuityAction } : {}),
       },
-      { jobId: job.jobId, policy: job.policy, occurrenceId, ...(digestEntry ? { parkedQitemIds: [digestEntry.qitemId] } : {}) },
+      { jobId: job.jobId, policy: job.policy, occurrenceId,
+        ...this.parkedSource(job.jobId, outcome.target.session, digestEntry, continuityAction !== undefined) },
     );
     if (
       isContextUsageThreshold &&
@@ -654,6 +662,15 @@ export class WatchdogPolicyEngine {
       this.jobsRepo.recordThresholdFire(job.jobId, occupantGeneration, evaluatedAt);
     }
     return this.recordAttempt({ job, outcome, evaluatedAt, deliverySchedule, delivery, isContextUsageThreshold: thresholdFire, notice: outcome.notice === true, sentMessage: message });
+  }
+
+  /** The parked rows a send reminds about: the digest entry's row, or else every live parked row of the target this job
+   *  is the current wake of (T-007715). A continuity action is not a park reminder: it never carries parked rows. */
+  private parkedSource(jobId: string, targetSession: string, entry: ParkReminderEntry | null, continuity: boolean): { parkedQitemIds?: string[] } {
+    if (entry) return { parkedQitemIds: [entry.qitemId] };
+    if (continuity) return {};
+    const rows = this.resolveParkedRows?.({ jobId, targetSession }) ?? [];
+    return rows.length ? { parkedQitemIds: rows } : {};
   }
 
   /** The pre-transport guard: a job its owning domain can prove is no longer actionable is terminaled, not sent. */
@@ -767,7 +784,8 @@ export class WatchdogPolicyEngine {
     const message = entry ? withContinuationPreview(held.outcome.message, entry.qitemId, entry.continuation) : held.outcome.message;
     const delivery = await this.deliver(
       { targetSession: seat, message },
-      { jobId: held.job.jobId, policy: held.job.policy, occurrenceId: held.occurrenceId, ...(entry ? { parkedQitemIds: [entry.qitemId] } : {}) },
+      { jobId: held.job.jobId, policy: held.job.policy, occurrenceId: held.occurrenceId,
+        ...this.parkedSource(held.job.jobId, seat, entry, false) },
     );
     this.recordAttempt({ ...held, deliverySchedule: schedule, delivery, isContextUsageThreshold: false, sentMessage: message });
   }

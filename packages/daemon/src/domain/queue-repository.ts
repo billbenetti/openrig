@@ -4188,6 +4188,16 @@ export class QueueRepository {
     return { qitemId: row.qitemId, summary: row.summary ?? null, continuation: this.currentParkContinuation(row.qitemId) };
   }
 
+  /** T-007715 (SH-A of the REVISAO-openrig-5): the live parked rows of `owner` that this job is the current wake of, by
+   *  the same binding the wake receipt follows (findBlockedQitemsByWatchdog, latest armed only), whatever the job's
+   *  message, policy or cadence. A row owned by another seat is not this reminder's own row. */
+  parkedRowsOwnedBy(jobId: string, owner: string): string[] {
+    return this.wakeRepo.findBlockedQitemsByWatchdog(jobId, true)
+      .map(({ qitemId }) => this.getById(qitemId))
+      .filter((row): row is NonNullable<typeof row> => !!row && row.state === "blocked" && row.destinationSession === owner)
+      .map((row) => row.qitemId);
+  }
+
   /** Called by the watchdog engine after the delivery attempt is durably
    *  audited. The queue transition records that attempt independently of
    *  whether the HELD row's owner consumed it. */
