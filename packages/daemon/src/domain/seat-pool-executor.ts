@@ -22,6 +22,7 @@ import {
   seatPoolCanReceive,
   seatPoolParkedLoadOver,
   seatPoolHeldByProcess,
+  seatPoolHeldByRefusal,
   seatPoolReceives,
   seatPoolRefusedCooldown,
   seatPoolDrainEpisode,
@@ -368,7 +369,7 @@ function transitionsTableOf(db: Database.Database, qitemId: string): "queue_tran
 }
 
 /** The reason a dispatch gives the queue's move (the transition note reads `fallback-routed: <from> → <to> (<reason>)`):
- *  the job, who had the row and why the seat could take it. seatPoolRefusalOf reads it back. */
+ *  the job, who had the row and why the seat could take it. seatPoolMovesOf reads it back. */
 function seatPoolMoveReason(jobId: string, from: string, to: string, parkedOn: string | null): string {
   return `seat pool ${jobId}: ${from} had not taken it; ${to} ${parkedOn !== null ? `was parked on ${parkedOn} (2nd row)` : "was free"}`;
 }
@@ -384,75 +385,89 @@ interface SeatPoolRefusalContext {
 
 const FALLBACK_NOTE = /^fallback-routed: (\S+) → (\S+) \((.*)\)$/s;
 const PARKED_MOVE_REASON = /^seat pool (\S+): .+ was parked on .+ \(2nd row\)$/s;
+const FREE_MOVE_REASON = /^seat pool (\S+): .+ was free$/s;
 
-/**
- * Whether a seat of the pool refused this row: the pool's latest move of the row was a dispatch to that seat as parked
- * (the note seatPoolMoveReason wrote, on the queue's own transition, live or archived: it lives as long as the row does,
- * past the job's history), and after it, with no move to in-progress in between (a claim, or an update by the seat;
- * claimed_at can't say it: an unclaim clears it), the seat gave the row back TO THE MODEL: a handoff it made whose
- * target is one of the model's addresses, or a reroute of the queue's fallback from the seat to the model that is not
- * the pool's own (a drain or a reap). A row the seat handed on to another seat is no refusal: that is routing (T-008296
- * B2, S1). Null: no refusal; else the seat and when it gave the row back.
- */
-function seatPoolRefusalOf(ctx: SeatPoolRefusalContext, qitemId: string): { seat: string; at: string } | null {
-  const table = transitionsTableOf(ctx.db, qitemId);
-  const moves = ctx.db.prepare(
-    `SELECT transition_id, transition_note FROM ${table} WHERE qitem_id = ? AND actor_session = ? ORDER BY transition_id DESC`,
-  ).all(qitemId, FALLBACK_ACTOR) as Array<{ transition_id: number; transition_note: string | null }>;
-  // The pool's latest move of the row, and any reroute after it (newest first, so those come before it).
-  let poolMove: { transitionId: number; seat: string } | null = null;
-  const after: Array<{ transitionId: number; from: string; to: string; reason: string }> = [];
-  for (const move of moves) {
-    const note = FALLBACK_NOTE.exec(move.transition_note ?? "");
-    if (!note) continue;
-    const [, from, to, reason] = note as unknown as [string, string, string, string];
-    if (reason.startsWith(`seat pool ${ctx.jobId}: `)) {
-      const parked = PARKED_MOVE_REASON.exec(reason);
-      poolMove = parked ? { transitionId: move.transition_id, seat: to } : null;
-      break;
-    }
-    after.push({ transitionId: move.transition_id, from, to, reason });
-  }
-  if (!poolMove) return null;
-  const seat = new Set(ctx.addressesOf(poolMove.seat));
-  if (seat.size === 0) return null;
-  const transitions = ctx.db.prepare(
-    `SELECT transition_id, ts, state, actor_session, closure_target FROM ${table} WHERE qitem_id = ? AND transition_id > ? ORDER BY transition_id`,
-  ).all(qitemId, poolMove.transitionId) as Array<{ transition_id: number; ts: string; state: string; actor_session: string; closure_target: string | null }>;
-  const rerouted = new Map(after.map((move) => [move.transitionId, move]));
-  for (const t of transitions) {
-    if (t.state === "in-progress") return null;
-    if (t.state === "handed-off" && seat.has(t.actor_session)) {
-      return t.closure_target !== null && ctx.modelAddresses.has(t.closure_target) ? { seat: poolMove.seat, at: t.ts } : null;
-    }
-    const move = rerouted.get(t.transition_id);
-    if (move && seat.has(move.from)) {
-      const pools = move.reason.startsWith(SEAT_POOL_DRAIN_REASON) || move.reason.startsWith(SEAT_POOL_REAP_REASON);
-      return !pools && ctx.modelAddresses.has(move.to) ? { seat: poolMove.seat, at: t.ts } : null;
-    }
-  }
-  return null;
+/** One of the pool's moves of a row to a seat, read from the queue, and how it ended: `refusedAt` when the seat gave the
+ *  row straight back to the model (seatPoolMovesOf), else null. */
+interface SeatPoolRowMove {
+  seat: string;
+  mode: "parked" | "free";
+  refusedAt: string | null;
 }
 
 /**
- * A seat's parked refusal (SeatPoolSlotView.parkedRefusal): the pool's latest move of a row to the seat (`moves`,
- * newest first) was made as parked, and the seat gave that row straight back to the model (seatPoolRefusalOf) less
- * than `cooldownSeconds` ago. Only the latest move counts: a row the seat took since ends the refusal before it. Read
- * from the job's history and the queue, so a restart of the daemon keeps it. Null: no such refusal.
+ * Every move the pool made of this row to one of its seats, oldest first, each with how it ended (T-008466 SH-A: a
+ * reroute keeps the row's id, so a row two seats handed back and forth carries both refusals; reading only the latest
+ * move lost the first). A move is the note seatPoolMoveReason wrote, on the queue's own transition, live or archived (it
+ * lives as long as the row does, past the job's history), as parked or as free. The seat REFUSED the row when, after
+ * that move and before the next one, with no move to in-progress in between (a claim, or an update by the seat;
+ * claimed_at can't say it: an unclaim clears it), the row went back TO THE MODEL: a handoff the seat made whose target is
+ * one of the model's addresses, or a reroute of the queue's fallback from the seat to the model that is not the pool's
+ * own (a drain or a reap). The reroute records no caller (routeToFallback writes FALLBACK_ACTOR, and the note's "from" is
+ * the row's destination), so a reroute to the model of a row the seat held, by the seat or by anyone else (a lead, a
+ * coord, a routine), counts as the seat giving it back (SH-D): either way the row was the seat's and it did not take it.
+ * A row the seat handed on to another seat, or rerouted to anyone but the model, is routing, no refusal (T-008296 B2,
+ * S1).
  */
-function parkedRefusalOf(
+function seatPoolMovesOf(ctx: SeatPoolRefusalContext, qitemId: string): SeatPoolRowMove[] {
+  const table = transitionsTableOf(ctx.db, qitemId);
+  const transitions = ctx.db.prepare(
+    `SELECT transition_id, ts, state, actor_session, closure_target, transition_note FROM ${table} WHERE qitem_id = ? ORDER BY transition_id`,
+  ).all(qitemId) as Array<{ transition_id: number; ts: string; state: string; actor_session: string; closure_target: string | null; transition_note: string | null }>;
+  const moves: SeatPoolRowMove[] = [];
+  // The pool's move still open (not taken, not given back, not routed on), and that seat's addresses.
+  let open: { move: SeatPoolRowMove; seat: ReadonlySet<string> } | null = null;
+  for (const t of transitions) {
+    const note = t.actor_session === FALLBACK_ACTOR ? FALLBACK_NOTE.exec(t.transition_note ?? "") : null;
+    if (note) {
+      const [, from, to, reason] = note as unknown as [string, string, string, string];
+      if (reason.startsWith(`seat pool ${ctx.jobId}: `)) {
+        const mode = PARKED_MOVE_REASON.test(reason) ? "parked" : FREE_MOVE_REASON.test(reason) ? "free" : null;
+        const seat = new Set(ctx.addressesOf(to));
+        if (mode === null || seat.size === 0) { open = null; continue; }
+        const move: SeatPoolRowMove = { seat: to, mode, refusedAt: null };
+        moves.push(move);
+        open = { move, seat };
+        continue;
+      }
+      if (open && open.seat.has(from)) {
+        const pools = reason.startsWith(SEAT_POOL_DRAIN_REASON) || reason.startsWith(SEAT_POOL_REAP_REASON);
+        if (!pools && ctx.modelAddresses.has(to)) open.move.refusedAt = t.ts;
+        open = null;
+      }
+      continue;
+    }
+    if (!open) continue;
+    if (t.state === "in-progress") { open = null; continue; }
+    if (t.state === "handed-off" && open.seat.has(t.actor_session)) {
+      if (t.closure_target !== null && ctx.modelAddresses.has(t.closure_target)) open.move.refusedAt = t.ts;
+      open = null;
+    }
+  }
+  return moves;
+}
+
+/**
+ * A seat's refusal (SeatPoolSlotView.parkedRefusal or freeRefusal): the pool's latest move of a row to the seat
+ * (`moves`, newest first, from the job's history) and, on the queue, the latest move of that row to that seat
+ * (seatPoolMovesOf) ended with the seat giving it straight back less than `cooldownSeconds` ago. Only the latest move
+ * counts: a row the seat took since ends the refusal before it. Read from the job's history and the queue, so a restart
+ * of the daemon keeps it. Null: no such refusal.
+ */
+function seatRefusalOf(
   ctx: SeatPoolRefusalContext, moves: readonly PoolMove[], sessionName: string, cooldownSeconds: number, nowMs: number,
-): { at: string; openRowIds: string[] | null } | null {
+): { mode: "parked" | "free"; at: string; openRowIds: string[] | null } | null {
   const latest = moves.find((move) => move.to === sessionName);
-  if (!latest || latest.mode !== "parked") return null;
-  const refusal = seatPoolRefusalOf(ctx, latest.qitemId);
-  if (refusal === null || refusal.seat !== sessionName || !(nowMs - Date.parse(refusal.at) < cooldownSeconds * 1000)) return null;
-  return { at: refusal.at, openRowIds: latest.openRowIds };
+  if (!latest || (latest.mode !== "parked" && latest.mode !== "free")) return null;
+  const move = seatPoolMovesOf(ctx, latest.qitemId).filter((m) => m.seat === sessionName).at(-1);
+  if (!move || move.mode !== latest.mode || move.refusedAt === null) return null;
+  if (!(nowMs - Date.parse(move.refusedAt) < cooldownSeconds * 1000)) return null;
+  return { mode: move.mode, at: move.refusedAt, openRowIds: latest.openRowIds };
 }
 
 /** The pool's seats that refused this row (it came back to the model by a reroute) or a row it succeeds by handoff
- *  (its chain of record), however many hops back (seatPoolRefusalOf). Read from the queue alone, so it holds for the
- *  row's whole lineage. */
+ *  (its chain of record), however many hops back, and at every move of each (seatPoolMovesOf). Read from the queue
+ *  alone, so it holds for the row's whole lineage. */
 function readRefusedBy(ctx: SeatPoolRefusalContext, qitemId: string, chain: string | null, poolSeats: ReadonlySet<string>): string[] {
   if (poolSeats.size === 0) return [];
   let ids: unknown = [];
@@ -464,8 +479,9 @@ function readRefusedBy(ctx: SeatPoolRefusalContext, qitemId: string, chain: stri
   const refused = new Set<string>();
   for (const id of [...(Array.isArray(ids) ? ids : []), qitemId]) {
     if (typeof id !== "string") continue;
-    const refusal = seatPoolRefusalOf(ctx, id);
-    if (refusal && poolSeats.has(refusal.seat)) refused.add(refusal.seat);
+    for (const move of seatPoolMovesOf(ctx, id)) {
+      if (move.refusedAt !== null && poolSeats.has(move.seat)) refused.add(move.seat);
+    }
   }
   return [...refused];
 }
@@ -590,8 +606,9 @@ export function readSeatPoolState(deps: SeatPoolStateReaderDeps, job: { jobId: s
     const idle = state?.activity === "idle-at-prompt" && state.needsInput.count === 0 && !state.backgroundWork;
     const sessionName = seatSessionName(slot.logicalId, model.rigName);
     const facts = present && parkedRule && deps.rowFacts ? deps.rowFacts(sessionName, maxOpenRows) : null;
-    const refusal = present && refusedCooldown > 0 && slot.opId !== null
-      ? parkedRefusalOf(refusalCtx, poolMoves, sessionName, refusedCooldown, nowMs) : null;
+    // An adopted seat is never parked (seatPoolCanReceive), but it is free like any other: its free refusal counts too.
+    const refusal = present && refusedCooldown > 0
+      ? seatRefusalOf(refusalCtx, poolMoves, sessionName, refusedCooldown, nowMs) : null;
     return {
       slotId: slot.slotId,
       logicalId: slot.logicalId,
@@ -612,7 +629,8 @@ export function readSeatPoolState(deps: SeatPoolStateReaderDeps, job: { jobId: s
       ...(facts?.parked ? { parked: facts.parked } : {}),
       ...(facts?.parkedRows ? { parkedRows: facts.parkedRows } : {}),
       ...busyOf(busyRule && present ? deps.busyProcess!(sessionName) : undefined),
-      ...(refusal ? { parkedRefusal: refusal } : {}),
+      ...(refusal?.mode === "parked" ? { parkedRefusal: { at: refusal.at, openRowIds: refusal.openRowIds } } : {}),
+      ...(refusal?.mode === "free" ? { freeRefusal: { at: refusal.at } } : {}),
     };
   });
   const adoptable = job.spec.adopt.flatMap((logicalId) => {
@@ -1851,8 +1869,11 @@ export class SeatPoolExecutor {
     if (intent.mode !== "parked") {
       if (mode !== "free") {
         // Free as the plan read it, but busy with heavy local work it does not track (T-006251, B1): said once here.
-        if (slot.busyProcess && seatPoolReceives(ctx.spec, { ...read, busyProcess: null }, nowMs, { usageLimited: limited }) === "free") {
+        if (slot.busyProcess && seatPoolReceives(ctx.spec, { ...read, busyProcess: null, freeRefusal: undefined }, nowMs, { usageLimited: limited }) === "free") {
           this.record(jobId, false, "seat_pool_dispatch_skipped", { ...base, code: "free_busy", busyProcess: slot.busyProcess });
+        } else if (slot.freeRefusal && seatPoolReceives(ctx.spec, { ...slot, freeRefusal: undefined }, nowMs, { usageLimited: limited }) === "free") {
+          // Free as the plan read it, but it gave a row it got as free straight back since (T-008466).
+          this.record(jobId, false, "seat_pool_dispatch_skipped", { ...base, code: "free_refused" });
         }
         return true;
       }
@@ -2024,13 +2045,20 @@ export class SeatPoolExecutor {
     const loadPerCpuPercent = this.parkedLoadNow(ctx.spec);
     // `held: "busy"` (T-007527): the free seat in usage held only by a busy_processes program the read found, the one
     // the plan counts as occupied for it; absent for every other seat (a null `receives` says no more than "no row now").
+    // T-008466 SH-B: a row a parked seat refused never goes to it while it is parked (refusedBy), so while such a row
+    // waits that seat is given to the demand command as receiving nothing: counted as a receiver, the row it refused
+    // would wait for it with no seat added, up to max_claim_age_s. A seat that is free takes the row, and stays one.
+    const refusing = new Set(ctx.state.pending.flatMap((row) => row.refusedBy ?? []));
     const slots = ctx.state.slots.map((slot) => {
       const read = withBusy(slot, busy);
       const limited = usageLimited.has(slot.sessionName);
+      const receives = seatPoolReceives(ctx.spec, read, nowMs, { usageLimited: limited, loadPerCpuPercent });
       return {
         session: seatSessionName(slot.logicalId, ctx.model.rigName), phase: slot.phase,
-        receives: seatPoolReceives(ctx.spec, read, nowMs, { usageLimited: limited, loadPerCpuPercent }),
-        ...(seatPoolHeldByProcess(ctx.spec, read, { usageLimited: limited }) ? { held: "busy" as const } : {}),
+        receives: receives === "parked" && refusing.has(slot.sessionName) ? null : receives,
+        ...(seatPoolHeldByProcess(ctx.spec, read, { usageLimited: limited })
+          ? { held: "busy" as const }
+          : seatPoolHeldByRefusal(ctx.spec, read, nowMs, { usageLimited: limited }) ? { held: "refused" as const } : {}),
       };
     });
     const result = await this.deps.effects.runCommand(ctx.spec.demandCmd, this.commandEnv(ctx, { OPENRIG_SEAT_POOL_SLOTS: JSON.stringify(slots) }), run.controller.signal);
