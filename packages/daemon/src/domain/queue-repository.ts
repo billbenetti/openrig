@@ -1,5 +1,7 @@
 import { PROMPT_ALERT_TAG, readWakeLadderBackstop } from "./queue-wake-ladder.js";
 import { withUrgentLine } from "./urgent-line.js";
+import { currentParkArmSql } from "./current-park-arm.js";
+import { PARK_WAKE_GUIDANCE } from "./park-wake-text.js";
 import { quietCustodyBackstop, quietHoldCustody } from "./quiet-hold-custody.js";
 import type Database from "better-sqlite3";
 import { createHash } from "node:crypto";
@@ -648,8 +650,15 @@ export function defaultParkWakeMessage(qitemId: string): string {
 }
 
 /** T-007715 (delta review N4): a park's default wake, for any row: a job shared by --wake-watchdog carries the default
- *  of the row that armed it, and a reminder outside a pass carries its continuation's preview after the default. */
-const DEFAULT_PARK_WAKE = /^Wake timer fired for parked qitem \S+\. Resume the recorded continuation and update the row\./;
+ *  of the row that armed it, and a reminder outside a pass carries its continuation's preview after the default
+ *  (park-wake-text.ts withContinuationPreview: the preview's one line, then the guidance). S1 of the delta review of
+ *  7590bf00e: only the default exactly, or with that preview; any other text after it is the reminder's own. */
+const escapeRegExp = (text: string) => text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+const DEFAULT_PARK_WAKE = new RegExp(
+  "^Wake timer fired for parked qitem \\S+\\. Resume the recorded continuation and update the row\\."
+  + "(?:\\nRecorded continuation(?: \\(the first \\d+ of \\d+ characters; read the rest with rig queue show \\S+ --full\\))?: [^\\n]*"
+  + `\\n${escapeRegExp(PARK_WAKE_GUIDANCE)})?$`,
+);
 export function isDefaultParkWakeMessage(message: string): boolean {
   return DEFAULT_PARK_WAKE.test(message);
 }
@@ -658,9 +667,11 @@ export function isDefaultParkWakeMessage(message: string): boolean {
  *  history (`rig watchdog show`). Still far below the base, which created a wd- row per fire. */
 export const PARK_NOTE_MESSAGE_MAX = 2000;
 function parkNoteReminder(message: string, jobId: string): string {
-  return message.length > PARK_NOTE_MESSAGE_MAX
-    ? `${message.slice(0, PARK_NOTE_MESSAGE_MAX)}… (full text: rig watchdog show ${jobId})`
-    : message;
+  if (message.length <= PARK_NOTE_MESSAGE_MAX) return message;
+  // N5 of the delta review of 7590bf00e: never split a surrogate pair at the cut (a lone half shows as U+FFFD)
+  const high = message.charCodeAt(PARK_NOTE_MESSAGE_MAX - 1);
+  const cut = high >= 0xd800 && high <= 0xdbff ? PARK_NOTE_MESSAGE_MAX - 1 : PARK_NOTE_MESSAGE_MAX;
+  return `${message.slice(0, cut)}… (full text: rig watchdog show ${jobId})`;
 }
 
 /** A hosted member's trigger, from the authored rosters (`<workspace.root>/rosters`) on this host. Null when it declares
@@ -3831,7 +3842,10 @@ export class QueueRepository {
       if (effectiveBlockedOn === input.qitemId) {
         throw new QueueRepositoryError("wake_self_blocker", "a repeating wait must name an upstream blocker, not its own packet");
       }
-      const oldWake = this.wakeRepo.getStatus(input.qitemId);
+      // The wait of the CURRENT park only (T-007715): read before this transition is appended, so a re-park
+      // blocked → blocked reuses its own wait, and a park after leaving `blocked` never inherits a past park's job
+      // (its doubled interval and old notice), even one a former attachment kept alive.
+      const oldWake = this.wakeRepo.getCurrentParkStatus(input.qitemId);
       const job = armQueueWait(this.db, jobsRepo, {
         // Reusing a shared job would rewrite the attachment's schedule and packet.
         previousJobId: oldWake?.kind === "timer" && this.wakeRepo.findLiveQitemsByAttachedWatchdog(oldWake.ref).length === 0
@@ -4047,6 +4061,9 @@ export class QueueRepository {
    * Non-live jobs are left alone, so calling this twice is harmless.
    */
   private retireParkGeneratedTimer(qitemId: string, reason: string): void {
+    // The RAW latest arm (T-007715): this runs after the exit transition is appended, when the park is no longer the
+    // current one. Whether another row's attachment still holds the job is the current-park rule
+    // (findLiveQitemsByAttachedWatchdog).
     const armed = this.wakeRepo.getStatus(qitemId);
     if (armed?.kind !== "timer" || !armed.live) return;
     // An explicit --wake-watchdog attachment gives another continuation custody
@@ -4133,8 +4150,11 @@ export class QueueRepository {
     return dependentEvents;
   }
 
+  /** What wakes this parked row now: its CURRENT park's wake (QueueWakeRepository.getCurrentParkStatus), never an
+   *  earlier park's job. The read for every diagnosis and backstop (rig parked, activity, the stuck sweep, the wake
+   *  ladder); the exit mechanisms below read the raw latest arm on purpose. */
   getParkWakeStatus(qitemId: string): ParkWakeStatus | null {
-    return this.wakeRepo.getStatus(qitemId);
+    return this.wakeRepo.getCurrentParkStatus(qitemId);
   }
 
   /** For parked diagnosis only (see QueueWakeRepository.servedByOwnRepeatingReminder). */
@@ -4935,9 +4955,9 @@ export class QueueRepository {
 
   /**
    * A seat pool's read of one seat's open rows (listOpenObligations' rows, order and limit) and, when the only open row
-   * is blocked, the facts of its park (ParkFacts): the current wake (the latest armed record, the one getStatus reads)
+   * is blocked, the facts of its park (ParkFacts): the current wake (the arm of its current park, current-park-arm.ts)
    * gives the transition that armed it (its actor and time) and, for a timer, its job's interval in any state of the job;
-   * getStatus says whether that wake is still armed and live. The row was taken at its claim, or else at its first move
+   * getCurrentParkStatus says whether that wake is still armed and live. The row was taken at its claim, or else at its first move
    * to in-progress by one of its destination's addresses (a seat that takes a row by update, with no claim).
    */
   listPoolSeatRowFacts(sessionName: string, maxBlocked = 1): PoolSeatRowFacts {
@@ -4955,11 +4975,12 @@ export class QueueRepository {
     if (!item) return null;
     let armed: { wake_kind: string; wake_ref: string; actor_session: string | null; ts: string | null } | undefined;
     try {
+      // T-007715: the arm of the row's current park; an earlier park's timer, still alive because another row is
+      // attached to it, is not this park's (it would read as a live timer and admit a dispatch to a gated row).
       armed = this.db.prepare(
         `SELECT w.wake_kind, w.wake_ref, t.actor_session, t.ts
            FROM queue_transition_wakes w LEFT JOIN queue_transitions t ON t.transition_id = w.transition_id
-          WHERE w.qitem_id = ? AND w.phase = 'armed'
-          ORDER BY w.transition_id DESC LIMIT 1`,
+          WHERE w.qitem_id = ? AND ${currentParkArmSql("w")}`,
       ).get(qitemId) as typeof armed;
     } catch {
       armed = undefined; // a database without the wake records: no wake to read
@@ -4967,7 +4988,7 @@ export class QueueRepository {
     const interval = armed?.wake_kind === "timer"
       ? (this.db.prepare("SELECT interval_seconds FROM watchdog_jobs WHERE job_id = ?").get(armed.wake_ref) as { interval_seconds: number } | undefined)
       : undefined;
-    const status = armed ? this.wakeRepo.getStatus(qitemId) : null;
+    const status = armed ? this.wakeRepo.getCurrentParkStatus(qitemId) : null;
     const destinations = this.resolveSessionAddresses(item.destination_session);
     const firstTake = item.claimed_at ? null : this.db.prepare(
       `SELECT MIN(ts) AS ts FROM queue_transitions
@@ -6050,7 +6071,10 @@ export class QueueRepository {
       }
       const blocker = qitem.blockedOn ?? null;
       const blockerRow = blocker ? this.getById(blocker) : null;
-      const armed = this.wakeRepo.getStatus(qitemId);
+      // What wakes the row NOW (T-007715, F1 of the lenses on the redesign): its current park's timer. A past park's
+      // timer, still alive because another row was attached to it, is not this row's: rearming it would give a gated
+      // row a new reminder, and moving it as a wait would leave it with nothing once that job ends.
+      const armed = this.wakeRepo.getCurrentParkStatus(qitemId);
       const armedJob = armed?.kind === "timer" && armed.live ? jobs.getById(armed.ref) : null;
       const ownTimer = armedJob?.state === "active" && this.wakeRepo.findLiveQitemsByAttachedWatchdog(armedJob.jobId).length === 0
         ? armedJob : null;

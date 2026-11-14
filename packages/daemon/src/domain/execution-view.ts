@@ -1,4 +1,5 @@
 import { physicalSessionName } from "./session-registry.js";
+import { currentParkArmSql } from "./current-park-arm.js";
 import { resolveNodeFile } from "./scope/node-file.js";
 import { belongsToProject } from "./workspace/project-catalog.js";
 import { inspectGraph } from "./workflow-reconciliation.js";
@@ -401,7 +402,7 @@ function readLifecycleExecutions(db: Database.Database, mission: string, project
         `SELECT ts, state, transition_note, actor_session FROM queue_transitions
           WHERE qitem_id = ? ORDER BY transition_id DESC LIMIT 1`,
       ).get(packetId) ?? null : null;
-      const wake = wakes.getStatus(packetId);
+      const wake = wakes.getCurrentParkStatus(packetId);
       const blocker = typeof packet?.blocked_on === "string" ? db.prepare(
         `SELECT qitem_id, summary, destination_session, state, evidence_ref FROM queue_items WHERE qitem_id = ?`,
       ).get(packet.blocked_on) ?? null : null;
@@ -1270,7 +1271,7 @@ export async function buildExecutionView(deps: ExecutionViewDeps, opts?: { missi
         now: now(),
       });
       const wake = deps.db
-        .prepare(`SELECT wake_ref, phase FROM queue_transition_wakes WHERE qitem_id = ? AND phase = 'armed' LIMIT 1`)
+        .prepare(`SELECT w.wake_ref, w.phase FROM queue_transition_wakes w WHERE w.qitem_id = ? AND ${currentParkArmSql("w")}`)
         .get(r.qitem_id) as { wake_ref: string; phase: string } | undefined;
       // park_kind is a CLOSED enum from the DESIGN: deliberate-with-wake |
       // stalled | indeterminate. Nothing else may leak in (the live artifact

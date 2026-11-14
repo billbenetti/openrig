@@ -1,4 +1,5 @@
 import { resolveEscalationOwner, hasConsumedEscalationHop } from "./escalation-owner.js";
+import { currentParkArmSql } from "./current-park-arm.js";
 import { isTypedGateBlocker } from "./queue-blocker.js";
 import type Database from "better-sqlite3";
 import { resolvePickupThresholdMinutes } from "./queue-pickup.js";
@@ -173,8 +174,7 @@ export function readWaitingView(db: Database.Database, id: string, readActivity?
     const hasTimers = statements.hasTable("queue_transition_wakes");
     const timer = hasTimers ? statements.statement(`SELECT j.job_id, j.policy, j.last_evaluation_at, j.registered_at, j.interval_seconds, j.scan_interval_seconds, j.spec_yaml
       FROM queue_transition_wakes w JOIN watchdog_jobs j ON j.job_id = w.wake_ref
-      WHERE w.qitem_id = ? AND w.phase = 'armed' AND j.state = 'active'
-      ORDER BY w.transition_id DESC LIMIT 1`).get(id) as { job_id: string; policy: WatchdogJob["policy"]; last_evaluation_at: string | null; registered_at: string; interval_seconds: number; scan_interval_seconds: number | null; spec_yaml: string } | undefined : undefined;
+      WHERE w.qitem_id = ? AND ${currentParkArmSql("w")} AND j.state = 'active'`).get(id) as { job_id: string; policy: WatchdogJob["policy"]; last_evaluation_at: string | null; registered_at: string; interval_seconds: number; scan_interval_seconds: number | null; spec_yaml: string } | undefined : undefined;
     // The scheduler's own due time: a never-evaluated reminder fires one interval after registration (#801),
     // and the wake-now marker is due now (#860).
     const timerDue = timer ? nextDueAt({ policy: timer.policy, specYaml: timer.spec_yaml, registeredAt: timer.registered_at,

@@ -581,13 +581,17 @@ export function readWakeLadderBackstop(db: Database.Database, qitemId: string, a
 }
 
 function appendMarker(repo: QueueRepository, row: QueueItem, note: string): void {
+  // N4 of the delta review of 7590bf00e: a marker repeats the row's state as it is NOW, not as read before an await
+  // (a wake attempt). A stale 'in-progress' on a row parked meanwhile would read as an exit from 'blocked' and end
+  // the current park's wake (current-park-arm.ts).
+  const state = repo.getById(row.qitemId)?.state ?? row.state;
   repo.transitionLog.append({
     qitemId: row.qitemId,
-    state: row.state,
+    state,
     actorSession: LADDER_ACTOR,
     transitionNote: note,
     // A scheduler receipt does not clear the claim's original gate. State writes do.
-    closureTarget: row.state === "in-progress" ? repo.retainedClaimBlocker(row.qitemId) : undefined,
+    closureTarget: state === "in-progress" ? repo.retainedClaimBlocker(row.qitemId) : undefined,
   });
 }
 

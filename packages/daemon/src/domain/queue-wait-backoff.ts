@@ -1,4 +1,5 @@
 import type Database from "better-sqlite3";
+import { currentParkArmSql, liveWatchdogAttachments } from "./current-park-arm.js";
 import { isDeepStrictEqual } from "node:util";
 import { lastMeaningfulTransition, type WaitingView } from "./queue-waiting.js";
 import type { PolicyEvaluation } from "./policies/types.js";
@@ -104,9 +105,14 @@ export function refreshQueueWaits(db: Database.Database, jobs: WatchdogJobsRepos
     const state = spec.context.queue_wait;
     if (changedQitem && state.blocker !== changedQitem) continue;
     const row = db.prepare("SELECT state, blocked_on FROM queue_items WHERE qitem_id = ?").get(state.qitemId) as { state: string; blocked_on: string | null } | undefined;
-    if (!row || row.state !== "blocked" || row.blocked_on !== state.blocker) {
-      const attached = db.prepare("SELECT 1 FROM queue_transition_wakes WHERE wake_ref = ? AND wake_kind = 'watchdog' LIMIT 1").get(job.jobId);
-      if (!attached) jobs.markTerminal(job.jobId, "park_wait_ended");
+    // T-007715: the wait is its row's only while it is the arm of the row's CURRENT park (current-park-arm.ts). A row
+    // that left and was parked again on the same blocker with no wake, or with another one, is not reminded by it.
+    const ownPark = row?.state === "blocked" && row.blocked_on === state.blocker && db.prepare(
+      `SELECT 1 FROM queue_transition_wakes w WHERE w.qitem_id = ? AND w.wake_ref = ? AND ${currentParkArmSql("w")}`,
+    ).get(state.qitemId, job.jobId) !== undefined;
+    if (!ownPark) {
+      // Only a current park's unconsumed attachment keeps the wait alive, not one a past park once made.
+      if (liveWatchdogAttachments(db, job.jobId, true).length === 0) jobs.markTerminal(job.jobId, "park_wait_ended");
       continue;
     }
     const current = blockerTransition(db, state.blocker);

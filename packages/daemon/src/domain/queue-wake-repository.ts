@@ -1,6 +1,7 @@
 import type Database from "better-sqlite3";
 import { isQueueWait } from "./queue-wait-backoff.js";
 import { deliveryReachedSeat } from "./watchdog-history-log.js";
+import { currentParkArm, currentParkArmSql, liveWatchdogAttachments, parkUnbrokenSinceSql } from "./current-park-arm.js";
 
 export type ParkWakeKind = "watchdog" | "timer" | "blocker";
 export type ParkWakePhase = "armed" | "fired";
@@ -90,6 +91,10 @@ export class QueueWakeRepository {
     return row ? this.row(row) : null;
   }
 
+  /** The RAW latest arm's status, whichever park wrote it. Only for the mechanisms that run after a row's exit
+   *  transition is appended (retiring a park timer, superseding it on a re-park, the retire inside routeInTransaction):
+   *  with the current-park rule (getCurrentParkStatus) they would find nothing there. Everything that asks "what wakes
+   *  this parked row now", rerouteParked included, reads getCurrentParkStatus. */
   getStatus(qitemId: string): ParkWakeStatus | null {
     if (!this.available) return null;
     const armed = this.db.prepare(
@@ -97,7 +102,20 @@ export class QueueWakeRepository {
         WHERE qitem_id = ? AND phase = 'armed'
         ORDER BY transition_id DESC LIMIT 1`,
     ).get(qitemId) as WakeRow | undefined;
-    if (!armed) return null;
+    return armed ? this.statusOf(armed) : null;
+  }
+
+  /** T-007715 (the redesign of the openrig#9): the status of the row's CURRENT park's wake (current-park-arm.ts), or
+   *  null when the current park has none: a row parked again with no wake of its own after leaving `blocked` is not
+   *  served by an earlier park's timer or attachment, however live that job still is. */
+  getCurrentParkStatus(qitemId: string): ParkWakeStatus | null {
+    if (!this.available) return null;
+    const armed = currentParkArm(this.db, qitemId);
+    return armed ? this.statusOf(armed) : null;
+  }
+
+  private statusOf(armed: WakeRow): ParkWakeStatus {
+    const qitemId = armed.qitem_id;
     const latestFired = this.db.prepare(
       `SELECT * FROM queue_transition_wakes
         WHERE qitem_id = ? AND phase = 'fired' AND wake_ref = ?
@@ -143,19 +161,10 @@ export class QueueWakeRepository {
    *  job, another target, a one-shot park timer, a blocker, missing history) answers false, leaving today's result. */
   servedByOwnRepeatingReminder(qitemId: string): boolean {
     if (!this.available) return false;
-    const armed = this.db.prepare(
-      `SELECT * FROM queue_transition_wakes
-        WHERE qitem_id = ? AND phase = 'armed'
-        ORDER BY transition_id DESC LIMIT 1`,
-    ).get(qitemId) as WakeRow | undefined;
+    // The current park's arm (current-park-arm.ts): a row that has left `blocked` since an earlier arm and was blocked
+    // again with no wake of its own (a gate or a person) is not served by that earlier park's reminder.
+    const armed = currentParkArm(this.db, qitemId);
     if (!armed || armed.wake_kind !== "watchdog") return false;
-    // That arm must belong to the current park: a row that has left `blocked` since then and was blocked again with no
-    // wake of its own (a gate or a person) wrote no arm, so the earlier park's reminder isn't serving this one.
-    // Note-only transitions stay `blocked`.
-    const leftSince = this.db.prepare(
-      `SELECT 1 FROM queue_transitions WHERE qitem_id = ? AND transition_id > ? AND state <> 'blocked' LIMIT 1`,
-    ).get(qitemId, armed.transition_id);
-    if (leftSince) return false;
     const job = this.db.prepare(
       `SELECT j.policy, j.spec_yaml, j.state, j.target_session, q.destination_session, q.state AS row_state
          FROM watchdog_jobs j JOIN queue_items q ON q.qitem_id = ?
@@ -195,23 +204,15 @@ export class QueueWakeRepository {
          JOIN queue_items q ON q.qitem_id = w.qitem_id
         WHERE w.phase = 'armed' AND w.wake_ref = ?
           AND w.wake_kind IN ('watchdog', 'timer') AND q.state = 'blocked'
-          -- An operator-owned job can outlive the park that attached it.
-          -- Only the latest armed continuation owns this row's wake receipt.
-          AND (? = 0 OR w.transition_id = (
-            SELECT MAX(a.transition_id) FROM queue_transition_wakes a
-             WHERE a.qitem_id = w.qitem_id AND a.phase = 'armed'
-          ))
+          -- An operator-owned job can outlive the park that attached it. Only the arm of the row's current park
+          -- (current-park-arm.ts: its latest arm, with no exit from 'blocked' since) owns this row's wake receipt.
+          AND (? = 0 OR (${currentParkArmSql("w")}))
           -- T-007715 (S1 of the REVISAO-openrig-9): a row attached to an existing job (--wake-watchdog, kind
-          -- 'watchdog') stays bound across its fires while the row is still parked: each later fire of an operator's
-          -- periodic reminder is that row's reminder too. A park's own one-shot timer (kind 'timer') is consumed once.
-          -- B1 of the delta review (2f1015c45): only while it is the same park. A row that has left 'blocked' since
-          -- the arm and was parked again with no wake of its own (a gate, a person) wrote no arm, so that earlier
-          -- attachment is not this park's reminder (the boundary servedByOwnRepeatingReminder reads); note-only
-          -- transitions stay 'blocked'.
-          AND (w.wake_kind <> 'watchdog' OR NOT EXISTS (
-            SELECT 1 FROM queue_transitions t
-             WHERE t.qitem_id = w.qitem_id AND t.transition_id > w.transition_id AND t.state <> 'blocked'
-          ))
+          -- 'watchdog') stays bound across its fires while the row is still in the same park: each later fire of an
+          -- operator's periodic reminder is that row's reminder too. A park's own one-shot timer (kind 'timer') is
+          -- consumed once. Without the latest-only filter (the bindings check of recordWatchdogWakeAttempt), an older
+          -- attachment still never outlives an exit from 'blocked'.
+          AND (w.wake_kind <> 'watchdog' OR ${parkUnbrokenSinceSql("w")})
           AND (? OR w.wake_kind = 'watchdog' OR NOT EXISTS (
             SELECT 1 FROM queue_transition_wakes f
              WHERE f.qitem_id = w.qitem_id AND f.phase = 'fired'
@@ -246,37 +247,17 @@ export class QueueWakeRepository {
    *  A retained attempt never consumes it; a failed one does, except on a repeating timer, which retries. */
   findLiveQitemsByAttachedWatchdog(jobId: string): Array<{ qitemId: string; state: string }> {
     if (!this.available) return [];
-    return this.db.prepare(
-      `SELECT DISTINCT w.qitem_id, q.state
-         FROM queue_transition_wakes w
-         JOIN queue_items q ON q.qitem_id = w.qitem_id
-        WHERE w.phase = 'armed' AND w.wake_ref = ? AND w.wake_kind = 'watchdog'
-          AND q.state = 'blocked'
-          AND w.transition_id = (
-            SELECT MAX(a.transition_id) FROM queue_transition_wakes a
-             WHERE a.qitem_id = w.qitem_id AND a.phase = 'armed'
-          )
-          AND NOT EXISTS (
-            SELECT 1 FROM queue_transition_wakes f
-             WHERE f.qitem_id = w.qitem_id AND f.phase = 'fired'
-               AND f.wake_ref = w.wake_ref AND f.transition_id > w.transition_id
-               -- A retained attempt never consumes an attachment; a failed one consumes it only on a one-shot timer.
-               AND (f.delivery_status IS NULL OR f.delivery_status != 'retained')
-               AND (? = 0 OR f.delivery_status IS NULL OR (
-                 f.delivery_status != 'failed' AND f.delivery_status NOT LIKE 'failed:%'
-               ))
-          )`,
-    ).all(jobId, this.isRepeatingTimer(jobId) ? 1 : 0).map((row) => {
-      const r = row as { qitem_id: string; state: string };
-      return { qitemId: r.qitem_id, state: r.state };
-    });
+    // T-007715 (B1 of the delta review of 7590bf00e): only a CURRENT park's attachment keeps the job alive. A row that
+    // was attached, left 'blocked' and was parked again with no wake no longer holds it, so the job's own row can
+    // retire it (retireParkGeneratedTimer) and the pre-delivery guard can end it.
+    return liveWatchdogAttachments(this.db, jobId, this.isRepeatingTimer(jobId));
   }
 
   /** The generating row retains timer lifecycle only while its current park
    *  uses this job, including an explicit reattachment to the same job. */
   findCurrentQitemsByGeneratedTimer(jobId: string): Array<{ qitemId: string; state: string }> {
     return this.findQitemsByGeneratedTimer(jobId).filter(row =>
-      row.state === "blocked" && this.getStatus(row.qitemId)?.ref === jobId);
+      row.state === "blocked" && this.getCurrentParkStatus(row.qitemId)?.ref === jobId);
   }
 
   /** An ordinary one-shot park has no later cycle to replace a failed wake.
@@ -291,17 +272,21 @@ export class QueueWakeRepository {
    *  them; any other job the retiring occupant registered still stops. */
   currentParkTimerIds(): string[] {
     if (!this.available) return [];
+    // A park timer is kept while it is the current wake of a blocked row of the job's target: the row that generated
+    // it, or (F2 of the lenses on the redesign) a row of the same owner whose current park is attached to it by
+    // --wake-watchdog, when the generating row has moved on. An operator's own job (never armed as a timer) is not a
+    // park timer, attached or not, and still stops with its occupant.
     return this.db.prepare(
-      `SELECT w.wake_ref
+      `SELECT DISTINCT w.wake_ref
          FROM queue_transition_wakes w
          JOIN queue_items q ON q.qitem_id = w.qitem_id
          JOIN watchdog_jobs j ON j.job_id = w.wake_ref
-        WHERE w.phase = 'armed' AND w.wake_kind = 'timer'
+        WHERE w.wake_kind IN ('timer', 'watchdog')
           AND q.state = 'blocked' AND j.state = 'active' AND j.target_session = q.destination_session
-          AND w.transition_id = (
-            SELECT MAX(a.transition_id) FROM queue_transition_wakes a
-             WHERE a.qitem_id = w.qitem_id AND a.phase = 'armed'
-          )`,
+          AND ${currentParkArmSql("w")}
+          AND (w.wake_kind = 'timer' OR EXISTS (
+            SELECT 1 FROM queue_transition_wakes g WHERE g.wake_ref = w.wake_ref AND g.phase = 'armed' AND g.wake_kind = 'timer'
+          ))`,
     ).all().map((row) => (row as { wake_ref: string }).wake_ref);
   }
 
