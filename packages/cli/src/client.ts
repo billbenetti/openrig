@@ -80,15 +80,19 @@ export function isLocalOperatorTarget(target: string): boolean {
  *  file's bearer never goes to a remote or another daemon). The daemon's bearer gate answers 401 before the handlers of
  *  these routes run; one handler (the account repair of `rig network connect`) can also answer 401, and the retry then
  *  repeats only that refused call. Never more than two requests; a 403 or any other status is returned as it came;
- *  nothing is printed (the value never reaches output). With neither --bearer nor the env, the request goes with
- *  `fallback` (none, or the terminal credential as operatorAuthHeaders does) and is not retried. */
+ *  nothing is printed (the value never reaches output). With neither --bearer nor the env, or with a value that is not
+ *  one line of visible ASCII (T-008454), the request goes with `fallback` (none, or the terminal credential as
+ *  operatorAuthHeaders does) and is not retried. */
 export async function withOperatorBearerRetry<T>(
   target: string,
   explicit: string | undefined,
   send: (headers: Record<string, string>) => Promise<DaemonResponse<T>>,
   opts: { fallback?: "none" | "terminal" } = {},
 ): Promise<DaemonResponse<T>> {
-  const sent = explicit?.trim() || process.env.OPENRIG_AUTH_BEARER_TOKEN?.trim();
+  const chosen = explicit?.trim() || process.env.OPENRIG_AUTH_BEARER_TOKEN?.trim();
+  // T-008454: a value that is not one line of visible ASCII is no bearer (like the file's): fetch would refuse it as a
+  // header quoting the value, and that error would reach the caller (an MCP tool's reply included)
+  const sent = chosen && OPERATOR_BEARER_VALUE.test(chosen) ? chosen : undefined;
   if (!sent) return send(opts.fallback === "terminal" ? terminalAuthHeaders() : {});
   const first = await send({ Authorization: `Bearer ${sent}` });
   if (first.status !== 401 || !isLocalOperatorTarget(target)) return first;

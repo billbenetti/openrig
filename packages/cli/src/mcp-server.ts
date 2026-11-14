@@ -4,7 +4,7 @@ import { createHash, randomBytes } from "node:crypto";
 import { statSync } from "node:fs";
 import nodePath from "node:path";
 import type { ToolAnnotations } from "@modelcontextprotocol/server";
-import { DaemonConnectionError, DaemonTimeoutError, terminalAuthHeaders, type DaemonClient, type DaemonResponse } from "./client.js";
+import { DaemonConnectionError, DaemonTimeoutError, terminalAuthHeaders, withOperatorBearerRetry, type DaemonClient, type DaemonResponse } from "./client.js";
 import { readOpenRigEnv } from "./openrig-compat.js";
 import { resolveRigHandle } from "./rig-handle.js";
 import { formatSeatActivity, type SeatActivityFields } from "./lib/seat-activity.js";
@@ -2202,9 +2202,13 @@ export function createMcpServer(client: DaemonClient, options: { seat?: string; 
         while (next < steps.length) {
           let res: DaemonResponse<Record<string, any>>;
           try {
-            res = await personClient.post<Record<string, any>>("/api/mission-control/action", {
-              verb, qitemId, ...steps[next], expectedRevision: expected, auditNotes: { operationId: `${operation}:${next}`, ...route },
-            });
+            // T-008454: the daemon's operator gate guards this route (401 without it on a daemon with a bearer): this
+            // process's operator bearer goes on this call only, never on the client (the person's other calls and the
+            // seat's never carry it); the actor stays the person's session. Retried once with the bearer file after a 401,
+            // as acp.ts does, only to this home's own daemon.
+            const body = { verb, qitemId, ...steps[next], expectedRevision: expected, auditNotes: { operationId: `${operation}:${next}`, ...route } };
+            res = await withOperatorBearerRetry(personClient.baseUrl, undefined, (headers) =>
+              personClient.post<Record<string, any>>("/api/mission-control/action", body, Object.keys(headers).length ? { headers } : undefined));
           } catch (err) {
             // No answer from the daemon (a timeout, a body that isn't JSON): this step may or may not have landed.
             const failed = caught(err).structuredContent as { code: string; message: string };
