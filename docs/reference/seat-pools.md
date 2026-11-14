@@ -223,15 +223,20 @@ parked seat, `parkedQitemId` (with 2 or more parks, also `parkedRows`, their cou
 
 A seat parked on its own waits may still give the row it got straight back to the model, without taking it (it is
 busier than its parks say). The pool remembers that, with `refused_cooldown_s` above 0 (the default, 1800): when the
-latest row moved to the seat as parked went back by a handoff the seat made, with no move to in-progress in between (a
-claim, or `--state in-progress`), the seat is out of the parked receivers until `refused_cooldown_s` has passed since
-the handoff, or until its open rows are no longer the parks it held when the row was moved (one closed, or a new one).
-That row, and any row that succeeds it by handoff, is never moved to that seat again: it goes to another seat that may
-receive, or is demand, as a row no seat takes. A seat that took the row and handed it on later is no refusal, nor is a
-free seat held back by it. The memory is read from the job's history (`seat_pool_dispatched`) and the queue's
-transitions, so a restart of the daemon keeps it; `refused_cooldown_s: 0` turns it off, and the pool moves rows as
-before the field. A daemon that predates `refused_cooldown_s` refuses it as an unknown field: deploy the daemon before
-setting it (leaving it out takes the default on a daemon that has it).
+latest row moved to the seat as parked went back to the model (a handoff the seat made to one of the model's
+addresses, or a reroute of the queue's fallback from the seat to the model that is not the pool's own drain or reap),
+with no move to in-progress in between (a claim, or `--state in-progress`), the seat is out of the parked receivers until
+`refused_cooldown_s` has passed since it gave the row back, or until its open rows are no longer the parks it held when
+the row was moved (one closed, or a new one). That row, and any row that succeeds it by handoff however many hops back,
+is never moved to that seat while it is parked: it goes to another seat that may receive, or waits. Once the seat is free
+(no open row) it takes any row, that one included, so a refused row never waits on a seat that could take it and that
+the demand command counts as a receiver. A row the seat handed on to another seat is routing, not a refusal; a seat that
+took the row and handed it on later is no refusal either. The memory is read from the job's history
+(`seat_pool_dispatched`) and the queue's transitions, live or archived, so a restart of the daemon keeps it;
+`refused_cooldown_s: 0` turns it off, and the pool moves rows as before the field. It applies at once to the rows
+already waiting: a row a parked seat gave back before the deploy is kept from that seat as well. A daemon that predates
+`refused_cooldown_s` refuses it as an unknown field: deploy the daemon before setting it (leaving it out takes the
+default on a daemon that has it).
 
 The key is read at each evaluation, so `rig watchdog update --spec` turns it on or off with no restart. A daemon that
 predates the key refuses it as an unknown field and holds the pool (`seat_pool_spec_invalid`): take the key out of the
