@@ -65,6 +65,13 @@ or else from the file `$OPENRIG_HOME/terminal-token`, which the person writes; t
 approve|deny` and the TUI's answers to asks send `OPENRIG_AUTH_BEARER_TOKEN` from their environment (`rig host` also
 takes `--bearer`), and otherwise the terminal token; refused for want of it, they say what to set.
 
+After the operator bearer rotates, a seat still carries the old value in its environment. So the CLI's operator writes
+(`rig queue resolve`, `rig mode set|unset`, `rig host approve|deny`, `rig network connect|disconnect` and the answers
+`rig acp serve` records) retry once on a 401. The retry uses the bearer read from the file named by
+`OPENRIG_AUTH_BEARER_FILE`, which defaults to `~/.config/setup/openrig-bearer.token`. It happens only when the first
+request carried a bearer from `--bearer` or `OPENRIG_AUTH_BEARER_TOKEN`, and only when the file exists, can be read and
+holds a different value. A request gets at most two tries. A 403 is never retried. Neither value is printed.
+
 A wrong or missing token gets HTTP 401. The routes that check `OPENRIG_AUTH_BEARER_TOKEN`, and `/api/transport`
 and `/api/compaction`, answer `{ "error": "unauthorized", "message", "what_failed", "why_it_matters", "what_to_do" }`.
 The `GET /api/terminal/<name>` routes, the websocket included, answer `{ "error": "unauthorized", "hint" }`. A valid configured bearer token in the Authorization header can pass the browser boundary's target-name check
