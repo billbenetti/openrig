@@ -40,6 +40,7 @@ function fakeClient(opts: {
 }): { client: unknown; calls: RecordedCall[] } {
   const calls: RecordedCall[] = [];
   const client = {
+    baseUrl: "http://127.0.0.1:7433", // this home's own daemon (no OPENRIG_URL, no daemon.json in the suite)
     get: vi.fn(async (path: string) => {
       calls.push({ method: "GET", path });
       if (path.startsWith("/api/rig-mode/defaults")) {

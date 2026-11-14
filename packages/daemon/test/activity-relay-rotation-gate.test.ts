@@ -103,11 +103,14 @@ async function daemonAfterRotation(daemonToken: string, operatorBearer = fake())
   };
 }
 
-/** OPENRIG_HOME with activity-endpoint.json as the daemon writes it at start: {baseUrl, token}, mode 600. */
+/** OPENRIG_HOME as the daemon leaves it at start: activity-endpoint.json ({baseUrl, token}, mode 600) and daemon.json
+ *  (its pid and port), which makes this daemon the home's own: the CLI retries the operator bearer file only there. */
 function homeWithEndpoint(baseUrl: string, token: string) {
   const home = fs.mkdtempSync(nodePath.join(os.tmpdir(), "openrig-giro-gate-"));
   cleanups.push(() => fs.rmSync(home, { recursive: true, force: true }));
   fs.writeFileSync(nodePath.join(home, "activity-endpoint.json"), JSON.stringify({ baseUrl, token }), { mode: 0o600 });
+  const url = new URL(baseUrl);
+  fs.writeFileSync(nodePath.join(home, "daemon.json"), JSON.stringify({ pid: process.pid, port: Number(url.port), host: url.hostname }));
   return home;
 }
 
