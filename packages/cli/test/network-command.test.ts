@@ -161,6 +161,7 @@ it("enrolls with the account page's code, connects a seat by name through it, an
 });
 
 it("an env bearer rotated away (T-007930): connect and disconnect retry once with the operator bearer file and go through", async () => {
+  vi.stubEnv("OPENRIG_PORT", "19731"); // the daemon of this home (its state file) is the configured one: the retry goes to it
   app = routesWith("op-secret");
   const out = vi.spyOn(console, "log").mockImplementation(() => {});
   const err = vi.spyOn(console, "error").mockImplementation(() => {});

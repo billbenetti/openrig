@@ -28,21 +28,62 @@ export function operatorBearerFilePath(): string {
   return process.env.OPENRIG_AUTH_BEARER_FILE?.trim() || path.join(os.homedir(), ".config", "setup", "openrig-bearer.token");
 }
 
+/** A bearer is one line of visible ASCII (no space, no control character): a file with anything else (a second line, a
+ *  comment, an .env of several keys) is treated as no file, so its content never reaches a header, an error or the
+ *  output (fetch rejects an invalid header value quoting the value). Only a regular file of at most 4 KiB is read. */
+const OPERATOR_BEARER_VALUE = /^[\x21-\x7E]+$/;
+const OPERATOR_BEARER_FILE_MAX_BYTES = 4096;
+
 function readOperatorBearerFile(): string | null {
   try {
-    return fs.readFileSync(operatorBearerFilePath(), "utf-8").trim() || null;
+    const file = operatorBearerFilePath();
+    const st = fs.statSync(file);
+    if (!st.isFile() || st.size > OPERATOR_BEARER_FILE_MAX_BYTES) return null;
+    const value = fs.readFileSync(file, "utf-8").trim();
+    return OPERATOR_BEARER_VALUE.test(value) ? value : null;
   } catch {
     return null;
   }
 }
 
-/** Sends an operator-gated write with the bearer from `explicit` (--bearer), else OPENRIG_AUTH_BEARER_TOKEN, and on a 401
- *  sends it once more with the bearer read from operatorBearerFilePath(), only when that file holds a different value. The
- *  daemon's bearer gate answers 401 before any handler runs, so the refused request wrote nothing. Never more than two
- *  requests; a 403 or any other status is returned as it came; nothing is printed (the value never reaches output). With
- *  neither --bearer nor the env, the request goes with `fallback` (none, or the terminal credential as operatorAuthHeaders
- *  does) and is not retried. */
+const LOOPBACK_HOST = /^(?:127(?:\.\d{1,3}){3}|localhost|\[::1\])$/i;
+
+function effectivePort(u: URL): string {
+  return u.port || (u.protocol === "https:" ? "443" : "80");
+}
+
+/** True when `target` is this home's own daemon: exactly the host and port of the daemon this home started (its
+ *  daemon.json), else of the configured daemon, and a loopback host. Another address on the same port (127.0.0.2,
+ *  [::1], localhost) can be another listener, and a daemon recorded on a wildcard address (0.0.0.0, ::) gets no retry:
+ *  it fails closed. The operator bearer file belongs to that daemon; a remote OPENRIG_URL (rig-em, --host) or another
+ *  local daemon never receives it. */
+export function isLocalOperatorTarget(target: string): boolean {
+  try {
+    const t = new URL(target);
+    if (!LOOPBACK_HOST.test(t.hostname)) return false;
+    let localUrl = localDaemonUrl();
+    if (!localUrl) {
+      const config = new ConfigStore().resolve();
+      localUrl = `http://${formatDaemonHostForUrl(config.daemon.host)}:${config.daemon.port}`;
+    }
+    const local = new URL(localUrl);
+    return t.hostname.toLowerCase() === local.hostname.toLowerCase() && t.protocol === local.protocol
+      && effectivePort(t) === effectivePort(local);
+  } catch {
+    return false;
+  }
+}
+
+/** Sends an operator-gated write to `target` (the client's baseUrl) with the bearer from `explicit` (--bearer), else
+ *  OPENRIG_AUTH_BEARER_TOKEN, and on a 401 sends it once more with the bearer read from operatorBearerFilePath(), only
+ *  when that file holds a different, well-formed value AND `target` is this home's own daemon (isLocalOperatorTarget: the
+ *  file's bearer never goes to a remote or another daemon). The daemon's bearer gate answers 401 before the handlers of
+ *  these routes run; one handler (the account repair of `rig network connect`) can also answer 401, and the retry then
+ *  repeats only that refused call. Never more than two requests; a 403 or any other status is returned as it came;
+ *  nothing is printed (the value never reaches output). With neither --bearer nor the env, the request goes with
+ *  `fallback` (none, or the terminal credential as operatorAuthHeaders does) and is not retried. */
 export async function withOperatorBearerRetry<T>(
+  target: string,
   explicit: string | undefined,
   send: (headers: Record<string, string>) => Promise<DaemonResponse<T>>,
   opts: { fallback?: "none" | "terminal" } = {},
@@ -50,7 +91,7 @@ export async function withOperatorBearerRetry<T>(
   const sent = explicit?.trim() || process.env.OPENRIG_AUTH_BEARER_TOKEN?.trim();
   if (!sent) return send(opts.fallback === "terminal" ? terminalAuthHeaders() : {});
   const first = await send({ Authorization: `Bearer ${sent}` });
-  if (first.status !== 401) return first;
+  if (first.status !== 401 || !isLocalOperatorTarget(target)) return first;
   const current = readOperatorBearerFile();
   if (!current || current === sent) return first;
   return send({ Authorization: `Bearer ${current}` });

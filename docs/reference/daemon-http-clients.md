@@ -69,8 +69,15 @@ After the operator bearer rotates, a seat still carries the old value in its env
 (`rig queue resolve`, `rig mode set|unset`, `rig host approve|deny`, `rig network enroll|connect|disconnect` and the answers
 `rig acp serve` records) retry once on a 401. The retry uses the bearer read from the file named by
 `OPENRIG_AUTH_BEARER_FILE`, which defaults to `~/.config/setup/openrig-bearer.token`. It happens only when the first
-request carried a bearer from `--bearer` or `OPENRIG_AUTH_BEARER_TOKEN`, and only when the file exists, can be read and
-holds a different value. A request gets at most two tries. A 403 is never retried. Neither value is printed.
+request carried a bearer from `--bearer` or `OPENRIG_AUTH_BEARER_TOKEN`, only when the request went to this home's own
+daemon (exactly the loopback address and port of its `daemon.json`, else of its configuration; a daemon recorded on a
+wildcard address gets no retry), and only when the file is a
+regular file of at most 4 KiB that holds one line of visible ASCII, after trimming, different from the value sent. A file
+with a second line, a space or a comment counts as no file. A remote `OPENRIG_URL` (`rig-em`, `--host`) or another local
+daemon never receives the file's bearer. A request gets at most two tries. A 403 is never retried. Neither value is
+printed. The daemon's bearer check answers 401 before these routes' handlers run; the one handler that can also answer
+401 is the account repair of `rig network connect`, and the retry then repeats only that refused call. A TUI opened
+before the rotation keeps its old bearer: reopen it.
 
 A wrong or missing token gets HTTP 401. The routes that check `OPENRIG_AUTH_BEARER_TOKEN`, and `/api/transport`
 and `/api/compaction`, answer `{ "error": "unauthorized", "message", "what_failed", "why_it_matters", "what_to_do" }`.

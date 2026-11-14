@@ -1579,7 +1579,7 @@ workspace home that is deferred/not-imminent belongs in its mission/slice.`)
       const deps = getDeps();
       await withClient(deps, async (client) => {
         // T-007930: a 401 with a stale bearer (rotated since the seat started) is retried once with the operator bearer file.
-        const res = await withOperatorBearerRetry(opts.bearer, (headers) => client.post<unknown>(
+        const res = await withOperatorBearerRetry(client.baseUrl, opts.bearer, (headers) => client.post<unknown>(
           "/api/mission-control/action",
           {
             verb: "resolve",

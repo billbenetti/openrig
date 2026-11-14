@@ -114,7 +114,7 @@ export function daemonTeamQueue(client: DaemonClient): TeamQueue {
       // The person's answer path, as a click in Slack records one: the daemon takes the actor from this client's caller.
       // T-007930: the serve process keeps the env it started with; a 401 after the bearer rotated is retried once with the
       // operator bearer file.
-      const response = await withOperatorBearerRetry(undefined, (headers) => client.post<Record<string, unknown>>("/api/mission-control/action",
+      const response = await withOperatorBearerRetry(client.baseUrl, undefined, (headers) => client.post<Record<string, unknown>>("/api/mission-control/action",
         { verb: "answer", qitemId, questionId, optionId }, Object.keys(headers).length ? { headers } : undefined));
       if (response.status < 400) return { ok: true };
       const data = (response.data ?? {}) as { message?: unknown; error?: unknown };

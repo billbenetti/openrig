@@ -374,17 +374,17 @@ export function rigModeCommand(depsOverride?: RigModeDeps): Command {
 
         const qualifierPath = qualifier ? `/${encodeURIComponent(qualifier)}` : "";
         // T-007930: a stale operator bearer (rotated since the seat started) is retried once with the bearer file.
-        const res = await withOperatorBearerRetry(opts.bearer, (headers) => client.put<BindingResponse | { error: string; errors?: string[] }>(
+        const res = await withOperatorBearerRetry(client.baseUrl, opts.bearer, (headers) => client.put<BindingResponse | { error: string; errors?: string[] }>(
           `/api/rig-mode/bindings/${scope}${qualifierPath}`,
           { mode, record },
           { headers },
         ));
         if (res.status === 401) {
           if (opts.json) {
-            console.log(JSON.stringify({ ok: false, error: "unauthorized", hint: "Daemon requires operator bearer. Pass --bearer <token> or set OPENRIG_AUTH_BEARER_TOKEN." }, null, 2));
+            console.log(JSON.stringify({ ok: false, error: "unauthorized", hint: "Daemon requires operator bearer. Pass --bearer <token>, set OPENRIG_AUTH_BEARER_TOKEN, or put the current one in the file OPENRIG_AUTH_BEARER_FILE names." }, null, 2));
           } else {
             console.error("Unauthorized. Daemon requires an operator bearer token.");
-            console.error("Pass --bearer <token> or export OPENRIG_AUTH_BEARER_TOKEN before re-running.");
+            console.error("Pass --bearer <token>, export OPENRIG_AUTH_BEARER_TOKEN, or put the current one in the file OPENRIG_AUTH_BEARER_FILE names (default ~/.config/setup/openrig-bearer.token) before re-running.");
           }
           process.exitCode = 1;
           return;
@@ -561,7 +561,7 @@ export function rigModeCommand(depsOverride?: RigModeDeps): Command {
         const categoryPath = opts.category !== undefined ? `/categories/${encodeURIComponent(opts.category)}` : "";
         let res: Awaited<ReturnType<typeof client.delete<{ removed: boolean; category?: Category; remaining?: Binding | null }>>>;
         try {
-          res = await withOperatorBearerRetry(opts.bearer,
+          res = await withOperatorBearerRetry(client.baseUrl, opts.bearer,
             (headers) => client.delete(`/api/rig-mode/bindings/${scope}${qualifierPath}${categoryPath}`, { headers }));
         } catch (error) {
           if (!(categoryPath && error instanceof DaemonResponseError && error.status === 404)) throw error;
