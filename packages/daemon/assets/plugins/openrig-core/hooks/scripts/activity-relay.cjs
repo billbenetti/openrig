@@ -296,38 +296,69 @@ function resolveEndpoint(env = process.env) {
   }
 
   if (!baseUrl || !token) {
-    try {
-      const fs = require("node:fs");
-      const path = require("node:path");
-      const os = require("node:os");
-      const home = firstString(env.OPENRIG_HOME, env.RIGGED_HOME) || path.join(os.homedir(), ".openrig");
-      const parsed = JSON.parse(fs.readFileSync(path.join(home, "activity-endpoint.json"), "utf8"));
-      if (!baseUrl && typeof parsed.baseUrl === "string" && parsed.baseUrl.length > 0) baseUrl = parsed.baseUrl;
-      if (!token && typeof parsed.token === "string" && parsed.token.length > 0) token = parsed.token;
-    } catch {
-      // absent/malformed — the caller no-ops safely below.
-    }
+    const file = readEndpointFile(env);
+    if (!baseUrl && file.baseUrl) baseUrl = file.baseUrl;
+    if (!token && file.token) token = file.token;
   }
 
   return { baseUrl, token };
 }
 
+/** {baseUrl, token} of OPENRIG_HOME/activity-endpoint.json (default ~/.openrig), each only when a non-empty string;
+ *  {} when the file is absent or malformed. The daemon rewrites it at every start with the token in force. */
+function readEndpointFile(env = process.env) {
+  try {
+    const fs = require("node:fs");
+    const path = require("node:path");
+    const os = require("node:os");
+    const home = firstString(env.OPENRIG_HOME, env.RIGGED_HOME) || path.join(os.homedir(), ".openrig");
+    const parsed = JSON.parse(fs.readFileSync(path.join(home, "activity-endpoint.json"), "utf8"));
+    return {
+      baseUrl: typeof parsed.baseUrl === "string" && parsed.baseUrl.length > 0 ? parsed.baseUrl : undefined,
+      token: typeof parsed.token === "string" && parsed.token.length > 0 ? parsed.token : undefined,
+    };
+  } catch {
+    return {}; // absent/malformed — the caller no-ops safely.
+  }
+}
+
+function sameOrigin(a, b) {
+  try { return new URL(a).origin === new URL(b).origin; } catch { return false; }
+}
+
+// A seat activity grant (src/domain/activity-grants.ts): the seat's own credential, never replaced by the file's.
+const ACTIVITY_GRANT_PREFIX = "oag_";
+
 async function postHookPayload(payload, env = process.env) {
   const { baseUrl, token } = resolveEndpoint(env);
   if (!baseUrl || !token || !payload || typeof fetch !== "function") return;
 
+  const url = new URL("/api/activity/hooks", baseUrl).toString();
+  const body = JSON.stringify(payload);
+  // One budget for the post, the retry included: the hook's own timeout (5 s for up to 2 posts) still holds.
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 1500);
+  const send = (bearer) => fetch(url, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      "authorization": `Bearer ${bearer}`,
+    },
+    body,
+    signal: controller.signal,
+  });
   try {
-    await fetch(new URL("/api/activity/hooks", baseUrl).toString(), {
-      method: "POST",
-      headers: {
-        "content-type": "application/json",
-        "authorization": `Bearer ${token}`,
-      },
-      body: JSON.stringify(payload),
-      signal: controller.signal,
-    });
+    const response = await send(token);
+    // The install-wide token rotated under a live seat: its process kept the token it was launched with, and the
+    // daemon rewrote activity-endpoint.json with the one in force. On a 401 (not a 403) for a token that is not a seat
+    // grant, post once more with the file's token, only when it is a different value and the file names this same
+    // daemon: one retry, never a loop.
+    // The file's token is the credential of the daemon that wrote the file: it goes only to that daemon's origin,
+    // never to another one an inherited OPENRIG_URL points at.
+    if (response && response.status === 401 && !token.startsWith(ACTIVITY_GRANT_PREFIX)) {
+      const file = readEndpointFile(env);
+      if (file.token && file.token !== token && sameOrigin(file.baseUrl, url)) await send(file.token);
+    }
   } catch {
     // Provider hooks must not block the agent loop if OpenRig is unavailable.
   } finally {
