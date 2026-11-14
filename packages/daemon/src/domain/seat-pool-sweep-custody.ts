@@ -2,10 +2,16 @@ import type Database from "better-sqlite3";
 import { parse as parseYaml } from "yaml";
 import { parseSeatPoolSpec, SEAT_POOL_NO_SEAT_GRACE_DEFAULT_SECONDS } from "./policies/seat-pool.js";
 import { nodeExecutorConfirmedStopped } from "./node-inventory.js";
+import { SeatPoolSlots } from "./seat-pool-executor.js";
 
-/** Per database: when the sweep first saw each open `live` seat of a pool not running (by slot id). The grace of a seat
- *  that stopped counts from there; a daemon restart starts it again, which delays the finding, never holds it forever. */
-const stoppedSinceByDb = new WeakMap<Database.Database, Map<number, number>>();
+/** T-007545 (B1 of its review): a seat the pool started counts as one the pool had only once it ran this long from its
+ *  start (live_at) to its stop as seen (stopped_since: the first sweep that saw it stopped, or its reap, which marks
+ *  before it cleans). Two sweep periods (the stuck sweep runs every 300 s): the stop is seen up to a sweep period after
+ *  the death (sooner when the reap comes first), so a seat that dies within ~5 min of its start never counts, and a
+ *  crash loop (the launch works, the session dies, the reap, the next add) never renews the grace, however often it
+ *  turns. A seat without live_at (started before it was kept) is measured from its add (created_at), so no path that
+ *  leaves it unset can renew the grace either; an adopted one counts as before. */
+export const SEAT_POOL_MIN_RUN_MS = 10 * 60_000;
 
 /** What the stuck sweep reads of one active seat pool to tell whether a row waiting for its model is the pool's to move. */
 interface PoolQueueFacts {
@@ -14,9 +20,11 @@ interface PoolQueueFacts {
    *  planner's seatStopped, inverted). An adopted seat that stopped doesn't count, nor a seat still being added: either
    *  would hold the queue forever. */
   hasSeat: boolean;
-  /** When the pool last had a seat: the latest of its registration, the retirement of a seat that was live (or
-   *  adopted), and when the sweep first saw a live seat of it stopped. A seat retired before it was ever live never
-   *  counts. */
+  /** When the pool last had a seat: the latest of its registration, when a retired seat that was live (or adopted)
+   *  stopped running (its retirement when it was reaped still running), and when a live seat of it stopped. A seat
+   *  retired before it was ever live never counts. T-007545: both stops are kept on the slot (stopped_since), so a
+   *  daemon restart doesn't renew the grace (SD1); and a seat the pool started counts only once it ran for
+   *  SEAT_POOL_MIN_RUN_MS from its start (live_at), so a crash loop's turns don't renew it either (SD2, B1). */
   lastSeatMs: number;
   graceMs: number;
 }
@@ -40,7 +48,7 @@ export function seatPoolQueueCustody(
       const jobs = db.prepare("SELECT job_id, spec_yaml, target_session, registered_at FROM watchdog_jobs WHERE policy = 'seat-pool' AND state = 'active'")
         .all() as Array<{ job_id: string; spec_yaml: string; target_session: string; registered_at: string }>;
       const liveSlots = db.prepare(
-        `SELECT s.id, s.node_id FROM seat_pool_slots s JOIN nodes n ON n.id = s.node_id
+        `SELECT s.id, s.node_id, s.op_id, s.live_at, s.created_at FROM seat_pool_slots s JOIN nodes n ON n.id = s.node_id
           WHERE s.pool_job_id = ? AND s.retired_at IS NULL AND s.phase = 'live'`,
       );
       const latestStatus = db.prepare("SELECT status FROM sessions WHERE node_id = ? ORDER BY id DESC LIMIT 1");
@@ -49,32 +57,43 @@ export function seatPoolQueueCustody(
       const running = (nodeId: string): boolean =>
         ["running", "idle", "unknown"].includes((latestStatus.get(nodeId) as { status: string } | undefined)?.status ?? "")
         && !nodeExecutorConfirmedStopped(db, nodeId);
-      let stoppedSince = stoppedSinceByDb.get(db);
-      if (!stoppedSince) stoppedSinceByDb.set(db, stoppedSince = new Map());
-      const stillStopped = new Set<number>();
+      const slots = new SeatPoolSlots(db);
+      const nowIso = new Date(nowMs).toISOString();
+      const stoppedSince = db.prepare("SELECT stopped_since FROM seat_pool_slots WHERE id = ?");
       // A retired seat counts as one the pool had unless it was retired before it was ever live (intent 'never_live',
       // SeatPoolSlots.retire: an add or a launch that failed) or before it got a node. The slot's own row, not the job's
       // history (whose retention keeps only the newest evaluations), so the grace holds as long as the row does.
+      // T-007545 (SD2): it counts until it stopped running (stopped_since), not until its reap, when that came first;
+      // and (B1) a seat the pool started counts only when it ran for SEAT_POOL_MIN_RUN_MS from its start (less 1 ms:
+      // julianday is a double, so a run of exactly SEAT_POOL_MIN_RUN_MS can come out a fraction of a ms short).
+      const stopOf = "CASE WHEN s.stopped_since IS NOT NULL AND s.stopped_since < s.retired_at THEN s.stopped_since ELSE s.retired_at END";
       const lastRetired = db.prepare(
-        `SELECT MAX(s.retired_at) AS at FROM seat_pool_slots s
+        `SELECT MAX(${stopOf}) AS at FROM seat_pool_slots s
           WHERE s.pool_job_id = ? AND s.retired_at IS NOT NULL
-            AND (s.op_id IS NULL OR (s.node_id IS NOT NULL AND COALESCE(s.intent, '') <> 'never_live'))`,
+            AND (s.op_id IS NULL OR (s.node_id IS NOT NULL AND COALESCE(s.intent, '') <> 'never_live'))
+            AND (s.op_id IS NULL OR (julianday(${stopOf}) - julianday(COALESCE(s.live_at, s.created_at))) * 86400000.0 >= ? - 1)`,
       );
       for (const job of jobs) {
         const parsed = parseYaml(job.spec_yaml) as { context?: unknown } | null;
         const context = parsed && typeof parsed.context === "object" && parsed.context !== null ? parsed.context as Record<string, unknown> : {};
         const pool = parseSeatPoolSpec(context);
         if (!("spec" in pool) || pool.spec.drain || !pool.spec.dispatchTag) continue;
-        const retired = Date.parse((lastRetired.get(job.job_id) as { at: string | null }).at ?? "");
+        const retired = Date.parse((lastRetired.get(job.job_id, SEAT_POOL_MIN_RUN_MS) as { at: string | null }).at ?? "");
         const registered = Date.parse(job.registered_at);
         let hasSeat = false;
         let lastStoppedMs = -Infinity;
-        for (const slot of liveSlots.all(job.job_id) as Array<{ id: number; node_id: string }>) {
-          if (running(slot.node_id)) { hasSeat = true; continue; }
-          const since = stoppedSince.get(slot.id) ?? nowMs;
-          stoppedSince.set(slot.id, since);
-          stillStopped.add(slot.id);
-          lastStoppedMs = Math.max(lastStoppedMs, since);
+        for (const slot of liveSlots.all(job.job_id) as Array<{ id: number; node_id: string; op_id: string | null; live_at: string | null; created_at: string }>) {
+          // A seat seen stopped that runs again starts afresh the next time it stops.
+          if (running(slot.node_id)) { hasSeat = true; slots.clearStopped(slot.id); continue; }
+          // T-007545 (SD1): kept on the slot the first time (from the session's record of the stop when there is one),
+          // so a daemon restart, or the adoption of a seat already stopped, doesn't give it a whole grace again
+          slots.markStopped(slot.id, nowIso);
+          const since = Date.parse((stoppedSince.get(slot.id) as { stopped_since: string | null } | undefined)?.stopped_since ?? "");
+          const stopMs = Number.isFinite(since) ? since : nowMs;
+          // T-007545 (B1): a seat the pool started that stopped before it ran for SEAT_POOL_MIN_RUN_MS never counts
+          const liveAt = slot.op_id !== null ? Date.parse(slot.live_at ?? slot.created_at) : NaN;
+          if (Number.isFinite(liveAt) && stopMs - liveAt < SEAT_POOL_MIN_RUN_MS) continue;
+          lastStoppedMs = Math.max(lastStoppedMs, stopMs);
         }
         const facts: PoolQueueFacts = {
           dispatchTag: pool.spec.dispatchTag,
@@ -87,8 +106,6 @@ export function seatPoolQueueCustody(
           pools.set(address, [...(pools.get(address) ?? []), facts]);
         }
       }
-      // A seat seen stopped that runs again, or left the pool, starts afresh the next time it stops.
-      for (const id of [...stoppedSince.keys()]) if (!stillStopped.has(id)) stoppedSince.delete(id);
     }
   } catch {
     pools.clear();
