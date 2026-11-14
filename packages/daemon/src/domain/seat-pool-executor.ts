@@ -349,36 +349,14 @@ function readPoolMoves(db: Database.Database, jobId: string, nowMs: number): Poo
       continue;
     }
     if (typeof notes["to"] !== "string" || typeof notes["qitemId"] !== "string") continue;
+    // A record of 2 or more parks without parkedQitemIds (a daemon from before them) names only the newest: not known.
     const ids = Array.isArray(notes["parkedQitemIds"]) && notes["parkedQitemIds"].every((id) => typeof id === "string")
       ? notes["parkedQitemIds"] as string[]
-      : typeof notes["parkedQitemId"] === "string" ? [notes["parkedQitemId"]] : null;
+      : typeof notes["parkedQitemId"] === "string" && !(typeof notes["parkedRows"] === "number" && notes["parkedRows"] > 1)
+        ? [notes["parkedQitemId"]] : null;
     moves.push({ to: notes["to"], qitemId: notes["qitemId"], mode: typeof notes["mode"] === "string" ? notes["mode"] : null, openRowIds: ids });
   }
   return moves;
-}
-
-/**
- * When a seat gave a row the pool moved to it straight back: the time of its handoff, made by one of `addresses`,
- * after the latest move of the row by the queue's fallback actor (the pool's move) with no move to in-progress in
- * between (a claim, or an update by the seat); null otherwise. A row the seat took and then handed on is no refusal.
- * (claimed_at can't say it: an unclaim clears it.) The caller knows from the job's history that the pool moved the row
- * to that seat.
- */
-function refusedUntakenAt(db: Database.Database, qitemId: string, addresses: readonly string[]): string | null {
-  if (addresses.length === 0) return null;
-  const table = transitionsTableOf(db, qitemId);
-  const move = db.prepare(`SELECT MAX(transition_id) AS id FROM ${table} WHERE qitem_id = ? AND actor_session = ?`)
-    .get(qitemId, FALLBACK_ACTOR) as { id: number | null };
-  if (move.id === null) return null;
-  const taken = db.prepare(`SELECT 1 FROM ${table} WHERE qitem_id = ? AND transition_id > ? AND state = 'in-progress' LIMIT 1`)
-    .get(qitemId, move.id);
-  if (taken) return null;
-  const back = db.prepare(
-    `SELECT ts FROM ${table}
-      WHERE qitem_id = ? AND transition_id > ? AND state = 'handed-off' AND actor_session IN (${addresses.map(() => "?").join(",")})
-      ORDER BY transition_id DESC LIMIT 1`,
-  ).get(qitemId, move.id, ...addresses) as { ts: string } | undefined;
-  return back?.ts ?? null;
 }
 
 /** Where a row's transitions are: the live log, or the archive the retention sweep moves a closed row's transitions to
@@ -389,71 +367,115 @@ function transitionsTableOf(db: Database.Database, qitemId: string): "queue_tran
   return archive ? "queue_transitions_archive" : "queue_transitions";
 }
 
-/**
- * A seat's parked refusal (SeatPoolSlotView.parkedRefusal): the pool's latest move of a row to the seat (`moves`,
- * newest first) was made as parked, and the seat gave that row straight back (refusedUntakenAt) less than
- * `cooldownSeconds` ago. Only the latest move counts: a row the seat took since ends the refusal before it. Read from the
- * job's history and the queue, so a restart of the daemon keeps it. Null: no such refusal.
- */
-function parkedRefusalOf(
-  deps: SeatPoolStateReaderDeps, moves: readonly PoolMove[], sessionName: string, cooldownSeconds: number, nowMs: number,
-): { at: string; openRowIds: string[] | null } | null {
-  const latest = moves.find((move) => move.to === sessionName);
-  if (!latest || latest.mode !== "parked") return null;
-  const at = refusedUntakenAt(deps.db, latest.qitemId, deps.sessionAddresses(sessionName));
-  if (at === null || !(nowMs - Date.parse(at) < cooldownSeconds * 1000)) return null;
-  return { at, openRowIds: latest.openRowIds };
-}
-
 /** The reason a dispatch gives the queue's move (the transition note reads `fallback-routed: <from> → <to> (<reason>)`):
- *  the job, who had the row and why the seat could take it. seatPoolParkedMoveTo reads it back. */
+ *  the job, who had the row and why the seat could take it. seatPoolRefusalOf reads it back. */
 function seatPoolMoveReason(jobId: string, from: string, to: string, parkedOn: string | null): string {
   return `seat pool ${jobId}: ${from} had not taken it; ${to} ${parkedOn !== null ? `was parked on ${parkedOn} (2nd row)` : "was free"}`;
 }
 
-/** The seat this pool's latest move of the row went to, when that move was a dispatch to a parked seat (the note
- *  seatPoolMoveReason wrote, on the queue's own transition, live or archived: it lives as long as the row does, past the
- *  job's history);
- *  null for any other move, or none. */
-function seatPoolParkedMoveTo(db: Database.Database, qitemId: string, jobId: string): { seat: string; transitionId: number } | null {
-  const move = db.prepare(
-    `SELECT transition_id, transition_note FROM ${transitionsTableOf(db, qitemId)} WHERE qitem_id = ? AND actor_session = ? ORDER BY transition_id DESC LIMIT 1`,
-  ).get(qitemId, FALLBACK_ACTOR) as { transition_id: number; transition_note: string | null } | undefined;
-  const note = move?.transition_note ?? "";
-  const match = /^fallback-routed: .+? → (\S+) \(seat pool (\S+): .+ was parked on .+ \(2nd row\)\)$/.exec(note);
-  return move && match && match[2] === jobId ? { seat: match[1]!, transitionId: move.transition_id } : null;
+/** What a refusal is read against: the pool's job, the addresses of its model (where a refused row goes back) and the
+ *  addresses of a seat (its own handoffs and reroutes). */
+interface SeatPoolRefusalContext {
+  db: Database.Database;
+  jobId: string;
+  modelAddresses: ReadonlySet<string>;
+  addressesOf(seat: string): readonly string[];
 }
 
-/** The pool's seats that gave this row, or a row it succeeds by handoff (its chain of record), straight back untaken
- *  after this pool moved it to them as parked (seatPoolParkedMoveTo, refusedUntakenAt). Read from the queue alone, so it
- *  holds for the row's whole lineage. */
-function readRefusedBy(
-  deps: SeatPoolStateReaderDeps, jobId: string, chain: string | null, poolSeats: ReadonlySet<string>, addresses: (seat: string) => string[],
-): string[] {
-  if (!chain || poolSeats.size === 0) return [];
-  let ids: unknown;
-  try {
-    ids = JSON.parse(chain);
-  } catch {
-    return [];
+const FALLBACK_NOTE = /^fallback-routed: (\S+) → (\S+) \((.*)\)$/s;
+const PARKED_MOVE_REASON = /^seat pool (\S+): .+ was parked on .+ \(2nd row\)$/s;
+
+/**
+ * Whether a seat of the pool refused this row: the pool's latest move of the row was a dispatch to that seat as parked
+ * (the note seatPoolMoveReason wrote, on the queue's own transition, live or archived: it lives as long as the row does,
+ * past the job's history), and after it, with no move to in-progress in between (a claim, or an update by the seat;
+ * claimed_at can't say it: an unclaim clears it), the seat gave the row back TO THE MODEL: a handoff it made whose
+ * target is one of the model's addresses, or a reroute of the queue's fallback from the seat to the model that is not
+ * the pool's own (a drain or a reap). A row the seat handed on to another seat is no refusal: that is routing (T-008296
+ * B2, S1). Null: no refusal; else the seat and when it gave the row back.
+ */
+function seatPoolRefusalOf(ctx: SeatPoolRefusalContext, qitemId: string): { seat: string; at: string } | null {
+  const table = transitionsTableOf(ctx.db, qitemId);
+  const moves = ctx.db.prepare(
+    `SELECT transition_id, transition_note FROM ${table} WHERE qitem_id = ? AND actor_session = ? ORDER BY transition_id DESC`,
+  ).all(qitemId, FALLBACK_ACTOR) as Array<{ transition_id: number; transition_note: string | null }>;
+  // The pool's latest move of the row, and any reroute after it (newest first, so those come before it).
+  let poolMove: { transitionId: number; seat: string } | null = null;
+  const after: Array<{ transitionId: number; from: string; to: string; reason: string }> = [];
+  for (const move of moves) {
+    const note = FALLBACK_NOTE.exec(move.transition_note ?? "");
+    if (!note) continue;
+    const [, from, to, reason] = note as unknown as [string, string, string, string];
+    if (reason.startsWith(`seat pool ${ctx.jobId}: `)) {
+      const parked = PARKED_MOVE_REASON.exec(reason);
+      poolMove = parked ? { transitionId: move.transition_id, seat: to } : null;
+      break;
+    }
+    after.push({ transitionId: move.transition_id, from, to, reason });
   }
-  if (!Array.isArray(ids)) return [];
+  if (!poolMove) return null;
+  const seat = new Set(ctx.addressesOf(poolMove.seat));
+  if (seat.size === 0) return null;
+  const transitions = ctx.db.prepare(
+    `SELECT transition_id, ts, state, actor_session, closure_target FROM ${table} WHERE qitem_id = ? AND transition_id > ? ORDER BY transition_id`,
+  ).all(qitemId, poolMove.transitionId) as Array<{ transition_id: number; ts: string; state: string; actor_session: string; closure_target: string | null }>;
+  const rerouted = new Map(after.map((move) => [move.transitionId, move]));
+  for (const t of transitions) {
+    if (t.state === "in-progress") return null;
+    if (t.state === "handed-off" && seat.has(t.actor_session)) {
+      return t.closure_target !== null && ctx.modelAddresses.has(t.closure_target) ? { seat: poolMove.seat, at: t.ts } : null;
+    }
+    const move = rerouted.get(t.transition_id);
+    if (move && seat.has(move.from)) {
+      const pools = move.reason.startsWith(SEAT_POOL_DRAIN_REASON) || move.reason.startsWith(SEAT_POOL_REAP_REASON);
+      return !pools && ctx.modelAddresses.has(move.to) ? { seat: poolMove.seat, at: t.ts } : null;
+    }
+  }
+  return null;
+}
+
+/**
+ * A seat's parked refusal (SeatPoolSlotView.parkedRefusal): the pool's latest move of a row to the seat (`moves`,
+ * newest first) was made as parked, and the seat gave that row straight back to the model (seatPoolRefusalOf) less
+ * than `cooldownSeconds` ago. Only the latest move counts: a row the seat took since ends the refusal before it. Read
+ * from the job's history and the queue, so a restart of the daemon keeps it. Null: no such refusal.
+ */
+function parkedRefusalOf(
+  ctx: SeatPoolRefusalContext, moves: readonly PoolMove[], sessionName: string, cooldownSeconds: number, nowMs: number,
+): { at: string; openRowIds: string[] | null } | null {
+  const latest = moves.find((move) => move.to === sessionName);
+  if (!latest || latest.mode !== "parked") return null;
+  const refusal = seatPoolRefusalOf(ctx, latest.qitemId);
+  if (refusal === null || refusal.seat !== sessionName || !(nowMs - Date.parse(refusal.at) < cooldownSeconds * 1000)) return null;
+  return { at: refusal.at, openRowIds: latest.openRowIds };
+}
+
+/** The pool's seats that refused this row (it came back to the model by a reroute) or a row it succeeds by handoff
+ *  (its chain of record), however many hops back (seatPoolRefusalOf). Read from the queue alone, so it holds for the
+ *  row's whole lineage. */
+function readRefusedBy(ctx: SeatPoolRefusalContext, qitemId: string, chain: string | null, poolSeats: ReadonlySet<string>): string[] {
+  if (poolSeats.size === 0) return [];
+  let ids: unknown = [];
+  try {
+    ids = chain ? JSON.parse(chain) : [];
+  } catch {
+    ids = [];
+  }
   const refused = new Set<string>();
-  for (const id of ids) {
+  for (const id of [...(Array.isArray(ids) ? ids : []), qitemId]) {
     if (typeof id !== "string") continue;
-    const moved = seatPoolParkedMoveTo(deps.db, id, jobId);
-    if (!moved || !poolSeats.has(moved.seat) || refused.has(moved.seat)) continue;
-    if (refusedUntakenAt(deps.db, id, addresses(moved.seat)) !== null) refused.add(moved.seat);
+    const refusal = seatPoolRefusalOf(ctx, id);
+    if (refusal && poolSeats.has(refusal.seat)) refused.add(refusal.seat);
   }
   return [...refused];
 }
 
 /** Pending rows addressed to any of `sessions` (in any of their addresses), longest waiting first. A row waits from its
  *  latest reroute, or from its creation. Only pending rows: a claimed, blocked or closed row is never the pool's to
- *  move. With `refusal` (read only with `refused_cooldown_s` above 0: the job and the pool's seats), each row says
- *  which of those seats gave it, or a row it succeeds, straight back (refusedBy). */
+ *  move. With `refusal` (read only with `refused_cooldown_s` above 0: the job, its model and the pool's seats), each row
+ *  says which of those seats refused it, or a row it succeeds (refusedBy). */
 function readPendingRows(
-  deps: SeatPoolStateReaderDeps, sessions: string[], refusal: { jobId: string; seats: ReadonlySet<string> } | null = null,
+  deps: SeatPoolStateReaderDeps, sessions: string[], refusal: { ctx: SeatPoolRefusalContext; seats: ReadonlySet<string> } | null = null,
 ): SeatPoolPendingRow[] {
   const sessionOf = new Map<string, string>();
   for (const session of sessions) {
@@ -467,13 +489,8 @@ function readPendingRows(
       WHERE q.state = 'pending' AND q.destination_session IN (${[...sessionOf.keys()].map(() => "?").join(",")})
       ORDER BY since, q.qitem_id`,
   ).all(FALLBACK_ACTOR, ...sessionOf.keys()) as Array<{ qitem_id: string; destination_session: string; tags: string | null; chain_of_record: string | null; since: string }>;
-  const seatAddresses = new Map<string, string[]>();
-  const addresses = (seat: string) => {
-    if (!seatAddresses.has(seat)) seatAddresses.set(seat, deps.sessionAddresses(seat));
-    return seatAddresses.get(seat)!;
-  };
   return rows.map((row) => {
-    const refusedBy = refusal ? readRefusedBy(deps, refusal.jobId, row.chain_of_record, refusal.seats, addresses) : [];
+    const refusedBy = refusal ? readRefusedBy(refusal.ctx, row.qitem_id, row.chain_of_record, refusal.seats) : [];
     return {
       qitemId: row.qitem_id, destination: sessionOf.get(row.destination_session)!, waitingSince: row.since,
       tags: row.tags ? JSON.parse(row.tags) as string[] : [],
@@ -540,6 +557,14 @@ export function readSeatPoolState(deps: SeatPoolStateReaderDeps, job: { jobId: s
   const refusedCooldown = seatPoolRefusedCooldown(job.spec);
   const nowMs = deps.now?.() ?? Date.now();
   const poolMoves = refusedCooldown > 0 ? readPoolMoves(db, job.jobId, nowMs) : [];
+  const seatAddresses = new Map<string, string[]>();
+  const refusalCtx: SeatPoolRefusalContext = {
+    db, jobId: job.jobId, modelAddresses: new Set(deps.sessionAddresses(model.sessionName)),
+    addressesOf: (seat) => {
+      if (!seatAddresses.has(seat)) seatAddresses.set(seat, deps.sessionAddresses(seat));
+      return seatAddresses.get(seat)!;
+    },
+  };
   const slots = deps.slots.listOpen(job.jobId).map((slot): SeatPoolSlotView => {
     const present = slot.nodeId !== null && nodeExists(slot.nodeId);
     const state = present ? deps.seatState(slot.nodeId!) : null;
@@ -547,7 +572,7 @@ export function readSeatPoolState(deps: SeatPoolStateReaderDeps, job: { jobId: s
     const sessionName = seatSessionName(slot.logicalId, model.rigName);
     const facts = present && parkedRule && deps.rowFacts ? deps.rowFacts(sessionName, maxOpenRows) : null;
     const refusal = present && refusedCooldown > 0 && slot.opId !== null
-      ? parkedRefusalOf(deps, poolMoves, sessionName, refusedCooldown, nowMs) : null;
+      ? parkedRefusalOf(refusalCtx, poolMoves, sessionName, refusedCooldown, nowMs) : null;
     return {
       slotId: slot.slotId,
       logicalId: slot.logicalId,
@@ -585,7 +610,7 @@ export function readSeatPoolState(deps: SeatPoolStateReaderDeps, job: { jobId: s
     adoptable,
     pending: readPendingRows(
       deps, [model.sessionName, ...slots.map((slot) => slot.sessionName), ...retired],
-      refusedCooldown > 0 ? { jobId: job.jobId, seats: new Set(slots.map((slot) => slot.sessionName)) } : null,
+      refusedCooldown > 0 ? { ctx: refusalCtx, seats: new Set(slots.map((slot) => slot.sessionName)) } : null,
     ),
     demand: job.spec.demandCmd ? deps.demand(job.jobId) : null,
     lastScaleAt: deps.slots.lastScaleAt(job.jobId),
@@ -1779,8 +1804,11 @@ export class SeatPoolExecutor {
     const limited = usageLimited.has(slot.sessionName);
     const mode = seatPoolReceives(ctx.spec, slot, nowMs, { usageLimited: limited });
     const base = { qitemId: intent.qitemId, from: intent.from, to: slot.sessionName };
-    // A row the seat gave straight back untaken (T-008296): the plan leaves it out; this catches a give-back since.
-    if (ctx.state.pending.find((row) => row.qitemId === intent.qitemId)?.refusedBy?.includes(slot.sessionName)) {
+    // A row the seat refused (T-008296) never goes to it while it is parked. The plan already leaves such a pair out
+    // (its refusedBy comes from closed rows, which a later read cannot add to the planned row itself), so this fires
+    // only for an intent that did not come from that plan: a guard of the executor's own, as the other rechecks here.
+    const refused = ctx.state.pending.find((row) => row.qitemId === intent.qitemId)?.refusedBy?.includes(slot.sessionName) ?? false;
+    if (refused && mode === "parked") {
       this.record(jobId, false, "seat_pool_dispatch_skipped", { ...base, code: "refused_row" });
       return true;
     }
@@ -1792,8 +1820,10 @@ export class SeatPoolExecutor {
         }
         return true;
       }
-    } else if (mode === null && slot.busyProcess && seatPoolReceives(ctx.spec, { ...read, busyProcess: null }, nowMs, { usageLimited: limited }) === "parked") {
-      // Parked as the plan read it, but busy with heavy local work under its pane (T-006090).
+    } else if (mode === null && slot.busyProcess
+      && seatPoolReceives(ctx.spec, { ...read, busyProcess: null, parkedRefusal: undefined }, nowMs, { usageLimited: limited }) === "parked") {
+      // Parked as the plan read it, but busy with heavy local work under its pane (T-006090); said so also when it
+      // refused a row besides (the refusal alone is parked_refused).
       this.record(jobId, false, "seat_pool_dispatch_skipped", { ...base, code: "parked_busy", busyProcess: slot.busyProcess });
       return true;
     } else if (mode === null && slot.parkedRefusal
