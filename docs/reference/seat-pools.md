@@ -47,6 +47,7 @@ context:
     busy_processes: [suite-flock]   # a seat with one of these programs running gets no row: no 2nd row parked, and no row free either (default: none)
     busy_orphan_max_age_s: 43200    # only with busy_processes: the oldest a process that left the pane's tree may be and still hold the seat (60..172800, default 43200)
     max_open_rows: 4                # a seat with up to this many open rows, ALL parked on its own waits, may receive (1..20, default 1)
+    refused_cooldown_s: 1800        # a parked seat that gave a row straight back untaken gets none for this long (0..86400, default 1800; 0: off)
 ```
 
 Registration and `rig watchdog update --spec` refuse a spec with an unknown field, `max` below `min`, a relative
@@ -212,11 +213,25 @@ blocked at the seat with its own timer. With `parked_max_load_per_cpu_percent` s
 before the move the executor asks the rule again, with the provider usage and the load read then: a seat that is no
 longer parked, or whose account ran out of usage, keeps nothing (`seat_pool_dispatch_skipped`, `code: parked_changed`;
 a free seat that changed is left to the next plan with no entry, but one held back by a busy process read then says so:
-`code: free_busy`, with `busyProcess`), and a load that rose above the limit since the plan
+`code: free_busy`, with `busyProcess`), one that gave a row it got as parked straight back since the plan keeps
+nothing either (`code: parked_refused`), a row the seat gave back untaken is never moved to it (`code: refused_row`),
+and a load that rose above the limit since the plan
 gives the parked seat no row (`code: parked_load`), and so does a busy process read then (`code: parked_busy`, with
 `busyProcess`: the program and its pid, or why the processes could not be read). The move's note and the row's resolution say
 `<seat> was parked on <gate> (2nd row)`, and `seat_pool_dispatched` carries `mode` (`free` or `parked`) and, for a
-parked seat, `parkedQitemId`.
+parked seat, `parkedQitemId` (with 2 or more parks, also `parkedRows`, their count, and `parkedQitemIds`, every one).
+
+A seat parked on its own waits may still give the row it got straight back to the model, without taking it (it is
+busier than its parks say). The pool remembers that, with `refused_cooldown_s` above 0 (the default, 1800): when the
+latest row moved to the seat as parked went back by a handoff the seat made, with no move to in-progress in between (a
+claim, or `--state in-progress`), the seat is out of the parked receivers until `refused_cooldown_s` has passed since
+the handoff, or until its open rows are no longer the parks it held when the row was moved (one closed, or a new one).
+That row, and any row that succeeds it by handoff, is never moved to that seat again: it goes to another seat that may
+receive, or is demand, as a row no seat takes. A seat that took the row and handed it on later is no refusal, nor is a
+free seat held back by it. The memory is read from the job's history (`seat_pool_dispatched`) and the queue's
+transitions, so a restart of the daemon keeps it; `refused_cooldown_s: 0` turns it off, and the pool moves rows as
+before the field. A daemon that predates `refused_cooldown_s` refuses it as an unknown field: deploy the daemon before
+setting it (leaving it out takes the default on a daemon that has it).
 
 The key is read at each evaluation, so `rig watchdog update --spec` turns it on or off with no restart. A daemon that
 predates the key refuses it as an unknown field and holds the pool (`seat_pool_spec_invalid`): take the key out of the
