@@ -28,7 +28,7 @@ import { getOpenRigHome } from "../openrig-compat.js";
 import { addHostEntry, updateHostEntry, removeHostEntry, defaultHostRegistryPath, loadHostRegistry, validateHostRegistry, hostDisplayTarget, resolveHost, resolveRemoteBearer, bearerAuthHeaders, type HostEntry, type HttpHostEntry } from "../host-registry.js";
 import { runCrossHostCommand, type CrossHostResult } from "../cross-host-executor.js";
 import { recordHostObservation, loadHostBindings, describeBindingConflict, defaultHostBindingsPath, type HostObservationOutcome } from "../host-bindings.js";
-import { DaemonClient, operatorAuthHeaders } from "../client.js";
+import { DaemonClient, withOperatorBearerRetry } from "../client.js";
 import { readOwnHostName, readSelectedHost } from "../host-selection.js";
 import { parseFeedHostSubscriptionKey } from "../config-store.js";
 
@@ -958,8 +958,10 @@ export function hostCommand(doctorDepsOverride?: DoctorDeps): Command {
         // The decision is gated by the operator bearer (OPENRIG_AUTH_BEARER_TOKEN), as rig queue resolve and rig mode are.
         let res: { status: number; data: Decided };
         try {
-          res = await new DaemonClient().post<Decided>("/api/hosts/pair-decision", { request: request.trim(), decision },
-            { headers: operatorAuthHeaders(opts.bearer) });
+          // T-007930: a stale operator bearer is retried once with the bearer file; with none, the terminal credential.
+          const client = new DaemonClient();
+          res = await withOperatorBearerRetry(client.baseUrl, opts.bearer, (headers) => client.post<Decided>("/api/hosts/pair-decision",
+            { request: request.trim(), decision }, { headers }), { fallback: "terminal" });
         } catch (err) {
           console.error((err as Error).message);
           process.exitCode = 1;
@@ -968,7 +970,7 @@ export function hostCommand(doctorDepsOverride?: DoctorDeps): Command {
         if (opts.json) console.log(JSON.stringify(res.data));
         if (res.status !== 200 || !res.data?.ok) {
           if (!opts.json) console.error(res.status === 401
-            ? `This daemon refused the decision without its operator bearer token. Set OPENRIG_AUTH_BEARER_TOKEN to the token this daemon runs with, or pass --bearer <token>. Nothing was decided.`
+            ? `This daemon refused the decision without its operator bearer token. Set OPENRIG_AUTH_BEARER_TOKEN to the token this daemon runs with, put it in the file OPENRIG_AUTH_BEARER_FILE names, or pass --bearer <token>. Nothing was decided.`
             : res.data?.message ?? res.data?.error ?? `the pairing decision failed (HTTP ${res.status})`);
           process.exitCode = 1;
           return;

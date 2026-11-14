@@ -124,7 +124,7 @@ describe("rig host approve against the real pairing route, with distinct credent
   beforeEach(async () => {
     dir = fs.mkdtempSync(path.join(os.tmpdir(), "hostdecide-real-"));
     savedEnv = {};
-    for (const k of ["OPENRIG_HOME", "RIGGED_HOME", "OPENRIG_URL", "RIGGED_URL", "OPENRIG_SESSION_NAME", "RIGGED_SESSION_NAME", "OPENRIG_TERMINAL_BEARER_TOKEN", "OPENRIG_AUTH_BEARER_TOKEN"]) {
+    for (const k of ["OPENRIG_HOME", "RIGGED_HOME", "OPENRIG_URL", "RIGGED_URL", "OPENRIG_SESSION_NAME", "RIGGED_SESSION_NAME", "OPENRIG_TERMINAL_BEARER_TOKEN", "OPENRIG_AUTH_BEARER_TOKEN", "OPENRIG_PORT"]) {
       savedEnv[k] = process.env[k];
       delete process.env[k];
     }
@@ -143,6 +143,7 @@ describe("rig host approve against the real pairing route, with distinct credent
       server = { close: () => { s.close(); db.close(); } };
     });
     process.env.OPENRIG_URL = base;
+    process.env.OPENRIG_PORT = new URL(base).port; // this home's own daemon: the bearer file's retry goes only to it
   });
 
   afterEach(() => {
@@ -178,11 +179,43 @@ describe("rig host approve against the real pairing route, with distinct credent
     expect(await poll(pair.pairId)).toEqual({ status: "denied" });
   });
 
+  it("an agent seat whose env bearer was rotated away (T-007930): the 401 is retried once with the bearer file, and it is approved", async () => {
+    const pair = await request();
+    const file = path.join(dir, "openrig-bearer.token");
+    fs.writeFileSync(file, `${AUTH}\n`, { mode: 0o600 });
+    process.env.OPENRIG_AUTH_BEARER_FILE = file;
+    process.env.OPENRIG_SESSION_NAME = "operator-agent@kernel";
+    process.env.OPENRIG_AUTH_BEARER_TOKEN = "synthetic-rotated-away-bearer";
+    try {
+      const { out, err, exitCode } = await run(["approve", pair.code]);
+      expect(exitCode).toBeUndefined();
+      expect(out).toContain(`Approved pairing ${pair.code} from "requester@far-host", as operator-agent@kernel.`);
+      expect(`${out}\n${err}`).not.toMatch(/synthetic-rotated-away-bearer|synthetic-operator-bearer/);
+      expect(await poll(pair.pairId)).toEqual({ status: "approved", token: AUTH });
+    } finally {
+      delete process.env.OPENRIG_AUTH_BEARER_FILE;
+    }
+  });
+
+  it("the rotated-away env bearer with no bearer file: the same refusal as before, and nothing is decided", async () => {
+    const pair = await request();
+    process.env.OPENRIG_AUTH_BEARER_FILE = path.join(dir, "no-such-bearer-file");
+    process.env.OPENRIG_AUTH_BEARER_TOKEN = "synthetic-rotated-away-bearer";
+    try {
+      const { err, exitCode } = await run(["approve", pair.code]);
+      expect(exitCode).toBe(1);
+      expect(err).toBe("This daemon refused the decision without its operator bearer token. Set OPENRIG_AUTH_BEARER_TOKEN to the token this daemon runs with, put it in the file OPENRIG_AUTH_BEARER_FILE names, or pass --bearer <token>. Nothing was decided.");
+      expect(await poll(pair.pairId)).toMatchObject({ status: "pending" });
+    } finally {
+      delete process.env.OPENRIG_AUTH_BEARER_FILE;
+    }
+  });
+
   it("with only a terminal token that isn't the operator bearer: refused with what to set, and nothing is decided", async () => {
     const pair = await request();
     const { err, exitCode } = await run(["approve", pair.code]);
     expect(exitCode).toBe(1);
-    expect(err).toBe("This daemon refused the decision without its operator bearer token. Set OPENRIG_AUTH_BEARER_TOKEN to the token this daemon runs with, or pass --bearer <token>. Nothing was decided.");
+    expect(err).toBe("This daemon refused the decision without its operator bearer token. Set OPENRIG_AUTH_BEARER_TOKEN to the token this daemon runs with, put it in the file OPENRIG_AUTH_BEARER_FILE names, or pass --bearer <token>. Nothing was decided.");
     expect(await poll(pair.pairId)).toMatchObject({ status: "pending" });
   });
 });
