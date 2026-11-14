@@ -204,6 +204,14 @@ export class QueueWakeRepository {
           -- T-007715 (S1 of the REVISAO-openrig-9): a row attached to an existing job (--wake-watchdog, kind
           -- 'watchdog') stays bound across its fires while the row is still parked: each later fire of an operator's
           -- periodic reminder is that row's reminder too. A park's own one-shot timer (kind 'timer') is consumed once.
+          -- B1 of the delta review (2f1015c45): only while it is the same park. A row that has left 'blocked' since
+          -- the arm and was parked again with no wake of its own (a gate, a person) wrote no arm, so that earlier
+          -- attachment is not this park's reminder (the boundary servedByOwnRepeatingReminder reads); note-only
+          -- transitions stay 'blocked'.
+          AND (w.wake_kind <> 'watchdog' OR NOT EXISTS (
+            SELECT 1 FROM queue_transitions t
+             WHERE t.qitem_id = w.qitem_id AND t.transition_id > w.transition_id AND t.state <> 'blocked'
+          ))
           AND (? OR w.wake_kind = 'watchdog' OR NOT EXISTS (
             SELECT 1 FROM queue_transition_wakes f
              WHERE f.qitem_id = w.qitem_id AND f.phase = 'fired'

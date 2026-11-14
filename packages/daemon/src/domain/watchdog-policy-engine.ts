@@ -848,8 +848,11 @@ export class WatchdogPolicyEngine {
           ...(retryPending && delivery.retryAt ? { retryAt: delivery.retryAt } : {}),
           ...(delivery.queuedQitemId ? { queuedQitemId: delivery.queuedQitemId } : {}),
           // T-007715 (B1 of the REVISAO-openrig-9): a reminder noted on a parked row carries its own text there (a
-          // custom message, a workflow's re-presentation, a wait's reason); a digest's members are default reminders
-          ...(delivery.code === "noted_on_parked_row" && !digest ? { message: outcome.message } : {}) });
+          // custom message, a workflow's re-presentation, a wait's reason); a digest's members are default reminders.
+          // S1 of the delta review: the text that was sent, in the history's own precedence (a recovered delivery's
+          // receipt keeps the original even if the job's message changed before the recovery)
+          ...(delivery.code === "noted_on_parked_row" && !digest
+            ? { message: delivery.sentMessage ?? sentMessage ?? outcome.message } : {}) });
       }
       if (delivery.terminalReason) this.jobsRepo.markTerminal(job.jobId, delivery.terminalReason);
     };

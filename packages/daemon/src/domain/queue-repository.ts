@@ -647,6 +647,22 @@ export function defaultParkWakeMessage(qitemId: string): string {
   return `Wake timer fired for parked qitem ${qitemId}. Resume the recorded continuation and update the row.`;
 }
 
+/** T-007715 (delta review N4): a park's default wake, for any row: a job shared by --wake-watchdog carries the default
+ *  of the row that armed it, and a reminder outside a pass carries its continuation's preview after the default. */
+const DEFAULT_PARK_WAKE = /^Wake timer fired for parked qitem \S+\. Resume the recorded continuation and update the row\./;
+export function isDefaultParkWakeMessage(message: string): boolean {
+  return DEFAULT_PARK_WAKE.test(message);
+}
+
+/** T-007715 (delta review N3): the most of a reminder's own text one park note keeps; the rest stays in the job's
+ *  history (`rig watchdog show`). Still far below the base, which created a wd- row per fire. */
+export const PARK_NOTE_MESSAGE_MAX = 2000;
+function parkNoteReminder(message: string, jobId: string): string {
+  return message.length > PARK_NOTE_MESSAGE_MAX
+    ? `${message.slice(0, PARK_NOTE_MESSAGE_MAX)}… (full text: rig watchdog show ${jobId})`
+    : message;
+}
+
 /** A hosted member's trigger, from the authored rosters (`<workspace.root>/rosters`) on this host. Null when it declares
  *  none, or when the rosters or this host's id can't be read: the member then stays unroutable, and its person is told. */
 function defaultHostedWake(destination: string): RosterWake | null {
@@ -4219,8 +4235,8 @@ export class QueueRepository {
             ? `park wake noted on this row: watchdog ${jobId}; delivery=${NOTED_ON_PARKED_ROW}; nothing typed; awaiting owner consumption`
               // T-007715 (B1): the reminder's own text, when it is not the park's default wake (at a queue-only seat
               // this note is the only place the owner reads it)
-              + (message && message.trim() && message !== defaultParkWakeMessage(qitemId)
-                ? `\nreminder: ${message}` : "")
+              + (message && message.trim() && !isDefaultParkWakeMessage(message)
+                ? `\nreminder: ${parkNoteReminder(message.trim(), jobId)}` : "")
           : `park wake fired: watchdog ${jobId}; delivery=${deliveryStatus}; awaiting owner consumption`,
       });
       if (!retryAt) this.wakeRepo.record({
