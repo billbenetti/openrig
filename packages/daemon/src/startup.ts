@@ -2592,11 +2592,14 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
       resolvePreDeliveryTerminalReason: ({ jobId }) =>
         queueRepoInstance.resolveWatchdogPreDeliveryTerminalReason(jobId),
       resolveQueueWait: (input) => queueRepoInstance.evaluateWaitReminder(input),
-      onWakeAttempt: ({ jobId, deliveryStatus, retryAt, queuedQitemId }) => {
-        queueRepoInstance.recordWatchdogWakeAttempt(jobId, deliveryStatus, retryAt, queuedQitemId);
+      onWakeAttempt: ({ jobId, deliveryStatus, retryAt, queuedQitemId, message }) => {
+        queueRepoInstance.recordWatchdogWakeAttempt(jobId, deliveryStatus, retryAt, queuedQitemId, message);
       },
       // Due parked-row reminders for one seat in one scheduler pass go as one message.
       resolveDigestEntry: ({ jobId, message }) => queueRepoInstance.parkReminderDigestEntry(jobId, message),
+      // T-007715: any reminder that is the current wake of its target's own parked row is noted on that row at a
+      // queue-only seat, also outside the digest (custom message, workflow park, repeating wait, shared watchdog).
+      resolveParkedRows: ({ jobId, targetSession }) => queueRepoInstance.parkedRowsOwnedBy(jobId, targetSession),
       // PL-004 Phase D: register workflow-keepalive policy alongside
       // Phase C's three built-in policies. workflow-keepalive reads
       // SQLite workflow_instances directly via the new Phase D tables

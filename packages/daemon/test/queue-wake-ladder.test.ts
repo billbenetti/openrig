@@ -183,6 +183,20 @@ describe("S01 wake-or-escalate — retry ladder, named rungs, derived suspension
     expect(attempts[2]).toMatch(/3\/3/); // counted from transitions, not memory
   });
 
+  it("T-007715 (N4): a marker repeats the row's state as it is after the wake attempt, so a park made meanwhile keeps its wake", async () => {
+    const baton = await mkBaton();
+    setNudgeResult(baton.qitemId, "failed:tmux session not found", 10);
+    await tick({ attemptWake: async (qitemId: string) => {
+      // the owner takes the row and parks it with a wake while the attempt is in flight
+      repo.update({ qitemId, actorSession: "worker@r", state: "in-progress", transitionNote: "taken" } as never);
+      repo.update({ qitemId, actorSession: "worker@r", state: "blocked", blockedOn: "external:x", transitionNote: "parked",
+        wakeAfterSeconds: 600 } as never);
+      return "failed:tmux session not found";
+    } });
+    expect(repo.listTransitions(baton.qitemId).at(-1)!.state).toBe("blocked");
+    expect(repo.getParkWakeStatus(baton.qitemId)).toMatchObject({ kind: "timer", phase: "armed", live: true });
+  });
+
   it("SCHEDULE HONORED: a tick inside the retry interval makes no attempt (bounded, never a hot loop)", async () => {
     const baton = await mkBaton();
     setNudgeResult(baton.qitemId, "failed:tmux session not found", 10);

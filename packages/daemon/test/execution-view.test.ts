@@ -1271,6 +1271,18 @@ describe("execution view — S27 (OPR.0.5.6.27)", () => {
     expect(String(parkedAfter.park_kind_basis)).toContain("no armed wake");
   });
 
+  it("park honesty (T-007715): parked again with no wake after leaving blocked, the earlier park's wake is not this park's", async () => {
+    db.prepare(
+      `INSERT INTO queue_transitions (transition_id, qitem_id, ts, state, transition_note, actor_session)
+       VALUES (31002, 'qitem-parked-33', '2026-08-29T21:20:00.000Z', 'in-progress', 'resumed', ?),
+              (31003, 'qitem-parked-33', '2026-08-29T21:21:00.000Z', 'blocked', 'gate, no wake', ?)`,
+    ).run(SEAT_B, SEAT_B);
+    const doc = await show();
+    const parked = (doc.q5_park as Record<string, unknown>[]).find((p) => p.qitem_id === "qitem-parked-33")!;
+    expect(parked.park_kind).toBe("indeterminate");
+    expect(String(parked.park_kind_basis)).toContain("no armed wake");
+  });
+
   it("INDETERMINATE floor: an unreachable worktree path renders INDETERMINATE for the git legs, never idle/dead/done", async () => {
     db.prepare(`UPDATE queue_items SET body = ? WHERE qitem_id = 'qitem-lane-31'`).run(
       "Build 31.\nworktree_path=/nonexistent/severed/path\n",

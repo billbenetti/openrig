@@ -189,7 +189,9 @@ const WAKE_MACHINERY_NOTE_PREFIXES = [
   "ladder-exhausted:",
   "ladder-suspend:",
   "ladder-resume:",
-  "park wake fired:",
+  // T-007715 (delta review N1): every park wake note ("fired:", "noted on this row:", "retained:", "queued as
+  // row:", "failed:"), now written on each fire of a reminder attached to a parked row
+  "park wake ",
   "idle-gate:",
 ];
 
