@@ -90,6 +90,12 @@ export interface SeatPoolDispatchToParked {
    *  before the pane's current occupant (its runtime, started anew by a fresh launch: seatPoolPaneOccupantMs), holds nothing
    *  (T-006251, S2). A process still under the pane holds it whatever its age. Absent without `busy_processes`. */
   busyOrphanMaxAgeSeconds?: number;
+  /** `refused_cooldown_s` (absent: no such property, read as DISPATCH_TO_PARKED_REFUSED_COOLDOWN_DEFAULT, 1800; 0 turns
+   *  it off): a seat that gave a row the pool moved to it as parked straight back to the model, without taking it (no
+   *  move to in-progress), is out of the parked receivers for this long, or until its open rows are no longer the ones
+   *  it held when the row was moved; and no row it gave back that way (nor a successor of one) is moved to it again
+   *  while it is parked. Once the seat is free (no open row) it takes any row, that one included. */
+  refusedCooldownSeconds?: number;
 }
 
 const SPEC_KEYS = new Set([
@@ -149,11 +155,20 @@ const DISPATCH_TO_PARKED_NUMBERS = {
 /** `max_open_rows`: its bounds; absent reads as 1 (DISPATCH_TO_PARKED_MAX_OPEN_ROWS_DEFAULT). */
 const DISPATCH_TO_PARKED_MAX_OPEN_ROWS = { min: 1, max: 20 } as const;
 export const DISPATCH_TO_PARKED_MAX_OPEN_ROWS_DEFAULT = 1;
+/** `refused_cooldown_s`: its bounds; absent reads as DISPATCH_TO_PARKED_REFUSED_COOLDOWN_DEFAULT (seatPoolRefusedCooldown). */
+const DISPATCH_TO_PARKED_REFUSED_COOLDOWN = { key: "refused_cooldown_s", min: 0, max: 86_400 } as const;
+export const DISPATCH_TO_PARKED_REFUSED_COOLDOWN_DEFAULT = 1800;
+
+/** The refusal memory's cooldown in seconds for a spec (0: off, as without dispatch_to_parked). */
+export function seatPoolRefusedCooldown(spec: Pick<SeatPoolSpec, "dispatchToParked">): number {
+  return spec.dispatchToParked ? spec.dispatchToParked.refusedCooldownSeconds ?? DISPATCH_TO_PARKED_REFUSED_COOLDOWN_DEFAULT : 0;
+}
 const DISPATCH_TO_PARKED_LISTS = ["refuse_gates", "busy_processes"] as const;
 /** `busy_orphan_max_age_s`: read only with `busy_processes` (it means nothing without it). */
 const BUSY_ORPHAN_MAX_AGE = { key: "busy_orphan_max_age_s", min: 60, max: 172_800, fallback: SEAT_POOL_BUSY_ORPHAN_MAX_AGE_S } as const;
 const DISPATCH_TO_PARKED_KEYS = new Set([
   ...Object.keys(DISPATCH_TO_PARKED_NUMBERS), "allow_background_work", ...DISPATCH_TO_PARKED_LISTS, BUSY_ORPHAN_MAX_AGE.key, "max_open_rows",
+  DISPATCH_TO_PARKED_REFUSED_COOLDOWN.key,
 ]);
 /** The most entries a `dispatch_to_parked` list may hold, and the longest entry. */
 const DISPATCH_TO_PARKED_LIST_MAX = 32;
@@ -212,6 +227,13 @@ function dispatchToParked(value: unknown): SeatPoolDispatchToParked | SpecProble
       return { field: `${DISPATCH_TO_PARKED}.max_open_rows`, message: `seat-pool: ${DISPATCH_TO_PARKED}.max_open_rows must be a whole number from ${min} to ${max}` };
     }
   }
+  const refusedCooldown = record[DISPATCH_TO_PARKED_REFUSED_COOLDOWN.key];
+  if (refusedCooldown !== undefined) {
+    const { key, min, max } = DISPATCH_TO_PARKED_REFUSED_COOLDOWN;
+    if (!Number.isInteger(refusedCooldown) || (refusedCooldown as number) < min || (refusedCooldown as number) > max) {
+      return { field: `${DISPATCH_TO_PARKED}.${key}`, message: `seat-pool: ${DISPATCH_TO_PARKED}.${key} must be a whole number from ${min} to ${max}` };
+    }
+  }
   const lists: Partial<Record<(typeof DISPATCH_TO_PARKED_LISTS)[number], string[]>> = {};
   for (const key of DISPATCH_TO_PARKED_LISTS) {
     if (record[key] === undefined) continue;
@@ -237,6 +259,7 @@ function dispatchToParked(value: unknown): SeatPoolDispatchToParked | SpecProble
       ? { busyProcesses: lists.busy_processes, busyOrphanMaxAgeSeconds: (orphanAge as number | undefined) ?? BUSY_ORPHAN_MAX_AGE.fallback }
       : {}),
     ...(maxOpenRows !== undefined ? { maxOpenRows: maxOpenRows as number } : {}),
+    ...(refusedCooldown !== undefined ? { refusedCooldownSeconds: refusedCooldown as number } : {}),
   };
 }
 
@@ -472,6 +495,10 @@ export interface SeatPoolSlotView {
    *  process of the seat matches. It holds back a parked seat from a 2nd row and, since T-006251 (B1), a free seat from
    *  its 1st. Absent: not read, which holds nothing back. */
   busyProcess?: string | null;
+  /** Only with `dispatch_to_parked.refused_cooldown_s` above 0: the latest row the pool moved to the seat as parked,
+   *  within the cooldown, that the seat gave straight back without taking it (seatPoolCanReceive). `at`: when it gave it
+   *  back. `openRowIds`: the seat's parked rows when the row was moved to it (null when the record does not say). */
+  parkedRefusal?: { at: string; openRowIds: string[] | null };
 }
 
 /** The park of a seat's only open row, a blocked one: what seatPoolCanReceive checks to call it the seat's own wait. */
@@ -503,6 +530,10 @@ export interface SeatPoolPendingRow {
   /** When it reached `destination`: its latest reroute, or its creation. */
   waitingSince: string;
   tags: string[];
+  /** Only with `dispatch_to_parked.refused_cooldown_s` above 0: the pool's seats (session names) that gave this row, or
+   *  a row it succeeds by handoff, straight back to the model after the pool moved it to them as parked, without taking
+   *  it. It is never moved to one of them while that seat is parked. Absent: none. */
+  refusedBy?: string[];
 }
 
 export interface SeatPoolState {
@@ -622,7 +653,24 @@ export function seatPoolCanReceive(spec: SeatPoolSpec, slot: SeatPoolSlotView, n
   const parks = slot.openRows === 1 ? (slot.parked ? [slot.parked] : []) : (slot.parkedRows ?? []);
   if (slot.openRows < 1 || slot.openRows > maxOpenRows || parks.length !== slot.openRows) return null;
   if (slot.busyProcess) return null;
+  if (seatPoolRefusedRecently(rule, slot, parks, nowMs)) return null;
   return parks.every((park) => seatPoolOwnPark(rule, slot.sessionName, park, nowMs)) ? "parked" : null;
+}
+
+/** A seat that gave a row it got as parked straight back, within `refused_cooldown_s`, still holding the same parks:
+ *  the pool's last row was refused, and a new one would be too (the seat gives rows back while its waits stand). A change
+ *  in its open rows (a park closed or a new one) ends it, as does the cooldown; `refused_cooldown_s: 0` turns it off. */
+function seatPoolRefusedRecently(rule: SeatPoolDispatchToParked, slot: SeatPoolSlotView, parks: readonly ParkFacts[], nowMs: number): boolean {
+  const refusal = slot.parkedRefusal;
+  const cooldown = rule.refusedCooldownSeconds ?? DISPATCH_TO_PARKED_REFUSED_COOLDOWN_DEFAULT;
+  if (!refusal || cooldown <= 0) return false;
+  const atMs = Date.parse(refusal.at);
+  // Written so that an unreadable time (NaN) holds the seat back for nothing.
+  if (!(nowMs - atMs < cooldown * 1000)) return false;
+  if (refusal.openRowIds === null) return true;
+  const now = parks.map((park) => park.qitemId).sort();
+  const then = [...refusal.openRowIds].sort();
+  return now.length === then.length && now.every((id, i) => id === then[i]);
 }
 
 /** Whether one blocked row is the seat's own short wait: an `external:` gate not refused, a live timer it armed within
@@ -754,17 +802,29 @@ export function planSeatPool(spec: SeatPoolSpec, state: SeatPoolState, nowMs: nu
     ...live.filter((slot) => modes.get(slot) === "free"),
     ...live.filter((slot) => modes.get(slot) === "parked").sort((a, b) => a.slotId - b.slotId),
   ];
-  const dispatched = movable.slice(0, receivers.length);
-  dispatched.forEach((row, i) => intents.push({
-    kind: "dispatch", qitemId: row.qitemId, from: row.destination, slotId: receivers[i]!.slotId,
-    ...(modes.get(receivers[i]!) === "parked" ? { mode: "parked" as const } : {}),
-  }));
-  const receiving = new Set(receivers.slice(0, dispatched.length));
+  // In order, each waiting row goes to the first receiver not taken yet, except a PARKED receiver that refused it (or
+  // a row it succeeds: refusedBy): a row a parked seat gave back waits for another seat, or for that seat once it is
+  // free (no open row: what made it give the row back is gone, and the row never waits with no seat able to take it,
+  // whatever the demand command counts: T-008296 B1).
+  const receiving = new Set<SeatPoolSlotView>();
+  const dispatched = new Set<SeatPoolPendingRow>();
+  for (const row of movable) {
+    if (receiving.size === receivers.length) break;
+    const receiver = receivers.find((slot) => !receiving.has(slot)
+      && !(modes.get(slot) === "parked" && row.refusedBy?.includes(slot.sessionName)));
+    if (!receiver) continue;
+    receiving.add(receiver);
+    dispatched.add(row);
+    intents.push({
+      kind: "dispatch", qitemId: row.qitemId, from: row.destination, slotId: receiver.slotId,
+      ...(modes.get(receiver) === "parked" ? { mode: "parked" as const } : {}),
+    });
+  }
 
   if (!spec.drain) {
     const holders = new Map<string, { nodeId: string; cause: SeatPoolSeatCause; rows: SeatPoolPendingRow[] }>();
     for (const row of waiting) {
-      if (dispatched.includes(row)) continue;
+      if (dispatched.has(row)) continue;
       const slot = seatOf.get(row.destination);
       // A seat the pool added whose session is gone is reaped, not launched: its rows go back to the model.
       const holder = slot
@@ -804,8 +864,8 @@ export function planSeatPool(spec: SeatPoolSpec, state: SeatPoolState, nowMs: nu
       const fresh = state.demand !== null && nowMs - Date.parse(state.demand.sampledAt) <= sampleMaxAgeMs;
       desired = fresh ? state.demand!.desired : null;
     } else {
-      desired = movable.length - dispatched.length + occupied.length
-        + (unread.length > 0 && movable.length > dispatched.length ? 1 : 0);
+      desired = movable.length - dispatched.size + occupied.length
+        + (unread.length > 0 && movable.length > dispatched.size ? 1 : 0);
     }
     if (desired === null) {
       // No current answer from the demand command: keep what exists and finish what was started.
