@@ -98,7 +98,7 @@ export class QueueWakeRepository {
         ORDER BY transition_id DESC LIMIT 1`,
     ).get(qitemId) as WakeRow | undefined;
     if (!armed) return null;
-    const fired = this.db.prepare(
+    const latestFired = this.db.prepare(
       `SELECT * FROM queue_transition_wakes
         WHERE qitem_id = ? AND phase = 'fired' AND wake_ref = ?
           AND transition_id > ?
@@ -110,6 +110,17 @@ export class QueueWakeRepository {
     const kind = armed.wake_kind as ParkWakeKind;
     const expiresAt = this.wakeExpiry(qitemId, kind, armed.wake_ref);
     const repeating = this.isRepeatingTimer(armed.wake_ref);
+    // T-007715 (S1): a row attached to an operator's periodic reminder stays bound across its fires, so a later attempt
+    // the typing guard held back is recorded after an earlier one that was delivered. The held-back attempt doesn't
+    // undo that delivery: the earlier wake still awaits the owner. Only a park whose every fire was held back reads so.
+    const fired = latestFired?.delivery_status === "retained" && !repeating
+      ? (this.db.prepare(
+        `SELECT * FROM queue_transition_wakes
+          WHERE qitem_id = ? AND phase = 'fired' AND wake_ref = ?
+            AND transition_id > ? AND (delivery_status IS NULL OR delivery_status != 'retained')
+          ORDER BY transition_id DESC LIMIT 1`,
+      ).get(qitemId, armed.wake_ref, armed.transition_id) as WakeRow | undefined) ?? latestFired
+      : latestFired;
     // A retained attempt (held back by the typing guard) was not delivered, so it doesn't consume a one-shot wake:
     // the backstop is still live and nothing awaits the owner. The attempt stays in the history.
     const heldBack = fired?.delivery_status === "retained" && !repeating;
@@ -190,7 +201,10 @@ export class QueueWakeRepository {
             SELECT MAX(a.transition_id) FROM queue_transition_wakes a
              WHERE a.qitem_id = w.qitem_id AND a.phase = 'armed'
           ))
-          AND (? OR NOT EXISTS (
+          -- T-007715 (S1 of the REVISAO-openrig-9): a row attached to an existing job (--wake-watchdog, kind
+          -- 'watchdog') stays bound across its fires while the row is still parked: each later fire of an operator's
+          -- periodic reminder is that row's reminder too. A park's own one-shot timer (kind 'timer') is consumed once.
+          AND (? OR w.wake_kind = 'watchdog' OR NOT EXISTS (
             SELECT 1 FROM queue_transition_wakes f
              WHERE f.qitem_id = w.qitem_id AND f.phase = 'fired'
                AND f.wake_ref = w.wake_ref AND f.transition_id > w.transition_id

@@ -96,8 +96,8 @@ export interface WatchdogDeliverySource {
   policy: string;
   /** A digest's members, when one send carries several reminders: each job and the occurrence it was due for. */
   members?: Array<{ jobId: string; occurrenceId: string }>;
-  /** The parked rows this send reminds about, when every reminder in it is an ordinary park timer of a row still
-   *  parked (the digest entry). Absent for any other reminder. */
+  /** The parked rows this send reminds about: the digest entry's row, or every live parked row of the target this job
+   *  is the current wake of (T-007715). Absent when the reminder is no parked row's. */
   parkedQitemIds?: string[];
 }
 
@@ -177,7 +177,7 @@ interface WatchdogPolicyEngineDeps {
   /** Queue-side observer for a wake attempt. It appends resume evidence to
    *  every HELD row armed to this job; delivery outcome is preserved. */
   resolveQueueWait?: (input: { jobId: string }) => PolicyEvaluation | null | undefined;
-  onWakeAttempt?: (attempt: { jobId: string; deliveryStatus: string; retryAt?: string; queuedQitemId?: string }) => void;
+  onWakeAttempt?: (attempt: { jobId: string; deliveryStatus: string; retryAt?: string; queuedQitemId?: string; message?: string }) => void;
   /** The parked row a due reminder is about, when it may share one message with other reminders due for the same
    *  seat in the same scheduler pass. Null, or absent, keeps the reminder's own send. */
   resolveDigestEntry?: (input: { jobId: string; message: string }) => ParkReminderEntry | null;
@@ -300,7 +300,7 @@ export class WatchdogPolicyEngine {
   private readonly resolveContextUsage?: WatchdogPolicyEngineDeps["resolveContextUsage"];
   private readonly resolvePreDeliveryTerminalReason?: (input: { jobId: string }) => string | null;
   private readonly resolveQueueWait?: WatchdogPolicyEngineDeps["resolveQueueWait"];
-  private readonly onWakeAttempt?: (attempt: { jobId: string; deliveryStatus: string; retryAt?: string; queuedQitemId?: string }) => void;
+  private readonly onWakeAttempt?: (attempt: { jobId: string; deliveryStatus: string; retryAt?: string; queuedQitemId?: string; message?: string }) => void;
   private readonly resolveDigestEntry?: WatchdogPolicyEngineDeps["resolveDigestEntry"];
   private readonly resolveParkedRows?: WatchdogPolicyEngineDeps["resolveParkedRows"];
 
@@ -846,7 +846,10 @@ export class WatchdogPolicyEngine {
           || (retryPending && current.lastEvaluationAt === deliverySchedule.lastEvaluationAt))) {
         this.onWakeAttempt?.({ jobId: job.jobId, deliveryStatus: deliveryStatusLabel(delivery),
           ...(retryPending && delivery.retryAt ? { retryAt: delivery.retryAt } : {}),
-          ...(delivery.queuedQitemId ? { queuedQitemId: delivery.queuedQitemId } : {}) });
+          ...(delivery.queuedQitemId ? { queuedQitemId: delivery.queuedQitemId } : {}),
+          // T-007715 (B1 of the REVISAO-openrig-9): a reminder noted on a parked row carries its own text there (a
+          // custom message, a workflow's re-presentation, a wait's reason); a digest's members are default reminders
+          ...(delivery.code === "noted_on_parked_row" && !digest ? { message: outcome.message } : {}) });
       }
       if (delivery.terminalReason) this.jobsRepo.markTerminal(job.jobId, delivery.terminalReason);
     };

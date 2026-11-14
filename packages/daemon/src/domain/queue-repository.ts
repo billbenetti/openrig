@@ -4201,7 +4201,7 @@ export class QueueRepository {
   /** Called by the watchdog engine after the delivery attempt is durably
    *  audited. The queue transition records that attempt independently of
    *  whether the HELD row's owner consumed it. */
-  recordWatchdogWakeAttempt(jobId: string, deliveryStatus: string, retryAt?: string, queuedQitemId?: string): void {
+  recordWatchdogWakeAttempt(jobId: string, deliveryStatus: string, retryAt?: string, queuedQitemId?: string, message?: string): void {
     const bindings = this.wakeRepo.findBlockedQitemsByWatchdog(jobId);
     if (bindings.length === 0) return;
     // Both receipt ownership and timer lifecycle follow the current park.
@@ -4217,6 +4217,10 @@ export class QueueRepository {
             ? `park wake queued as row: watchdog ${jobId}; delivery=${QUEUED_AS_ROW}${queuedQitemId ? ` ${queuedQitemId}` : ""}; nothing typed; awaiting owner consumption`
           : deliveryStatus === NOTED_ON_PARKED_ROW
             ? `park wake noted on this row: watchdog ${jobId}; delivery=${NOTED_ON_PARKED_ROW}; nothing typed; awaiting owner consumption`
+              // T-007715 (B1): the reminder's own text, when it is not the park's default wake (at a queue-only seat
+              // this note is the only place the owner reads it)
+              + (message && message.trim() && message !== defaultParkWakeMessage(qitemId)
+                ? `\nreminder: ${message}` : "")
           : `park wake fired: watchdog ${jobId}; delivery=${deliveryStatus}; awaiting owner consumption`,
       });
       if (!retryAt) this.wakeRepo.record({
