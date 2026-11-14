@@ -11,7 +11,10 @@
 //   - Citation helper format matches convention §Citation Rules
 //     (short-prose with mode + scope(:qualifier) + operator source).
 
-import { describe, expect, it, vi, beforeEach } from "vitest";
+import { describe, expect, it, vi, beforeEach, afterEach } from "vitest";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import { rigModeCommand, __test__, type RigModeDeps } from "../src/commands/rig-mode.js";
 import { DaemonResponseError } from "../src/client.js";
 import type { LifecycleDeps } from "../src/daemon-lifecycle.js";
@@ -595,5 +598,51 @@ describe("rig mode: legacy record fields marked stored, not applied (04-A3)", ()
     const set = rigModeCommand(deps(fakeClient({}).client)).commands.find((c) => c.name() === "set")!;
     const marked = set.options.filter((o) => (o.description ?? "").includes(`${MARK}: nothing in OpenRig acts on it yet`)).map((o) => o.long!.slice(2).replace(/-/g, "_"));
     expect(marked.sort()).toEqual([...MARKED].sort());
+  });
+});
+
+// T-007930 (token rotation 1/2): a stale operator bearer (in the env since the seat started, or a --bearer it was told) is
+// refused with 401; set and unset retry once with the bearer file and stop there.
+describe("rig policy set/unset — one retry with the operator bearer file on a 401", () => {
+  let dir: string;
+  beforeEach(() => {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), "rig-mode-bearer-"));
+    fs.writeFileSync(path.join(dir, "bearer"), "synthetic-current-bearer\n", { mode: 0o600 });
+    vi.stubEnv("OPENRIG_AUTH_BEARER_FILE", path.join(dir, "bearer"));
+  });
+  afterEach(() => { fs.rmSync(dir, { recursive: true, force: true }); vi.unstubAllEnvs(); });
+  /** The daemon's gate takes only the current bearer. */
+  const gated = <T,>(ok: T) => async (_path: string, ...rest: unknown[]) => {
+    const options = rest.at(-1) as { headers?: Record<string, string> } | undefined;
+    return options?.headers?.Authorization === "Bearer synthetic-current-bearer" ? { status: 200, data: ok } : { status: 401, data: { error: "unauthorized" } };
+  };
+
+  it("set with a rotated-away --bearer: PUT twice, the 2nd with the file's bearer, and the binding is set", async () => {
+    const { client, calls } = fakeClient({});
+    const c = client as { put: ReturnType<typeof vi.fn> };
+    const ok = gated({ binding: { id: "qitem:q-1", mode: "debug", record: { scope: "qitem" }, qualifier: "q-1", setAt: "2026-11-14T00:00:00.000Z", setBy: "operator" } });
+    c.put.mockImplementation(async (p: string, body: unknown, options?: { headers?: Record<string, string> }) => { calls.push({ method: "PUT", path: p, body, options }); return ok(p, body, options); });
+    await rigModeCommand(deps(client)).parseAsync(["node", "rig", "set", "debug", "--qualifier", "q-1", "--confirm", "--bearer", "synthetic-old-bearer"]);
+    expect(process.exitCode).toBeUndefined();
+    expect(calls.filter((x) => x.method === "PUT").map((x) => x.options?.headers?.Authorization)).toEqual(["Bearer synthetic-old-bearer", "Bearer synthetic-current-bearer"]);
+    expect([...logs, ...errs].join("\n")).not.toMatch(/synthetic-(old|current)-bearer/);
+  });
+
+  it("unset with a rotated-away env bearer: DELETE twice, the 2nd with the file's bearer", async () => {
+    vi.stubEnv("OPENRIG_AUTH_BEARER_TOKEN", "synthetic-old-bearer");
+    const { client, calls } = fakeClient({});
+    const c = client as { delete: ReturnType<typeof vi.fn> };
+    const ok = gated({ removed: true });
+    c.delete.mockImplementation(async (p: string, options?: { headers?: Record<string, string> }) => { calls.push({ method: "DELETE", path: p, options }); return ok(p, options); });
+    await rigModeCommand(deps(client)).parseAsync(["node", "rig", "unset", "qitem", "q-1"]);
+    expect(process.exitCode).toBeUndefined();
+    expect(calls.filter((x) => x.method === "DELETE").map((x) => x.options?.headers?.Authorization)).toEqual(["Bearer synthetic-old-bearer", "Bearer synthetic-current-bearer"]);
+  });
+
+  it("authz negative: a 403 on set is not retried, and the error is the daemon's", async () => {
+    const { client, calls } = fakeClient({ putResponse: { status: 403, data: { error: "forbidden" } } });
+    await rigModeCommand(deps(client)).parseAsync(["node", "rig", "set", "debug", "--qualifier", "q-1", "--confirm", "--bearer", "synthetic-old-bearer"]);
+    expect(process.exitCode).toBe(1);
+    expect(calls.filter((x) => x.method === "PUT")).toHaveLength(1);
   });
 });

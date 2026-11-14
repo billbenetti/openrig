@@ -3,7 +3,7 @@ import { execFileSync, spawnSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
-import { DaemonClient, type DaemonResponse } from "../client.js";
+import { DaemonClient, withOperatorBearerRetry, type DaemonResponse } from "../client.js";
 import { daemonMayAnswer, daemonStatusGuard, getDaemonStatus, getDaemonUrl, statusGuardMessage } from "../daemon-lifecycle.js";
 import { processIdentity } from "../local-daemon-owner.js";
 import { getOpenRigHome, readOpenRigEnv } from "../openrig-compat.js";
@@ -112,9 +112,10 @@ export function daemonTeamQueue(client: DaemonClient): TeamQueue {
     },
     async answer(qitemId, questionId, optionId) {
       // The person's answer path, as a click in Slack records one: the daemon takes the actor from this client's caller.
-      const bearer = process.env.OPENRIG_AUTH_BEARER_TOKEN;
-      const response = await client.post<Record<string, unknown>>("/api/mission-control/action", { verb: "answer", qitemId, questionId, optionId },
-        bearer ? { headers: { Authorization: `Bearer ${bearer}` } } : undefined);
+      // T-007930: the serve process keeps the env it started with; a 401 after the bearer rotated is retried once with the
+      // operator bearer file.
+      const response = await withOperatorBearerRetry(undefined, (headers) => client.post<Record<string, unknown>>("/api/mission-control/action",
+        { verb: "answer", qitemId, questionId, optionId }, Object.keys(headers).length ? { headers } : undefined));
       if (response.status < 400) return { ok: true };
       const data = (response.data ?? {}) as { message?: unknown; error?: unknown };
       return { ok: false, reason: String(data.message ?? data.error ?? `HTTP ${response.status}`) };
