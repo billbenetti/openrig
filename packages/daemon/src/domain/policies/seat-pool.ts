@@ -499,6 +499,11 @@ export interface SeatPoolSlotView {
    *  within the cooldown, that the seat gave straight back without taking it (seatPoolCanReceive). `at`: when it gave it
    *  back. `openRowIds`: the seat's parked rows when the row was moved to it (null when the record does not say). */
   parkedRefusal?: { at: string; openRowIds: string[] | null };
+  /** Only with `dispatch_to_parked.refused_cooldown_s` above 0: the latest row the pool moved to the seat as free,
+   *  within the cooldown, that the seat gave straight back without taking it (seatPoolCanReceive). `at`: when it gave it
+   *  back. A free seat with no open row that refuses a row refuses for a reason the pool cannot see (its tarefas in
+   *  execution, a rule of its own), so it is out of the free receivers for the cooldown (T-008466). */
+  freeRefusal?: { at: string };
 }
 
 /** The park of a seat's only open row, a blocked one: what seatPoolCanReceive checks to call it the seat's own wait. */
@@ -531,8 +536,11 @@ export interface SeatPoolPendingRow {
   waitingSince: string;
   tags: string[];
   /** Only with `dispatch_to_parked.refused_cooldown_s` above 0: the pool's seats (session names) that gave this row, or
-   *  a row it succeeds by handoff, straight back to the model after the pool moved it to them as parked, without taking
-   *  it. It is never moved to one of them while that seat is parked. Absent: none. */
+   *  a row it succeeds by handoff, straight back to the model after the pool moved it to them (as parked or as free),
+   *  without taking it: every such move of the row, not only the latest (a reroute keeps the row's id, so two parked
+   *  seats could otherwise hand it back and forth, T-008466 SH-A). It is never moved to one of them while that seat is
+   *  parked; a seat that is free takes it (nothing of its own made it give the row back), unless its free refusal holds
+   *  it out (freeRefusal). Absent: none. */
   refusedBy?: string[];
 }
 
@@ -623,12 +631,25 @@ export function seatPoolHeldByProcess(spec: SeatPoolSpec, slot: SeatPoolSlotView
 }
 
 /**
+ * Whether a free seat is held only by its free refusal (T-008466): quiet, live, in usage, with no busy process, and it
+ * gave the pool's last free row straight back within `refused_cooldown_s` (freeRefusal). The plan counts it as occupied,
+ * as it does a seat held by a busy process, and the demand command is told so as `held: "refused"`.
+ */
+export function seatPoolHeldByRefusal(spec: SeatPoolSpec, slot: SeatPoolSlotView, nowMs: number, facts: { usageLimited?: boolean } = {}): boolean {
+  const rule = spec.dispatchToParked;
+  if (!rule || facts.usageLimited || slot.cause === "usage_limit") return false;
+  return seatPoolLive(slot) && seatPoolQuiet(slot) && !seatPoolHeldBusy(spec, slot) && seatPoolFreeRefusedRecently(rule, slot, nowMs);
+}
+
+/**
  * Whether a seat may receive a waiting row now, and how; null when it may not. The planner, the executor's check just
  * before the move and the slots the demand command is given (`receives`) all ask this one function.
  *
  * Both ways need the pool not draining, the seat live, its node present, not to be reaped and no held message.
  * `free`: no open row and idle at its prompt (the rule from before `dispatch_to_parked`), and, with
- * `dispatch_to_parked.busy_processes`, no such program of the seat's (`busyProcess`, T-006251). `parked`, only with
+ * `dispatch_to_parked.busy_processes`, no such program of the seat's (`busyProcess`, T-006251), and, with
+ * `dispatch_to_parked.refused_cooldown_s` above 0, no free row given straight back within it (`freeRefusal`,
+ * T-008466). `parked`, only with
  * `dispatch_to_parked`: a seat the pool added (not adopted), at its prompt (idle, or working only through a background
  * shell, which `allow_background_work: false` refuses), whose open rows (one, or up to `max_open_rows`) are each blocked
  * on an `external:` gate with a
@@ -643,7 +664,10 @@ export function seatPoolCanReceive(spec: SeatPoolSpec, slot: SeatPoolSlotView, n
   if (slot.openRows === 0 && slot.idleSince !== null && slot.cause === "idle") {
     // A free seat with heavy local work its runtime does not track (a suite-flock or congelar-eval orphaned by the shell
     // that started it) gives the row back too, as a parked one would (T-006251, B1). Only with busy_processes.
-    return rule?.busyProcesses?.length && slot.busyProcess ? null : "free";
+    if (rule?.busyProcesses?.length && slot.busyProcess) return null;
+    // A free seat that gave the pool's last free row straight back, within refused_cooldown_s, would give the next one
+    // back too: what made it refuse is nothing the pool reads (T-008466; 10 dispatches to one seat in 10 minutes).
+    return rule && seatPoolFreeRefusedRecently(rule, slot, nowMs) ? null : "free";
   }
   if (!rule || slot.adopted) return null;
   if (slot.atPrompt !== true || (slot.cause !== "idle" && slot.cause !== "working")) return null;
@@ -672,6 +696,16 @@ function seatPoolRefusedRecently(rule: SeatPoolDispatchToParked, slot: SeatPoolS
   const now = parks.map((park) => park.qitemId).sort();
   const then = [...refusal.openRowIds].sort();
   return now.length === then.length && now.every((id, i) => id === then[i]);
+}
+
+/** A free seat that gave a row the pool moved to it as free straight back, within `refused_cooldown_s`
+ *  (`refused_cooldown_s: 0` turns it off). Only the cooldown ends it: a free seat has no open rows whose change would. */
+function seatPoolFreeRefusedRecently(rule: SeatPoolDispatchToParked, slot: SeatPoolSlotView, nowMs: number): boolean {
+  const refusal = slot.freeRefusal;
+  const cooldown = rule.refusedCooldownSeconds ?? DISPATCH_TO_PARKED_REFUSED_COOLDOWN_DEFAULT;
+  if (!refusal || cooldown <= 0) return false;
+  // Written so that an unreadable time (NaN) holds the seat back for nothing.
+  return nowMs - Date.parse(refusal.at) < cooldown * 1000;
 }
 
 /** Whether one blocked row is the seat's own short wait: an `external:` gate not refused, a live timer it armed within
@@ -776,8 +810,12 @@ export function planSeatPool(spec: SeatPoolSpec, state: SeatPoolState, nowMs: nu
   // takes no row, so it is not idle: it counts as occupied (the pool grows for the row it can't take, as for a parked
   // seat) and is never drained as free while its suite runs (REVISAO lente de lógica, wf_fff3f5f2).
   const heldBusy = (slot: SeatPoolSlotView) => seatPoolHeldBusy(spec, slot);
+  // T-008466: a free seat that gave the pool's last free row straight back takes no row for refused_cooldown_s, so it is
+  // not idle either: it counts as occupied (the pool grows for the row it refused, instead of the row waiting the
+  // cooldown out and going back to it) and is never drained as free while the refusal holds.
+  const heldRefused = (slot: SeatPoolSlotView) => seatPoolHeldByRefusal(spec, slot, nowMs);
   const quiet = seatPoolQuiet;
-  const idle = (slot: SeatPoolSlotView) => quiet(slot) && !heldBusy(slot);
+  const idle = (slot: SeatPoolSlotView) => quiet(slot) && !heldBusy(slot) && !heldRefused(slot);
   // T-006251 S6: a quiet seat held only because its processes could not be read (a timeout under load, an unreadable
   // environment, its pane not found) takes no row and is never drained, but it is no occupant either: counting it grew
   // the pool to `max` with no row dispatched (every seat added failed the same read). It still holds its place in the
