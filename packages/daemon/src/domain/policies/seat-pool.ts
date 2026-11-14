@@ -91,10 +91,10 @@ export interface SeatPoolDispatchToParked {
    *  (T-006251, S2). A process still under the pane holds it whatever its age. Absent without `busy_processes`. */
   busyOrphanMaxAgeSeconds?: number;
   /** `refused_cooldown_s` (absent: no such property, read as DISPATCH_TO_PARKED_REFUSED_COOLDOWN_DEFAULT, 1800; 0 turns
-   *  it off): a seat that gave a row the pool moved to it as parked straight
-   *  back, without taking it (no move to in-progress), is out of the parked receivers for this long, or until its open
-   *  rows are no longer the ones it held when it gave the row back; and no row it gave back that way (nor a successor of
-   *  one) is moved to it again. A free seat is never held back by it. */
+   *  it off): a seat that gave a row the pool moved to it as parked straight back to the model, without taking it (no
+   *  move to in-progress), is out of the parked receivers for this long, or until its open rows are no longer the ones
+   *  it held when the row was moved; and no row it gave back that way (nor a successor of one) is moved to it again
+   *  while it is parked. Once the seat is free (no open row) it takes any row, that one included. */
   refusedCooldownSeconds?: number;
 }
 
@@ -531,8 +531,8 @@ export interface SeatPoolPendingRow {
   waitingSince: string;
   tags: string[];
   /** Only with `dispatch_to_parked.refused_cooldown_s` above 0: the pool's seats (session names) that gave this row, or
-   *  a row it succeeds by handoff, straight back after the pool moved it to them, without taking it. It is never moved to
-   *  one of them again. Absent: none. */
+   *  a row it succeeds by handoff, straight back to the model after the pool moved it to them as parked, without taking
+   *  it. It is never moved to one of them while that seat is parked. Absent: none. */
   refusedBy?: string[];
 }
 
@@ -802,13 +802,16 @@ export function planSeatPool(spec: SeatPoolSpec, state: SeatPoolState, nowMs: nu
     ...live.filter((slot) => modes.get(slot) === "free"),
     ...live.filter((slot) => modes.get(slot) === "parked").sort((a, b) => a.slotId - b.slotId),
   ];
-  // In order, each waiting row goes to the first receiver not taken yet that never gave it (or a row it succeeds) back
-  // untaken (refusedBy): a row a seat gave back waits for another seat, or for one more.
+  // In order, each waiting row goes to the first receiver not taken yet, except a PARKED receiver that refused it (or
+  // a row it succeeds: refusedBy): a row a parked seat gave back waits for another seat, or for that seat once it is
+  // free (no open row: what made it give the row back is gone, and the row never waits with no seat able to take it,
+  // whatever the demand command counts: T-008296 B1).
   const receiving = new Set<SeatPoolSlotView>();
   const dispatched = new Set<SeatPoolPendingRow>();
   for (const row of movable) {
     if (receiving.size === receivers.length) break;
-    const receiver = receivers.find((slot) => !receiving.has(slot) && !row.refusedBy?.includes(slot.sessionName));
+    const receiver = receivers.find((slot) => !receiving.has(slot)
+      && !(modes.get(slot) === "parked" && row.refusedBy?.includes(slot.sessionName)));
     if (!receiver) continue;
     receiving.add(receiver);
     dispatched.add(row);

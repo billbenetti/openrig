@@ -421,32 +421,112 @@ describe("seat pool: a parked seat that gives a dispatched row back untaken is n
     expect(to(h, p).map((n) => n["qitemId"])).toEqual([successor]);
   });
 
-  it("the row given back never returns to the seat, a day later (past the job's history) with the seat free, nor once its transitions are archived", async () => {
+  it("the row given back never returns to the seat while it is parked, a day later (past the job's history) nor once its transitions are archived", async () => {
     h.register({ ...BASE, max: 1, dispatch_to_parked: { max_open_rows: 2 } });
     const p = h.poolSeat("dev.impl-s1", "idle");
     const [a, b] = await twoParks(h, p);
     const first = await h.row(MODEL);
     await h.tickAt(61);
     const successor = await giveBack(h, p);
-    // A day and an hour on: the parks are done, the seat is free, the dispatch has left the history's window.
+    const repark = async (parks: string[]) => {
+      for (const park of parks) {
+        h.queue.update({ qitemId: park, actorSession: p.session, state: "done", closureReason: "no-follow-on", transitionNote: "done" } as never);
+      }
+      return twoParks(h, p);
+    };
+    // A day and an hour on: the seat is parked again, on other waits; the dispatch has left the history's window.
     h.nowMs = T0 + 90_000_000;
-    for (const park of [a, b]) {
-      h.queue.update({ qitemId: park, actorSession: p.session, state: "done", closureReason: "no-follow-on", transitionNote: "done" } as never);
-    }
+    const again = await repark([a, b]);
     await h.tickAt(90_000);
     expect(to(h, p).map((n) => n["qitemId"])).not.toContain(successor);
     expect(h.get(successor)).toMatchObject({ destinationSession: MODEL, state: "pending" });
-    // 31 days on, the retention sweep archives the row given back (closed, handed off): it still never returns.
+    // 31 days on, the retention sweep archives the row given back (closed, handed off): still never to the parked seat.
     const later = 31 * 86_400;
     h.nowMs = T0 + later * 1000;
     const archived = archiveAgedTerminalTransitions(h.db, { nowIso: iso(h.nowMs), transitionsRetentionDays: 30 });
     expect(archived.archivedQitems).toBeGreaterThan(0);
     expect(h.db.prepare("SELECT COUNT(*) AS n FROM queue_transitions_archive WHERE qitem_id = ?").get(first) as { n: number }).not.toEqual({ n: 0 });
+    await repark(again);
     await h.tickAt(later + 1);
     expect(to(h, p).map((n) => n["qitemId"])).not.toContain(successor);
     const fresh = await h.row(MODEL);
     await h.tickAt(later + 62);
     expect(to(h, p).map((n) => n["qitemId"]).slice(1)).toEqual([fresh]);
+  });
+
+  it("a seat that refused a row and then goes free (no open row) takes that row in the next evaluation: it never waits with no seat able to take it", async () => {
+    h.register({ ...BASE, max: 1, dispatch_to_parked: { max_open_rows: 2 } });
+    const p = h.poolSeat("dev.impl-s1", "idle");
+    const parks = await twoParks(h, p);
+    await h.row(MODEL);
+    await h.tickAt(61);
+    const successor = await giveBack(h, p);
+    for (const park of parks) {
+      h.queue.update({ qitemId: park, actorSession: p.session, state: "done", closureReason: "no-follow-on", transitionNote: "done" } as never);
+    }
+    await h.tickAt(122);
+    expect(to(h, p).map((n) => n["qitemId"])).toEqual([to(h, p)[0]!["qitemId"], successor]);
+    expect(to(h, p)[1]).toMatchObject({ mode: "free" });
+  });
+
+  it("a row the seat hands on to another seat (not the model) is routing, no refusal: the seat keeps receiving", async () => {
+    h.register({ ...BASE, max: 1, dispatch_to_parked: { max_open_rows: 2 } });
+    const p = h.poolSeat("dev.impl-s1", "idle");
+    await twoParks(h, p);
+    const b = await h.row(MODEL);
+    await h.tickAt(61);
+    await h.queue.handoff({ qitemId: b, fromSession: p.session, toSession: LEAD, nudge: false });
+    const fresh = await h.row(MODEL);
+    await h.tickAt(122);
+    expect(to(h, p).map((n) => n["qitemId"])).toEqual([b, fresh]);
+  });
+
+  it("a seat that sends the row back to the model by a reroute (not a handoff) refused it too", async () => {
+    h.register({ ...BASE, max: 1, dispatch_to_parked: { max_open_rows: 2 } });
+    const p = h.poolSeat("dev.impl-s1", "idle");
+    await twoParks(h, p);
+    const b = await h.row(MODEL);
+    await h.tickAt(61);
+    h.queue.routeToFallback(b, MODEL, "devolvida pelo slot", { expectDestination: p.session });
+    await h.tickAt(122);
+    await h.tickAt(183);
+    expect(to(h, p).map((n) => n["qitemId"])).toEqual([b]);
+    expect(h.get(b)).toMatchObject({ destinationSession: MODEL, state: "pending" });
+  });
+
+  it("the exclusion follows the whole lineage: a row refused by s1, then its successor by s2, never goes to s1 nor s2 while they are parked", async () => {
+    h.register({ ...BASE, max: 2, dispatch_to_parked: { max_open_rows: 2, refused_cooldown_s: 300 } });
+    const p1 = h.poolSeat("dev.impl-s1", "idle");
+    const p2 = h.poolSeat("dev.impl-s2", "idle");
+    await twoParks(h, p1);
+    await twoParks(h, p2);
+    await h.row(MODEL);
+    await h.tickAt(61);
+    const second = await giveBack(h, p1);
+    await h.tickAt(122);
+    expect(to(h, p2).map((n) => n["qitemId"])).toEqual([second]);
+    const third = await giveBack(h, p2);
+    // Past the cooldown of both, still parked on the same waits: a fresh row goes, the twice-refused one does not.
+    h.nowMs = T0 + 600_000;
+    const fresh = await h.row(MODEL);
+    await h.tickAt(700);
+    const given = h.notes(DISPATCHED).map((n) => n["qitemId"]);
+    expect(given).toContain(fresh);
+    expect(given).not.toContain(third);
+    expect(h.get(third)).toMatchObject({ destinationSession: MODEL, state: "pending" });
+  });
+
+  it("the executor's own guard: an intent that moves a refused row to the parked seat that refused it moves nothing (refused_row)", async () => {
+    h.register({ ...BASE, max: 1, dispatch_to_parked: { max_open_rows: 2, refused_cooldown_s: 300 } });
+    const p = h.poolSeat("dev.impl-s1", "idle");
+    await twoParks(h, p);
+    await h.row(MODEL);
+    await h.tickAt(61);
+    const successor = await giveBack(h, p);
+    h.nowMs = T0 + 600_000; // past the cooldown: the seat receives as parked again, just not this row
+    await h.submit([{ kind: "dispatch", qitemId: successor, from: MODEL, slotId: p.slotId, mode: "parked" }]);
+    expect(h.notes(SKIPPED)).toEqual([{ qitemId: successor, from: MODEL, to: p.session, code: "refused_row" }]);
+    expect(h.get(successor)).toMatchObject({ destinationSession: MODEL, state: "pending" });
   });
 
   it("refused_cooldown_s: 0 turns the memory off: the seat is given the row each time, as before the field", async () => {
