@@ -578,6 +578,48 @@ describe("T-007715 (SH-A of the REVISAO-openrig-5): a park timer outside the dig
     expect(f.submissions).toEqual([]);
   });
 
+  it("B1 of the delta review: a row resumed and parked again with no wake of its own is no longer that reminder's row", async () => {
+    const { f, s, wdRows, parkWith, notas } = queueOnly();
+    const job = s.jobs.register({ policy: "periodic-reminder", targetSession: seat, intervalSeconds: 600, registeredBySession: "orch@test",
+      specYaml: `policy: periodic-reminder\ntarget:\n  session: ${JSON.stringify(seat)}\nmessage: "check your rows"\n` });
+    const b = await parkWith("bound to the operator's reminder", { wakeWatchdogId: job.jobId });
+    s.due(job.jobId);
+    await s.scheduler.runTickNow();
+    expect(notas(b.qitemId, job.jobId)).toHaveLength(1);
+    // the owner takes the row back, then parks it on a gate with no wake: the attachment belonged to the earlier park
+    s.repo.update({ qitemId: b.qitemId, actorSession: seat, state: "in-progress", transitionNote: "resumed" } as never);
+    s.repo.update({ qitemId: b.qitemId, actorSession: seat, state: "blocked", blockedOn: "external:gate", transitionNote: "gate" } as never);
+    s.due(job.jobId);
+    await s.scheduler.runTickNow();
+    expect(notas(b.qitemId, job.jobId)).toHaveLength(1);
+    expect(wdRows().map(r => r.destination_session)).toEqual([seat]);
+    expect(f.submissions).toEqual([]);
+  });
+
+  it("N2 of the delta review: a park's default wake adds no reminder line, nor the default of the row that armed a shared job", async () => {
+    const { s, parkWith, notas } = queueOnly();
+    const a = await s.park("A's wait");
+    const b = await parkWith("B attached", { wakeWatchdogId: a.jobId });
+    s.due(a.jobId);
+    await s.scheduler.runTickNow();
+    for (const q of [a.qitemId, b.qitemId]) {
+      expect(notas(q, a.jobId)).toHaveLength(1);
+      expect(notas(q, a.jobId).some(n => n.includes("\nreminder:"))).toBe(false);
+    }
+  });
+
+  it("N3 of the delta review: a long reminder is cut on the note, pointing at the job's full text", async () => {
+    const { s, notas } = queueOnly();
+    const a = await s.park("A's wait");
+    updateWatchdogJob(s.jobs, a.jobId, { message: `Check the notes. ${"x".repeat(3000)}` });
+    s.due(a.jobId);
+    await s.scheduler.runTickNow();
+    const [nota] = notas(a.qitemId, a.jobId);
+    expect(nota).toContain("Check the notes.");
+    expect(nota).toContain(`… (full text: rig watchdog show ${a.jobId})`);
+    expect(nota!.length).toBeLessThan(2400);
+  });
+
   it("unchanged: a reminder whose target is another seat than the parked row's owner is still that seat's row", async () => {
     const { s, wdRows, parkWith } = queueOnly();
     const job = s.jobs.register({ policy: "periodic-reminder", targetSession: seat, intervalSeconds: 600, registeredBySession: "orch@test",
