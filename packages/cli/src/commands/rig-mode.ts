@@ -23,7 +23,7 @@
 //     §Citation Rules.
 
 import { Command } from "commander";
-import { DaemonClient, DaemonResponseError } from "../client.js";
+import { DaemonClient, DaemonResponseError, withOperatorBearerRetry } from "../client.js";
 import { getDaemonStatus, getDaemonUrl , daemonStatusGuard} from "../daemon-lifecycle.js";
 import { realDeps } from "./daemon.js";
 import type { StatusDeps } from "./status.js";
@@ -372,15 +372,13 @@ export function rigModeCommand(depsOverride?: RigModeDeps): Command {
           return;
         }
 
-        const headers: Record<string, string> = {};
-        const bearer = opts.bearer ?? process.env.OPENRIG_AUTH_BEARER_TOKEN;
-        if (bearer) headers.Authorization = `Bearer ${bearer}`;
         const qualifierPath = qualifier ? `/${encodeURIComponent(qualifier)}` : "";
-        const res = await client.put<BindingResponse | { error: string; errors?: string[] }>(
+        // T-007930: a stale operator bearer (rotated since the seat started) is retried once with the bearer file.
+        const res = await withOperatorBearerRetry(opts.bearer, (headers) => client.put<BindingResponse | { error: string; errors?: string[] }>(
           `/api/rig-mode/bindings/${scope}${qualifierPath}`,
           { mode, record },
           { headers },
-        );
+        ));
         if (res.status === 401) {
           if (opts.json) {
             console.log(JSON.stringify({ ok: false, error: "unauthorized", hint: "Daemon requires operator bearer. Pass --bearer <token> or set OPENRIG_AUTH_BEARER_TOKEN." }, null, 2));
@@ -558,15 +556,13 @@ export function rigModeCommand(depsOverride?: RigModeDeps): Command {
       const deps = getDeps();
       await withClient(deps, async (client) => {
         const qualifierPath = qualifier ? `/${encodeURIComponent(qualifier)}` : "";
-        const headers: Record<string, string> = {};
-        const bearer = opts.bearer ?? process.env.OPENRIG_AUTH_BEARER_TOKEN;
-        if (bearer) headers.Authorization = `Bearer ${bearer}`;
         // One category is removed through its own path: a daemon that predates categories has no such route, so it
         // answers 404 and removes nothing (its plain DELETE would remove whatever binding is stored there).
         const categoryPath = opts.category !== undefined ? `/categories/${encodeURIComponent(opts.category)}` : "";
         let res: Awaited<ReturnType<typeof client.delete<{ removed: boolean; category?: Category; remaining?: Binding | null }>>>;
         try {
-          res = await client.delete(`/api/rig-mode/bindings/${scope}${qualifierPath}${categoryPath}`, { headers });
+          res = await withOperatorBearerRetry(opts.bearer,
+            (headers) => client.delete(`/api/rig-mode/bindings/${scope}${qualifierPath}${categoryPath}`, { headers }));
         } catch (error) {
           if (!(categoryPath && error instanceof DaemonResponseError && error.status === 404)) throw error;
           res = { status: 404, data: { removed: false } };
