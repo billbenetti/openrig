@@ -100,8 +100,8 @@ function scheduled(f: ReturnType<typeof fixture>, { withoutPreview = false, park
   const history = new WatchdogHistoryLog(f.db);
   const engine = new WatchdogPolicyEngine({ jobsRepo: jobs, historyLog: history, eventBus: bus, deliver: f.deliver,
     resolvePreDeliveryTerminalReason: ({ jobId }) => repo.resolveWatchdogPreDeliveryTerminalReason(jobId),
-    onWakeAttempt: ({ jobId, deliveryStatus, retryAt, queuedQitemId }: { jobId: string; deliveryStatus: string; retryAt?: string; queuedQitemId?: string }) =>
-      repo.recordWatchdogWakeAttempt(jobId, deliveryStatus, retryAt, queuedQitemId),
+    onWakeAttempt: ({ jobId, deliveryStatus, retryAt, queuedQitemId, message }: { jobId: string; deliveryStatus: string; retryAt?: string; queuedQitemId?: string; message?: string }) =>
+      (repo.recordWatchdogWakeAttempt as (...a: unknown[]) => void)(jobId, deliveryStatus, retryAt, queuedQitemId, message),
     ...(withoutPreview ? {} : { resolveDigestEntry: ({ jobId, message }: { jobId: string; message: string }) => repo.parkReminderDigestEntry(jobId, message) }),
     // As startup wires them (T-007715). Optional chaining keeps the fixture loadable on a base without the method, so
     // the tests that need it fail there by behaviour (a wd- row), not by a missing function.
@@ -503,19 +503,21 @@ describe("T-007715 (SH-A of the REVISAO-openrig-5): a park timer outside the dig
       repo.update({ qitemId: row.qitemId, actorSession: seat, state: "blocked", blockedOn: "external:wait", transitionNote: "parked", ...wake } as never);
       return { qitemId: row.qitemId, jobId: repo.getParkWakeStatus(row.qitemId)!.ref };
     };
-    const noted = (qitemId: string, jobId: string) => s.repo.listTransitions(qitemId).map(t => t.transitionNote ?? "")
-      .some(n => n.includes(`park wake noted on this row: watchdog ${jobId}; delivery=noted_on_parked_row; nothing typed`));
-    return { f, s, wdRows, parkWith, noted };
+    const notas = (qitemId: string, jobId: string) => s.repo.listTransitions(qitemId).map(t => t.transitionNote ?? "")
+      .filter(n => n.includes(`park wake noted on this row: watchdog ${jobId}; delivery=noted_on_parked_row; nothing typed`));
+    const noted = (qitemId: string, jobId: string) => notas(qitemId, jobId).length > 0;
+    return { f, s, wdRows, parkWith, noted, notas };
   }
 
   it("a park timer with its own message (rig watchdog update --message)", async () => {
-    const { f, s, wdRows, noted } = queueOnly();
+    const { f, s, wdRows, notas } = queueOnly();
     const a = await s.park("A's wait");
     updateWatchdogJob(s.jobs, a.jobId, { message: "Check the release notes first." });
     s.due(a.jobId);
     await s.scheduler.runTickNow();
     expect(wdRows()).toEqual([]);
-    expect(noted(a.qitemId, a.jobId)).toBe(true);
+    // B1 of the REVISAO-openrig-9: the reminder's own text is on the note (the wd- row used to carry it)
+    expect(notas(a.qitemId, a.jobId).some(n => n.includes("Check the release notes first."))).toBe(true);
     expect(s.history.listForJob(a.jobId, 1)[0]).toMatchObject({ outcome: "sent", deliveryStatus: "noted_on_parked_row" });
     expect(s.repo.getById(a.qitemId)!.state).toBe("blocked");
     expect(f.pastes).toEqual([]);
@@ -523,24 +525,25 @@ describe("T-007715 (SH-A of the REVISAO-openrig-5): a park timer outside the dig
   });
 
   it("a workflow's park (its re-presentation message, never the default one)", async () => {
-    const { f, s, wdRows, parkWith, noted } = queueOnly();
+    const { f, s, wdRows, parkWith, notas } = queueOnly();
     const w = await parkWith("work step", { wakeAfterSeconds: 60, wakeMessage:
       "Workflow wait re-presentation (blocker progress or reminder): authored-wait@1 instance wf-x step work.\nYou still own the same frontier packet." });
     s.due(w.jobId);
     await s.scheduler.runTickNow();
     expect(wdRows()).toEqual([]);
-    expect(noted(w.qitemId, w.jobId)).toBe(true);
+    expect(notas(w.qitemId, w.jobId).some(n => n.includes("You still own the same frontier packet."))).toBe(true);
     expect(s.history.listForJob(w.jobId, 1)[0]).toMatchObject({ outcome: "sent", deliveryStatus: "noted_on_parked_row" });
     expect(f.submissions).toEqual([]);
   });
 
   it("a repeating wait (wakeMaxSeconds): noted on the row, and the wait keeps its cadence", async () => {
-    const { f, s, wdRows, parkWith, noted } = queueOnly();
+    const { f, s, wdRows, parkWith, notas } = queueOnly();
     const r = await parkWith("long wait", { wakeAfterSeconds: 600, wakeMaxSeconds: 2400 });
     s.due(r.jobId);
     await s.scheduler.runTickNow();
     expect(wdRows()).toEqual([]);
-    expect(noted(r.qitemId, r.jobId)).toBe(true);
+    // the wait's reason (backstop or source changed) is on the note too
+    expect(notas(r.qitemId, r.jobId).some(n => /Waiting (backstop|source changed)/.test(n))).toBe(true);
     expect(s.history.listForJob(r.jobId, 1)[0]).toMatchObject({ outcome: "sent", deliveryStatus: "noted_on_parked_row" });
     expect(s.jobs.getByIdOrThrow(r.jobId).state).toBe("active");
     expect(f.submissions).toEqual([]);
@@ -556,6 +559,22 @@ describe("T-007715 (SH-A of the REVISAO-openrig-5): a park timer outside the dig
     expect(noted(a.qitemId, a.jobId)).toBe(true);
     expect(noted(b.qitemId, a.jobId)).toBe(true);
     expect(s.history.listForJob(a.jobId, 1)[0]).toMatchObject({ outcome: "sent", deliveryStatus: "noted_on_parked_row" });
+    expect(f.submissions).toEqual([]);
+  });
+
+  it("S1 of the REVISAO-openrig-9: an operator's periodic reminder attached by --wake-watchdog notes the parked row on every fire", async () => {
+    const { f, s, wdRows, parkWith, notas } = queueOnly();
+    const job = s.jobs.register({ policy: "periodic-reminder", targetSession: seat, intervalSeconds: 600, registeredBySession: "orch@test",
+      specYaml: `policy: periodic-reminder\ntarget:\n  session: ${JSON.stringify(seat)}\nmessage: "check your rows"\n` });
+    const b = await parkWith("bound to the operator's reminder", { wakeWatchdogId: job.jobId });
+    for (let i = 0; i < 2; i++) {
+      s.due(job.jobId);
+      await s.scheduler.runTickNow();
+    }
+    expect(wdRows()).toEqual([]);
+    expect(notas(b.qitemId, job.jobId).filter(n => n.includes("check your rows"))).toHaveLength(2);
+    expect(s.jobs.getByIdOrThrow(job.jobId).state).toBe("active");
+    expect(s.repo.getById(b.qitemId)!.state).toBe("blocked");
     expect(f.submissions).toEqual([]);
   });
 
