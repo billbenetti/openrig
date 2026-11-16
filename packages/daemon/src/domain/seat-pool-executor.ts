@@ -22,7 +22,6 @@ import {
   seatPoolCanReceive,
   seatPoolParkedLoadOver,
   seatPoolHeldByProcess,
-  seatPoolHeldByRefusal,
   seatPoolReceives,
   seatPoolRefusedCooldown,
   seatPoolDrainEpisode,
@@ -385,21 +384,21 @@ interface SeatPoolRefusalContext {
 
 const FALLBACK_NOTE = /^fallback-routed: (\S+) → (\S+) \((.*)\)$/s;
 const PARKED_MOVE_REASON = /^seat pool (\S+): .+ was parked on .+ \(2nd row\)$/s;
-const FREE_MOVE_REASON = /^seat pool (\S+): .+ was free$/s;
 
-/** One of the pool's moves of a row to a seat, read from the queue, and how it ended: `refusedAt` when the seat gave the
- *  row straight back to the model (seatPoolMovesOf), else null. */
+/** One of the pool's moves of a row to a seat as parked, read from the queue, and how it ended: `refusedAt` when the
+ *  seat gave the row straight back to the model (seatPoolMovesOf), else null. */
 interface SeatPoolRowMove {
   seat: string;
-  mode: "parked" | "free";
   refusedAt: string | null;
 }
 
 /**
- * Every move the pool made of this row to one of its seats, oldest first, each with how it ended (T-008466 SH-A: a
- * reroute keeps the row's id, so a row two seats handed back and forth carries both refusals; reading only the latest
- * move lost the first). A move is the note seatPoolMoveReason wrote, on the queue's own transition, live or archived (it
- * lives as long as the row does, past the job's history), as parked or as free. The seat REFUSED the row when, after
+ * Every move the pool made of this row to one of its seats as parked, oldest first, each with how it ended (T-008466
+ * SH-A: a reroute keeps the row's id, so a row two parked seats handed back and forth carries both refusals; reading
+ * only the latest move lost the first). A move is the note seatPoolMoveReason wrote, on the queue's own transition, live
+ * or archived (it lives as long as the row does, past the job's history). A move to a free seat is no parked move: it
+ * only ends the one before it, and a free seat that gives a row back is not remembered (the pool can't tell why; the
+ * fabrica's dev seats park the row on their own cap, T-008600). The seat REFUSED the row when, after
  * that move and before the next one, with no move to in-progress in between (a claim, or an update by the seat;
  * claimed_at can't say it: an unclaim clears it), the row went back TO THE MODEL: a handoff the seat made whose target is
  * one of the model's addresses, or a reroute of the queue's fallback from the seat to the model that is not the pool's
@@ -422,10 +421,9 @@ function seatPoolMovesOf(ctx: SeatPoolRefusalContext, qitemId: string): SeatPool
     if (note) {
       const [, from, to, reason] = note as unknown as [string, string, string, string];
       if (reason.startsWith(`seat pool ${ctx.jobId}: `)) {
-        const mode = PARKED_MOVE_REASON.test(reason) ? "parked" : FREE_MOVE_REASON.test(reason) ? "free" : null;
         const seat = new Set(ctx.addressesOf(to));
-        if (mode === null || seat.size === 0) { open = null; continue; }
-        const move: SeatPoolRowMove = { seat: to, mode, refusedAt: null };
+        if (!PARKED_MOVE_REASON.test(reason) || seat.size === 0) { open = null; continue; }
+        const move: SeatPoolRowMove = { seat: to, refusedAt: null };
         moves.push(move);
         open = { move, seat };
         continue;
@@ -448,21 +446,21 @@ function seatPoolMovesOf(ctx: SeatPoolRefusalContext, qitemId: string): SeatPool
 }
 
 /**
- * A seat's refusal (SeatPoolSlotView.parkedRefusal or freeRefusal): the pool's latest move of a row to the seat
- * (`moves`, newest first, from the job's history) and, on the queue, the latest move of that row to that seat
- * (seatPoolMovesOf) ended with the seat giving it straight back less than `cooldownSeconds` ago. Only the latest move
- * counts: a row the seat took since ends the refusal before it. Read from the job's history and the queue, so a restart
- * of the daemon keeps it. Null: no such refusal.
+ * A seat's parked refusal (SeatPoolSlotView.parkedRefusal): the pool's latest move of a row to the seat (`moves`,
+ * newest first, from the job's history) was made as parked, and, on the queue, that move of the row to that seat
+ * (seatPoolMovesOf; a seat gets a row as parked at most once, since refusedBy keeps it from the seat while parked) ended
+ * with the seat giving it straight back less than `cooldownSeconds` ago. Only the latest move counts: a row the seat took
+ * since ends the refusal before it. Read from the job's history and the queue, so a restart of the daemon keeps it.
+ * Null: no such refusal.
  */
-function seatRefusalOf(
+function parkedRefusalOf(
   ctx: SeatPoolRefusalContext, moves: readonly PoolMove[], sessionName: string, cooldownSeconds: number, nowMs: number,
-): { mode: "parked" | "free"; at: string; openRowIds: string[] | null } | null {
+): { at: string; openRowIds: string[] | null } | null {
   const latest = moves.find((move) => move.to === sessionName);
-  if (!latest || (latest.mode !== "parked" && latest.mode !== "free")) return null;
+  if (!latest || latest.mode !== "parked") return null;
   const move = seatPoolMovesOf(ctx, latest.qitemId).filter((m) => m.seat === sessionName).at(-1);
-  if (!move || move.mode !== latest.mode || move.refusedAt === null) return null;
-  if (!(nowMs - Date.parse(move.refusedAt) < cooldownSeconds * 1000)) return null;
-  return { mode: move.mode, at: move.refusedAt, openRowIds: latest.openRowIds };
+  if (!move || move.refusedAt === null || !(nowMs - Date.parse(move.refusedAt) < cooldownSeconds * 1000)) return null;
+  return { at: move.refusedAt, openRowIds: latest.openRowIds };
 }
 
 /** The pool's seats that refused this row (it came back to the model by a reroute) or a row it succeeds by handoff
@@ -587,9 +585,8 @@ export function readSeatPoolState(deps: SeatPoolStateReaderDeps, job: { jobId: s
     const idle = state?.activity === "idle-at-prompt" && state.needsInput.count === 0 && !state.backgroundWork;
     const sessionName = seatSessionName(slot.logicalId, model.rigName);
     const facts = present && parkedRule && deps.rowFacts ? deps.rowFacts(sessionName, maxOpenRows) : null;
-    // An adopted seat is never parked (seatPoolCanReceive), but it is free like any other: its free refusal counts too.
-    const refusal = present && refusedCooldown > 0
-      ? seatRefusalOf(refusalCtx, poolMoves, sessionName, refusedCooldown, nowMs) : null;
+    const refusal = present && refusedCooldown > 0 && slot.opId !== null
+      ? parkedRefusalOf(refusalCtx, poolMoves, sessionName, refusedCooldown, nowMs) : null;
     return {
       slotId: slot.slotId,
       logicalId: slot.logicalId,
@@ -610,8 +607,7 @@ export function readSeatPoolState(deps: SeatPoolStateReaderDeps, job: { jobId: s
       ...(facts?.parked ? { parked: facts.parked } : {}),
       ...(facts?.parkedRows ? { parkedRows: facts.parkedRows } : {}),
       ...busyOf(busyRule && present ? deps.busyProcess!(sessionName) : undefined),
-      ...(refusal?.mode === "parked" ? { parkedRefusal: { at: refusal.at, openRowIds: refusal.openRowIds } } : {}),
-      ...(refusal?.mode === "free" ? { freeRefusal: { at: refusal.at } } : {}),
+      ...(refusal ? { parkedRefusal: refusal } : {}),
     };
   });
   const adoptable = job.spec.adopt.flatMap((logicalId) => {
@@ -1833,11 +1829,8 @@ export class SeatPoolExecutor {
     if (intent.mode !== "parked") {
       if (mode !== "free") {
         // Free as the plan read it, but busy with heavy local work it does not track (T-006251, B1): said once here.
-        if (slot.busyProcess && seatPoolReceives(ctx.spec, { ...read, busyProcess: null, freeRefusal: undefined }, nowMs, { usageLimited: limited }) === "free") {
+        if (slot.busyProcess && seatPoolReceives(ctx.spec, { ...read, busyProcess: null }, nowMs, { usageLimited: limited }) === "free") {
           this.record(jobId, false, "seat_pool_dispatch_skipped", { ...base, code: "free_busy", busyProcess: slot.busyProcess });
-        } else if (slot.freeRefusal && seatPoolReceives(ctx.spec, { ...slot, freeRefusal: undefined }, nowMs, { usageLimited: limited }) === "free") {
-          // Free as the plan read it, but it gave a row it got as free straight back since (T-008466).
-          this.record(jobId, false, "seat_pool_dispatch_skipped", { ...base, code: "free_refused" });
         }
         return true;
       }
@@ -2020,9 +2013,7 @@ export class SeatPoolExecutor {
       return {
         session: seatSessionName(slot.logicalId, ctx.model.rigName), phase: slot.phase,
         receives: receives === "parked" && refusing.has(slot.sessionName) ? null : receives,
-        ...(seatPoolHeldByProcess(ctx.spec, read, { usageLimited: limited })
-          ? { held: "busy" as const }
-          : seatPoolHeldByRefusal(ctx.spec, read, nowMs, { usageLimited: limited }) ? { held: "refused" as const } : {}),
+        ...(seatPoolHeldByProcess(ctx.spec, read, { usageLimited: limited }) ? { held: "busy" as const } : {}),
       };
     });
     const result = await this.deps.effects.runCommand(ctx.spec.demandCmd, this.commandEnv(ctx, { OPENRIG_SEAT_POOL_SLOTS: JSON.stringify(slots) }), run.controller.signal);
