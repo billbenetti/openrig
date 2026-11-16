@@ -242,13 +242,21 @@ describe("seat scope on, but no user scope can be made: today's launch, with a w
     const on = makeAdapter({ seatScope: { tasksMax: 2048 } });
     const result = await on.adapter.respawnPane("%1", "codex resume", { cwd: "/private", restartInPlace: true });
     expect(result.ok).toBe(true);
-    expect(result.ok && result.warnings).toHaveLength(1);
-    expect(result.ok && result.warnings?.[0]).toMatch(/^Seat scope not applied on a restart in place: .*without this seat's own TasksMax/);
+    if (process.platform === "linux") {
+      expect(result.ok && result.warnings).toHaveLength(1);
+      expect(result.ok && result.warnings?.[0]).toMatch(/^Seat scope not applied on a restart in place: .*without this seat's own TasksMax.*--fresh --stop --reason .*blank conversation/);
+    } else {
+      expect(result.ok && result.warnings).toBeUndefined();  // no launch can scope a seat here, so nothing to say
+    }
     expect(probes(on.shellCalls)).toEqual([]);
     expect(on.argvCalls.at(-1)).toEqual(["tmux", "respawn-pane", "-t", "%1", "-c", "/private", "codex resume"]);
     // with the key off, the same restart says nothing
     const off = makeAdapter({});
     const quiet = await off.adapter.respawnPane("%1", "codex resume", { cwd: "/private", restartInPlace: true });
     expect(quiet.ok && quiet.warnings).toBeUndefined();
+    // with the key on but no user manager (no MANAGERPID), no launch would scope the seat either: quiet (N3)
+    vi.stubEnv("MANAGERPID", "");
+    const noManager = await on.adapter.respawnPane("%1", "codex resume", { cwd: "/private", restartInPlace: true });
+    expect(noManager.ok && noManager.warnings).toBeUndefined();
   });
 });

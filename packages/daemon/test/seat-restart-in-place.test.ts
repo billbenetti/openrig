@@ -95,6 +95,8 @@ interface WorldOptions {
   defaultShell?: string | null | "omitted";
   /** Initial foreground command returned by getPaneCommand before stop (default "codex"). */
   paneCommandBefore?: string;
+  /** Warnings the fake respawnPane returns (as the adapter's restart-in-place seat scope warning, T-009602). */
+  respawnWarnings?: string[];
 }
 
 const dbs: Database.Database[] = [];
@@ -150,6 +152,7 @@ function world(options: WorldOptions = {}) {
   let paneGone = false;
   let remainOnExit: string | null = options.remainOnExit === "unreadable" ? null : options.remainOnExit ?? null;
   const calls: string[] = [];
+  const respawnOpts: Array<Record<string, unknown> | undefined> = [];
   const paneLines: string[] = (options.screenBefore ?? "").split("\n").filter(Boolean);
   let relaunched = false;
   let replacementReads = 0;
@@ -211,7 +214,10 @@ function world(options: WorldOptions = {}) {
     restorePaneOption: async (_pane: string, _option: string, value: string | null): Promise<TmuxResult> => {
       calls.push(`restore remain-on-exit ${value}`); maybeThrow("restorePaneOption"); remainOnExit = value; return { ok: true };
     },
-    respawnPane: async (_pane: string, command?: string): Promise<TmuxResult> => { calls.push(`respawn ${command}`); maybeThrow("respawnPane"); relaunch(); return { ok: true }; },
+    respawnPane: async (_pane: string, command?: string, opts?: Record<string, unknown>): Promise<TmuxResult> => {
+      calls.push(`respawn ${command}`); respawnOpts.push(opts); maybeThrow("respawnPane"); relaunch();
+      return (options.respawnWarnings ? { ok: true, warnings: options.respawnWarnings } : { ok: true }) as TmuxResult;
+    },
     capturePaneHistory: async () => paneLines.join("\n"),
     capturePaneHistoryParts: async () => {
       const history = paneLines.slice(0, Math.max(0, paneLines.length - (options.screenRows ?? 3)));
@@ -334,7 +340,7 @@ function world(options: WorldOptions = {}) {
   });
   const events = () => (db.prepare("SELECT type, payload FROM events WHERE type LIKE 'seat.restart_in_place%' ORDER BY seq").all() as Array<{ type: string; payload: string }>)
     .map((row) => ({ type: row.type, ...JSON.parse(row.payload) }));
-  return { db, service, node, session, calls, launches, proofHomes, builds, events, sessionRegistry, tmux,
+  return { db, service, node, session, calls, respawnOpts, launches, proofHomes, builds, events, sessionRegistry, tmux,
     wrapperBinDir: wrapperEnv?.binDir,
     replacementYields, get replacementReads() { return replacementReads; }, get relaunched() { return relaunched; },
     setRows: (next: NativeProcessRow[]) => { rows = next; },
@@ -991,6 +997,15 @@ describe("rig seat restart --keep-conversation: outcomes", () => {
     expect(result).not.toHaveProperty("paneHeld");
     expect(w.calls).toEqual(["remain-on-exit on", "remain-on-exit on", "signalPaneProcess TERM", `respawn env CODEX_HOME='${HOME}' codex -m 'gpt-5.5' -s workspace-write resume '${TOKEN}'`,
       "verifyResumeInPane", "restore remain-on-exit null"]);
+  });
+
+  it("direct-native: the respawn is marked as a restart in place, and its seat scope warning reaches the report (T-009602, SH-1)", async () => {
+    const warning = "Seat scope not applied on a restart in place: synthetic";
+    const w = world({ shape: "direct_native", remainOnExit: null, respawnWarnings: [warning] });
+    const result = await w.service.restartInPlace({ seatRef: SEAT, reason: "x" });
+    expect(result).toMatchObject({ ok: true, outcome: "restarted_account_unverified", paneShape: "direct_native" });
+    expect(w.respawnOpts).toEqual([expect.objectContaining({ restartInPlace: true })]);
+    expect((result as { warnings?: string[] }).warnings).toContain(warning);
   });
 
   it("direct-native failure keeps the dead pane held and says so", async () => {

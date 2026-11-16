@@ -525,7 +525,8 @@ export class TmuxAdapter {
   private seatScopeOnRestartInPlace(warnings: string[]): void {
     let on = false;
     try { on = Boolean(this.launchEnvironment?.().seatScope); } catch { return; }
-    if (on) this.seatScopeWarning(warnings, "Seat scope not applied on a restart in place: the restarted command runs in the shared terminal server scope, without this seat's own TasksMax, until the seat's next launch (rig seat launch <seat> --fresh, or a relaunch) puts it back in a seat scope.");
+    // Where no user scope can be made (not Linux, no user manager), no launch would put the seat in one: nothing to say.
+    if (on && this.userScopeUnavailable() === null) this.seatScopeWarning(warnings, "Seat scope not applied on a restart in place: the restarted command runs in the shared terminal server scope, without this seat's own TasksMax, until the seat's next launch puts it back in a seat scope (rig seat launch <seat>@<rig> --fresh --stop --reason \"…\" starts a blank conversation; or the next relaunch).");
   }
 
   private seatScopeWarning(warnings: string[], warning: string): void {
