@@ -472,9 +472,11 @@ function readRefusedBy(ctx: SeatPoolRefusalContext, qitemId: string, chain: stri
 
 /** The dispatch rank of a queue priority, lower first (T-009034): critical, then urgent (and high), then routine (and
  *  normal, and any value the queue does not know), then low. The queue writes only routine, urgent and critical; the
- *  other names rank as they read, so a row from an older or a foreign writer is never put first or dropped. */
+ *  other names rank as they read (in any case: the CLI keeps a value it does not know as typed), so a row from an older or
+ *  a foreign writer is never put first or dropped. The rank is strict, with no aging: with the pool at its max and
+ *  urgent rows arriving as fast as it hands them out, a routine row waits; below the max it is demand and the pool grows. */
 export function seatPoolPriorityRank(priority: string | null | undefined): number {
-  switch (priority) {
+  switch (priority?.toLowerCase()) {
     case "critical": return 0;
     case "urgent":
     case "high": return 1;
