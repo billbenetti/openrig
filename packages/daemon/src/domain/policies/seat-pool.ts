@@ -55,7 +55,7 @@ export interface SeatPoolSpec {
   /** Where an escalation about a seat of the pool goes (a needs-input escalation, and a row a reap moves a second
    *  time), in place of the model's escalation owner. Null: the model's escalation owner, as without the field. */
   escalationOwner: string | null;
-  /** A seat whose open rows (one, or up to `max_open_rows`) it parked itself on waits of its own may receive one row
+  /** A seat whose open rows (one, or more: `max_open_rows`) it parked itself on waits of its own may receive one row
    *  more (seatPoolCanReceive).
    *  Absent (no such property) when the key is not in the context: the rule is off, as before the key. */
   dispatchToParked?: SeatPoolDispatchToParked;
@@ -82,8 +82,10 @@ export interface SeatPoolDispatchToParked {
    *  too (T-006251, B1): a process the seat's runtime does not track (reparented, nohup) gives the row back as well. */
   busyProcesses?: string[];
   /** `max_open_rows`: a seat may hold up to this many open rows and still receive, when ALL of them are blocked on its
-   *  own `external:` waits, each passing the checks the single park passes (T-007036). Absent (no property) when the
-   *  field is not given, which reads as 1: exactly one open row, the rule from before the field. */
+   *  own `external:` waits, each passing the checks the single park passes (T-007036). A row blocked on an `external:`
+   *  gate does not count toward it (T-009130: a wait on another seat or an outside event holds no CPU of the seat's);
+   *  a row blocked on another row does, and a pending or in-progress row keeps the seat from receiving anyway. Absent
+   *  (no property) when the field is not given, which reads as 1. */
   maxOpenRows?: number;
   /** `busy_orphan_max_age_s`, only with `busy_processes` (default 43200, 12 h): the oldest a matching process that left
    *  the pane's tree (found by the TMUX_PANE it inherited) may be and still hold the seat; an older one, or one started
@@ -487,8 +489,9 @@ export interface SeatPoolSlotView {
   backgroundWork?: boolean;
   /** Only with `dispatch_to_parked` in the spec, the row facts read and exactly one open row, blocked: that row's park. */
   parked?: ParkFacts;
-  /** Only with `dispatch_to_parked.max_open_rows` above 1, the row facts read and 2 or more open rows, all blocked (at
-   *  most that many): the park of each (T-007036). A seat with one open row carries `parked` instead. */
+  /** Only with `dispatch_to_parked`, the row facts read and 2 or more open rows, all blocked, at most
+   *  `max_open_rows` of them on something other than an `external:` gate (T-009130): the park of each (T-007036). A
+   *  seat with one open row carries `parked` instead. */
   parkedRows?: ParkFacts[];
   /** Only with `dispatch_to_parked.busy_processes` in the spec, for a seat the process read looked at: why the seat
    *  counts as busy for a row (the matching process, or that its processes could not be read), or null when no
@@ -629,12 +632,13 @@ export function seatPoolHeldByProcess(spec: SeatPoolSpec, slot: SeatPoolSlotView
  * `free`: no open row and idle at its prompt (the rule from before `dispatch_to_parked`), and, with
  * `dispatch_to_parked.busy_processes`, no such program of the seat's (`busyProcess`, T-006251). `parked`, only with
  * `dispatch_to_parked`: a seat the pool added (not adopted), at its prompt (idle, or working only through a background
- * shell, which `allow_background_work: false` refuses), whose open rows (one, or up to `max_open_rows`) are each blocked
+ * shell, which `allow_background_work: false` refuses), whose open rows (one, or more: `max_open_rows`) are each blocked
  * on an `external:` gate with a
  * timer of at most `max_wake_s` still armed and live, armed by the seat itself, after it took the row (by claim or by
  * update) no more than `max_claim_age_s` ago, on a gate that contains none of `refuse_gates`, and with no
- * `busy_processes` program under its pane (`busyProcess`). A seat with more open rows than `max_open_rows` (default 1),
- * or with one that is pending or in progress, never receives: one row more is the ceiling (T-007036).
+ * `busy_processes` program under its pane (`busyProcess`). A seat with more rows blocked on something other than an
+ * `external:` gate than `max_open_rows` (default 1), or with one that is pending or in progress, never receives; its
+ * `external:` waits do not count toward that ceiling (T-009130).
  */
 export function seatPoolCanReceive(spec: SeatPoolSpec, slot: SeatPoolSlotView, nowMs: number): SeatPoolReceiveMode | null {
   if (spec.drain || slot.phase !== "live" || !slot.nodeExists || seatPoolReapable(slot) || slot.heldMessages !== 0) return null;
@@ -647,11 +651,14 @@ export function seatPoolCanReceive(spec: SeatPoolSpec, slot: SeatPoolSlotView, n
   if (!rule || slot.adopted) return null;
   if (slot.atPrompt !== true || (slot.cause !== "idle" && slot.cause !== "working")) return null;
   if (!rule.allowBackgroundWork && slot.backgroundWork === true) return null;
-  // Every open row must be one of the seat's own parks: exactly one (`parked`), or with max_open_rows above 1 up to that
-  // many (`parkedRows`, T-007036). A pending or in-progress row has no park, so the counts then differ and it refuses.
+  // Every open row must be one of the seat's own parks: exactly one (`parked`), or more (`parkedRows`, T-007036). A
+  // pending or in-progress row has no park, so the counts then differ and it refuses. Toward max_open_rows count only the
+  // rows not blocked on an `external:` gate (T-009130): a wait on another seat or an outside event holds no CPU of the
+  // seat's; each of them must still be the seat's own short wait (seatPoolOwnPark, refuse_gates included).
   const maxOpenRows = rule.maxOpenRows ?? DISPATCH_TO_PARKED_MAX_OPEN_ROWS_DEFAULT;
   const parks = slot.openRows === 1 ? (slot.parked ? [slot.parked] : []) : (slot.parkedRows ?? []);
-  if (slot.openRows < 1 || slot.openRows > maxOpenRows || parks.length !== slot.openRows) return null;
+  if (slot.openRows < 1 || parks.length !== slot.openRows) return null;
+  if (parks.filter((park) => !park.blockedOn.startsWith("external:")).length > maxOpenRows) return null;
   if (slot.busyProcess) return null;
   if (seatPoolRefusedRecently(rule, slot, parks, nowMs)) return null;
   return parks.every((park) => seatPoolOwnPark(rule, slot.sessionName, park, nowMs)) ? "parked" : null;

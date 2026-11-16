@@ -1095,14 +1095,21 @@ export interface QueueDestinationAdvisory {
   message: string;
 }
 
+/** A row's blocked_on is an `external:` gate: a wait on another seat or an outside event, which the seat pool does not
+ *  count toward `dispatch_to_parked.max_open_rows` (T-009130). */
+export function isExternalGate(blockedOn: string | null | undefined): boolean {
+  return typeof blockedOn === "string" && blockedOn.startsWith("external:");
+}
+
 /** A seat pool seat's open rows and, when its only open row is blocked, that row's park (listPoolSeatRowFacts). */
 export interface PoolSeatRowFacts {
   /** The open rows: listOpenObligations' rows, in its order (newest first) and with its limit. */
   rows: Array<{ qitemId: string; state: "pending" | "in-progress" | "blocked" }>;
   /** Only when `rows` is exactly one blocked row; null otherwise. */
   parked: ParkFacts | null;
-  /** Only when asked with maxBlocked above 1 and `rows` is 2 to maxBlocked rows, all blocked: the park of each, in
-   *  `rows`' order (T-007036, dispatch_to_parked.max_open_rows). Absent otherwise. */
+  /** Only when `rows` is 2 or more rows, all blocked, and at most maxBlocked of them blocked on something other than an
+   *  `external:` gate (T-009130): the park of each, in `rows`' order (T-007036, dispatch_to_parked.max_open_rows).
+   *  Absent otherwise. */
   parkedRows?: ParkFacts[];
 }
 
@@ -4962,7 +4969,12 @@ export class QueueRepository {
    */
   listPoolSeatRowFacts(sessionName: string, maxBlocked = 1): PoolSeatRowFacts {
     const rows = this.listOpenObligations(sessionName, 500).map((row) => ({ qitemId: row.qitemId, state: row.state }));
-    if (rows.length === 0 || rows.length > Math.max(1, maxBlocked) || rows.some((row) => row.state !== "blocked")) return { rows, parked: null };
+    if (rows.length === 0 || rows.some((row) => row.state !== "blocked")) return { rows, parked: null };
+    // T-009130: a row blocked on an external: gate (a wait on another seat or an outside event, no CPU of the seat's)
+    // does not count toward maxBlocked; a row blocked on another row does.
+    const blockedOn = this.db.prepare("SELECT blocked_on FROM queue_items WHERE qitem_id = ?");
+    const counted = rows.filter((row) => !isExternalGate((blockedOn.get(row.qitemId) as { blocked_on: string | null } | undefined)?.blocked_on)).length;
+    if (counted > Math.max(1, maxBlocked)) return { rows, parked: null };
     if (rows.length === 1) return { rows, parked: this.poolSeatParkFacts(rows[0]!.qitemId) };
     const parks = rows.map((row) => this.poolSeatParkFacts(row.qitemId));
     return parks.every((park): park is ParkFacts => park !== null) ? { rows, parked: null, parkedRows: parks } : { rows, parked: null };

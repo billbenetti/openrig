@@ -1,7 +1,8 @@
 // dispatch_to_parked.max_open_rows (T-007036): a pool seat whose open rows are ALL blocked on its own external: waits,
-// each with a live timer it armed itself, may receive one row more while it holds at most max_open_rows of them. The
-// default, 1, is the rule from before the field (exactly one open row). A pending or in-progress row, or a blocked one
-// without a live timer, still keeps the seat from receiving.
+// each with a live timer it armed itself, may receive one row more. Since T-009130 a row blocked on an external: gate
+// (a wait on another seat or an outside event, with no CPU of the seat's) no longer counts toward max_open_rows; a row
+// blocked on another row, a pending or an in-progress one still counts, and still keeps the seat from receiving, as does
+// a blocked one without a live timer.
 
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import type Database from "better-sqlite3";
@@ -12,6 +13,7 @@ import { EventBus } from "../src/domain/event-bus.js";
 import { QueueRepository } from "../src/domain/queue-repository.js";
 import {
   parseSeatPoolSpec,
+  planSeatPool,
   seatPoolCanReceive,
   type ParkFacts,
   type SeatPoolSlotView,
@@ -63,11 +65,26 @@ describe("dispatch_to_parked.max_open_rows: seatPoolCanReceive", () => {
     expect(seatPoolCanReceive(spec({ max_open_rows: 4 }), seat([park(1)]), NOW)).toBe("parked");
   });
 
-  it("three rows, all blocked on external: with a live timer it armed: receives with max 4, not with the default", () => {
+  it("three rows, all blocked on external: with a live timer it armed: receives, the external: waits not counted (T-009130)", () => {
     const three = seat([park(1), park(2), park(3)]);
     expect(seatPoolCanReceive(spec({ max_open_rows: 4 }), three, NOW)).toBe("parked");
-    expect(seatPoolCanReceive(spec(), three, NOW)).toBeNull();
-    expect(seatPoolCanReceive(spec({ max_open_rows: 2 }), three, NOW)).toBeNull();
+    expect(seatPoolCanReceive(spec(), three, NOW)).toBe("parked");
+    expect(seatPoolCanReceive(spec({ max_open_rows: 2 }), three, NOW)).toBe("parked");
+  });
+
+  it("T-009130: a row blocked on another row still counts toward max_open_rows, and keeps the seat from receiving", () => {
+    const onRow = (n: number) => park(n, { blockedOn: `qitem-${n}` });
+    // 2 rows blocked on other rows with max 1: over the ceiling; with max 3, under it but not the seat's own wait
+    expect(seatPoolCanReceive(spec(), seat([park(1), onRow(2), onRow(3)]), NOW)).toBeNull();
+    expect(seatPoolCanReceive(spec({ max_open_rows: 3 }), seat([park(1), onRow(2), onRow(3)]), NOW)).toBeNull();
+    // an external: wait that is a refused gate (heavy local work) still refuses, counted or not
+    expect(seatPoolCanReceive(spec({ max_open_rows: 3, refuse_gates: ["suite-flock"] }),
+      seat([park(1), park(2), park(3, { blockedOn: "external:suite-flock-teto-s1" })]), NOW)).toBeNull();
+  });
+
+  it("T-009130: three in-progress (or pending) rows: no parks, so the seat does not receive, whatever the max", () => {
+    expect(seatPoolCanReceive(spec({ max_open_rows: 3 }), seat([], 3), NOW)).toBeNull();
+    expect(seatPoolCanReceive(spec({ max_open_rows: 20 }), seat([], 3), NOW)).toBeNull();
   });
 
   it("a pending (or in-progress) row among them: no park for it, so the seat does not receive", () => {
@@ -117,14 +134,14 @@ describe("dispatch_to_parked.max_open_rows: listPoolSeatRowFacts over the real q
     queue.update({ qitemId, actorSession: SLOT, state: "blocked", blockedOn: `external:x${n}`, wakeAfterSeconds: 1800, transitionNote: "parked" } as never);
   }
 
-  it("three blocked rows with live timers: no single park; with max 4, the three parks, and the seat receives", async () => {
+  it("three blocked rows with live timers: no single park; the three parks (external: not counted), and the seat receives", async () => {
     const ids = [await taken(), await taken(), await taken()];
     at(T0 + 60_000);
     ids.forEach((id, i) => parkRow(id, i + 1));
     at(T0 + 120_000);
     const one = queue.listPoolSeatRowFacts(SLOT);
     expect(one.parked).toBeNull();
-    expect(one).not.toHaveProperty("parkedRows");
+    expect(one.parkedRows).toHaveLength(3); // T-009130: the external: waits don't count toward the default max (1)
     const four = queue.listPoolSeatRowFacts(SLOT, 4);
     expect(four.parked).toBeNull();
     expect(four.parkedRows!.map((p) => p.qitemId).sort()).toEqual([...ids].sort());
@@ -146,11 +163,17 @@ describe("dispatch_to_parked.max_open_rows: listPoolSeatRowFacts over the real q
     expect(facts).not.toHaveProperty("parkedRows");
   });
 
-  it("more blocked rows than the max: no parks", async () => {
+  it("more rows blocked on other rows than the max: no parks; blocked on external: they don't count (T-009130)", async () => {
     const ids = [await taken(), await taken(), await taken()];
     at(T0 + 60_000);
     ids.forEach((id, i) => parkRow(id, i + 1));
-    expect(queue.listPoolSeatRowFacts(SLOT, 2)).not.toHaveProperty("parkedRows");
+    expect(queue.listPoolSeatRowFacts(SLOT, 2).parkedRows).toHaveLength(3);
+    expect(queue.listPoolSeatRowFacts(SLOT).parkedRows).toHaveLength(3);
+    const other = [await taken(), await taken()];
+    at(T0 + 90_000);
+    other.forEach((id) => queue.update({ qitemId: id, actorSession: SLOT, state: "blocked", blockedOn: ids[0], transitionNote: "on a row" } as never));
+    expect(queue.listPoolSeatRowFacts(SLOT, 1)).not.toHaveProperty("parkedRows");
+    expect(queue.listPoolSeatRowFacts(SLOT, 2).parkedRows).toHaveLength(5);
   });
 
   it("one blocked row: the single park, as before, with or without a max", async () => {
@@ -161,5 +184,60 @@ describe("dispatch_to_parked.max_open_rows: listPoolSeatRowFacts over the real q
     const four = queue.listPoolSeatRowFacts(SLOT, 4);
     expect(four.parked?.qitemId).toBe(id);
     expect(four).not.toHaveProperty("parkedRows");
+  });
+});
+
+describe("T-009130: the dispatch counts no external: wait toward max_open_rows", () => {
+  const T0 = Date.parse("2026-11-13T00:00:00.000Z");
+  let db: Database.Database;
+  let queue: QueueRepository;
+  const at = (ms: number) => vi.setSystemTime(ms);
+  const S2 = "dev-impl-s2@r";
+
+  beforeEach(() => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    at(T0);
+    db = createDb();
+    migrate(db, ALL_MIGRATIONS);
+    queue = new QueueRepository(db, new EventBus(db));
+  });
+  afterEach(() => {
+    db.close();
+    vi.useRealTimers();
+  });
+
+  async function taken(dest: string): Promise<string> {
+    const row = await queue.create({ sourceSession: "dev-impl@r", destinationSession: dest, body: "A", tags: ["tarefa-nova"], nudge: false } as never);
+    queue.claim({ qitemId: row.qitemId, destinationSession: dest });
+    return row.qitemId;
+  }
+
+  function view(slotId: number, sessionName: string, maxOpenRows: number): SeatPoolSlotView {
+    const facts = queue.listPoolSeatRowFacts(sessionName, maxOpenRows);
+    return {
+      slotId, logicalId: `dev.impl-s${slotId}`, sessionName, nodeId: `node-${slotId}`, phase: "live", adopted: false, nodeExists: true,
+      openRows: facts.rows.length, heldMessages: 0, idleSince: null, cause: "working", atPrompt: true, backgroundWork: false,
+      ...(facts.parked ? { parked: facts.parked } : {}),
+      ...(facts.parkedRows ? { parkedRows: facts.parkedRows } : {}),
+    };
+  }
+
+  it("a seat with 3 rows blocked on external: receives the waiting row; a seat with 3 in progress does not", async () => {
+    const parked = [await taken(SLOT), await taken(SLOT), await taken(SLOT)];
+    await taken(S2); await taken(S2); await taken(S2);
+    at(T0 + 60_000);
+    parked.forEach((id, i) => queue.update({ qitemId: id, actorSession: SLOT, state: "blocked", blockedOn: `external:sre-push-${i}`,
+      wakeAfterSeconds: 1800, transitionNote: "parked" } as never));
+    at(T0 + 120_000);
+    const sp = spec({ max_open_rows: 2 });
+    const slots = [view(2, S2, 2), view(1, SLOT, 2)];
+    const state = {
+      model: { rigId: "rig-1", rigName: "r", podNamespace: "dev", memberId: "impl", logicalId: "dev.impl", nodeId: "model", sessionName: "dev-impl@r" },
+      modelCause: "working" as const, restoring: false, slots, adoptable: [], demand: null, lastScaleAt: null,
+      pending: [{ qitemId: "q-wait", destination: "dev-impl@r", waitingSince: new Date(T0 - 600_000).toISOString(), tags: [] }],
+    };
+    const dispatch = planSeatPool(sp, state, T0 + 120_000, 120_000).intents.filter((i) => i.kind === "dispatch");
+    expect(dispatch).toEqual([{ kind: "dispatch", qitemId: "q-wait", from: "dev-impl@r", slotId: 1, mode: "parked" }]);
+    expect(seatPoolCanReceive(sp, slots[0]!, T0 + 120_000)).toBeNull();
   });
 });
