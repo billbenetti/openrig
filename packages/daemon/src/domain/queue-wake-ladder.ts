@@ -14,6 +14,7 @@ import { findQueueRecovery, recoveryTag } from "./queue-recovery.js";
 import { lastMeaningfulTransition, type WaitingView } from "./queue-waiting.js";
 import { readWakeOutcome } from "./connection-contract.js";
 import { runSyncSite } from "./sync-site-wrap.js";
+import { readOffLoop } from "./read-off-loop.js";
 // S01 (OPR.0.5.5.1) — WAKE OR ESCALATE ON BATONS. A handoff whose wake fails must never
 // silently park: today one failed nudge is recorded and nothing follows (the measured
 // dominant 0.5.3 failure class — a perfect surviving packet, a recipient never woken).
@@ -1237,6 +1238,13 @@ function recoversEscalationNotice(deps: WakeLadderDeps, row: QueueItem): boolean
     && deps.queueRepo.getById(tag.slice(prefix.length))?.tags?.includes(WAKE_ESCALATION_TAG)) ?? false;
 }
 
+/** readPromptRefusalCandidates on the read worker's connection, off the event loop (T-010231), under the same site
+ *  name; on the main handle where the worker cannot serve the read (a memory database, an open transaction). */
+export function readPromptRefusalCandidatesOffLoop(db: Database.Database): Promise<Array<{ qitem_id: string; destination_session: string }>> {
+  return readOffLoop(db, "promptRefusalCandidates", {}, () => readPromptRefusalCandidates(db),
+    { site: "queue.wake_ladder.prompt_candidates", record: "always" });
+}
+
 /** Positive refusals enter the existing rungs without ever retrying the blocked
  * seat. One aggregate carries the episode's obligations and notification key;
  * original work remains owned by its current recipient. */
@@ -1265,7 +1273,7 @@ async function advancePromptRefusals(
       return null;
     }
   };
-  const candidates = readPromptRefusalCandidates(deps.db);
+  const candidates = await readPromptRefusalCandidatesOffLoop(deps.db);
   // Every tag value of every final prompt disposition, read once per tick when the first episode needs it,
   // rather than one scan of all terminal rows per open episode. The row predicates are the per-episode lookup's;
   // membership is the same exact json_each value equality; and nothing below writes before the last episode is
