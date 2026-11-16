@@ -51,3 +51,22 @@ export function recordSlowDiagnostic(elapsedMs: number, record: Record<string, u
   if (!(elapsedMs >= SLOW_OPERATION_THRESHOLD_MS)) return;
   try { recorder?.recordDiagnostic?.(record); } catch { /* the recorder reports its own health */ }
 }
+
+/**
+ * runAsyncSite for a NON-blocking site on a hot path (per request): like runSyncSiteWhenSlow, it records only a call
+ * that took at least the recorder's slow threshold, so a read moved off the event loop is still named when it is slow
+ * without a record per call. The time is the caller's wait, not loop time.
+ */
+export async function runAsyncSiteWhenSlow<T>(site: string, fn: () => Promise<T>): Promise<T> {
+  const record = recorder?.recordSlowSync?.bind(recorder);
+  if (!record) return fn();
+  const startedAt = performance.now();
+  let outcome: "ok" | "failed" = "failed";
+  try {
+    const value = await fn();
+    outcome = "ok";
+    return value;
+  } finally {
+    try { record(site, performance.now() - startedAt, outcome); } catch { /* the recorder reports its own health */ }
+  }
+}

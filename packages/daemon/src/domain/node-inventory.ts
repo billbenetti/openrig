@@ -1585,7 +1585,7 @@ const NEEDS_INPUT_RUNGS: readonly EvidenceRungId[] = ["needs-input-chrome", "lif
  *   - an occupant a handover started without a required startup file (`startedWithoutRequired`, #2456)
  */
 export function seatNeedsAttention(
-  entry: NodeInventoryEntry,
+  entry: Pick<NodeInventoryEntry, "lifecycleState" | "startupStatus" | "heldReason" | "latestError" | "startedWithoutRequired">,
   activity: AgentActivity | null,
   arbitratedNeedsInput: boolean | null = null,
 ): boolean {
