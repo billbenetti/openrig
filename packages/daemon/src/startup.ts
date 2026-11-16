@@ -132,7 +132,7 @@ import { ChatRepository } from "./domain/chat-repository.js";
 import { StreamStore } from "./domain/stream-store.js";
 import { StreamIntakeCoordinator } from "./domain/stream-intake.js";
 import { SlowOpRecorder, type SlowOperationInstrumentation } from "./domain/slow-op-recorder.js";
-import { configureSyncSiteRecorder } from "./domain/sync-site-wrap.js";
+import { configureSyncSiteRecorder, syncSitesDuring } from "./domain/sync-site-wrap.js";
 import { RequestPhaseObserver } from "./domain/request-phase-observer.js";
 import { QueueRepository, isBlockerLive, type QueueDestinationAdvisory } from "./domain/queue-repository.js";
 import { describeDefaultReceiver, permissionDeciderFor } from "./domain/default-receiver.js";
@@ -3101,7 +3101,8 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
   // (loop lag / last-tick age) and the expensive topology routes are timed.
   const { EventLoopMonitor } = await import("./domain/event-loop-monitor.js");
   const { RouteTimingRecorder } = await import("./domain/route-timing-recorder.js");
-  const requestPhaseObserver = slowOpRecorder?.recordDiagnostic ? new RequestPhaseObserver(slowOpRecorder) : undefined;
+  const requestPhaseObserver = slowOpRecorder?.recordDiagnostic
+    ? new RequestPhaseObserver(slowOpRecorder, undefined, undefined, syncSitesDuring) : undefined;
   deps.requestPhaseObserver = requestPhaseObserver;
   const eventLoopMonitor = new EventLoopMonitor({ onTick: (at, previous) => requestPhaseObserver?.tick(at, previous) });
   const routeTimingRecorder = new RouteTimingRecorder();
