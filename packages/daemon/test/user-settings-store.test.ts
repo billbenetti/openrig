@@ -186,6 +186,8 @@ describe("SettingsStore (User Settings v0)", () => {
       "terminal.history_limit",
       "terminal.fixed_geometry",
       "terminal.inherit_tmux_environment",
+      "terminal.seat_scope",
+      "terminal.seat_scope_tasks_max",
       // Slice 15 (OPR.0.7.0.15) — compact command-output defaults switch.
       "output.compact",
       // Slice 15 P5 — the whoami peer bound under output.compact.
