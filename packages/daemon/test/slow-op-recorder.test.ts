@@ -100,8 +100,10 @@ describe("SlowOpRecorder locked instrumentation contract", () => {
     if (!mod) return;
 
     expect(mod.SLOW_OPERATION_THRESHOLD_MS).toBe(250);
-    expect(mod.SLOW_OPERATION_ROTATION_BYTES).toBe(1024 * 1024);
-    expect(mod.SLOW_OPERATION_ROTATION_COUNT).toBe(3);
+    // Retention: the live file plus 6 rotated ones of 16 MiB keep a day or more at the ~2 MB/h a busy daemon writes
+    // (1 MiB x 3 kept ~2.5 h on 16/11/2026, so a gap's spans were gone before anyone read them).
+    expect(mod.SLOW_OPERATION_ROTATION_BYTES).toBe(16 * 1024 * 1024);
+    expect(mod.SLOW_OPERATION_ROTATION_COUNT).toBe(6);
     expect(mod.SLOW_OPERATION_LOG_BASENAME).toBe("slow-operations.jsonl");
 
     const dir = tempDir();
@@ -269,6 +271,7 @@ describe("SlowOpRecorder locked instrumentation contract", () => {
       logPath,
       maxBytes: 512,
       rotationCount: 3,
+      retentionMs: 0, // the count alone: the retention by age is the test below
       slowThresholdMs: 250,
     });
     for (let i = 0; i < 30; i += 1) recorder.recordMeasurement(`test.measure.${i}`, 300);
@@ -288,6 +291,29 @@ describe("SlowOpRecorder locked instrumentation contract", () => {
     expect(all).toContain('"site":"request:GET /api/queue/:qitemId"');
     expect(all).not.toContain('"durationMs":249');
     expect(all).toContain('"durationMs":250');
+    await recorder.close();
+  });
+
+  it("keeps a rotated file past the count until its newest record is older than the retention, under a file ceiling", async () => {
+    const mod = await loadRecorderModule();
+    expect(mod, "slow-op-recorder production module is missing").not.toBeNull();
+    if (!mod) return;
+    expect(mod.SLOW_OPERATION_RETENTION_MS).toBe(24 * 60 * 60 * 1000);
+    const dir = tempDir();
+    const logPath = path.join(dir, "slow-operations.jsonl");
+    // ~130 bytes a record and a 256-byte cap: each record past the first rotates
+    const recorder = new mod.SlowOpRecorder({ logPath, maxBytes: 256, rotationCount: 2, retentionMs: 3_600_000, maxFiles: 5 });
+    const exists = (n: number) => fs.existsSync(`${logPath}.${n}`);
+    for (let i = 0; i < 60; i++) recorder.recordMeasurement(`test.retention.${i}`, 300);
+    await recorder.flush();
+    expect([1, 2, 3, 4, 5].map(exists)).toEqual([true, true, true, true, true]); // young: kept past the count
+    expect(exists(6)).toBe(false); // the ceiling
+    const old = new Date(Date.now() - 2 * 3_600_000);
+    for (const n of [3, 4, 5]) fs.utimesSync(`${logPath}.${n}`, old, old);
+    recorder.recordMeasurement("test.retention.more", 300);
+    await recorder.flush();
+    // one rotation: the young .2 is now .3 and stays; the files whose newest record is past the retention go
+    expect([1, 2, 3, 4, 5, 6].map(exists)).toEqual([true, true, true, false, false, false]);
     await recorder.close();
   });
 
@@ -333,6 +359,55 @@ describe("SlowOpRecorder locked instrumentation contract", () => {
     expect(requests.map((request) => request.durationMs)).toEqual([5, 5]);
     // The observer records site + duration only — the query param never leaks.
     expect(JSON.stringify(requests)).not.toContain("must-not-appear");
+  });
+
+  it("records a slow request's query filters and sender, never an unlisted value (hermetic middleware contract)", async () => {
+    const requests: Array<{ site: string; durationMs: number; detail?: Record<string, unknown> }> = [];
+    const recorder = {
+      recordRequest(site: string, durationMs: number, detail?: Record<string, unknown>): void { requests.push({ site, durationMs, detail }); },
+    };
+    const app = new Hono();
+    app.use("*", createSlowOpRequestMiddleware(recorder, () => 0));
+    app.get("/api/queue/list", (c) => c.json([]));
+    const long = "x".repeat(500);
+    const url = "/api/queue/list?rig=fabrica&activeOnly=1&compact=1&limit=1000&state=pending,blocked&tag=a&tag=b"
+      + `&destinationSession=${long}&token=secret-must-not-appear&body=row-body-must-not-appear`;
+    const res = await app.request(url, { headers: { "x-openrig-session": "build-dev-2@fabrica" } });
+    expect(res.status).toBe(200);
+    expect(requests).toHaveLength(1);
+    const detail = requests[0]!.detail!;
+    expect(detail.sender).toBe("build-dev-2@fabrica");
+    const query = detail.query as Record<string, unknown>;
+    expect(query).toMatchObject({ rig: "fabrica", activeOnly: "1", compact: "1", limit: "1000", state: "pending,blocked", tag: ["a", "b"] });
+    // A value is cut, and a key outside the filter allowlist is only counted: a token can come as a name or a value.
+    expect(String(query.destinationSession).length).toBeLessThanOrEqual(130);
+    expect(query).not.toHaveProperty("token");
+    expect(query).not.toHaveProperty("body");
+    expect(detail.queryOmitted).toBe(2);
+    expect(JSON.stringify(requests)).not.toContain("must-not-appear");
+    // No query and no header: the request still records, without the fields.
+    await app.request("/api/queue/list");
+    expect(requests[1]!.detail).toEqual({});
+  });
+
+  it("writes the request's query and sender only on a slow request's record", async () => {
+    const mod = await loadRecorderModule();
+    expect(mod, "slow-op-recorder production module is missing").not.toBeNull();
+    if (!mod) return;
+    const dir = tempDir();
+    const logPath = path.join(dir, "slow-operations.jsonl");
+    const recorder = new mod.SlowOpRecorder({ logPath, slowThresholdMs: 250 });
+    const detail = { query: { rig: "fabrica", limit: "1000" }, sender: "build-dev-2@fabrica" };
+    recorder.recordRequest("GET /api/queue/list", 249, detail);
+    recorder.recordRequest("GET /api/queue/list", 994, detail);
+    recorder.recordRequest("GET /api/queue/list", 300);
+    await recorder.flush();
+    const records = (await readRecords(logPath)).filter((r) => r.site === "request:GET /api/queue/list");
+    expect(records.map((r) => [r.durationMs, r.query, r.sender])).toEqual([
+      [994, { rig: "fabrica", limit: "1000" }, "build-dev-2@fabrica"],
+      [300, undefined, undefined],
+    ]);
+    await recorder.close();
   });
 
   it("keeps the accepted slow-operation site labels", () => {
