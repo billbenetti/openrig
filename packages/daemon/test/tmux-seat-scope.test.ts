@@ -162,15 +162,33 @@ describe.skipIf(process.platform !== "linux")("seat scope on, on Linux with a us
     expect((await on.plan(SEAT))?.[4]).toBe("/usr/bin/systemd-run");
   });
 
-  it("a systemd-run that could not make the throwaway scope is not kept: tried again at the next launch", async () => {
-    const probe: Probe = { scope: fail("Failed to start transient scope unit: Access denied") };
-    const on = makeAdapter({ seatScope: { tasksMax: 2048 }, probe });
-    const warnings: string[] = [];
-    expect((await on.plan(SEAT, "/bin/sh", warnings))?.[0]).toBe("/bin/sh");
-    expect(warnings[0]).toMatch(/throwaway seat scope could not be made: Failed to start transient scope unit/);
-    delete probe.scope;
-    expect((await on.plan(SEAT))?.[4]).toBe("/usr/bin/systemd-run");
-  });
+  // T-009602 (SH-2): a probe that fails (the throwaway scope refused, or its 10 s timeout) keeps the bus's 60 s: with the
+  // user manager stuck, each launch would otherwise wait up to 10 s again (98 relaunches ~16 min)
+  const probeFailures: Array<[string, Error, RegExp]> = [
+    ["refused", fail("Failed to start transient scope unit: Access denied"), /throwaway seat scope could not be made: Failed to start transient scope unit/],
+    ["timed out", Object.assign(new Error("Command failed"), { stderr: "", code: 124 }), /throwaway seat scope could not be made/],
+  ];
+  for (const [name, error, reason] of probeFailures) {
+    it(`a throwaway scope ${name}: not kept, not probed again for 60 s, then tried again`, async () => {
+      const probe: Probe = { scope: error };
+      const on = makeAdapter({ seatScope: { tasksMax: 2048 }, probe });
+      let now = 2_000_000;
+      vi.spyOn(Date, "now").mockImplementation(() => now);
+      const warnings: string[] = [];
+      expect((await on.plan(SEAT, "/bin/sh", warnings))?.[0]).toBe("/bin/sh");
+      expect(warnings[0]).toMatch(reason);
+      const asked = on.shellCalls.length;
+      delete probe.scope;
+      now += 1_000;
+      const quiet: string[] = [];
+      expect((await on.plan(SEAT, "/bin/sh", quiet))?.[0]).toBe("/bin/sh");
+      expect(quiet[0]).toMatch(reason);
+      expect(probes(on.shellCalls.slice(asked))).toEqual([]);
+      now += 60_000;
+      expect((await on.plan(SEAT))?.[4]).toBe("/usr/bin/systemd-run");
+      expect(kinds(on.shellCalls.slice(asked))).toEqual(["which", "version", "scope", "bus"]);
+    });
+  }
 });
 
 describe("seat scope on, but no user scope can be made: today's launch, with a warning", () => {
@@ -207,9 +225,8 @@ describe("seat scope on, but no user scope can be made: today's launch, with a w
     expect(probes(on.shellCalls)).toEqual([]);
   });
 
-  it("a respawn without the seat env (a restart in place) is not reinterpreted: no policy read, no probe, no scope", async () => {
-    // the contract of tmux-agent-environment ("does not reinterpret a restart that owns its existing command"): the
-    // launch policy is not even read, so the seat scope can't apply; terminal.seat_scope's help says so
+  it("a respawn without the seat env is not reinterpreted: no policy read, no probe, no scope", async () => {
+    // the contract of tmux-agent-environment ("does not reinterpret a restart that owns its existing command")
     const on = makeAdapter({ seatScope: { tasksMax: 2048 } });
     const policy = on.adapter.launchEnvironment!;
     const read = vi.fn(policy);
@@ -219,5 +236,19 @@ describe("seat scope on, but no user scope can be made: today's launch, with a w
     expect(result.ok && result.warnings).toBeUndefined();
     expect(read).not.toHaveBeenCalled();
     expect(probes(on.shellCalls)).toEqual([]);
+  });
+
+  it("a restart in place with the seat scope on keeps its command, out of the scope, and says so (T-009602, SH-1)", async () => {
+    const on = makeAdapter({ seatScope: { tasksMax: 2048 } });
+    const result = await on.adapter.respawnPane("%1", "codex resume", { cwd: "/private", restartInPlace: true });
+    expect(result.ok).toBe(true);
+    expect(result.ok && result.warnings).toHaveLength(1);
+    expect(result.ok && result.warnings?.[0]).toMatch(/^Seat scope not applied on a restart in place: .*without this seat's own TasksMax/);
+    expect(probes(on.shellCalls)).toEqual([]);
+    expect(on.argvCalls.at(-1)).toEqual(["tmux", "respawn-pane", "-t", "%1", "-c", "/private", "codex resume"]);
+    // with the key off, the same restart says nothing
+    const off = makeAdapter({});
+    const quiet = await off.adapter.respawnPane("%1", "codex resume", { cwd: "/private", restartInPlace: true });
+    expect(quiet.ok && quiet.warnings).toBeUndefined();
   });
 });

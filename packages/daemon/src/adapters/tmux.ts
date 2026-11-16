@@ -424,7 +424,7 @@ function usableEnvLine(lines: readonly string[], name: string): boolean {
 
 /** The slice every seat scope goes in (terminal.seat_scope): where an operator puts the limits of all seats together. */
 export const SEAT_SCOPE_SLICE = "openrig-seats.slice";
-/** How long a seat scope launch skips asking a user bus that did not answer. */
+/** How long a seat scope launch skips asking again after the user bus did not answer or the probe of systemd-run failed. */
 const SEAT_SCOPE_RETRY_MS = 60_000;
 
 /** systemd-run reaches the user manager through the runtime directory, not the seat's unusable bus address (#2030). */
@@ -516,8 +516,17 @@ export class TmuxAdapter {
 
   /** The systemd-run found for seat scopes (its path and version), kept once a throwaway scope was made with it. */
   private seatScopeFound?: Promise<{ path: string; version: number }>;
-  /** When the user bus last failed to answer: for SEAT_SCOPE_RETRY_MS, launches go the old way without asking again. */
+  /** When the user bus last failed to answer or the probe failed: for SEAT_SCOPE_RETRY_MS, launches go the old way
+   *  without asking again. */
   private seatScopeBusFailedAt?: { at: number; reason: string };
+
+  /** T-009602 (SH-1): a restart in place keeps its own command and brings no seat env, so it is not reinterpreted and runs
+   *  outside a seat scope; with terminal.seat_scope on, the operator is told (the policy is read only for that). */
+  private seatScopeOnRestartInPlace(warnings: string[]): void {
+    let on = false;
+    try { on = Boolean(this.launchEnvironment?.().seatScope); } catch { return; }
+    if (on) this.seatScopeWarning(warnings, "Seat scope not applied on a restart in place: the restarted command runs in the shared terminal server scope, without this seat's own TasksMax, until the seat's next launch (rig seat launch <seat> --fresh, or a relaunch) puts it back in a seat scope.");
+  }
 
   private seatScopeWarning(warnings: string[], warning: string): void {
     warnings.push(warning);
@@ -557,9 +566,12 @@ export class TmuxAdapter {
       this.seatScopeFound ??= this.findSeatScopeRunner(runtimeDir, scope);
       found = await this.seatScopeFound;
     } catch (error) {
-      // Not kept: a systemd-run or manager that comes back is used at the next launch.
+      // Not kept: a systemd-run or manager that comes back is used again, but only after SEAT_SCOPE_RETRY_MS, as for the
+      // bus: with the user manager stuck, every launch would otherwise wait up to the probe's 10 s (T-009602, SH-2).
       this.seatScopeFound = undefined;
-      return fallback((error as Error).message);
+      const reason = (error as Error).message;
+      this.seatScopeBusFailedAt = { at: Date.now(), reason };
+      return fallback(reason);
     }
     // The bus at this launch, not at the first one: a manager that went away since must not end the seat.
     try {
@@ -1556,7 +1568,9 @@ export class TmuxAdapter {
   async respawnPane(
     paneTarget: string,
     command?: string,
-    opts?: { cwd?: string; env?: Record<string, string> },
+    /** restartInPlace: the caller is a restart in place (no seat env, its own command): with terminal.seat_scope on, the
+     *  result carries a warning that the restarted command runs outside a seat scope (T-009602, SH-1). */
+    opts?: { cwd?: string; env?: Record<string, string>; restartInPlace?: boolean },
   ): Promise<TmuxResult> {
     return this.guardedInput(paneTarget, async (pane, beforeWrite) => {
       beforeWrite();
@@ -1568,13 +1582,14 @@ export class TmuxAdapter {
     }, false, "respawn");
   }
 
-  private async respawnPaneUnchecked(paneTarget: string, command?: string, opts?: { cwd?: string; env?: Record<string, string> }): Promise<TmuxResult> {
+  private async respawnPaneUnchecked(paneTarget: string, command?: string, opts?: { cwd?: string; env?: Record<string, string>; restartInPlace?: boolean }): Promise<TmuxResult> {
     const exact = exactTarget(paneTarget, "pane");
     const argv = ["tmux", "respawn-pane", "-t", exact];
     if (opts?.cwd != null) argv.push("-c", opts.cwd);
     if (opts?.env) for (const [k, v] of Object.entries(opts.env)) argv.push("-e", `${k}=${v}`);
     const warnings: string[] = [];
     const scopedCommand = await this.scopedLaunchCommand(opts?.env ?? {}, command, warnings);
+    if (!scopedCommand && opts?.restartInPlace) this.seatScopeOnRestartInPlace(warnings);
     // Legacy commands remain one argument; the scoped wrapper executes directly before the user shell.
     if (scopedCommand) argv.push(...scopedCommand);
     else if (command != null && command.length > 0) argv.push(command);
