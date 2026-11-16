@@ -11,7 +11,7 @@
 // TODAY — those are it.todo ledger entries at the bottom (routed to the desk as
 // findings; a passing pin would freeze the defect). When a finding's fix lands,
 // its todo graduates to a real pin.
-import { describe, it, expect, beforeAll, afterAll } from "vitest";
+import { describe, it, expect, beforeAll, afterAll, vi } from "vitest";
 import fs from "node:fs";
 import { execFileSync } from "node:child_process";
 import os from "node:os";
@@ -92,6 +92,15 @@ describe("P16 — AppDeps members with safety semantics are composed (definednes
 describe("P16 — domain-internal safety injections (the recurred class, pinned at the wire)", () => {
   it("new seats receive the daemon's runtime directory default (#2030)", () => {
     expect(deps.tmuxAdapter.launchEnvironment!()).toHaveProperty("runtimeDir", seatRuntimeDir(process.env));
+  });
+  it("terminal.seat_scope is read at each launch: off gives no seat scope, on gives the configured TasksMax (#3253)", () => {
+    vi.stubEnv("OPENRIG_TERMINAL_SEAT_SCOPE", "false");
+    try {
+      expect(deps.tmuxAdapter.launchEnvironment!()).not.toHaveProperty("seatScope");
+      vi.stubEnv("OPENRIG_TERMINAL_SEAT_SCOPE", "true");
+      vi.stubEnv("OPENRIG_TERMINAL_SEAT_SCOPE_TASKS_MAX", "300");
+      expect(deps.tmuxAdapter.launchEnvironment!().seatScope).toEqual({ tasksMax: 300 });
+    } finally { vi.unstubAllEnvs(); }
   });
   it("new seats receive the selected database and configured tmux directory, not a stale DB override", () => {
     const env = deps.tmuxAdapter.launchEnvironment!().env;

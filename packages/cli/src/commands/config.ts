@@ -166,6 +166,17 @@ Keys:
                          POSIX launches otherwise start from daemon + seat environment, preserving shell startup.
                          Turn on for custom setups that intentionally rely on tmux globals. Running agents are unchanged.
                          If the scoped boundary is unavailable, launch continues with its previous environment and a diagnostic.
+  terminal.seat_scope     each seat in a systemd user scope of its own, with TasksMax (default off; Linux, daemon as a
+                         systemd user service). A seat that forks without end hits its own ceiling, not the others'.
+                         The scopes go in openrig-seats.slice, out of the seat terminal server's scope: limits put on
+                         that scope for all seats together no longer reach them; put those on the slice before turning
+                         this on. OOMPolicy=continue (systemd 253+), as the server's scope: an OOM kill ends one process,
+                         not the seat. Applies at each seat's next launch. Where no user scope can be made (no user
+                         manager or bus, systemd-run missing or refusing, terminal.inherit_tmux_environment on), the
+                         seat launches as before, with a warning. A restart in place that keeps its own command and
+                         brings no seat environment runs as before too, out of the seat scope and without a warning.
+                         Never stop a seat's scope by hand: use rig seat stop.
+  terminal.seat_scope_tasks_max  TasksMax of each seat scope (default 2048, integer in [64, 4194304])
   terminal.fixed_geometry  use 90x27 web geometry while subscribed (default off; other viewers share the pinned size)
   terminal.status_bar    show the inner tmux status bar on launch (default off)
   terminal.tmux_server   inherit the launching server, or isolated per OpenRig home (restart required)
