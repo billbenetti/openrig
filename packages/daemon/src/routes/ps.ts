@@ -35,8 +35,10 @@ psRoutes.get("/", (c) => {
   // slice-04: the whole projection + JSON serialization runs as ONE cooperative
   // lane job (shared with /api/rigs/summary) so a concurrent burst yields the event
   // loop between jobs and /healthz stays responsive. Only query-flag parsing is here.
-  return projectionLane.run(() => {
-    const entries = psService.getEntries({ includeArchived, archivedOnly });
+  // T-010231: the projection's database reads run on the read worker, so the job
+  // holds the loop only for the in-memory fold and the JSON.
+  return projectionLane.run(async () => {
+    const entries = await psService.getEntriesOffLoop({ includeArchived, archivedOnly });
     // #3636: the archived count rides beside the list as a header, so `rig ps` can print its count line from the default
     // (active-only) list instead of folding every archived rig. The bare-array body is unchanged. It's read after the
     // list, so the list stays the route's first read, and a failure in either is the route's existing 500.

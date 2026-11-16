@@ -18,7 +18,9 @@ import { archiveWhereClause, type RigArchiveFilter } from "./rig-repository.js";
 import { runningNonArchivedRigIds } from "./periodic-snapshot-scheduler.js";
 import type { SeatActivityService } from "./seat-activity-service.js";
 import type { SeatStructuralActivityService } from "./seat-structural-activity-service.js";
-import type { AgentActivityStore } from "./agent-activity-store.js";
+import { AgentActivityStore } from "./agent-activity-store.js";
+import type { AgentActivity } from "./types.js";
+import { readOffLoop } from "./read-off-loop.js";
 
 export interface PsEntry {
   rigId: string;
@@ -111,9 +113,9 @@ export function deriveRigLifecycleState(nodeStates: NodeLifecycleState[]): RigLi
 
 /** Shared display rollup for ps and the rig summaries consumed by the TUI.
  * Intentionally stopped seats remain in process counts and node diagnostics. */
-export function deriveRigLifecycleFromInventory(
-  inventory: readonly NodeInventoryEntry[],
-  assignedWorkCount: (entry: NodeInventoryEntry) => number,
+export function deriveRigLifecycleFromInventory<E extends NodeInventoryEntry>(
+  inventory: readonly E[],
+  assignedWorkCount: (entry: E) => number,
 ): RigLifecycleState {
   return deriveRigLifecycleState(
     inventory.filter((entry) => {
@@ -143,7 +145,9 @@ export function deriveRigLifecycleFromInventory(
  * through this one predicate so the three never contradict each other. This
  * reads the verdict; it NEVER mutates `sessions.status`.
  */
-export function isEffectivelyRunning(node: NodeInventoryEntry): boolean {
+export function isEffectivelyRunning(
+  node: Pick<NodeInventoryEntry, "sessionStatus" | "identityVerdict" | "startupStatus" | "latestErrorStage">,
+): boolean {
   if (node.sessionStatus !== "running") return false;
   // Positive evidence that no harness started: restore left the pane as a bare shell (its own marker). Other attention
   // keeps the existing running count; that count alone doesn't establish a useful harness when runtime evidence is unknown.
@@ -183,84 +187,47 @@ export class PsProjectionService {
     this.periodicSnapshotIntervalSeconds = intervalSeconds;
   }
 
-  getEntries(filter?: RigArchiveFilter): PsEntry[] {
-    // OPR.0.3.3.19 - default excludes archived rigs at the projection layer
-    // (NOT client-side). Explicit includeArchived/archivedOnly opt in.
-    const cond = archiveWhereClause("r.archived_at", filter);
-    const where = cond ? `WHERE ${cond}` : "";
-    const rows = this.db.prepare(`
-      SELECT
-        r.id as rig_id,
-        r.name,
-        r.archived_at as archived_at,
-        (SELECT COUNT(*) FROM nodes n WHERE n.rig_id = r.id) as node_count,
-        (SELECT snap.created_at FROM snapshots snap WHERE snap.rig_id = r.id ORDER BY snap.created_at DESC, snap.id DESC LIMIT 1) as latest_snapshot_at,
-        (SELECT COUNT(*) FROM snapshots snap WHERE snap.rig_id = r.id AND snap.kind = 'auto-periodic') as auto_periodic_count
-      FROM rigs r
-      ${where}
-      ORDER BY r.name
-    `).all() as Array<{
-      rig_id: string;
-      name: string;
-      archived_at: string | null;
-      node_count: number;
-      latest_snapshot_at: string | null;
-      auto_periodic_count: number;
-    }>;
+  getEntries(filter?: RigArchiveFilter, now: number = Date.now()): PsEntry[] {
+    return this.assemble(readPsBase(this.db, filter, {
+      now, periodicSnapshotActive: this.periodicSnapshotActive, hooks: this.agentActivity,
+    }), now);
+  }
 
-    const now = Date.now();
+  /**
+   * getEntries with every database read (the rigs, the queue's assigned work, the node inventory, the session times,
+   * the hook rows) on the read worker's own connection, off the event loop; only the in-memory seat state and the
+   * formatting run here. Resolves to what getEntries returns. Stays synchronous where the worker cannot serve the
+   * read (a memory database, an open transaction; see readOffLoop), and wherever the hook reader is not the daemon's
+   * own store on this database, whose wiring the worker rebuilds on its connection. Without `now`, the clock is read
+   * when the read starts, as getEntries reads it beside its queries, so a row written while the read waited for the
+   * worker is never newer than `now`.
+   */
+  async getEntriesOffLoop(filter?: RigArchiveFilter, now?: number): Promise<PsEntry[]> {
+    const hooks = this.agentActivity;
+    if (hooks !== null && !(hooks instanceof AgentActivityStore && hooks.db === this.db)) return this.getEntries(filter, now);
+    const read = await readOffLoop(this.db, "psBase", {
+      filter, now: now ?? null, periodicSnapshotActive: this.periodicSnapshotActive,
+      hookFreshnessMs: hooks ? hooks.freshnessMs : null,
+    }, () => readPsBaseAt(this.db, filter, { now: now ?? null, periodicSnapshotActive: this.periodicSnapshotActive, hooks }),
+    { site: "ps.entries.read", record: "whenSlow" });
+    return this.assemble(read.rigs, read.now);
+  }
 
-    // FS-1 W1.2 (rig-level N+1 collapse): the assigned-work map is host-global and
-    // bounded by distinct destination sessions (seat count), so read it ONCE here
-    // instead of one countNodesWithPendingWork query per rig. Per-rig hasWorkCount
-    // is then a pure JS derivation over the already-fetched inventory below.
-    const assignedByDest = readAssignedWorkBySession(this.db);
-    // FS-1 W1.2: node inventory built in ONE batched pass (was one getNodeInventory
-    // query-set PER RIG — the rig-level N+1); indexed per rig below. Scoped to the
-    // rigs this projection returns, as /api/rigs/summary does, so the default
-    // projection never folds the nodes of archived rigs it then discards (#3636).
-    // With no archive filter every rig is returned: the all-rigs pass avoids an
-    // IN list of every rig id.
-    const inventoryByRig = cond === null
-      ? getNodeInventoryForAllRigs(this.db)
-      : getNodeInventoryForRigs(this.db, new Set(rows.map((r) => r.rig_id)));
-
-    // Read the current registration's timestamp once per node, in one batch.
-    // Uptime membership comes from the same effective-running inventory below.
-    const sessionTimes = this.db.prepare(`
-      SELECT n.id as node_id,
-        (SELECT s.created_at FROM sessions s WHERE s.node_id = n.id ORDER BY s.id DESC LIMIT 1) as created_at
-      FROM nodes n JOIN rigs r ON r.id = n.rig_id
-      ${where}
-    `).all() as Array<{ node_id: string; created_at: string | null }>;
-    const sessionCreatedAt = new Map(sessionTimes.map((row) => [row.node_id, row.created_at]));
-    // The scheduler snapshots only running, non-archived rigs; ask it which, so a stopped rig doesn't read as saved.
-    const snapshotted = this.periodicSnapshotActive ? new Set(runningNonArchivedRigIds(this.db)) : null;
-
-    return rows.map((r) => {
-      // Derive rig-level lifecycleState by folding per-node states. FS-1 W1.2:
-      // inventory for ALL rigs was built in ONE batched pass above (previously one
-      // getNodeInventory query-set per rig — the rig-level N+1); index it here.
-      const inventory = inventoryByRig.get(r.rig_id) ?? [];
-
-      // Count the same current registrations used for lifecycle and activity.
-      // Registry IDs stay monotonic through clock rollback within one daemon;
-      // created_at does not. Reusing inventory also avoids another per-node sort.
+  /** The rows from the database read, folded with the in-memory seat state (activity, arbitration, the cached pane
+   *  reading) and formatted. Reads no database. */
+  private assemble(base: PsBaseRig[], now: number): PsEntry[] {
+    return base.map((r) => {
+      const inventory = r.nodes;
       const running = inventory.filter(isEffectivelyRunning);
       const effectiveRunningCount = running.length;
-      let earliestRunningAt: string | null = null;
-      for (const node of running) {
-        const createdAt = sessionCreatedAt.get(node.nodeId);
-        if (createdAt != null && (earliestRunningAt === null || createdAt < earliestRunningAt)) earliestRunningAt = createdAt;
-      }
 
       const status: PsEntry["status"] =
-        r.node_count === 0 ? "stopped"
-        : effectiveRunningCount === r.node_count ? "running"
+        r.nodeCount === 0 ? "stopped"
+        : effectiveRunningCount === r.nodeCount ? "running"
         : effectiveRunningCount > 0 ? "partial"
         : "stopped";
 
-      const lifecycleState = deriveRigLifecycleFromInventory(inventory, (node) => countAssignedWorkForEntry(node, assignedByDest).assignedWorkCount);
+      const lifecycleState = deriveRigLifecycleFromInventory(inventory, (node) => node.assignedWorkCount);
 
       // Slice 15 — `terminal-active` count. Subset of running tmux-bound
       // seats whose latest SeatActivity observation says
@@ -276,16 +243,8 @@ export class PsProjectionService {
         }
       }
 
-      // Slice 15 — `has-work-to-do` count. Subset of nodes with at
-      // least one pending, in-progress, or blocked qitem whose destination
-      // matches either canonical coordinate for the node. Sourced ONLY from the queue
-      // projection; never from tmux output.
-      // Slice 17: this is the SAME dual-key resolver and active-state map used by
-      // per-node inventory. The former single-key/pending-only divergence is gone.
-      let hasWorkCount = 0;
-      for (const node of inventory) {
-        if (countAssignedWorkForEntry(node, assignedByDest).assignedWorkCount > 0) hasWorkCount++;
-      }
+      // Slice 15 — `has-work-to-do` count (read with the inventory; see readPsBase).
+      const hasWorkCount = inventory.filter((node) => node.assignedWorkCount > 0).length;
 
       // OPR.0.4.4.21 — attention fold, same inventory pass. `needs_input` is
       // read from the ARBITRATED seat state first — the same oracle the
@@ -299,44 +258,39 @@ export class PsProjectionService {
       // nothing). Preferring one source over the other is what let a gated seat
       // show `needs-input x1` on its row while the rig total read ATTN 0.
       let attentionCount = 0;
-      const nowDate = new Date(now);
       for (const node of inventory) {
         const session = node.canonicalSessionName;
         const arbitrated = this.seatActivity && session
           && typeof this.seatActivity.getSeatStateBySession === "function"
           ? this.seatActivity.getSeatStateBySession(session)
           : null;
-        const hook = this.agentActivity && session
-          ? this.agentActivity.getLatestForNode({ nodeId: node.nodeId, sessionName: session, now: nowDate,
-            order: node.runtime === "claude-code" ? "source" : "arrival" })
-          : null;
+        const hook = node.hook;
         // The row's served activity: a live hook, else the cached pane reading. A confirmed-missing session serves
         // neither, as on the row.
         const structural = this.structuralActivity && session ? this.structuralActivity.getStructuralActivity(session) : null;
         const activity = identityVerdictConfirmsExecutorStopped(node.identityVerdict) ? null
-          : providerFailureActivity(retainedProviderFailure(this.agentActivity, { nodeId: node.nodeId, sessionName: session,
-            runtime: node.runtime, now: nowDate }, hook), structural, node.runtime)
+          : providerFailureActivity(node.providerFailure, structural, node.runtime)
             ?? hookOrPaneActivity(hook, structural, false, node.runtime)?.activity ?? hook;
-        if (seatNeedsAttention(node, activity, arbitratedNeedsInputSignal(arbitrated), countAssignedWorkForEntry(node, assignedByDest).assignedWorkCount)) attentionCount++;
+        if (seatNeedsAttention(node, activity, arbitratedNeedsInputSignal(arbitrated), node.assignedWorkCount)) attentionCount++;
       }
 
       return {
-        rigId: r.rig_id,
+        rigId: r.rigId,
         name: r.name,
         rigName: r.name,
-        nodeCount: r.node_count,
+        nodeCount: r.nodeCount,
         runningCount: effectiveRunningCount,
         activeCount,
         hasWorkCount,
         status,
         lifecycleState,
-        uptime: earliestRunningAt ? formatDuration(now - new Date(earliestRunningAt + "Z").getTime()) : null,
-        latestSnapshot: r.latest_snapshot_at ? formatAge(now - new Date(r.latest_snapshot_at + "Z").getTime()) : null,
-        archivedAt: r.archived_at,
-        isArchived: r.archived_at !== null,
-        periodicSnapshotActive: snapshotted?.has(r.rig_id) ?? false,
+        uptime: r.earliestRunningAt ? formatDuration(now - new Date(r.earliestRunningAt + "Z").getTime()) : null,
+        latestSnapshot: r.latestSnapshotAt ? formatAge(now - new Date(r.latestSnapshotAt + "Z").getTime()) : null,
+        archivedAt: r.archivedAt,
+        isArchived: r.archivedAt !== null,
+        periodicSnapshotActive: r.snapshotted,
         periodicSnapshotIntervalSeconds: this.periodicSnapshotIntervalSeconds,
-        autoPeriodicSnapshotCount: r.auto_periodic_count,
+        autoPeriodicSnapshotCount: r.autoPeriodicCount,
         attentionCount,
       };
     });
@@ -369,6 +323,147 @@ export class PsProjectionService {
     }
     return running;
   }
+}
+
+/** One seat of the ps read: its inventory entry (whole, since the planned-hold rule of #3538 reads the entry's hold,
+ *  session, attachment and restore fields), its assigned work, its latest hook and its retained provider failure. */
+export type PsBaseNode = NodeInventoryEntry & {
+  /** Slice 15 / #3538: the seat's assigned queue work (pending, in-progress or blocked), from the queue projection. */
+  assignedWorkCount: number;
+  /** The hook store's latest activity for the seat, read at `now`; null without a store or a session. */
+  hook: AgentActivity | null;
+  /** #3571: retainedProviderFailure for the seat, read at `now`; null for a seat whose executor is confirmed stopped. */
+  providerFailure: AgentActivity | null;
+};
+
+/** The hook reads of the ps read: the latest activity, and (#3571) the retained provider failure when the store has it. */
+type PsHookReader = Pick<AgentActivityStore, "getLatestForNode"> & Partial<Pick<AgentActivityStore, "latestUnsupersededProviderFailure">>;
+
+/** One rig of the ps read: every value of its entry that comes from the database. */
+export interface PsBaseRig {
+  rigId: string;
+  name: string;
+  archivedAt: string | null;
+  nodeCount: number;
+  latestSnapshotAt: string | null;
+  autoPeriodicCount: number;
+  /** The earliest current registration among the rig's effectively running seats. */
+  earliestRunningAt: string | null;
+  snapshotted: boolean;
+  nodes: PsBaseNode[];
+}
+
+/** readPsBase with the clock read when the read starts (or the caller's `now`), returned with the rows. */
+export function readPsBaseAt(
+  db: Database.Database,
+  filter: RigArchiveFilter | undefined,
+  opts: { now: number | null; periodicSnapshotActive: boolean; hooks: PsHookReader | null },
+): { now: number; rigs: PsBaseRig[] } {
+  const now = opts.now ?? Date.now();
+  return { now, rigs: readPsBase(db, filter, { ...opts, now }) };
+}
+
+/**
+ * Every database read of `rig ps`, and only those: the rig rows, the host's assigned work, the node inventory, the
+ * session times and the hook rows. Runs on the main handle (getEntries) or on the read worker's connection
+ * (getEntriesOffLoop) with the same result for the same data; its output is plain data, so it crosses a thread.
+ */
+export function readPsBase(
+  db: Database.Database,
+  filter: RigArchiveFilter | undefined,
+  opts: { now: number; periodicSnapshotActive: boolean; hooks: PsHookReader | null },
+): PsBaseRig[] {
+  // OPR.0.3.3.19 - default excludes archived rigs at the projection layer
+  // (NOT client-side). Explicit includeArchived/archivedOnly opt in.
+  const cond = archiveWhereClause("r.archived_at", filter);
+  const where = cond ? `WHERE ${cond}` : "";
+  const rows = db.prepare(`
+    SELECT
+      r.id as rig_id,
+      r.name,
+      r.archived_at as archived_at,
+      (SELECT COUNT(*) FROM nodes n WHERE n.rig_id = r.id) as node_count,
+      (SELECT snap.created_at FROM snapshots snap WHERE snap.rig_id = r.id ORDER BY snap.created_at DESC, snap.id DESC LIMIT 1) as latest_snapshot_at,
+      (SELECT COUNT(*) FROM snapshots snap WHERE snap.rig_id = r.id AND snap.kind = 'auto-periodic') as auto_periodic_count
+    FROM rigs r
+    ${where}
+    ORDER BY r.name
+  `).all() as Array<{
+    rig_id: string;
+    name: string;
+    archived_at: string | null;
+    node_count: number;
+    latest_snapshot_at: string | null;
+    auto_periodic_count: number;
+  }>;
+
+  // FS-1 W1.2 (rig-level N+1 collapse): the assigned-work map is host-global and
+  // bounded by distinct destination sessions (seat count), so read it ONCE here
+  // instead of one countNodesWithPendingWork query per rig. Per-rig hasWorkCount
+  // is then a pure JS derivation over the already-fetched inventory below.
+  const assignedByDest = readAssignedWorkBySession(db);
+  // FS-1 W1.2: node inventory built in ONE batched pass (was one getNodeInventory
+  // query-set PER RIG — the rig-level N+1); indexed per rig below. Scoped to the
+  // rigs this projection returns, as /api/rigs/summary does, so the default
+  // projection never folds the nodes of archived rigs it then discards (#3636).
+  // With no archive filter every rig is returned: the all-rigs pass avoids an
+  // IN list of every rig id.
+  const inventoryByRig = cond === null
+    ? getNodeInventoryForAllRigs(db)
+    : getNodeInventoryForRigs(db, new Set(rows.map((r) => r.rig_id)));
+
+  // Read the current registration's timestamp once per node, in one batch.
+  // Uptime membership comes from the same effective-running inventory below.
+  const sessionTimes = db.prepare(`
+    SELECT n.id as node_id,
+      (SELECT s.created_at FROM sessions s WHERE s.node_id = n.id ORDER BY s.id DESC LIMIT 1) as created_at
+    FROM nodes n JOIN rigs r ON r.id = n.rig_id
+    ${where}
+  `).all() as Array<{ node_id: string; created_at: string | null }>;
+  const sessionCreatedAt = new Map(sessionTimes.map((row) => [row.node_id, row.created_at]));
+  // The scheduler snapshots only running, non-archived rigs; ask it which, so a stopped rig doesn't read as saved.
+  const snapshotted = opts.periodicSnapshotActive ? new Set(runningNonArchivedRigIds(db)) : null;
+  const nowDate = new Date(opts.now);
+
+  return rows.map((r) => {
+    const inventory = inventoryByRig.get(r.rig_id) ?? [];
+    // Count the same current registrations used for lifecycle and activity.
+    // Registry IDs stay monotonic through clock rollback within one daemon;
+    // created_at does not. Reusing inventory also avoids another per-node sort.
+    let earliestRunningAt: string | null = null;
+    for (const node of inventory.filter(isEffectivelyRunning)) {
+      const createdAt = sessionCreatedAt.get(node.nodeId);
+      if (createdAt != null && (earliestRunningAt === null || createdAt < earliestRunningAt)) earliestRunningAt = createdAt;
+    }
+    return {
+      rigId: r.rig_id,
+      name: r.name,
+      archivedAt: r.archived_at,
+      nodeCount: r.node_count,
+      latestSnapshotAt: r.latest_snapshot_at,
+      autoPeriodicCount: r.auto_periodic_count,
+      earliestRunningAt,
+      snapshotted: snapshotted?.has(r.rig_id) ?? false,
+      nodes: inventory.map((node): PsBaseNode => {
+        const session = node.canonicalSessionName;
+        const hook = opts.hooks && session
+          ? opts.hooks.getLatestForNode({ nodeId: node.nodeId, sessionName: session, now: nowDate,
+            order: node.runtime === "claude-code" ? "source" : "arrival" })
+          : null;
+        return {
+          ...node,
+          // Slice 15 — `has-work-to-do`: pending, in-progress, or blocked qitems whose destination matches either
+          // canonical coordinate for the node. Sourced ONLY from the queue projection; never from tmux output.
+          // Slice 17: the SAME dual-key resolver and active-state map used by per-node inventory.
+          assignedWorkCount: countAssignedWorkForEntry(node, assignedByDest).assignedWorkCount,
+          hook,
+          // #3571: read only where the fold serves an activity (a seat whose executor isn't confirmed stopped).
+          providerFailure: identityVerdictConfirmsExecutorStopped(node.identityVerdict) ? null
+            : retainedProviderFailure(opts.hooks, { nodeId: node.nodeId, sessionName: session, runtime: node.runtime, now: nowDate }, hook),
+        };
+      }),
+    };
+  });
 }
 
 /**
