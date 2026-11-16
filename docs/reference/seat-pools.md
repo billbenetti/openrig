@@ -47,7 +47,7 @@ context:
     busy_processes: [suite-flock]   # a seat with one of these programs running gets no row: no 2nd row parked, and no row free either (default: none)
     busy_orphan_max_age_s: 43200    # only with busy_processes: the oldest a process that left the pane's tree may be and still hold the seat (60..172800, default 43200)
     max_open_rows: 4                # a seat with up to this many open rows, ALL parked on its own waits, may receive (1..20, default 1)
-    refused_cooldown_s: 1800        # a parked seat that gave a row straight back untaken gets none for this long (0..86400, default 1800; 0: off)
+    refused_cooldown_s: 1800        # a parked seat that gave a row straight back untaken gets no row as parked for this long, or until its open rows change (0..86400, default 1800; 0: off)
 ```
 
 Registration and `rig watchdog update --spec` refuse a spec with an unknown field, `max` below `min`, a relative
@@ -65,7 +65,7 @@ environment plus:
 | `OPENRIG_SEAT_POOL_SLOT` | `prepare_cmd`, `release_cmd`, `reap_cmd`, `remove_cmd` | the seat's session name |
 | `OPENRIG_SEAT_POOL_SLOT_CWD` | `prepare_cmd` | the seat's working directory |
 | `OPENRIG_SEAT_POOL_RELEASE_REASON` | `release_cmd` | why it is asked: `idle` (a free seat drained, by `drain` or by `idle_grace_s`), `drain-deadline` (the forced pass at a drain's deadline) or `reap` (a seat whose session is gone) |
-| `OPENRIG_SEAT_POOL_SLOTS` | `demand_cmd` | JSON list of `{session, phase, receives, held?}` for the pool's seats; `receives` is how the seat may take a waiting row now: `"free"`, `"parked"` (see [A seat parked on its own wait](#a-seat-parked-on-its-own-wait)) or `null`, as the plan reads it: a seat out of provider usage, a parked seat while the load is above `parked_max_load_per_cpu_percent`, and a free or parked seat with a `busy_processes` program running, say `null`; `held` is `"busy"` only for a free seat (no open row, no held message) whose `busy_processes` read found a program under its pane, the seat the plan counts as occupied for it, and is absent for every other seat (out of usage, a held message, to be reaped, a failed process read) |
+| `OPENRIG_SEAT_POOL_SLOTS` | `demand_cmd` | JSON list of `{session, phase, receives, held?}` for the pool's seats; `receives` is how the seat may take a waiting row now: `"free"`, `"parked"` (see [A seat parked on its own wait](#a-seat-parked-on-its-own-wait)) or `null`: a seat out of provider usage, a parked seat while the load is above `parked_max_load_per_cpu_percent` and a free or parked seat with a `busy_processes` program running say `null`, as the plan reads it; one more `null` is the demand command's alone: a parked seat that a waiting row was refused by (the plan still gives it other rows, never that one), so the refused row is demand ([A seat parked on its own wait](#a-seat-parked-on-its-own-wait)); `held` is `"busy"` only for a free seat (no open row, no held message) whose `busy_processes` read found a program under its pane, the seat the plan counts as occupied for it, and is absent for every other seat (out of usage, a held message, to be reaped, a failed process read) |
 
 A command that runs past `timeout_s` is killed and counts as failed. Each command has its own `timeout_s` (default 60),
 so a slow `release_cmd` can be given longer than `demand_cmd`; `release_cmd` runs under the seat's lifecycle lease,
@@ -222,21 +222,32 @@ gives the parked seat no row (`code: parked_load`), and so does a busy process r
 parked seat, `parkedQitemId` (with 2 or more parks, also `parkedRows`, their count, and `parkedQitemIds`, every one).
 
 A seat parked on its own waits may still give the row it got straight back to the model, without taking it (it is
-busier than its parks say). The pool remembers that, with `refused_cooldown_s` above 0 (the default, 1800): when the
-latest row moved to the seat as parked went back to the model (a handoff the seat made to one of the model's
-addresses, or a reroute of the queue's fallback from the seat to the model that is not the pool's own drain or reap),
-with no move to in-progress in between (a claim, or `--state in-progress`), the seat is out of the parked receivers until
-`refused_cooldown_s` has passed since it gave the row back, or until its open rows are no longer the parks it held when
-the row was moved (one closed, or a new one). That row, and any row that succeeds it by handoff however many hops back,
-is never moved to that seat while it is parked: it goes to another seat that may receive, or waits. Once the seat is free
-(no open row) it takes any row, that one included, so a refused row never waits on a seat that could take it and that
-the demand command counts as a receiver. A row the seat handed on to another seat is routing, not a refusal; a seat that
-took the row and handed it on later is no refusal either. The memory is read from the job's history
-(`seat_pool_dispatched`) and the queue's transitions, live or archived, so a restart of the daemon keeps it;
-`refused_cooldown_s: 0` turns it off, and the pool moves rows as before the field. It applies at once to the rows
-already waiting: a row a parked seat gave back before the deploy is kept from that seat as well. A daemon that predates
-`refused_cooldown_s` refuses it as an unknown field: deploy the daemon before setting it (leaving it out takes the
-default on a daemon that has it).
+busier than its parks say). The pool remembers that, with `refused_cooldown_s` above 0 (the default, 1800). A seat
+refuses a row when, after the pool moved the row to it as parked, the row went back to the model (a handoff the seat made
+to one of the model's addresses, or a reroute of the queue's fallback from the seat to the model that is not the pool's
+own drain or reap) with no move to in-progress in between (a claim, or `--state in-progress`). The reroute records no
+caller, so a reroute to the model of a row the seat held counts whoever made it (the seat, a lead, a coord, a routine); a
+handoff or a reroute to anyone but the model is routing, not a refusal, and a seat that took the row and handed it on
+later is no refusal either. A free seat (no open row) that gives a row back is not remembered: the pool can't read why it
+did, and the seat's own rule handles it (in the fabrica, a dev seat at its cap parks the row on its own gate).
+
+- **The seat:** when the latest row moved to it as parked went back that way, the seat is out of the parked receivers
+  until `refused_cooldown_s` has passed since it gave the row back, or until its open rows are no longer the parks it
+  held when the row was moved (one closed, or a new one), whichever comes first.
+- **The row:** that row, and any row that succeeds it by handoff however many hops back, is never moved to a seat that
+  refused it at any move (a reroute keeps the row's id, so every move of the row counts, not only the latest) while that
+  seat is parked: it goes to another seat that may receive, or waits. Once the seat is free (no open row) it takes any
+  row, that one included.
+- **The demand command:** while a row a parked seat refused waits, that seat goes to the demand command as
+  `receives: null`, as a seat that takes no row, so a refused row is never left waiting on a seat counted as a receiver.
+  The cost is at most one seat more than needed for each parked seat that refused a waiting row, when it would still
+  have taken another row.
+
+The memory is read from the job's history (`seat_pool_dispatched`) and the queue's transitions, live or archived, so a
+restart of the daemon keeps it; `refused_cooldown_s: 0` turns it off, and the pool moves rows as before the field. It
+applies at once to the rows already waiting: a row a seat gave back before the deploy is kept from that seat as well.
+A daemon that predates `refused_cooldown_s` refuses it as an unknown field: deploy the daemon before setting it (leaving
+it out takes the default on a daemon that has it).
 
 The key is read at each evaluation, so `rig watchdog update --spec` turns it on or off with no restart. A daemon that
 predates the key refuses it as an unknown field and holds the pool (`seat_pool_spec_invalid`): take the key out of the

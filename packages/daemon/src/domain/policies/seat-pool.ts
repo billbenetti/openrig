@@ -532,7 +532,9 @@ export interface SeatPoolPendingRow {
   tags: string[];
   /** Only with `dispatch_to_parked.refused_cooldown_s` above 0: the pool's seats (session names) that gave this row, or
    *  a row it succeeds by handoff, straight back to the model after the pool moved it to them as parked, without taking
-   *  it. It is never moved to one of them while that seat is parked. Absent: none. */
+   *  it: every such move of the row, not only the latest (a reroute keeps the row's id, so two parked seats could
+   *  otherwise hand it back and forth, T-008466 SH-A). It is never moved to one of them while that seat is parked.
+   *  Absent: none. */
   refusedBy?: string[];
 }
 
