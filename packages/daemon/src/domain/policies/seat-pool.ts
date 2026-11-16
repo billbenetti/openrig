@@ -544,7 +544,8 @@ export interface SeatPoolState {
   slots: SeatPoolSlotView[];
   /** The spec's adopt entries that exist in the rig and no pool has linked yet. */
   adoptable: Array<{ logicalId: string; nodeId: string }>;
-  /** Pending rows addressed to the model, to the pool's seats and to the seats it removed, longest waiting first. */
+  /** Pending rows addressed to the model, to the pool's seats and to the seats it removed, by priority rank, then
+   *  longest waiting first (readPendingRows, T-009034). */
   pending: SeatPoolPendingRow[];
   /** The demand command's last good answer, when the spec has one. */
   demand: { desired: number; sampledAt: string } | null;
@@ -731,8 +732,8 @@ export function seatPoolOutOfUsage(state: Pick<SeatPoolState, "modelCause" | "sl
  *
  * A pending row waits once it has been at its seat for `dispatch_after_s` (since its creation or its latest reroute).
  * A waiting row addressed to the model (with `dispatch_tag`, only one carrying that tag) or to a seat the pool removed
- * goes to a free seat (live, idle at a prompt, no open row, no held message), the longest waiting first; one that finds
- * no free seat is demand. A waiting row the pool
+ * goes to a free seat (live, idle at a prompt, no open row, no held message), by priority rank, then the longest
+ * waiting first (readPendingRows, T-009034); one that finds no free seat is demand. A waiting row the pool
  * doesn't move wakes the seat holding it by why that seat isn't taking it: a stopped seat is launched and one that needs
  * input is escalated; an idle one is left to the queue's own wakes, and one out of usage waits. Only pending rows are read,
  * so a blocked or claimed row is never moved or counted. A seat the pool added whose session is gone is reaped rather
