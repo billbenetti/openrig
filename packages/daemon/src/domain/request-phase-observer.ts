@@ -55,6 +55,8 @@ export class RequestPhaseObserver {
     private readonly sink: SlowOperationInstrumentation,
     private readonly now: () => number = () => performance.now(),
     private readonly utc: () => string = () => new Date().toISOString(),
+    // T-010230: what ran inside a stall (syncSitesDuring), so an event_loop_gap without a span gets a name
+    private readonly sitesDuring: (from: number, to: number, origin: number) => Record<string, unknown> = () => ({}),
   ) {
     this.started = this.windowStart = now();
     this.record("activated", { limits: DIAGNOSTIC_LIMITS, build: BUILD_INFO });
@@ -145,7 +147,10 @@ export class RequestPhaseObserver {
       this.ticks.push({ from: previous, to: at });
       if (this.ticks.length > DIAGNOSTIC_LIMITS.tickWindow) this.ticks.shift();
       const gapMs = Math.max(0, at - previous);
-      if (gapMs - 250 >= 250) this.record("event_loop_gap", { fromMs: previous - this.started, toMs: at - this.started, gapMs });
+      if (gapMs - 250 >= 250) {
+        this.record("event_loop_gap", { fromMs: previous - this.started, toMs: at - this.started, gapMs,
+          ...this.sitesDuring(previous, at, this.started) });
+      }
       for (const trace of this.active) {
         if (at - trace.started < DIAGNOSTIC_LIMITS.ageMs) continue;
         this.expired++; this.emit(trace, "trace_expired"); this.retire(trace);

@@ -176,6 +176,7 @@ import { contextUsageWatchdogUnitsSchema } from "./migrations/124_context_usage_
 import { nodeAdvisorSchema } from "./migrations/125_node_advisor.js";
 import { operationCorrelationSchema } from "./migrations/127_operation_correlation.js";
 import { queueListReceiptAndStateIndexesSchema } from "./migrations/170_queue_list_receipt_and_state_indexes.js";
+import { queueTransitionsPromptRefusalIndexSchema } from "./migrations/171_queue_transitions_prompt_refusal_index.js";
 
 /** Ordered migrations; numbers may be reserved by independent changes. */
 
@@ -351,4 +352,5 @@ export const ALL_MIGRATIONS: Migration[] = [
   seatPoolSlotsStoppedSinceSchema,
   seatPoolSlotsLiveAtSchema,
   queueListReceiptAndStateIndexesSchema,
+  queueTransitionsPromptRefusalIndexSchema,
 ];

@@ -11,6 +11,7 @@ import { SeatIdentityStore, SelfHostIdentityStore } from "./seat-identity-store.
 import { RESERVED_HOST_IDS, validateHostRegistry } from "./hosts/hosts-registry-reader.js";
 import { communityHarnessOf } from "./built-in-runtimes.js";
 import { sessionCommunityHarnessSelect } from "./session-registry.js";
+import { runSyncSiteWhenSlow } from "./sync-site-wrap.js";
 
 /** Default identity-reconcile cadence: 5s. Process identity changes rarely
  *  (a seat's pane/process is stable for its whole life), and the check is
@@ -175,7 +176,7 @@ export class SeatIdentityReconciler {
     }
   }
 
-  private async reconcileSweep(generation: number): Promise<void> {
+  private sweepPrologue() {
     const seats = this.runningSeats();
     // Capture exact issuance before any observation awaits. A delayed verdict cannot revoke a successor.
     const grants = hasActivityGrantsTable(this.db) ? new ActivityGrantStore(this.db) : null;
@@ -196,6 +197,13 @@ export class SeatIdentityReconciler {
     }));
     // Prune verdicts for nodes no longer running (keep the table bounded), except a released seat's.
     this.store.pruneExcept([...seats.map((s) => s.node_id), ...this.releasedSeats()]);
+    return { seats, grants, observedGrants };
+  }
+
+  private async reconcileSweep(generation: number): Promise<void> {
+    // T-010230: the sweep is async; only its synchronous stretches are named (the whole sweep would only time its
+    // first stretch), each in the slow-operation log when it took the slow threshold.
+    const { seats, grants, observedGrants } = runSyncSiteWhenSlow("seat_identity.sweep_prologue", () => this.sweepPrologue());
     if (seats.length === 0) return;
 
     const observedAt = this.now().toISOString();
@@ -213,9 +221,11 @@ export class SeatIdentityReconciler {
     }
     if (generation !== this.generation) return;
     if (liveSessions === null || liveSessions.size === 0) {
-      for (const seat of seats) {
-        this.store.upsert(this.tmuxUnavailableVerdict(seat, observedAt));
-      }
+      runSyncSiteWhenSlow("seat_identity.tmux_unavailable", () => {
+        for (const seat of seats) {
+          this.store.upsert(this.tmuxUnavailableVerdict(seat, observedAt));
+        }
+      });
       return;
     }
 
@@ -293,12 +303,14 @@ export class SeatIdentityReconciler {
       try {
         const verdict = await this.computeVerdict(seat, liveSessions, observedAt, nativeProofs.get(seat.node_id) ?? null, panes);
         if (generation !== this.generation) return;
-        this.store.upsert(verdict);
-        const observedGrant = observedGrants.get(seat.node_id);
-        if (observedGrant && (verdict.verdict === "pane_missing"
-          || (verdict.verdict === "mismatch" && verdict.reason === "process_identity_mismatch" && observedGrant.shellExitConfirmed))) {
-          grants!.revoke({ grantId: observedGrant.grantId }, "runner_exit_observed");
-        }
+        runSyncSiteWhenSlow("seat_identity.persist_verdict", () => {
+          this.store.upsert(verdict);
+          const observedGrant = observedGrants.get(seat.node_id);
+          if (observedGrant && (verdict.verdict === "pane_missing"
+            || (verdict.verdict === "mismatch" && verdict.reason === "process_identity_mismatch" && observedGrant.shellExitConfirmed))) {
+            grants!.revoke({ grantId: observedGrant.grantId }, "runner_exit_observed");
+          }
+        });
       } catch {
         if (generation !== this.generation) return;
         // A single seat's tmux failure must not crash the loop; record it as
