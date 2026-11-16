@@ -470,10 +470,25 @@ function readRefusedBy(ctx: SeatPoolRefusalContext, qitemId: string, chain: stri
   return [...refused];
 }
 
-/** Pending rows addressed to any of `sessions` (in any of their addresses), longest waiting first. A row waits from its
- *  latest reroute, or from its creation. Only pending rows: a claimed, blocked or closed row is never the pool's to
- *  move. With `refusal` (read only with `refused_cooldown_s` above 0: the job, its model and the pool's seats), each row
- *  says which of those seats refused it, or a row it succeeds (refusedBy). */
+/** The dispatch rank of a queue priority, lower first (T-009034): critical, then urgent (and high), then routine (and
+ *  normal, and any value the queue does not know), then low. The queue writes only routine, urgent and critical; the
+ *  other names rank as they read, so a row from an older or a foreign writer is never put first or dropped. */
+export function seatPoolPriorityRank(priority: string | null | undefined): number {
+  switch (priority) {
+    case "critical": return 0;
+    case "urgent":
+    case "high": return 1;
+    case "low": return 3;
+    default: return 2;
+  }
+}
+
+/** Pending rows addressed to any of `sessions` (in any of their addresses), by priority rank (seatPoolPriorityRank:
+ *  the planner hands rows out in this order, so an urgent row goes before older routine ones, T-009034), then longest
+ *  waiting first, then by id. With every row at the same rank the order is the plain FIFO it always was. A row waits
+ *  from its latest reroute, or from its creation. Only pending rows: a claimed, blocked or closed row is never the
+ *  pool's to move. With `refusal` (read only with `refused_cooldown_s` above 0: the job, its model and the pool's
+ *  seats), each row says which of those seats refused it, or a row it succeeds (refusedBy). */
 function readPendingRows(
   deps: SeatPoolStateReaderDeps, sessions: string[], refusal: { ctx: SeatPoolRefusalContext; seats: ReadonlySet<string> } | null = null,
 ): SeatPoolPendingRow[] {
@@ -483,12 +498,14 @@ function readPendingRows(
   }
   if (sessionOf.size === 0) return [];
   const rows = deps.db.prepare(
-    `SELECT q.qitem_id, q.destination_session, q.tags, q.chain_of_record,
+    `SELECT q.qitem_id, q.destination_session, q.tags, q.chain_of_record, q.priority,
             COALESCE((SELECT MAX(t.ts) FROM queue_transitions t WHERE t.qitem_id = q.qitem_id AND t.actor_session = ?), q.ts_created) AS since
        FROM queue_items q
       WHERE q.state = 'pending' AND q.destination_session IN (${[...sessionOf.keys()].map(() => "?").join(",")})
       ORDER BY since, q.qitem_id`,
-  ).all(FALLBACK_ACTOR, ...sessionOf.keys()) as Array<{ qitem_id: string; destination_session: string; tags: string | null; chain_of_record: string | null; since: string }>;
+  ).all(FALLBACK_ACTOR, ...sessionOf.keys()) as Array<{ qitem_id: string; destination_session: string; tags: string | null; chain_of_record: string | null; priority: string | null; since: string }>;
+  // A stable sort over the SQL order: within a rank, the rows keep since, then qitem_id.
+  rows.sort((a, b) => seatPoolPriorityRank(a.priority) - seatPoolPriorityRank(b.priority));
   return rows.map((row) => {
     const refusedBy = refusal ? readRefusedBy(refusal.ctx, row.qitem_id, row.chain_of_record, refusal.seats) : [];
     return {
