@@ -21,6 +21,7 @@ import type { SeatStructuralActivityService } from "./seat-structural-activity-s
 import { AgentActivityStore } from "./agent-activity-store.js";
 import type { AgentActivity } from "./types.js";
 import { readOffLoop } from "./read-off-loop.js";
+import { runSyncSiteWhenSlow } from "./sync-site-wrap.js";
 
 export interface PsEntry {
   rigId: string;
@@ -187,10 +188,11 @@ export class PsProjectionService {
     this.periodicSnapshotIntervalSeconds = intervalSeconds;
   }
 
+  /** T-010230: named in the slow-operation log when slow (it held the loop 8,2 s in a GET /api/ps on 16/11 16:38Z). */
   getEntries(filter?: RigArchiveFilter, now: number = Date.now()): PsEntry[] {
-    return this.assemble(readPsBase(this.db, filter, {
+    return runSyncSiteWhenSlow("ps.get_entries", () => this.assemble(readPsBase(this.db, filter, {
       now, periodicSnapshotActive: this.periodicSnapshotActive, hooks: this.agentActivity,
-    }), now);
+    }), now));
   }
 
   /**

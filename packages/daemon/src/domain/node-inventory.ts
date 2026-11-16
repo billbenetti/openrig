@@ -48,6 +48,7 @@ import { sessionCommunityHarnessSelect } from "./session-registry.js";
 import { claudeMcpArgs, readSeatClaudeMcp, type ClaudeMcp } from "./claude-mcp.js";
 import { isLaunchWrapperRuntime, parseStoredLaunchWrapper } from "./launch-wrapper.js";
 import { shellQuote } from "../adapters/shell-quote.js";
+import { runSyncSiteWhenSlow } from "./sync-site-wrap.js";
 
 // -- Row types for SQL results --
 
@@ -1283,6 +1284,11 @@ function readAllRigWorkspaceJson(db: Database.Database): Map<string, WorkspaceSp
 // `rows` decides the scope (all rigs vs a selected rig set); entry derivation is
 // identical, so a rig's entries are byte-identical regardless of which caller ran.
 function buildInventoryMapFromRows(db: Database.Database, rows: InventoryRow[]): Map<string, NodeInventoryEntry[]> {
+  // T-010230: named in the slow-operation log when slow, so a stall in it is not a gap without a span
+  return runSyncSiteWhenSlow("node_inventory.build_map", () => readInventoryMapFromRows(db, rows));
+}
+
+function readInventoryMapFromRows(db: Database.Database, rows: InventoryRow[]): Map<string, NodeInventoryEntry[]> {
   const snapshotByRig = findLatestUsableSnapshotsForAllRigs(db);
   const workspaceByRig = readAllRigWorkspaceJson(db);
   const verdictsByRig = new SeatIdentityStore(db).getForAllRigs();
