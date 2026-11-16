@@ -16,6 +16,7 @@
 import type Database from "better-sqlite3";
 import { HumanQuietStore } from "./gateway/human-quiet-windows.js";
 import { hasToken, parseQuietHoldNote, releaseJobWindowSpec } from "./policies/quiet-release.js";
+import { QUIET_HOLD_NOTE_PREDICATE } from "../db/migrations/170_queue_list_receipt_and_state_indexes.js";
 
 export interface QuietHoldCustody {
   state: "held" | "released" | "release-failed" | "orphaned";
@@ -34,6 +35,9 @@ export interface QuietHoldCustody {
 export function quietHoldCustody(db: Database.Database, qitemId: string, now: Date = new Date()): QuietHoldCustody | null {
   let sawHold = false;
   try {
+    // T-009903: a row with no quiet-hold note at all (nearly every row) is answered by the partial index, without
+    // reading its notes (a blocked row has ~120, and a listing reads them for each of its rows)
+    if (!db.prepare(`SELECT 1 FROM queue_transitions WHERE qitem_id = ? AND ${QUIET_HOLD_NOTE_PREDICATE} LIMIT 1`).get(qitemId)) return null;
     const notes = (db.prepare("SELECT transition_note AS note FROM queue_transitions WHERE qitem_id = ? ORDER BY transition_id")
       .all(qitemId) as Array<{ note: string | null }>).map((r) => r.note ?? "");
     if (!notes.some((n) => n.startsWith("delivery-decision: quiet-hold "))) return null;

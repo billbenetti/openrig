@@ -2,10 +2,16 @@ import { randomUUID } from "node:crypto";
 import { performance } from "node:perf_hooks";
 import { Worker } from "node:worker_threads";
 import type { Context, MiddlewareHandler } from "hono";
+import { transportSenderSession } from "../routes/require-sender-identity.js";
 
 export const SLOW_OPERATION_THRESHOLD_MS = 250;
-export const SLOW_OPERATION_ROTATION_BYTES = 1024 * 1024;
-export const SLOW_OPERATION_ROTATION_COUNT = 3;
+// 16 MiB x (1 live + 6 rotated) keeps a day or more at the ~2 MB/h a busy daemon writes; 1 MiB x 3 kept ~2.5 h.
+export const SLOW_OPERATION_ROTATION_BYTES = 16 * 1024 * 1024;
+export const SLOW_OPERATION_ROTATION_COUNT = 6;
+// A rotated file past the count goes only once its newest record is a day old (its mtime), so a burst can't cut the
+// window under a day; the file ceiling bounds the disk (32 x 16 MiB) whatever the rate (T-009903).
+export const SLOW_OPERATION_RETENTION_MS = 24 * 60 * 60 * 1000;
+export const SLOW_OPERATION_MAX_FILES = 32;
 export const SLOW_OPERATION_LOG_BASENAME = "slow-operations.jsonl";
 
 export interface SlowOperationSnapshot {
@@ -47,7 +53,7 @@ export interface SlowOperationInstrumentation {
     fn: () => Promise<T>,
     classify?: (value: T) => "ok" | "failed",
   ): Promise<T>;
-  recordRequest?(site: string, durationMs: number): void;
+  recordRequest?(site: string, durationMs: number, detail?: RequestDetail): void;
   /** A synchronous site's duration, recorded only at or above the slow threshold (runSyncSiteWhenSlow). */
   recordSlowSync?(site: string, durationMs: number, outcome: "ok" | "failed"): void;
   /** Bounded nonblocking diagnostic append; false means observation was dropped. */
@@ -63,6 +69,55 @@ export interface SlowOperationInstrumentation {
 /** A successful long-poll response includes intentional idle time, not slow work. */
 export function exemptSlowOpRequest(c: Context): void {
   c.set("slowOpRequestExempt", true);
+}
+
+/** What a slow request's record says about the request besides its route: the filters it asked for and who asked. */
+export interface RequestDetail {
+  /** The allowlisted query keys with their values (cut), a repeated key as a list. */
+  query?: Record<string, string | string[]>;
+  /** How many query keys were left out: neither their names nor their values are recorded. */
+  queryOmitted?: number;
+  /** The transport sender (X-OpenRig-Session), canonicalized, when the request named one. */
+  sender?: string;
+}
+
+// The query keys a slow request's record keeps, with their values: the listing filters and the window. Any other
+// key is only counted, never named, so a token or a row body passed in a query string never reaches the log.
+const REQUEST_QUERY_KEYS_KEPT = new Set([
+  "destinationSession", "sourceSession", "as", "rig", "state", "tag", "targetRepo", "limit", "compact", "activeOnly",
+  "attention", "handedOffFrom", "updatedSince", "sort", "view", "full",
+]);
+const REQUEST_QUERY_VALUE_MAX = 120;
+const REQUEST_QUERY_VALUES_PER_KEY_MAX = 10;
+
+function cutQueryValue(value: string): string {
+  return value.length > REQUEST_QUERY_VALUE_MAX ? `${value.slice(0, REQUEST_QUERY_VALUE_MAX)}…` : value;
+}
+
+/** The request's allowlisted query filters and transport sender, for a slow request's record. Never throws. */
+export function describeRequest(c: Context): RequestDetail {
+  const detail: RequestDetail = {};
+  try {
+    const params = new URL(c.req.url).searchParams;
+    const query: Record<string, string | string[]> = {};
+    let omitted = 0;
+    for (const key of new Set(params.keys())) {
+      if (!REQUEST_QUERY_KEYS_KEPT.has(key)) { omitted += 1; continue; }
+      const values = params.getAll(key).slice(0, REQUEST_QUERY_VALUES_PER_KEY_MAX).map(cutQueryValue);
+      query[key] = values.length === 1 ? values[0]! : values;
+    }
+    if (Object.keys(query).length > 0) detail.query = query;
+    if (omitted > 0) detail.queryOmitted = omitted;
+  } catch {
+    // An unparsable URL leaves the record with its route only.
+  }
+  try {
+    const sender = transportSenderSession(c);
+    if (sender) detail.sender = cutQueryValue(sender);
+  } catch {
+    // Same: the sender is extra, never a reason to lose the timing.
+  }
+  return detail;
 }
 
 // The request-timing MIDDLEWARE, extracted as a wired seam (OPR request-observer). It is
@@ -82,7 +137,7 @@ export function createSlowOpRequestMiddleware(
     } finally {
       try {
         if (c.get("slowOpRequestExempt") !== true || c.res.status >= 400) {
-          recorder.recordRequest?.(`${c.req.method} ${c.req.path}`, now() - startedAt);
+          recorder.recordRequest?.(`${c.req.method} ${c.req.path}`, now() - startedAt, describeRequest(c));
         }
       } catch (error) {
         // A measurement throw must never re-enter Hono control flow (would turn the route into a 500).
@@ -96,6 +151,10 @@ interface SlowOpRecorderOptions {
   logPath: string;
   maxBytes?: number;
   rotationCount?: number;
+  /** A rotated file past rotationCount stays until its newest record is this old (0: rotationCount only). */
+  retentionMs?: number;
+  /** The most rotated files kept, whatever their age. */
+  maxFiles?: number;
   slowThresholdMs?: number;
 }
 
@@ -110,14 +169,26 @@ const WORKER_SOURCE = String.raw`
   const path = require("node:path");
   const { parentPort } = require("node:worker_threads");
 
-  function rotate(logPath, rotationCount) {
-    for (let index = rotationCount; index >= 1; index -= 1) {
+  // Shift every rotated file up by one, then drop, oldest first, the ones past rotationCount whose newest record (mtime)
+  // is retentionMs old, and any past maxFiles; a younger file stops the drop (the files below it are younger still).
+  function rotate(logPath, rotationCount, retentionMs, maxFiles) {
+    let top = 0;
+    while (top < maxFiles && fs.existsSync(logPath + "." + (top + 1))) top += 1;
+    for (let index = top + 1; index >= 1; index -= 1) {
       const source = index === 1 ? logPath : logPath + "." + (index - 1);
       const target = logPath + "." + index;
       if (!fs.existsSync(source)) continue;
       if (fs.existsSync(target)) fs.rmSync(target, { force: true });
       fs.renameSync(source, target);
       fs.chmodSync(target, 0o600);
+    }
+    const now = Date.now();
+    for (let index = top + 1; index > rotationCount; index -= 1) {
+      const file = logPath + "." + index;
+      let mtime = 0;
+      try { mtime = fs.statSync(file).mtimeMs; } catch { continue; }
+      if (index <= maxFiles && now - mtime < retentionMs) break;
+      fs.rmSync(file, { force: true });
     }
   }
 
@@ -127,7 +198,7 @@ const WORKER_SOURCE = String.raw`
     let size = 0;
     try { size = fs.statSync(message.logPath).size; } catch {}
     if (size > 0 && size + Buffer.byteLength(line) > message.maxBytes) {
-      rotate(message.logPath, message.rotationCount);
+      rotate(message.logPath, message.rotationCount, message.retentionMs, message.maxFiles);
     }
     const fd = fs.openSync(message.logPath, "a", 0o600);
     try {
@@ -157,6 +228,8 @@ export class SlowOpRecorder implements SlowOperationInstrumentation {
   private readonly logPath: string;
   private readonly maxBytes: number;
   private readonly rotationCount: number;
+  private readonly retentionMs: number;
+  private readonly maxFiles: number;
   private readonly slowThresholdMs: number;
   private readonly pending = new Map<string, { resolve: () => void; reject: (error: unknown) => void }>();
   private degraded: SlowOperationSnapshot = { healthy: true };
@@ -180,6 +253,8 @@ export class SlowOpRecorder implements SlowOperationInstrumentation {
     this.logPath = options.logPath;
     this.maxBytes = options.maxBytes ?? SLOW_OPERATION_ROTATION_BYTES;
     this.rotationCount = options.rotationCount ?? SLOW_OPERATION_ROTATION_COUNT;
+    this.retentionMs = options.retentionMs ?? SLOW_OPERATION_RETENTION_MS;
+    this.maxFiles = Math.max(options.maxFiles ?? SLOW_OPERATION_MAX_FILES, this.rotationCount);
     this.slowThresholdMs = options.slowThresholdMs ?? SLOW_OPERATION_THRESHOLD_MS;
     this.worker = new Worker(WORKER_SOURCE, { eval: true, execArgv: [] });
     this.worker.unref();
@@ -266,9 +341,20 @@ export class SlowOpRecorder implements SlowOperationInstrumentation {
     });
   }
 
-  recordRequest(site: string, durationMs: number): void {
+  recordRequest(site: string, durationMs: number, detail?: RequestDetail): void {
     if (!Number.isFinite(durationMs) || durationMs < this.slowThresholdMs) return;
-    this.recordMeasurement(`request:${site}`, durationMs);
+    this.appendAsync({
+      v: 1,
+      ts: new Date().toISOString(),
+      spanId: randomUUID(),
+      phase: "end",
+      site: `request:${site}`,
+      durationMs: Math.max(0, durationMs),
+      outcome: "ok",
+      ...(detail?.query ? { query: detail.query } : {}),
+      ...(detail?.queryOmitted ? { queryOmitted: detail.queryOmitted } : {}),
+      ...(detail?.sender ? { sender: detail.sender } : {}),
+    });
   }
 
   recordSlowSync(site: string, durationMs: number, outcome: "ok" | "failed" = "ok"): void {
@@ -288,7 +374,7 @@ export class SlowOpRecorder implements SlowOperationInstrumentation {
     }
     this.diagnostic.enqueued++;
     void this.postAndWait({ type: "append", logPath: this.logPath, maxBytes: this.maxBytes,
-      rotationCount: this.rotationCount, record: { ...record, coverage } }, true).catch(() => {});
+      rotationCount: this.rotationCount, retentionMs: this.retentionMs, maxFiles: this.maxFiles, record: { ...record, coverage } }, true).catch(() => {});
     return true;
   }
 
@@ -343,6 +429,8 @@ export class SlowOpRecorder implements SlowOperationInstrumentation {
       logPath: this.logPath,
       maxBytes: this.maxBytes,
       rotationCount: this.rotationCount,
+      retentionMs: this.retentionMs,
+      maxFiles: this.maxFiles,
       record,
     }).catch(() => {});
   }

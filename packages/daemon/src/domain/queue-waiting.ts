@@ -34,6 +34,24 @@ export function reusedStatement(db: Database.Database, sql: string): Database.St
   return statement;
 }
 
+/** The machine actors whose transitions are bookkeeping unless they change the state. */
+const SYSTEM_ACTORS = "('watchdog@system', 'wake-ladder@system', 'daemon@kernel', 'daemon@system')";
+
+/** The newest meaningful transition of the row named by `idExpr`, as a scalar subquery on its transition_id: it walks the
+ * row's transitions newest first by the (qitem_id, transition_id) index and stops at the first one an author made, that
+ * changed the state (its previous transition read the same way, by the index), or (with the wakes table) whose wake did
+ * not fire. T-009903: a LAG and ROW_NUMBER window over every transition of the rows, sorted in a temporary B-tree, held
+ * the daemon's event loop ~160 ms per listing of ~570 active rows (~40 000 transitions); this walk reads the same answer
+ * in ~15 ms. */
+function newestMeaningfulTransitionId(idExpr: string, hasWakes: boolean): string {
+  return `(SELECT m.transition_id FROM queue_transitions m WHERE m.qitem_id = ${idExpr}
+      AND (m.actor_session NOT IN ${SYSTEM_ACTORS}
+        OR m.state IS NOT (SELECT pv.state FROM queue_transitions pv WHERE pv.qitem_id = m.qitem_id AND pv.transition_id < m.transition_id
+                           ORDER BY pv.transition_id DESC LIMIT 1))
+      ${hasWakes ? "AND NOT EXISTS (SELECT 1 FROM queue_transition_wakes w WHERE w.transition_id = m.transition_id AND w.phase = 'fired')" : ""}
+      ORDER BY m.transition_id DESC LIMIT 1)`;
+}
+
 /** A read of the existing transition log, not another progress receipt. Machine
  * actors and typed wake receipts are bookkeeping, never task progress. Historical
  * untyped author notes remain author testimony; their text is not classified.
@@ -41,30 +59,23 @@ export function reusedStatement(db: Database.Database, sql: string): Database.St
  * ladder before it can join its dispatch marker to the delivery receipt. */
 export function lastMeaningfulTransition(db: Database.Database, id: string): { id: number; at: string } | null {
   if (!reusedStatement(db, "SELECT 1 FROM sqlite_master WHERE name = 'queue_transitions'").get()) return null;
-  const hasWakes = reusedStatement(db, "SELECT 1 FROM sqlite_master WHERE name = 'queue_transition_wakes'").get();
-  const row = reusedStatement(db, `SELECT t.transition_id, t.ts FROM (
-      SELECT *, LAG(state) OVER (ORDER BY transition_id) AS previous_state FROM queue_transitions WHERE qitem_id = ?
-    ) t WHERE (t.actor_session NOT IN ('watchdog@system', 'wake-ladder@system', 'daemon@kernel', 'daemon@system') OR t.state IS NOT t.previous_state)
-    ${hasWakes ? "AND NOT EXISTS (SELECT 1 FROM queue_transition_wakes w WHERE w.transition_id = t.transition_id AND w.phase = 'fired')" : ""}
-    ORDER BY t.transition_id DESC LIMIT 1`).get(id) as { transition_id: number; ts: string } | undefined;
+  const hasWakes = !!reusedStatement(db, "SELECT 1 FROM sqlite_master WHERE name = 'queue_transition_wakes'").get();
+  const row = reusedStatement(db, `SELECT t.transition_id, t.ts FROM queue_transitions t
+    WHERE t.transition_id = ${newestMeaningfulTransitionId("?", hasWakes)}`).get(id) as { transition_id: number; ts: string } | undefined;
   return row ? { id: row.transition_id, at: row.ts } : null;
 }
 
-/** lastMeaningfulTransition for many rows in one read: the same LAG window, partitioned by row, and the same filters.
+/** lastMeaningfulTransition for many rows in one read: the same walk per row, and the same filters.
  * Every requested id is a key of the result; an id without a meaningful transition maps to null. */
 export function lastMeaningfulTransitionMany(db: Database.Database, ids: readonly string[]): Map<string, { id: number; at: string } | null> {
   const unique = [...new Set(ids)];
   const out = new Map<string, { id: number; at: string } | null>(unique.map((id) => [id, null]));
   if (unique.length === 0) return out;
   if (!reusedStatement(db, "SELECT 1 FROM sqlite_master WHERE name = 'queue_transitions'").get()) return out;
-  const hasWakes = reusedStatement(db, "SELECT 1 FROM sqlite_master WHERE name = 'queue_transition_wakes'").get();
-  const rows = reusedStatement(db, `SELECT qitem_id, transition_id, ts FROM (
-      SELECT t.qitem_id, t.transition_id, t.ts, ROW_NUMBER() OVER (PARTITION BY t.qitem_id ORDER BY t.transition_id DESC) AS newest FROM (
-        SELECT *, LAG(state) OVER (PARTITION BY qitem_id ORDER BY transition_id) AS previous_state FROM queue_transitions
-         WHERE qitem_id IN (SELECT value FROM json_each(?))
-      ) t WHERE (t.actor_session NOT IN ('watchdog@system', 'wake-ladder@system', 'daemon@kernel', 'daemon@system') OR t.state IS NOT t.previous_state)
-      ${hasWakes ? "AND NOT EXISTS (SELECT 1 FROM queue_transition_wakes w WHERE w.transition_id = t.transition_id AND w.phase = 'fired')" : ""}
-    ) WHERE newest = 1`).all(JSON.stringify(unique)) as Array<{ qitem_id: string; transition_id: number; ts: string }>;
+  const hasWakes = !!reusedStatement(db, "SELECT 1 FROM sqlite_master WHERE name = 'queue_transition_wakes'").get();
+  const rows = reusedStatement(db, `SELECT j.value AS qitem_id, t.transition_id, t.ts FROM json_each(?) j
+      JOIN queue_transitions t ON t.transition_id = ${newestMeaningfulTransitionId("j.value", hasWakes)}`)
+    .all(JSON.stringify(unique)) as Array<{ qitem_id: string; transition_id: number; ts: string }>;
   for (const row of rows) out.set(row.qitem_id, { id: row.transition_id, at: row.ts });
   return out;
 }
@@ -112,6 +123,14 @@ export interface WaitingReads {
   statements?: WaitingStatements;
   /** lastMeaningfulTransitionMany over the listing's rows and their qitem blockers; an id it lacks is read alone. */
   meaningful?: ReadonlyMap<string, { id: number; at: string } | null>;
+  /** A destination's escalation owner (resolveEscalationOwner's owner, null when it throws), read once per destination
+   *  for the whole listing: it reads the topology only, which a synchronous listing can't see change (T-009903). */
+  escalationOwner?: (destination: string) => string | null;
+}
+
+/** resolveEscalationOwner's owner for a waiting view; a schema without the routing tables has none. */
+export function escalationOwnerOf(db: Database.Database, destination: string, acceptsDestination?: (destination: string) => boolean): string | null {
+  try { return resolveEscalationOwner(db, destination, acceptsDestination).owner; } catch { return null; /* bootstrap schema has no routing evidence */ }
 }
 
 /** One row's last meaningful transition: from the listing's batch when it read this id, else read alone. */
@@ -172,8 +191,9 @@ export function readWaitingView(db: Database.Database, id: string, readActivity?
     "SELECT destination_session, state FROM queue_items WHERE qitem_id = ?",
   ).get(row.blocked_on) as { destination_session: string; state: string } | undefined : undefined;
   let recoveryOwner: string | null = null;
-  try { recoveryOwner = hasConsumedEscalationHop(db, id)
-    ? null : resolveEscalationOwner(db, row.destination_session, acceptsDestination).owner; } catch { /* bootstrap schema has no routing evidence */ }
+  try { recoveryOwner = hasConsumedEscalationHop(db, id) ? null
+    : reads?.escalationOwner ? reads.escalationOwner(row.destination_session) : escalationOwnerOf(db, row.destination_session, acceptsDestination); }
+  catch { /* bootstrap schema has no routing evidence */ }
   const subject = row.blocked_on ? blocker?.destination_session ?? row.blocked_on : row.destination_session;
   let observed: ReturnType<WaitingActivityReader> = null;
   try { observed = readActivity?.(subject) ?? null; } catch { /* unavailable remains unknown */ }

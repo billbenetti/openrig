@@ -82,7 +82,8 @@ import { physicalSessionName, SessionRegistry } from "./session-registry.js";
 import type { QueueWakeFacts } from "./draft-aware-delivery.js";
 import { derivePickup, type PickupReceipt } from "./queue-pickup.js";
 import { withRecoveryIndex } from "./queue-recovery.js";
-import { lastMeaningfulTransition, lastMeaningfulTransitionMany, meaningfulFor, readWaitingView, WaitingStatements, type WaitingView, type WaitingActivityReader, type WaitingReads } from "./queue-waiting.js";
+import { escalationOwnerOf, lastMeaningfulTransition, lastMeaningfulTransitionMany, meaningfulFor, readWaitingView, WaitingStatements, type WaitingView, type WaitingActivityReader, type WaitingReads } from "./queue-waiting.js";
+import { CLOSED_STATE_PREDICATE, RECEIPT_NOTE_PREDICATE } from "../db/migrations/170_queue_list_receipt_and_state_indexes.js";
 import { isTypedGateBlocker, typedGateBlockerPrefix } from "./queue-blocker.js";
 export { TYPED_GATE_BLOCKER_PREFIXES, isTypedGateBlocker, typedGateBlockerPrefix } from "./queue-blocker.js";
 import { isOpenRigSender, OPENRIG_SENDER, wrapPaneEnvelope } from "../lib/pane-envelope.js";
@@ -751,6 +752,9 @@ export type InboxCheckIn = { state: "seen"; at: string } | { state: "never" } | 
 
 /** A session's check-in is written at most this often; the stuck sweep reads it in units of its unclaimed age. */
 const INBOX_CHECKIN_WRITE_INTERVAL_MS = 60_000;
+
+/** The states the listing's active-first order puts first (its CASE WHEN state IN (...) THEN 0). */
+const OPEN_LISTING_STATES: ReadonlySet<string> = new Set(["pending", "in-progress", "blocked"]);
 
 export class QueueRepositoryError extends Error {
   readonly code: string;
@@ -5689,10 +5693,18 @@ export class QueueRepository {
       params.push(opts.targetRepo);
     }
     pushFollowThroughFilters(opts, conditions, params);
+    // T-009903: with a state filter whose states are all open, or all closed, the active-first key is the same for every
+    // row; left in, it keeps SQLite from reading the rows newest first by an index and sorts them all (~85 000 for
+    // "done", ~200 ms) to return the first LIMIT. A filter of closed states only also gets its redundant term, which lets
+    // SQLite read them newest first by the closed-rows index (idx_queue_items_closed_created)
+    const filterStates = opts?.state ? (Array.isArray(opts.state) ? opts.state : [opts.state]) : undefined;
+    const allClosed = !!filterStates && filterStates.length > 0 && filterStates.every((s) => !OPEN_LISTING_STATES.has(s));
+    const allOpen = !!filterStates && filterStates.length > 0 && filterStates.every((s) => OPEN_LISTING_STATES.has(s));
+    if (allClosed) conditions.push(CLOSED_STATE_PREDICATE);
 
     const where = conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "";
     const columns = opts?.compact ? this.compactColumns() : "*";
-    const useActiveFirst = !!(opts?.rig || opts?.asSession || opts?.activeOnly);
+    const useActiveFirst = !!(opts?.rig || opts?.asSession || opts?.activeOnly) && !allOpen && !allClosed;
     const newest = opts?.sortByUpdated ? "ts_updated DESC" : "ts_created DESC";
     const orderBy = useActiveFirst
       ? `CASE WHEN state IN ('pending', 'in-progress', 'blocked') THEN 0 ELSE 1 END, ${newest}`
@@ -6418,11 +6430,9 @@ export class QueueRepository {
   /** The delivery receipt notes of these qitems, newest first, by qitem. */
   private receiptNotesFor(qitemIds: string[]): Map<string, string[]> {
     this.receiptNotesStatement ??= this.db.prepare(
+      // T-009903: the predicate is the partial index's (idx_queue_transitions_receipt_notes), so only receipts are read
       `SELECT qitem_id, transition_note FROM queue_transitions
-        WHERE qitem_id IN (SELECT value FROM json_each(?)) AND (transition_note LIKE 'slack-owner-notification-posted %'
-                             OR transition_note LIKE 'relay-owner-notification-accepted %'
-                             OR transition_note LIKE 'slack-owner-notification-transport-failed %'
-                             OR transition_note LIKE 'relay-owner-notification-transport-failed %')
+        WHERE qitem_id IN (SELECT value FROM json_each(?)) AND ${RECEIPT_NOTE_PREDICATE}
         ORDER BY transition_id DESC`,
     );
     const notes = new Map<string, string[]>();
@@ -7009,7 +7019,14 @@ export class QueueRepository {
       if (!activities.has(session)) activities.set(session, this.ownerActivity(session));
       return activities.get(session) ?? null;
     };
-    return { meaningful: lastMeaningfulTransitionMany(this.db, ids), statements: new WaitingStatements(this.db), activity };
+    // Each destination's escalation owner once per listing (T-009903): ~5 topology reads a row, the same for every row
+    // to that destination; ~60 ms of a listing of the ~320 blocked rows
+    const owners = new Map<string, string | null>();
+    const escalationOwner = (destination: string): string | null => {
+      if (!owners.has(destination)) owners.set(destination, escalationOwnerOf(this.db, destination, (target) => this.acceptsDestination(target)));
+      return owners.get(destination) ?? null;
+    };
+    return { meaningful: lastMeaningfulTransitionMany(this.db, ids), statements: new WaitingStatements(this.db), activity, escalationOwner };
   }
 
   /** listed: the row's owner notifications and ledger, when a listing read them for all its rows. */
