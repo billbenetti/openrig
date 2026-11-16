@@ -2259,6 +2259,55 @@ describe("readSeatPoolState", () => {
     expect(slots.listOpen(other).map((s) => s.logicalId)).toEqual(["dev.impl-s2"]);
   });
 
+  it("hands the pending rows out by priority rank, then by how long they waited and their id (T-009034)", () => {
+    db = createFullTestDb();
+    const rigRepo = new RigRepository(db);
+    const rig = rigRepo.createRig("r");
+    const pod = new PodRepository(db).createPod(rig.id, "dev", "Dev");
+    const model = rigRepo.addNode(rig.id, "dev.impl", { runtime: "claude-code", cwd: "/tmp", podId: pod.id });
+    const s1 = rigRepo.addNode(rig.id, "dev.impl-s1", { runtime: "claude-code", cwd: "/tmp", podId: pod.id });
+    const s2 = rigRepo.addNode(rig.id, "dev.impl-s2", { runtime: "claude-code", cwd: "/tmp", podId: pod.id });
+    db.prepare("INSERT INTO sessions (id, node_id, session_name, status) VALUES ('s-model', ?, 'dev-impl@r', 'running')").run(model.id);
+    const slots = new SeatPoolSlots(db);
+    for (const [logicalId, nodeId] of [["dev.impl-s1", s1.id], ["dev.impl-s2", s2.id]] as const) {
+      db.prepare("INSERT INTO sessions (id, node_id, session_name, status) VALUES (?, ?, ?, 'running')").run(`s-${logicalId}`, nodeId, `${logicalId.replace(".", "-")}@r`);
+      slots.insert({ poolJobId: JOB, logicalId, nodeId, phase: "live", intent: null, opId: `op-${logicalId}`, at: "2026-11-09T10:00:00.000Z" });
+    }
+    const insert = (id: string, priority: string, ts: string) => db.prepare(
+      `INSERT INTO queue_items (qitem_id, ts_created, ts_updated, source_session, destination_session, state, priority, body)
+       VALUES (?, ?, ?, 'lead@r', 'dev-impl@r', 'pending', ?, 'work')`,
+    ).run(id, ts, ts, priority);
+    // Old routine rows first in time; the urgent and critical ones are the newest. A value the queue never writes
+    // ranks by its name (high with urgent, normal with routine, low last) and an unknown one as routine.
+    insert("q-low", "low", "2026-11-09T10:00:00.000Z");
+    insert("q-routine-b", "routine", "2026-11-09T11:00:00.000Z");
+    insert("q-routine-a", "routine", "2026-11-09T11:00:00.000Z");
+    insert("q-normal", "normal", "2026-11-09T11:05:00.000Z");
+    insert("q-unknown", "whenever", "2026-11-09T11:07:00.000Z");
+    insert("q-routine-new", "routine", "2026-11-09T11:10:00.000Z");
+    insert("q-urgent", "urgent", "2026-11-09T11:15:00.000Z");
+    insert("q-high", "high", "2026-11-09T11:20:00.000Z");
+    insert("q-critical", "critical", "2026-11-09T11:30:00.000Z");
+
+    const state = readSeatPoolState({
+      db, slots,
+      openRows: () => [],
+      sessionAddresses: (session) => [session],
+      heldMessages: () => 0,
+      seatStopped: () => false,
+      seatState: () => ({ activity: "idle-at-prompt", needsInput: { count: 0, reason: null }, backgroundWork: null, changedAt: "2026-11-09T10:00:00.000Z" }) as never,
+      restoring: () => false,
+      demand: () => null,
+    }, { jobId: JOB, targetSession: "dev-impl@r", spec: spec() });
+
+    expect(state.pending.map((row) => row.qitemId)).toEqual([
+      "q-critical", "q-urgent", "q-high", "q-routine-a", "q-routine-b", "q-normal", "q-unknown", "q-routine-new", "q-low",
+    ]);
+    // The plan hands rows out in that order: with two free seats, the critical and the urgent row go first.
+    const dispatched = planSeatPool(spec(), state, T0, 120_000).intents.filter((intent) => intent.kind === "dispatch");
+    expect(dispatched.map((intent) => (intent as { qitemId: string }).qitemId)).toEqual(["q-critical", "q-urgent"]);
+  });
+
   it("reads the pending rows to the model, its seats and the seats it removed, and each seat's cause", () => {
     db = createFullTestDb();
     const rigRepo = new RigRepository(db);
