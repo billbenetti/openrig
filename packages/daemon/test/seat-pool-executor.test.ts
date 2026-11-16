@@ -2286,7 +2286,7 @@ describe("readSeatPoolState", () => {
     insert("q-unknown", "whenever", "2026-11-09T11:07:00.000Z");
     insert("q-routine-new", "routine", "2026-11-09T11:10:00.000Z");
     insert("q-urgent", "urgent", "2026-11-09T11:15:00.000Z");
-    insert("q-high", "high", "2026-11-09T11:20:00.000Z");
+    insert("q-high", "High", "2026-11-09T11:20:00.000Z"); // any case: the CLI keeps an unknown value as typed
     insert("q-critical", "critical", "2026-11-09T11:30:00.000Z");
 
     const state = readSeatPoolState({
