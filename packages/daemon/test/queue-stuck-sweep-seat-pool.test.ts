@@ -13,7 +13,8 @@ import { migrate } from "../src/db/migrate.js";
 import { RigRepository } from "../src/domain/rig-repository.js";
 import { EventBus } from "../src/domain/event-bus.js";
 import { QueueRepository, type QueueItem } from "../src/domain/queue-repository.js";
-import { runStuckSweep, createStuckSweepStatus } from "../src/domain/queue-stuck-sweep.js";
+import { runStuckSweep, createStuckSweepStatus, findingDedupTag, parentBacklogTag, STUCK_SWEEP_FINDING_TAG }
+  from "../src/domain/queue-stuck-sweep.js";
 
 const MODEL = "impl@dev";
 const TAG = "tarefa-nova";
@@ -92,6 +93,26 @@ describe("stuck sweep: rows waiting in an active seat pool's queue (T-007029, #2
   const findingFor = (row: QueueItem) => queue.list({ limit: 500 })
     .some((item) => (item.tags ?? []).includes(`recovery-for:${row.qitemId}`));
 
+  // N2 of the REVISAO-v0713 (T-008302): the sweep above injects resolveOrchestrator, which turns off the grouping by
+  // delegation parent (#3049). These run the sweep as the daemon does, with the route the topology declares.
+  /** The model seat and a lead that delegates to it, both in the rig "dev". */
+  function delegatedModel(): void {
+    const rig = rigs.listRigs().find((r) => r.name === "dev") ?? rigs.createRig("dev");
+    const lead = rigs.addNode(rig.id, "lead", { runtime: "claude-code" });
+    const model = rigs.addNode(rig.id, "impl", { runtime: "claude-code" });
+    const n = ++nodeSeq;
+    db.prepare("INSERT INTO sessions (id, node_id, session_name, status) VALUES (?, ?, 'lead@dev', 'running')").run(`session-lead-${n}`, lead.id);
+    db.prepare("INSERT INTO sessions (id, node_id, session_name, status) VALUES (?, ?, ?, 'running')").run(`session-model-${n}`, model.id, MODEL);
+    rigs.addEdge(rig.id, lead.id, model.id, "delegates_to");
+  }
+  async function sweepRouted() {
+    return runStuckSweep({ db, queueRepo: queue, status: createStuckSweepStatus(), unclaimedAgeMinutes: 60, log: () => {},
+      isRegisteredHost: () => false, resolveRecoveryAgentSeat: () => null, resolveOperatorSeat: () => null });
+  }
+  const findingsTo = (session: string): QueueItem[] => queue.list({ limit: 500 })
+    .filter((item) => item.destinationSession === session && (item.tags ?? []).includes(STUCK_SWEEP_FINDING_TAG))
+    .map((item) => queue.getById(item.qitemId)!);
+
   it("an active pool with a live seat: no finding for its tagged row", async () => {
     slot(pool({}), { live: true });
     const row = await work();
@@ -104,6 +125,25 @@ describe("stuck sweep: rows waiting in an active seat pool's queue (T-007029, #2
     const row = await work();
     await sweep();
     expect(findingFor(row)).toBe(true);
+  });
+
+  it("N2: a draining pool's rows, through the daemon's route: one standing notice to the model's delegation parent", async () => {
+    slot(pool({ drain: true }), { live: true });
+    delegatedModel();
+    const rows = [await work(), await work(), await work()];
+    await sweepRouted();
+    const filed = findingsTo("lead@dev");
+    expect(filed).toHaveLength(1);
+    expect(filed[0]!.tags).toContain(parentBacklogTag("lead@dev", MODEL));
+    expect(filed[0]!.summary).toBe(`Checked on ${MODEL}'s work, for its delegation parent lead@dev: 3 items nobody has picked up`);
+    for (const row of rows) expect(filed[0]!.body).toContain(row.qitemId);
+    // No finding per row, to the parent or anywhere else.
+    for (const row of rows) {
+      expect(queue.list({ limit: 500 }).some((item) => (item.tags ?? []).includes(findingDedupTag("unclaimed-obligation", row.qitemId)))).toBe(false);
+    }
+    // A later pass keeps the one notice.
+    await sweepRouted();
+    expect(findingsTo("lead@dev").map((f) => f.qitemId)).toEqual([filed[0]!.qitemId]);
   });
 
   it("a row without the pool's dispatch_tag: finding", async () => {
