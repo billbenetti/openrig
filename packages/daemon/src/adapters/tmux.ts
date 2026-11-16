@@ -422,11 +422,35 @@ function usableEnvLine(lines: readonly string[], name: string): boolean {
   return lines.some((line) => line.startsWith(prefix) && line.slice(prefix.length).trim().length > 0);
 }
 
+/** The slice every seat scope goes in (terminal.seat_scope): where an operator puts the limits of all seats together. */
+export const SEAT_SCOPE_SLICE = "openrig-seats.slice";
+/** How long a seat scope launch skips asking a user bus that did not answer. */
+const SEAT_SCOPE_RETRY_MS = 60_000;
+
+/** systemd-run reaches the user manager through the runtime directory, not the seat's unusable bus address (#2030). */
+function seatScopeBusEnv(runtimeDir: string): string[] {
+  return ["/usr/bin/env", "-u", "DBUS_SESSION_BUS_ADDRESS", `XDG_RUNTIME_DIR=${runtimeDir}`];
+}
+
+/** The systemd-run options of a seat scope, up to (not including) the `--` before the command. */
+function seatScopeArgv(found: { path: string; version: number }, unit: string, description: string, tasksMax: number): string[] {
+  return [found.path, "--user", "--scope", "--quiet", "--collect", "--slice", SEAT_SCOPE_SLICE, "--unit", unit,
+    "--description", description,
+    // systemd-run 254+ expands ${VAR} in the command's arguments (from 258 also for --scope): the reset script must
+    // reach /bin/sh exactly as written. Before 254 there is no such option and no expansion.
+    ...(found.version >= 254 ? ["--expand-environment=no"] : []),
+    // Before 253 a scope has no OOMPolicy=; its OOM handling is then the manager's, as for the server's scope there.
+    ...(found.version >= 253 ? ["-p", "OOMPolicy=continue"] : []),
+    "-p", `TasksMax=${tasksMax}`];
+}
+
 export class TmuxAdapter {
   /** Read for each new agent/successor. Unconfigured adapters retain legacy behavior. */
   launchEnvironment?: () => { inheritTmuxEnvironment: boolean; env: Readonly<Record<string, string | undefined>>;
     /** The runtime directory a seat gets when it has none of its own (seat-runtime-dir.ts); none on macOS. */
-    runtimeDir?: string };
+    runtimeDir?: string;
+    /** terminal.seat_scope (default off): each seat's pane command in a systemd user scope of its own (seatScopePrefix). */
+    seatScope?: { tasksMax: number } };
 
   /** Reset before the selected user shell runs, without changing the server or other sessions.
    * Multiple tmux command arguments execute directly; only this fixed non-interactive sh runs
@@ -434,10 +458,16 @@ export class TmuxAdapter {
    * Keep the configured default-command and default-shell lookup, including rc functions.
    */
   private async scopedLaunchCommand(seatEnv: Record<string, string>, command?: string, warnings: string[] = []): Promise<string[] | null> {
+    // A restart that owns its command and brings no seat env (a restart in place) is not reinterpreted: the launch policy
+    // is not even read, so it runs as before, without the seat scope too (terminal.seat_scope's help says so).
     if (!this.launchEnvironment || !seatEnv.OPENRIG_NODE_ID) return null;
     try {
       const policy = this.launchEnvironment();
-      if (policy.inheritTmuxEnvironment) return null;
+      if (policy.inheritTmuxEnvironment) {
+        // The seat scope wraps the daemon's launch command; the inherited launch has none, so it starts as before.
+        if (policy.seatScope) this.seatScopeWarning(warnings, "Seat scope not applied: terminal.inherit_tmux_environment is on, so this seat launches as before, in the shared terminal server scope.");
+        return null;
+      }
       if (process.platform === "win32") throw new Error("POSIX launch boundary unavailable");
       let shell = await this.getDefaultShell();
       // tmux reads these options from a running server. The first seat on a new server starts the empty server here,
@@ -473,7 +503,8 @@ export class TmuxAdapter {
       await this.fileOps.writeFile(file, `/bin/rm -f -- ${shellQuote(file)}\n${values.join("\n")}\nexec "$@"\n`, { mode: 0o600, flag: "wx" });
       // tmux supplies its terminal identity per pane; the daemon's terminal may be different.
       const reset = 'exec /usr/bin/env -i -- TMUX="$TMUX" TMUX_PANE="$TMUX_PANE" TERM="$TERM" TERM_PROGRAM="${TERM_PROGRAM-}" TERM_PROGRAM_VERSION="${TERM_PROGRAM_VERSION-}" SHELL="$SHELL" /bin/sh "$@"';
-      return ["/bin/sh", "-c", reset, "sh", file, shell, ...(command ? ["-c", command] : ["-l"])];
+      const seatScope = policy.seatScope ? await this.seatScopePrefix(policy.seatScope, seatEnv, warnings) : [];
+      return [...seatScope, "/bin/sh", "-c", reset, "sh", file, shell, ...(command ? ["-c", command] : ["-l"])];
     } catch {
       // Keep the working launch, with a diagnostic; this option is not a new admission gate.
       const warning = "Scoped tmux environment unavailable; retaining the previous environment for this launch.";
@@ -481,6 +512,89 @@ export class TmuxAdapter {
       console.warn(`[seat launch] ${warning}`);
       return null;
     }
+  }
+
+  /** The systemd-run found for seat scopes (its path and version), kept once a throwaway scope was made with it. */
+  private seatScopeFound?: Promise<{ path: string; version: number }>;
+  /** When the user bus last failed to answer: for SEAT_SCOPE_RETRY_MS, launches go the old way without asking again. */
+  private seatScopeBusFailedAt?: { at: number; reason: string };
+
+  private seatScopeWarning(warnings: string[], warning: string): void {
+    warnings.push(warning);
+    console.warn(`[seat launch] ${warning}`);
+  }
+
+  /**
+   * terminal.seat_scope (mvschwarz/openrig#3253): the argv that starts a seat's pane command in a transient
+   * `systemd-run --user --scope` of its own, with TasksMax as its only limit (memory and CPU limits wait for a
+   * measurement), so a seat that forks without end hits its own ceiling, not the other seats'. systemd-run --scope runs
+   * the command itself, in the new scope: the pane's process is the seat's.
+   * - OOMPolicy=continue (systemd 253+), as the server's scope has: with the default (stop), a kernel OOM kill of one of
+   *   the seat's processes would stop the whole seat. It is no limit, only today's behaviour kept.
+   * - The scopes go in SEAT_SCOPE_SLICE, not in the server's scope (a scope can't hold another): limits the operator put
+   *   on the server's scope (all seats together) do not reach them. Put the aggregate ones on that slice instead.
+   * - The seat's shell gets a session bus that can't connect (#2030), so only systemd-run reaches the user manager,
+   *   through the runtime directory; the command after `--` starts with exactly today's environment.
+   * - The scope ends with the seat (--collect). It is never stopped by hand: a stop kills every process in it, the seat
+   *   included; `rig seat stop` is the way.
+   * Where no user scope can be made (as for the server, userScopeUnavailable; systemd-run missing or refusing a
+   * throwaway scope; the user bus not answering now), the launch is today's, with a warning. A systemd-run that fails
+   * inside the pane after the checks passed ends that launch (it is not retried without the scope): the launch's
+   * readiness reports it. Never throws: the scoped launch environment must not be lost.
+   */
+  private async seatScopePrefix(scope: { tasksMax: number }, seatEnv: Record<string, string>, warnings: string[]): Promise<string[]> {
+    const fallback = (reason: string): string[] => {
+      this.seatScopeWarning(warnings, `Seat scope unavailable (${reason}); this seat launches as before, in the shared terminal server scope.`);
+      return [];
+    };
+    const unavailable = this.userScopeUnavailable();
+    if (unavailable) return fallback(unavailable);
+    const runtimeDir = seatRuntimeDir(process.env)!;
+    const failed = this.seatScopeBusFailedAt;
+    if (failed && Date.now() - failed.at < SEAT_SCOPE_RETRY_MS) return fallback(failed.reason);
+    let found: { path: string; version: number };
+    try {
+      this.seatScopeFound ??= this.findSeatScopeRunner(runtimeDir, scope);
+      found = await this.seatScopeFound;
+    } catch (error) {
+      // Not kept: a systemd-run or manager that comes back is used at the next launch.
+      this.seatScopeFound = undefined;
+      return fallback((error as Error).message);
+    }
+    // The bus at this launch, not at the first one: a manager that went away since must not end the seat.
+    try {
+      await this.exec(posixJoinArgv([...seatScopeBusEnv(runtimeDir), "timeout", "5",
+        "systemctl", "--user", "show", "--property=Version", "--value"]));
+      this.seatScopeBusFailedAt = undefined;
+    } catch (error) {
+      const reason = `the systemd user bus did not answer: ${execFailureReason(error)}`;
+      this.seatScopeBusFailedAt = { at: Date.now(), reason };
+      return fallback(reason);
+    }
+    const name = seatEnv.OPENRIG_SESSION_NAME || seatEnv.OPENRIG_NODE_ID || "seat";
+    // Unit names take ASCII letters, digits and ":-_.\\"; an "@" would read as a template instance.
+    const unit = `openrig-seat-${name.replace(/[^A-Za-z0-9_.-]/g, "_").slice(0, 120)}-${randomUUID().slice(0, 8)}`;
+    return [...seatScopeBusEnv(runtimeDir), ...seatScopeArgv(found, unit, `OpenRig seat ${name}`, scope.tasksMax), "--"];
+  }
+
+  /** systemd-run's path and version, proven by making one throwaway scope with the seat's own options. */
+  private async findSeatScopeRunner(runtimeDir: string, scope: { tasksMax: number }): Promise<{ path: string; version: number }> {
+    let path: string;
+    try { path = (await this.exec("command -v systemd-run")).trim(); }
+    catch (error) { throw new Error(`systemd-run not found: ${execFailureReason(error)}`); }
+    if (!path.startsWith("/")) throw new Error(`systemd-run not found (command -v gave "${path}")`);
+    let versionText: string;
+    try { versionText = await this.exec(posixJoinArgv([path, "--version"])); }
+    catch (error) { throw new Error(`systemd-run --version failed: ${execFailureReason(error)}`); }
+    const version = Number(/^systemd (\d+)/.exec(versionText.trim())?.[1]);
+    if (!Number.isInteger(version)) throw new Error("systemd-run printed no version");
+    const found = { path, version };
+    try {
+      await this.exec(posixJoinArgv([...seatScopeBusEnv(runtimeDir), "timeout", "10",
+        ...seatScopeArgv(found, `openrig-seat-probe-${randomUUID().slice(0, 8)}`, "OpenRig seat scope probe", scope.tasksMax),
+        "--", "/bin/true"]));
+    } catch (error) { throw new Error(`a throwaway seat scope could not be made: ${execFailureReason(error)}`); }
+    return found;
   }
 
   private inputGuard?: SeatDeliveryGuard;
