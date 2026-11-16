@@ -258,6 +258,21 @@ describe("custody of asks held for quiet hours", () => {
     } finally { spy.mockRestore(); }
   });
 
+  it("an ordinary row is answered by the quiet-hold partial index, without reading its notes (T-009903)", async () => {
+    const row = await ask(); // never held
+    const seen: string[] = [];
+    const prepare = db.prepare.bind(db);
+    const spy = vi.spyOn(db, "prepare").mockImplementation(((sql: string) => { seen.push(sql); return prepare(sql); }) as typeof db.prepare);
+    try {
+      expect(quietHoldCustody(db, row.qitemId)).toBeNull();
+    } finally { spy.mockRestore(); }
+    expect(seen.some((sql) => sql.includes("SELECT transition_note AS note"))).toBe(false);
+    const probe = seen.find((sql) => sql.includes("delivery-decision: quiet-hold"));
+    expect(probe).toBeDefined();
+    const plan = (db.prepare(`EXPLAIN QUERY PLAN ${probe!}`).all(row.qitemId) as Array<{ detail: string }>).map((r) => r.detail).join("\n");
+    expect(plan).toContain("idx_queue_transitions_quiet_hold");
+  });
+
   it("a release turned back because quiet came on again reads as held", async () => {
     const row = await held();
     quiet.end("person", { endedBy: "t", now: new Date() });

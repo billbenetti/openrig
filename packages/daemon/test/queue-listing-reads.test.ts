@@ -101,6 +101,68 @@ describe("lastMeaningfulTransitionMany answers what lastMeaningfulTransition ans
   });
 });
 
+// The windowed read lastMeaningfulTransitionMany ran before T-009903 (LAG and ROW_NUMBER over every transition of the
+// listed rows, sorted in a temporary B-tree): the reference the per-row walk down the index must keep answering.
+const WINDOWED_READ = `SELECT qitem_id, transition_id, ts FROM (
+    SELECT t.qitem_id, t.transition_id, t.ts, ROW_NUMBER() OVER (PARTITION BY t.qitem_id ORDER BY t.transition_id DESC) AS newest FROM (
+      SELECT *, LAG(state) OVER (PARTITION BY qitem_id ORDER BY transition_id) AS previous_state FROM queue_transitions
+       WHERE qitem_id IN (SELECT value FROM json_each(?))
+    ) t WHERE (t.actor_session NOT IN ('watchdog@system', 'wake-ladder@system', 'daemon@kernel', 'daemon@system') OR t.state IS NOT t.previous_state)
+    AND NOT EXISTS (SELECT 1 FROM queue_transition_wakes w WHERE w.transition_id = t.transition_id AND w.phase = 'fired')
+  ) WHERE newest = 1`;
+
+describe("lastMeaningfulTransitionMany walks each row's index instead of a window over the listing (T-009903)", () => {
+  beforeEach(() => { db = new Database(":memory:"); migrate(db, ALL_MIGRATIONS); });
+  afterEach(() => { vi.restoreAllMocks(); db.close(); });
+
+  it("answers what the windowed read answered, on 60 histories of authors, system actors, state changes and wakes", () => {
+    const actors = ["sender@r", "worker@r", "watchdog@system", "wake-ladder@system", "daemon@kernel", "daemon@system"];
+    const states = ["pending", "in-progress", "blocked"];
+    let seed = 7;
+    const next = (n: number) => { seed = (seed * 1103515245 + 12345) % 2147483648; return seed % n; };
+    const ids: string[] = [];
+    for (let i = 0; i < 60; i++) {
+      const id = `q-${i}`;
+      ids.push(id);
+      item(id);
+      let state = "pending";
+      for (let k = 0, n = next(12); k < n; k++) {
+        if (next(3) === 0) state = states[next(3)]!;
+        const t = transition(id, state, actors[next(actors.length)]!, k);
+        if (next(5) === 0) wake(t, id, next(2) === 0 ? "fired" : "armed");
+      }
+    }
+    const reference = Object.fromEntries(ids.map((id) => [id, null as { id: number; at: string } | null]));
+    for (const r of db.prepare(WINDOWED_READ).all(JSON.stringify(ids)) as Array<{ qitem_id: string; transition_id: number; ts: string }>) {
+      reference[r.qitem_id] = { id: r.transition_id, at: r.ts };
+    }
+    expect(Object.values(reference).filter(Boolean).length).toBeGreaterThan(30);
+    const { many, perRow } = both(ids);
+    expect(many).toEqual(reference);
+    expect(perRow).toEqual(reference);
+  });
+
+  it("plans the read by the (qitem_id, transition_id) index, with no temporary B-tree, for the listing and for one row", () => {
+    item("q-a");
+    transition("q-a", "pending", "sender@r", 1);
+    const seen: string[] = [];
+    const original = db.prepare.bind(db);
+    vi.spyOn(db, "prepare").mockImplementation((sql: string) => { seen.push(sql); return original(sql); });
+    lastMeaningfulTransitionMany(db, ["q-a"]);
+    lastMeaningfulTransition(db, "q-a");
+    vi.restoreAllMocks();
+    const reads = seen.filter((sql) => sql.includes("FROM queue_transitions"));
+    expect(reads).toHaveLength(2);
+    for (const sql of reads) {
+      const plan = (db.prepare(`EXPLAIN QUERY PLAN ${sql}`).all(sql.includes("json_each") ? JSON.stringify(["q-a"]) : "q-a") as Array<{ detail: string }>)
+        .map((r) => r.detail).join("\n");
+      expect(plan).toContain("idx_queue_transitions_qitem_id_order");
+      expect(plan).not.toContain("TEMP B-TREE");
+      expect(sql).not.toMatch(/ OVER \(/);
+    }
+  });
+});
+
 describe("lastMeaningfulTransitionMany on older schemas", () => {
   afterEach(() => db.close());
 
@@ -269,6 +331,47 @@ describe("a listing reads each owner's activity once", () => {
   });
 });
 
+describe("a listing resolves each destination's escalation owner once (T-009903)", () => {
+  let repo: QueueRepository;
+  beforeEach(() => {
+    db = new Database(":memory:");
+    migrate(db, ALL_MIGRATIONS);
+    repo = new QueueRepository(db, new EventBus(db), { validateRig: () => true, loadHumanRegistry: () => ({ ok: true, entities: [] }) } as never);
+  });
+  afterEach(() => { vi.restoreAllMocks(); db.close(); });
+
+  /** Runs of the session→node read (resolveEscalationOwner's first step) while `fn` lists. */
+  function sessionReads(fn: () => unknown): number {
+    type Run = (this: { source: string }, ...args: unknown[]) => unknown;
+    const proto = Object.getPrototypeOf(db.prepare("SELECT 1")) as { get: Run };
+    const original = proto.get;
+    let n = 0;
+    const spy = vi.spyOn(proto, "get").mockImplementation(function (this: { source: string }, ...args: unknown[]) {
+      if (this.source.includes("SELECT node_id FROM sessions WHERE session_name = ?")) n++;
+      return original.apply(this, args);
+    });
+    try { fn(); } finally { spy.mockRestore(); }
+    return n;
+  }
+
+  it("the reads don't grow with the rows, and the waiting views are the per-row ones", async () => {
+    const block = async (n: number) => {
+      for (let i = 0; i < n; i++) {
+        const q = (await repo.create({ sourceSession: "orch@r", destinationSession: i % 2 ? "worker@r" : "other@r", body: `w${i}`, nudge: false } as never)).qitemId;
+        repo.update({ qitemId: q, actorSession: "worker@r", state: "blocked", blockedOn: "external:ci", transitionNote: "continuation: CI" } as never);
+      }
+    };
+    await block(4);
+    const few = sessionReads(() => repo.list({ state: "blocked", limit: 100 }));
+    await block(26);
+    const many = sessionReads(() => repo.list({ state: "blocked", limit: 100 }));
+    expect(many).toBe(few);
+    const listed = repo.list({ state: "blocked", limit: 100 });
+    expect(listed).toHaveLength(30);
+    for (const item of listed) expect(item.waiting).toEqual(repo.waitingView(item.qitemId));
+  });
+});
+
 describe("a listed row's waiting view reads the row in hand instead of reading it again", () => {
   let repo: QueueRepository;
   beforeEach(() => {
@@ -380,5 +483,81 @@ describe("show (getById) is the listing projection of one row", () => {
     repo.getById(q);
     for (const spy of spies) spy.mockRestore();
     expect(n).toBe(1);
+  });
+});
+
+describe("a listing's hot reads go by an index (T-009903)", () => {
+  let repo: QueueRepository;
+  beforeEach(() => {
+    db = new Database(":memory:");
+    migrate(db, ALL_MIGRATIONS);
+    repo = new QueueRepository(db, new EventBus(db), { validateRig: () => true, loadHumanRegistry: () => ({ ok: true, entities: [] }) } as never);
+  });
+  afterEach(() => { vi.restoreAllMocks(); db.close(); });
+
+  /** The SQL texts the listing prepared, and each one's query plan. */
+  function plans(run: () => unknown): Array<{ sql: string; plan: string }> {
+    const seen: string[] = [];
+    const original = db.prepare.bind(db);
+    vi.spyOn(db, "prepare").mockImplementation((sql: string) => { seen.push(sql); return original(sql); });
+    run();
+    vi.restoreAllMocks();
+    return seen.map((sql) => {
+      const n = (sql.match(/\?/g) ?? []).length;
+      const args = Array.from({ length: n }, () => "[]");
+      let plan = "";
+      try { plan = (db.prepare(`EXPLAIN QUERY PLAN ${sql}`).all(...args) as Array<{ detail: string }>).map((r) => r.detail).join("\n"); }
+      catch { plan = "(unplannable)"; }
+      return { sql, plan };
+    });
+  }
+
+  function seedStates() {
+    const ids: Record<string, string> = {};
+    for (let i = 0; i < 12; i++) {
+      const id = `q-${String(i).padStart(2, "0")}`;
+      const state = ["pending", "in-progress", "blocked", "done"][i % 4]!;
+      db.prepare(`INSERT INTO queue_items(qitem_id, ts_created, ts_updated, source_session, destination_session, state, body)
+        VALUES (?, ?, ?, 'sender@r', 'worker@r', ?, 'body')`).run(id, at(i), at(i), state);
+      ids[id] = state;
+    }
+    return ids;
+  }
+
+  it("the delivery receipt notes are read by their partial index, not by every transition of the listed rows", () => {
+    seedStates();
+    const read = plans(() => repo.list({ state: ["pending", "in-progress", "blocked"], compact: true, limit: 100 }))
+      .find((p) => p.sql.includes("relay-owner-notification-transport-failed"));
+    expect(read, "the listing read no receipt notes").toBeDefined();
+    expect(read!.plan).toContain("idx_queue_transitions_receipt_notes");
+  });
+
+  it("a listing of one closed state, active rows first, goes newest first by the closed-rows index, with no sort", () => {
+    seedStates();
+    const listed = plans(() => repo.list({ state: "done", activeOnly: true, compact: true, limit: 2 }))
+      .find((p) => /FROM queue_items WHERE/.test(p.sql) && p.sql.includes("LIMIT"));
+    expect(listed!.plan).toContain("idx_queue_items_closed_created");
+    expect(listed!.plan).not.toContain("TEMP B-TREE");
+    expect(repo.list({ state: "done", activeOnly: true, compact: true, limit: 2 }).map((q) => q.qitemId)).toEqual(["q-11", "q-07"]);
+    // every state of the filter active: the order is the same newest first
+    expect(repo.list({ state: ["blocked", "pending"], rig: "r", compact: true, limit: 3 }).map((q) => q.qitemId)).toEqual(["q-10", "q-08", "q-06"]);
+  });
+
+  it("rows created in the same ms keep the order the listing gave them before the index (insertion order)", () => {
+    for (const id of ["q-c", "q-a", "q-b"]) {
+      db.prepare(`INSERT INTO queue_items(qitem_id, ts_created, ts_updated, source_session, destination_session, state, body)
+        VALUES (?, ?, ?, 'sender@r', 'worker@r', 'done', 'body')`).run(id, at(5), at(5));
+    }
+    expect(repo.list({ state: "done", activeOnly: true, compact: true, limit: 10 }).map((q) => q.qitemId)).toEqual(["q-c", "q-a", "q-b"]);
+    // the stuck sweep's oldest-first read by state can't take the closed-rows index: it carries no closed-state term
+    const plan = (db.prepare("EXPLAIN QUERY PLAN SELECT * FROM queue_items WHERE state = 'pending' ORDER BY ts_created ASC").all() as Array<{ detail: string }>)
+      .map((r) => r.detail).join("\n");
+    expect(plan).not.toContain("idx_queue_items_closed_created");
+  });
+
+  it("a filter that mixes active and closed states still lists the active rows first", () => {
+    seedStates();
+    expect(repo.list({ state: ["done", "pending"], activeOnly: true, compact: true, limit: 4 }).map((q) => q.qitemId))
+      .toEqual(["q-08", "q-04", "q-00", "q-11"]);
   });
 });
