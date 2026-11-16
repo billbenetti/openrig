@@ -571,7 +571,7 @@ function rerouteBack(h: Harness, seat: Seat, reason = "devolvida pelo slot"): st
   return row!.qitemId;
 }
 
-describe("seat pool: every move of a row counts, a free seat's refusal and the demand command (T-008466)", () => {
+describe("seat pool: every move of a row counts, and the demand command (T-008466)", () => {
   let h: Harness;
 
   beforeEach(() => {
@@ -611,72 +611,8 @@ describe("seat pool: every move of a row counts, a free seat's refusal and the d
     expect(h.get(r)).toMatchObject({ destinationSession: MODEL, state: "pending" });
   });
 
-  it("FREE: a free seat that gives the row back is given rows once in 10 minutes (the s14 case: 10 dispatches 12:22-12:32Z), and again after refused_cooldown_s", async () => {
+  it("a free seat that gives a row back is not remembered: it is given the next row (the lead's decision on the T-008466; the seat's own cap holds it, T-008600)", async () => {
     h.register({ ...BASE, max: 1, dispatch_to_parked: { max_open_rows: 2 } });
-    const s = h.poolSeat("dev.impl-s1", "idle");
-    await h.row(MODEL);
-    for (let at = 61; at <= 61 * 11; at += 61) {
-      await h.tickAt(at);
-      if (h.queue.listOpenObligations(s.session, 10).some((r) => r.state === "pending")) await giveBack(h, s);
-    }
-    expect(to(h, s)).toHaveLength(1);
-    expect(to(h, s)[0]).toMatchObject({ mode: "free" });
-    expect(h.state().slots[0]!.freeRefusal).toBeDefined();
-    // 1800 s (the default) after it gave the row back, the seat is free again for the pool.
-    await h.tickAt(61 + 1801);
-    expect(to(h, s)).toHaveLength(2);
-  });
-
-  it("FREE: a reroute to the model of the row a free seat holds is its refusal too", async () => {
-    h.register({ ...BASE, max: 1, dispatch_to_parked: { max_open_rows: 2 } });
-    const s = h.poolSeat("dev.impl-s1", "idle");
-    const r = await h.row(MODEL);
-    await h.tickAt(61);
-    rerouteBack(h, s);
-    await h.tickAt(122);
-    await h.tickAt(183);
-    expect(to(h, s).map((n) => n["qitemId"])).toEqual([r]);
-    expect(h.get(r)).toMatchObject({ destinationSession: MODEL, state: "pending" });
-  });
-
-  it("FREE: a free seat that reroutes the row to another seat (not the model) is routing: it keeps receiving", async () => {
-    h.register({ ...BASE, max: 1, dispatch_to_parked: { max_open_rows: 2 } });
-    const s = h.poolSeat("dev.impl-s1", "idle");
-    const r = await h.row(MODEL);
-    await h.tickAt(61);
-    h.queue.routeToFallback(r, LEAD, "ao lead", { expectDestination: s.session });
-    const fresh = await h.row(MODEL);
-    await h.tickAt(122);
-    expect(to(h, s).map((n) => n["qitemId"])).toEqual([r, fresh]);
-  });
-
-  it("FREE: a free seat that took the row (in progress) and handed it back is no refusal: it keeps receiving", async () => {
-    h.register({ ...BASE, max: 1, dispatch_to_parked: { max_open_rows: 2 } });
-    const s = h.poolSeat("dev.impl-s1", "idle");
-    const r = await h.row(MODEL);
-    await h.tickAt(61);
-    h.queue.claim({ qitemId: r, destinationSession: s.session });
-    const successor = (await h.queue.handoff({ qitemId: r, fromSession: s.session, toSession: MODEL, nudge: false })).created.qitemId;
-    await h.tickAt(122);
-    expect(to(h, s).map((n) => n["qitemId"])).toEqual([r, successor]);
-    expect(h.state().slots[0]!.freeRefusal).toBeUndefined();
-  });
-
-  it("FREE: the executor's recheck moves nothing to a free seat that gave a free row back since the plan (free_refused)", async () => {
-    h.register({ ...BASE, max: 1, dispatch_to_parked: { max_open_rows: 2 } });
-    const s = h.poolSeat("dev.impl-s1", "idle");
-    await h.row(MODEL);
-    await h.tickAt(61);
-    await giveBack(h, s);
-    h.nowMs = T0 + 70_000;
-    const other = await h.row(MODEL);
-    await h.submit([{ kind: "dispatch", qitemId: other, from: MODEL, slotId: s.slotId }]);
-    expect(h.notes(SKIPPED)).toEqual([{ qitemId: other, from: MODEL, to: s.session, code: "free_refused" }]);
-    expect(h.get(other)).toMatchObject({ destinationSession: MODEL, state: "pending" });
-  });
-
-  it("FREE: refused_cooldown_s: 0 turns the free memory off too", async () => {
-    h.register({ ...BASE, max: 1, dispatch_to_parked: { max_open_rows: 2, refused_cooldown_s: 0 } });
     const s = h.poolSeat("dev.impl-s1", "idle");
     await h.row(MODEL);
     for (let at = 61; at <= 61 * 3; at += 61) {
@@ -684,6 +620,8 @@ describe("seat pool: every move of a row counts, a free seat's refusal and the d
       if (h.queue.listOpenObligations(s.session, 10).some((r) => r.state === "pending")) await giveBack(h, s);
     }
     expect(to(h, s)).toHaveLength(3);
+    expect(to(h, s).every((n) => n["mode"] === "free")).toBe(true);
+    expect(h.state().slots[0]!.parkedRefusal).toBeUndefined();
   });
 
   it("SH-B: while a row a parked seat refused waits, the demand command is given that seat as receiving nothing; before, as parked", async () => {
@@ -704,48 +642,6 @@ describe("seat pool: every move of a row counts, a free seat's refusal and the d
     h.queue.update({ qitemId: successor, actorSession: MODEL, state: "done", closureReason: "no-follow-on", transitionNote: "done" } as never);
     await h.tickAt(660);
     expect(h.demandSlots.at(-1)!.find((x) => x.session === p.session)?.receives).toBe("parked");
-  });
-
-  it("FREE: the pool grows for the row a free seat refused (no demand_cmd): the seat counts as occupied, and an add is asked", async () => {
-    h.register({ ...BASE, max: 2, dispatch_to_parked: { max_open_rows: 2 } });
-    const s = h.poolSeat("dev.impl-s1", "idle");
-    await h.row(MODEL);
-    await h.tickAt(61);
-    await giveBack(h, s);
-    h.calls = [];
-    await h.tickAt(122);
-    expect(to(h, s)).toHaveLength(1);
-    expect(h.calls.filter((c) => c.startsWith("add "))).toHaveLength(1);
-  });
-
-  it("FREE: a free seat within its refusal is never drained as free, even past idle_grace_s with nothing waiting", async () => {
-    h.register({ ...BASE, idle_grace_s: 0, max: 1, dispatch_to_parked: { max_open_rows: 2 } });
-    const s = h.poolSeat("dev.impl-s1", "idle");
-    await h.row(MODEL);
-    await h.tickAt(61);
-    const successor = await giveBack(h, s);
-    h.queue.update({ qitemId: successor, actorSession: MODEL, state: "done", closureReason: "no-follow-on", transitionNote: "done" } as never);
-    h.calls = [];
-    await h.tickAt(122);
-    expect(h.calls.filter((c) => c.startsWith("stop "))).toEqual([]);
-    expect(h.notes("seat_pool_planned").flatMap((n) => (n["intents"] as Array<{ kind: string }> | undefined) ?? []).filter((i) => i.kind === "drain")).toEqual([]);
-    // Past the cooldown it is idle again, and drained as any free seat.
-    await h.tickAt(61 + 1801);
-    expect(h.notes("seat_pool_planned").flatMap((n) => (n["intents"] as Array<{ kind: string }> | undefined) ?? []).some((i) => i.kind === "drain")).toBe(true);
-  });
-
-  it("SH-B: a free seat out of the free receivers is given to the demand command as receiving nothing", async () => {
-    h.register({ ...BASE, max: 1, demand_cmd: { argv: ["demand"] }, dispatch_to_parked: { max_open_rows: 2 } });
-    const s = h.poolSeat("dev.impl-s1", "idle");
-    await h.row(MODEL);
-    await h.tickAt(61);
-    await giveBack(h, s);
-    await h.tickAt(122);
-    // Still free (the row it gave back was not moved to it again), yet not counted as a receiver.
-    expect(to(h, s)).toHaveLength(1);
-    expect(h.queue.listOpenObligations(s.session, 10)).toHaveLength(0);
-    expect(h.demandSlots.at(-1)!.find((x) => x.session === s.session)?.receives).toBeNull();
-    expect((h.demandSlots.at(-1)!.find((x) => x.session === s.session) as { held?: string } | undefined)?.held).toBe("refused");
   });
 
   it("SH-C (D3): a reroute of the seat's row to the model by the pool's own drain or reap is no refusal", async () => {
