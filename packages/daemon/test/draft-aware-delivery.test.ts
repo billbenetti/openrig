@@ -1257,4 +1257,15 @@ describe("T-006631: a draft typed between the guard's read and the paste", () =>
     const sent = await f.send("no-client", "Wake timer fired again.", { openrigNotice: true, verify: false });
     expect(sent).toMatchObject({ ok: true });
   });
+
+  it("B2: the hold for an unreadable key time carries its own input-read diagnostic, so a caller never keeps an older one", async () => {
+    const f = fixture(undefined, { runtime: "claude-code" });
+    await f.enable();
+    activity(f, async () => { throw new Error("PRIVATE_INPUT command timed out"); });
+    const held = await f.send("activity-unreadable-diagnostic", "Wake timer fired.", { openrigNotice: true, verify: false });
+    expect(held).toMatchObject({ sent: false, reason: "draft_input_unknown",
+      inputReadFailure: { check: "draft-aware", reason: "client_activity_unavailable", timedOut: null } });
+    expect(JSON.stringify(held.inputReadFailure)).not.toMatch(/PRIVATE_INPUT/);
+    expect(pastes(f)).toEqual([]);
+  });
 });

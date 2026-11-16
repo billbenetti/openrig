@@ -867,6 +867,8 @@ interface Context {
 }
 
 const STOPPED_CODES = new Set(["session_not_live", "no_session"]);
+/** The forced pass reads a seat's open rows page by page (openRows is bounded): at most this many reads per seat. */
+const SEAT_POOL_DRAIN_MOVE_PASSES = 20;
 /** A reroute refused because the row was claimed, closed or moved since the plan: nothing failed. */
 const ROW_MOVED_ON = new Set(["fallback_state_mismatch", "fallback_destination_mismatch", "qitem_not_found"]);
 /** An unclaim refused because the row was closed or released since it was read: the move that follows decides. */
@@ -1371,17 +1373,32 @@ export class SeatPoolExecutor {
       const reason = `${SEAT_POOL_DRAIN_REASON}${sessionName}`;
       const to = inLease.model.sessionName;
       const rows: Array<{ qitemId: string; to: string }> = [];
-      for (const row of this.deps.effects.openRows(sessionName)) {
-        if (row.state === "in-progress") {
-          const unclaimed = this.deps.effects.unclaimRow({ qitemId: row.qitemId, seat: sessionName, reason });
-          if (!unclaimed.ok && !UNCLAIM_MOVED_ON.has(unclaimed.code)) return leftStopped("move_failed", rows);
+      // openRows reads a bounded page: the seat is read again until no row it hasn't seen is left, so a seat with more
+      // rows than one page still has them all moved before the removal, which refuses a seat with an open row. The
+      // passes are capped against a read that keeps returning rows: a seat that still has rows after the cap is left
+      // stopped (move_failed), not handed to a removal that would refuse it.
+      const seen = new Set<string>();
+      let drained = false;
+      for (let pass = 0; pass < SEAT_POOL_DRAIN_MOVE_PASSES; pass++) {
+        const page = this.deps.effects.openRows(sessionName).filter((row) => !seen.has(row.qitemId));
+        if (page.length === 0) {
+          drained = true;
+          break;
         }
-        // A blocked row keeps what wakes it (moveRow).
-        const move = this.deps.effects.moveRow({ qitemId: row.qitemId, from: sessionName, to, reason, state: row.state === "blocked" ? "blocked" : "pending" });
-        if (move.ok) rows.push({ qitemId: row.qitemId, to });
-        // A row that was claimed, closed or moved since it was read went on without the pool: nothing failed.
-        else if (!ROW_MOVED_ON.has(move.code)) return leftStopped("move_failed", rows);
+        for (const row of page) {
+          seen.add(row.qitemId);
+          if (row.state === "in-progress") {
+            const unclaimed = this.deps.effects.unclaimRow({ qitemId: row.qitemId, seat: sessionName, reason });
+            if (!unclaimed.ok && !UNCLAIM_MOVED_ON.has(unclaimed.code)) return leftStopped("move_failed", rows);
+          }
+          // A blocked row keeps what wakes it (moveRow).
+          const move = this.deps.effects.moveRow({ qitemId: row.qitemId, from: sessionName, to, reason, state: row.state === "blocked" ? "blocked" : "pending" });
+          if (move.ok) rows.push({ qitemId: row.qitemId, to });
+          // A row that was claimed, closed or moved since it was read went on without the pool: nothing failed.
+          else if (!ROW_MOVED_ON.has(move.code)) return leftStopped("move_failed", rows);
+        }
       }
+      if (!drained) return leftStopped("move_failed", rows);
       this.setIntent(slot.slotId, "remove");
       // T-007545 (SD2): when it stopped running, before the node (and its sessions) go: a retired seat counts until then
       this.deps.slots.markStopped(slot.slotId, this.at());

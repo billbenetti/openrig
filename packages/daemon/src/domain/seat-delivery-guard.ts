@@ -529,7 +529,9 @@ export class SeatDeliveryGuard {
     const typing = async () => {
       if (!this.inputActivity) return;
       const last = await this.inputActivity(target).then(at => ({ at }), () => null);
-      if (!last) throw new DeliveryGuardError("draft_input_unknown", "OpenRig couldn't read when the seat's terminal last had a key. Automatic delivery is held; nothing was pasted.");
+      // Its own diagnostic: a caller keeps the last one it was given, which would otherwise be an older refusal's.
+      if (!last) throw new DeliveryGuardError("draft_input_unknown", "OpenRig couldn't read when the seat's terminal last had a key. Automatic delivery is held; nothing was pasted.",
+        inputReadDiagnostic("draft-aware", null, "client_activity_unavailable"));
       // tmux reports whole seconds: a key at N.999 s reads as N, so the quiet window counts from the end of that second.
       if (last.at !== null && Date.now() - (last.at + CLIENT_ACTIVITY_PRECISION_MS) < INPUT_QUIET_MS) {
         throw new DeliveryGuardError("draft_input_busy", "A person is typing at this seat. Automatic delivery is held; nothing was pasted.");
