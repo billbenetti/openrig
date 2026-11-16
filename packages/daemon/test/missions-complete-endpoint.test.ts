@@ -10,7 +10,7 @@
 //  - 404 when mission doesn't exist
 //  - Idempotent: calling complete twice still succeeds
 
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import YAML from "yaml";
 import { Hono } from "hono";
 import * as fs from "node:fs";
@@ -18,6 +18,11 @@ import * as os from "node:os";
 import * as path from "node:path";
 import type Database from "better-sqlite3";
 import { createDb } from "../src/db/connection.js";
+import { migrate } from "../src/db/migrate.js";
+import { coreSchema } from "../src/db/migrations/001_core_schema.js";
+import { eventsSchema } from "../src/db/migrations/003_events.js";
+import { streamItemsSchema } from "../src/db/migrations/023_stream_items.js";
+import { queueItemsSchema } from "../src/db/migrations/024_queue_items.js";
 import { SliceIndexer } from "../src/domain/slices/slice-indexer.js";
 import { missionsRoutes } from "../src/routes/missions.js";
 import { slicesRoutes } from "../src/routes/slices.js";
@@ -337,5 +342,91 @@ describe("VM-005 B1 — read-after-write coherence at the daemon's own API", () 
     expect(indexer.get("target")).toBe(recordBefore);
     // ...while the sidecar rebuilt from disk with the new word.
     expect(indexer.missionAuthoredStatuses()["relx"]).toEqual({ authoredStatus: "complete" });
+  });
+});
+
+describe("POST complete with a cold slice index", () => {
+  // A daemon's listing cache expires after 60 s, so a complete usually meets a
+  // cold index. Rebuilding the whole listing reads every queue row's body to
+  // compute per-slice membership; with tens of thousands of rows that held the
+  // event loop for ~30 s per complete. The write only needs the mission folder.
+  function seedWorkspace(root: string, missions: number): number {
+    let files = 0;
+    const write = (rel: string, content: string) => {
+      const full = path.join(root, rel);
+      fs.mkdirSync(path.dirname(full), { recursive: true });
+      fs.writeFileSync(full, content);
+      files++;
+    };
+    for (let m = 0; m < missions; m++) {
+      const id = `m-${String(m).padStart(3, "0")}`;
+      write(`${id}/mission.yaml`, `kind: mission\nmetadata:\n  name: ${id}\n  status: active\n`);
+      write(`${id}/SPEC.md`, `---\nstatus: active\n---\n# ${id}\n`);
+      write(`${id}/PROGRESS.md`, `# ${id} progress\n`);
+      for (let s = 0; s < 5; s++) {
+        const slice = `${id}/slices/${id}-s${s}`;
+        write(`${slice}/README.md`, `---\nstatus: active\n---\n# ${id}-s${s}\n`);
+        for (const extra of ["PROGRESS.md", "NOTES.md", "proof.md", "plan.md", "log.md"]) {
+          write(`${slice}/${extra}`, `# ${extra}\n`);
+        }
+      }
+    }
+    return files;
+  }
+
+  it("resolves the mission without reading the queue, under 1 s on a ~5,500-file workspace", async () => {
+    const queueDb = createDb(":memory:");
+    try {
+      migrate(queueDb, [coreSchema, eventsSchema, streamItemsSchema, queueItemsSchema]);
+      expect(seedWorkspace(missionsRoot, 168)).toBeGreaterThanOrEqual(5500);
+      const insert = queueDb.prepare(
+        `INSERT INTO queue_items (qitem_id, ts_created, ts_updated, source_session, destination_session, state, priority, body)
+         VALUES (?, ?, ?, 'src@r', 'dst@r', 'pending', 'routine', ?)`,
+      );
+      queueDb.transaction(() => {
+        for (let q = 0; q < 2000; q++) {
+          const ts = new Date(Date.UTC(2026, 10, 1, 0, 0, q)).toISOString();
+          insert.run(`q-${q}`, ts, ts, `work on m-${String(q % 168).padStart(3, "0")}-s${q % 5} `.repeat(20));
+        }
+      })();
+      const cold = new SliceIndexer({ slicesRoot: missionsRoot, dogfoodEvidenceRoot: null, db: queueDb });
+      cold.list();
+      cold.invalidate();
+      const prepare = vi.spyOn(queueDb, "prepare");
+
+      const started = performance.now();
+      const res = await buildApp(cold).request("/api/missions/m-080/complete", { method: "POST" });
+      const elapsedMs = performance.now() - started;
+
+      expect(res.status).toBe(200);
+      expect(await res.json()).toEqual({ missionId: "m-080", status: "complete" });
+      const queueReads = prepare.mock.calls.map(([sql]) => String(sql)).filter((sql) => /queue_items/.test(sql));
+      expect(queueReads).toEqual([]);
+      expect(elapsedMs).toBeLessThan(1000);
+      const manifest = YAML.parse(fs.readFileSync(path.join(missionsRoot, "m-080", "mission.yaml"), "utf8"));
+      expect(manifest.metadata.status).toBe("complete");
+
+      const missing = await buildApp(cold).request("/api/missions/m-999/complete", { method: "POST" });
+      expect(missing.status).toBe(404);
+      expect(prepare.mock.calls.map(([sql]) => String(sql)).filter((sql) => /queue_items/.test(sql))).toEqual([]);
+    } finally {
+      queueDb.close();
+    }
+  });
+
+  it("finds the mission the listing would show when a slice name repeats across missions", async () => {
+    writeSliceInMission(missionsRoot, "alpha", "shared");
+    writeSliceInMission(missionsRoot, "beta", "shared");
+    writeSliceInMission(missionsRoot, "beta", "own");
+    writeMissionReadme(missionsRoot, "alpha", "---\nstatus: active\n---\n# Alpha\n");
+    writeMissionReadme(missionsRoot, "beta", "---\nstatus: active\n---\n# Beta\n");
+    const listed = new Set(indexer.list().map((s) => s.missionId));
+    indexer.invalidate();
+    const app = buildApp(indexer);
+    for (const missionId of ["alpha", "beta"]) {
+      const res = await app.request(`/api/missions/${missionId}/complete`, { method: "POST" });
+      expect(res.status).toBe(listed.has(missionId) ? 200 : 404);
+    }
+    expect(fs.readFileSync(path.join(missionsRoot, "beta", "README.md"), "utf8")).toContain("status: complete");
   });
 });

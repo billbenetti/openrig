@@ -535,6 +535,18 @@ export class SliceIndexer {
     return entries;
   }
 
+  /** The folder of the mission the listing would show for `missionId`, or null when
+   *  no listed slice belongs to it. Same locations, order and name dedup as list(),
+   *  but only a directory walk: it never builds listing entries, so it never reads
+   *  the queue for slice membership. A write route that only needs the mission folder
+   *  (POST /missions/:id/complete) uses this, because a cold list() reads every queue
+   *  row's body and can hold the event loop for tens of seconds. */
+  missionPath(missionId: string): string | null {
+    if (!this.isReady()) return null;
+    const location = this.readSliceLocations().find((candidate) => candidate.missionId === missionId);
+    return location ? path.resolve(location.slicePath, "..", "..") : null;
+  }
+
   get(name: string): SliceRecord | null {
     if (!this.isReady()) return null;
     if (this.batchDepth === 0) this.reconcileComposition();
