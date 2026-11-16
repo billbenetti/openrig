@@ -18,6 +18,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import type Database from "better-sqlite3";
 import { parseScopeTags } from "./qitem-membership.js";
+import { AsciiLiteralMatcher } from "./ascii-literal-matcher.js";
 import { NODE_FILE_PRECEDENCE, resolveNodeFile, withSpecFirst } from "../scope/node-file.js";
 
 export type SliceStatus = "active" | "done" | "blocked" | "draft";
@@ -308,10 +309,10 @@ function likePatternBodyToRegExpSource(patternBody: string): string {
  *  wildcard, leaving an end-anchored `%prefix`).
  *  - Untruncated pattern (the overwhelmingly common no-NUL case):
  *    `%term%` is exactly a contains-match, so the term translates
- *    UNANCHORED — a wildcard-free term compiles to a pure literal, which
- *    keeps the combined prefilter alternation on the regex engine's fast
- *    literal path (an anchored `^.*x.*$` form measured a ~80x benchmark
+ *    UNANCHORED (an anchored `^.*x.*$` form measured a ~80x benchmark
  *    regression: every non-matching row pays a greedy scan per branch).
+ *    The membership scan answers plain ASCII literals with
+ *    AsciiLiteralMatcher instead; this translation serves the rest.
  *  - Truncated pattern: LIKE full-match semantics now matter (the lost
  *    trailing `%` end-anchors the remainder), so translate the truncated
  *    pattern verbatim and anchor `^...$`.
@@ -1470,11 +1471,26 @@ export class SliceIndexer {
     }
     if (!tableAbsent && fallbackTerms.size > 0) {
       const termList = Array.from(fallbackTerms);
-      const matchers = termList.map((term) => ({
-        term,
-        re: new RegExp(likeBoundPatternToRegExpSource(term), LIKE_REGEXP_FLAGS),
-      }));
-      const prefilter = new RegExp(matchers.map((m) => `(?:${m.re.source})`).join("|"), LIKE_REGEXP_FLAGS);
+      // Plain ASCII terms (no LIKE wildcard, no U+0000: every slice and
+      // mission name in practice) are answered by ONE linear pass over the
+      // raw haystack (AsciiLiteralMatcher). A single RegExp alternating every
+      // term cost ~45 s of synchronous loop time per cold listing on ~86k rows
+      // and ~800 terms. Only the remaining terms keep the translated-LIKE
+      // regex, with its own prefilter, so the matched set is unchanged.
+      const literalIdOfTerm = new Int32Array(termList.length).fill(-1);
+      const literalTerms: string[] = [];
+      termList.forEach((term, index) => {
+        if (!AsciiLiteralMatcher.eligible(term)) return;
+        literalIdOfTerm[index] = literalTerms.length;
+        literalTerms.push(term);
+      });
+      const literal = new AsciiLiteralMatcher(literalTerms);
+      const literalMarks = new Uint32Array(literalTerms.length);
+      const patternRegexes = termList.map((term, index) =>
+        literalIdOfTerm[index] === -1 ? new RegExp(likeBoundPatternToRegExpSource(term), LIKE_REGEXP_FLAGS) : null,
+      );
+      const patternSources = patternRegexes.filter((re): re is RegExp => re !== null).map((re) => `(?:${re.source})`);
+      const patternPrefilter = patternSources.length > 0 ? new RegExp(patternSources.join("|"), LIKE_REGEXP_FLAGS) : null;
       // Buckets accumulate LOCALLY and are published
       // to the index only after the scan completes. Previously they were
       // pre-seeded on the published map and a broad catch let a partially
@@ -1486,14 +1502,30 @@ export class SliceIndexer {
       const scan = tagsColumnPresent
         ? this.db.prepare(`SELECT qitem_id, body, tags FROM queue_items`)
         : this.db.prepare(`SELECT qitem_id, body FROM queue_items`);
+      let stamp = 0;
       for (const r of scan.iterate() as Iterable<{ qitem_id: string; body: string; tags?: string | null }>) {
         if (this.projectId && !belongsToProject(r.tags, this.projectId)) continue;
-        const hayBody = asciiFold(sqliteVisiblePrefix(r.body));
-        const hayTags = r.tags != null ? asciiFold(sqliteVisiblePrefix(r.tags)) : null;
-        if (!prefilter.test(hayBody) && !(hayTags !== null && prefilter.test(hayTags))) continue;
-        for (const m of matchers) {
-          if (m.re.test(hayBody) || (hayTags !== null && m.re.test(hayTags))) {
-            const bucket = localBuckets.get(m.term)!;
+        stamp++;
+        // Both haystacks are scanned (no short-circuit) so every literal hit is marked.
+        const bodyHit = literal.scan(r.body, literalMarks, stamp);
+        const tagsHit = r.tags != null ? literal.scan(r.tags, literalMarks, stamp) : false;
+        let hayBody: string | null = null;
+        let hayTags: string | null = null;
+        let patternHit = false;
+        if (patternPrefilter) {
+          hayBody = asciiFold(sqliteVisiblePrefix(r.body));
+          hayTags = r.tags != null ? asciiFold(sqliteVisiblePrefix(r.tags)) : null;
+          patternHit = patternPrefilter.test(hayBody) || (hayTags !== null && patternPrefilter.test(hayTags));
+        }
+        if (!bodyHit && !tagsHit && !patternHit) continue;
+        for (let index = 0; index < termList.length; index++) {
+          const literalId = literalIdOfTerm[index]!;
+          const re = patternRegexes[index];
+          const hit = literalId !== -1
+            ? literalMarks[literalId] === stamp
+            : patternHit && (re!.test(hayBody!) || (hayTags !== null && re!.test(hayTags)));
+          if (hit) {
+            const bucket = localBuckets.get(termList[index]!)!;
             if (bucket.length < 500) bucket.push(r.qitem_id);
           }
         }
