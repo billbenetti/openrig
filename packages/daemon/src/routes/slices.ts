@@ -18,7 +18,7 @@ import { inferCatalogProject, ProjectReadError } from "../domain/workspace/proje
 // avoid `/proof-asset` being parsed as a slice-name.
 
 import { Hono, type Context } from "hono";
-import { readSliceReadiness, readProjectReadinessAsync } from "../domain/proof/judgments.js";
+import { createProofPolicyRead, readSliceReadiness, readProjectReadinessAsync } from "../domain/proof/judgments.js";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { SliceIndexer, SliceListEntry, SliceStatus } from "../domain/slices/slice-indexer.js";
@@ -102,11 +102,14 @@ export function slicesRoutes(): Hono {
         complete: projectLookup.complete,
       });
       const authored = deps.indexer.missionAuthoredStatuses();
+      // One policy reader per request: sibling slices share their mission and
+      // project manifests, so each is read and parsed once, not once per slice.
+      const readPolicy = createProofPolicyRead();
       return {
         slices: filtered.map((s) => ({
           ...s,
           queueCounts: queueCountsByPath.get(s.slicePath) ?? null,
-          readiness: readSliceReadiness(s.slicePath),
+          readiness: readSliceReadiness(s.slicePath, undefined, readPolicy),
         })),
         totalCount: filtered.length,
         filter,
