@@ -1614,6 +1614,54 @@ describe("seat-pool executor", () => {
       expect(slots.get(slot.slotId)?.retiredAt).not.toBeNull();
     });
 
+    // N7 of the REVISAO-v0713 (T-008302): the seat's open rows are read 500 at a time, and the node's removal refuses a
+    // seat that still has an open row. A seat with more than 500 has them all moved, read again until none is left.
+    it("N7: a seat with 501 open rows has every row moved to the model, and its removal goes through", async () => {
+      const ids: string[] = [];
+      for (let i = 0; i < 501; i++) ids.push((await repo.create({ sourceSession: "lead@r", destinationSession: SEAT, body: `work ${i}`, nudge: false })).qitemId);
+      const slot = liveSeat();
+      const effects = withQueue();
+      await toDeadline(executorWith({
+        ...effects,
+        // As the daemon's removal does: a node whose seat still has open rows is not removed (active_qitems).
+        removeSlot: async (input) => {
+          const open = repo.listOpenObligationClaims(SEAT, 1_000).length;
+          if (open > 0) return { ok: false, code: "active_qitems", error: `${open} open rows` };
+          return effects.removeSlot(input);
+        },
+      }));
+      expect(repo.listOpenObligationClaims(SEAT, 1_000)).toEqual([]);
+      expect(repo.listOpenObligationClaims(MODEL.sessionName, 1_000)).toHaveLength(501);
+      expect(slots.get(slot.slotId)?.retiredAt).not.toBeNull();
+      expect(expired()).toEqual([expect.objectContaining({ failed: false, notes: expect.objectContaining({ left: [] }) })]);
+      const moved = (expired()[0]!.notes as { moved: Array<{ qitemId: string }> }).moved.map((m) => m.qitemId);
+      expect(new Set(moved)).toEqual(new Set(ids));
+    });
+
+    // N7 (its review): the reads are capped. A read that keeps returning rows it hasn't seen is not followed for good,
+    // and a seat that still has rows after the cap is left stopped (move_failed), not handed to the removal.
+    it("N7: a read that keeps returning new rows is read at most 20 times, and the seat is left stopped without its removal", async () => {
+      jobSpec = spec({ drain: true });
+      const slot = liveSeat();
+      let reads = 0;
+      const base = world.effects();
+      await toDeadline(executorWith({
+        ...base,
+        openRows: (sessionName) => {
+          if (sessionName !== SEAT) return base.openRows(sessionName);
+          reads++;
+          // Without the cap the pass would never end: fail the test instead of hanging it.
+          if (reads > 100) throw new Error("openRows read past any cap");
+          return [{ qitemId: `qitem-${reads}`, state: "pending" }];
+        },
+        moveRow: () => ({ ok: true }),
+      }));
+      expect(reads).toBe(20);
+      expect(world.calls.filter((c) => c.startsWith("remove"))).toEqual([]);
+      expect(slots.get(slot.slotId)).toMatchObject({ phase: "draining", intent: "stop", retiredAt: null });
+      expect(expired()).toEqual([expect.objectContaining({ notes: expect.objectContaining({ left: [expect.objectContaining({ slot: "dev.impl-s1", why: "move_failed", stopped: true })] }) })]);
+    });
+
     it("T-007545: the forced pass's removal marks when the seat stopped before its node goes", async () => {
       const slot = liveSeat();
       await toDeadline(executorWith(world.effects()));
