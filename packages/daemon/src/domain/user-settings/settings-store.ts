@@ -205,6 +205,9 @@ export const SETTINGS_VALID_KEYS = [
   "terminal.history_limit",
   "terminal.fixed_geometry",
   "terminal.inherit_tmux_environment",
+  // Each seat in a systemd user scope of its own with TasksMax (Linux, daemon as a user service); default off. Twin of the CLI key.
+  "terminal.seat_scope",
+  "terminal.seat_scope_tasks_max",
   // Slice 15 (OPR.0.7.0.15) — compact command-output defaults; CLI-read, twin of the CLI key.
   "output.compact",
   "output.whoami_peers",
@@ -359,6 +362,8 @@ const ENV_MAP: Record<SettingsValidKey, { primary: string; legacy?: string }> = 
   "terminal.history_limit": { primary: "OPENRIG_TERMINAL_HISTORY_LIMIT" },
   "terminal.fixed_geometry": { primary: "OPENRIG_TERMINAL_FIXED_GEOMETRY" },
   "terminal.inherit_tmux_environment": { primary: "OPENRIG_TERMINAL_INHERIT_TMUX_ENVIRONMENT" },
+  "terminal.seat_scope": { primary: "OPENRIG_TERMINAL_SEAT_SCOPE" },
+  "terminal.seat_scope_tasks_max": { primary: "OPENRIG_TERMINAL_SEAT_SCOPE_TASKS_MAX" },
   "output.compact": { primary: "OPENRIG_OUTPUT_COMPACT" },
   "output.whoami_peers": { primary: "OPENRIG_OUTPUT_WHOAMI_PEERS" },
   "output.rebuild_recaps": { primary: "OPENRIG_OUTPUT_REBUILD_RECAPS" },
@@ -474,6 +479,8 @@ const KEY_TO_PATH: Record<SettingsValidKey, string[]> = {
   "terminal.history_limit": ["terminal", "historyLimit"],
   "terminal.fixed_geometry": ["terminal", "fixedGeometry"],
   "terminal.inherit_tmux_environment": ["terminal", "inheritTmuxEnvironment"],
+  "terminal.seat_scope": ["terminal", "seatScope"],
+  "terminal.seat_scope_tasks_max": ["terminal", "seatScopeTasksMax"],
   "output.compact": ["output", "compact"],
   "output.whoami_peers": ["output", "whoamiPeers"],
   "output.rebuild_recaps": ["output", "rebuildRecaps"],
@@ -799,6 +806,8 @@ function getDefaultValue(key: SettingsValidKey, workspaceRoot: string): string |
     case "terminal.history_limit": return 10000;
     case "terminal.fixed_geometry": return false;
     case "terminal.inherit_tmux_environment": return false;
+    case "terminal.seat_scope": return false;
+    case "terminal.seat_scope_tasks_max": return 2048;
     case "output.compact": return false;
     case "output.whoami_peers": return 8;
     case "output.rebuild_recaps": return 3;
@@ -930,6 +939,12 @@ const KEY_CONSTRAINTS: Partial<Record<SettingsValidKey, KeyConstraint>> = {
   "terminal.history_limit": (raw, coerced) => {
     if (!/^\d+$/.test(raw.trim()) || typeof coerced !== "number" || !Number.isSafeInteger(coerced) || coerced < 2000 || coerced > 1_000_000) {
       throw new Error(`Invalid value for terminal.history_limit: must be an integer in [2000, 1000000], got "${raw}"`);
+    }
+  },
+  // terminal.seat_scope's TasksMax: a seat's own process ceiling. Below 64 a seat would not start its own runtime.
+  "terminal.seat_scope_tasks_max": (raw, coerced) => {
+    if (!/^\d+$/.test(raw.trim()) || typeof coerced !== "number" || !Number.isSafeInteger(coerced) || coerced < 64 || coerced > 4_194_304) {
+      throw new Error(`Invalid value for terminal.seat_scope_tasks_max: must be an integer in [64, 4194304], got "${raw}"`);
     }
   },
   // Constraint gap fix — lockstep with cli/src/config-store.ts KEY_CONSTRAINTS.

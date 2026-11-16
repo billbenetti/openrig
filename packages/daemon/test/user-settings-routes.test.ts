@@ -145,7 +145,8 @@ describe("config routes (User Settings v0)", () => {
     // + 1 ui.topology_remote_seats (read a remote rig's seats in the TUI topology; default off).
     // + 1 output.rebuild_recaps (optional rebuild briefing preview; default 3).
     // + 4 policies.seat_pool.* (the seat pools' launch budget; default 1 in flight, 1 per tick, 1024 MB free, 100% load per CPU).
-    expect(Object.keys(body.settings).length).toBe(110);
+    // + 2 terminal.seat_scope, terminal.seat_scope_tasks_max (each seat in its own systemd user scope; default off, 2048).
+    expect(Object.keys(body.settings).length).toBe(112);
     expect(body.settings["output.rebuild_recaps"]).toMatchObject({ value: 3, source: "default", defaultValue: 3 });
     expect(body.settings["launch.codex_login_shell"]).toMatchObject({ value: false, source: "default", defaultValue: false });
     expect(body.settings["ui.topology_remote_seats"]).toMatchObject({ value: false, source: "default", defaultValue: false });

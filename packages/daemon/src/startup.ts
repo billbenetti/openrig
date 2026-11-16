@@ -823,6 +823,9 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
       .map(key => [key, process.env[key]])), ...launchSessionEnv },
     // #2030: on Linux, the daemon's runtime directory, with a session bus address that can't connect.
     runtimeDir: seatRuntimeDir(process.env),
+    // terminal.seat_scope (default off, read at each launch): the seat's own systemd user scope, with TasksMax (#3253).
+    ...(tmuxOptionSettings.resolveOne("terminal.seat_scope").value === true
+      ? { seatScope: { tasksMax: Number(tmuxOptionSettings.resolveOne("terminal.seat_scope_tasks_max").value) } } : {}),
   });
   const tmuxOptionDefaults = new TmuxOptionDefaultsApplier({
     tmuxAdapter,
