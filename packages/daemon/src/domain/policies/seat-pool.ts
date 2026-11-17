@@ -34,6 +34,10 @@ export interface SeatPoolSpec {
    *  model's rows carrying dispatch_tag) to it (T-007029). Absent (no property) when not given: 1800 s
    *  (SEAT_POOL_NO_SEAT_GRACE_DEFAULT_SECONDS). */
   noSeatGraceSeconds?: number;
+  /** `priority_aging_s` (T-010078): a low row pending at least this long is handed out as routine, so it is not left
+   *  waiting forever behind newer routine rows; the aging never goes past routine (it never makes an urgent row).
+   *  Absent (no property) when not given: SEAT_POOL_PRIORITY_AGING_DEFAULT_SECONDS (2 h); 0 turns it off. */
+  priorityAgingSeconds?: number;
   /** How long a drain waits for the pool's seats to become free before the executor takes the rest out (the forced
    *  pass): their open rows go back to the model, their sessions stop and their nodes are removed. 0: no deadline. */
   drainDeadlineSeconds: number;
@@ -101,6 +105,7 @@ export interface SeatPoolDispatchToParked {
 const SPEC_KEYS = new Set([
   "min", "max", "cooldown_s", "idle_grace_s", "dispatch_after_s", "dispatch_tag", "drain", "drain_deadline_s", "no_seat_grace_s", "adopt", "cwd_template",
   "demand_cmd", "release_cmd", "prepare_cmd", "reap_cmd", "remove_cmd", "escalation_owner", "dispatch_to_parked",
+  "priority_aging_s",
 ]);
 const DEFAULT_COOLDOWN_SECONDS = 60;
 const DEFAULT_IDLE_GRACE_SECONDS = 300;
@@ -144,6 +149,15 @@ function command(value: unknown, field: string): SeatPoolCommand | null | SpecPr
 /** `no_seat_grace_s`: its bounds, and the value when it is not given (T-007029). */
 const NO_SEAT_GRACE = { min: 60, max: 86_400 } as const;
 export const SEAT_POOL_NO_SEAT_GRACE_DEFAULT_SECONDS = 1800;
+
+/** `priority_aging_s`: its bounds (0 turns the aging off; at most 7 days) and the value when it is not given (T-010078). */
+const PRIORITY_AGING = { min: 0, max: 604_800 } as const;
+export const SEAT_POOL_PRIORITY_AGING_DEFAULT_SECONDS = 7200;
+
+/** How long a low row waits before it is handed out as routine (T-010078); 0 when the aging is off. */
+export function seatPoolPriorityAging(spec: Pick<SeatPoolSpec, "priorityAgingSeconds">): number {
+  return spec.priorityAgingSeconds ?? SEAT_POOL_PRIORITY_AGING_DEFAULT_SECONDS;
+}
 
 const DISPATCH_TO_PARKED = "dispatch_to_parked";
 /** The fields of `dispatch_to_parked`: the bounds of each whole number, and its default. */
@@ -294,6 +308,11 @@ export function parseSeatPoolSpec(context: Record<string, unknown>): { spec: Sea
     && (!Number.isInteger(noSeatGrace) || (noSeatGrace as number) < NO_SEAT_GRACE.min || (noSeatGrace as number) > NO_SEAT_GRACE.max)) {
     return { problem: { field: "no_seat_grace_s", message: `seat-pool: no_seat_grace_s must be a whole number from ${NO_SEAT_GRACE.min} to ${NO_SEAT_GRACE.max}` } };
   }
+  const priorityAging = context["priority_aging_s"];
+  if (priorityAging !== undefined
+    && (!Number.isInteger(priorityAging) || (priorityAging as number) < PRIORITY_AGING.min || (priorityAging as number) > PRIORITY_AGING.max)) {
+    return { problem: { field: "priority_aging_s", message: `seat-pool: priority_aging_s must be a whole number of seconds from ${PRIORITY_AGING.min} (off) to ${PRIORITY_AGING.max}` } };
+  }
   const adopt = context["adopt"] ?? [];
   if (!Array.isArray(adopt) || adopt.some((id) => typeof id !== "string" || !id.trim())) {
     return { problem: { field: "adopt", message: "seat-pool: adopt must be a list of logical ids" } };
@@ -329,6 +348,7 @@ export function parseSeatPoolSpec(context: Record<string, unknown>): { spec: Sea
       reapCmd: commands["reap_cmd"]!, removeCmd: commands["remove_cmd"]!, escalationOwner: escalationOwner as string | null,
       ...(parkedRule ? { dispatchToParked: parkedRule } : {}),
       ...(noSeatGrace !== undefined ? { noSeatGraceSeconds: noSeatGrace as number } : {}),
+      ...(priorityAging !== undefined ? { priorityAgingSeconds: priorityAging as number } : {}),
     },
   };
 }
