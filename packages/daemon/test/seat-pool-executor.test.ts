@@ -2403,6 +2403,55 @@ describe("readSeatPoolState", () => {
     expect(pending.find((row) => row.qitemId === "q-low-rerouted")?.waitingSince).toBe(ago(1));
   });
 
+  it("ages a low row by its transitions in transition_id order, not by ts, when the clock moves backwards (T-011880)", () => {
+    db = createFullTestDb();
+    const rigRepo = new RigRepository(db);
+    const rig = rigRepo.createRig("r");
+    const pod = new PodRepository(db).createPod(rig.id, "dev", "Dev");
+    const model = rigRepo.addNode(rig.id, "dev.impl", { runtime: "claude-code", cwd: "/tmp", podId: pod.id });
+    db.prepare("INSERT INTO sessions (id, node_id, session_name, status) VALUES ('s-model', ?, 'dev-impl@r', 'running')").run(model.id);
+    const slots = new SeatPoolSlots(db);
+    const ago = (minutes: number) => new Date(T0 - minutes * 60_000).toISOString();
+    const insert = (id: string, priority: string, minutesAgo: number) => db.prepare(
+      `INSERT INTO queue_items (qitem_id, ts_created, ts_updated, source_session, destination_session, state, priority, body)
+       VALUES (?, ?, ?, 'lead@r', 'dev-impl@r', 'pending', ?, 'work')`,
+    ).run(id, ago(minutesAgo), ago(minutesAgo), priority);
+    // Appended in this order, so transition_id grows with each call whatever the ts says.
+    const transition = (id: string, minutesAgo: number, state: string, actor: string) => db.prepare(
+      "INSERT INTO queue_transitions (qitem_id, ts, state, actor_session) VALUES (?, ?, ?, ?)",
+    ).run(id, ago(minutesAgo), state, actor);
+    // T0 is 12:00. Pending at 09:00, blocked at 11:31, then made pending again from outside the pool when the clock had
+    // moved back a minute: the reopening's ts (11:30) is older than the block's. It waits from 11:30, 30 min: still low.
+    insert("q-low-clock-back", "low", 180);
+    transition("q-low-clock-back", 180, "pending", "lead@r");
+    transition("q-low-clock-back", 29, "blocked", "dev-impl@r");
+    transition("q-low-clock-back", 30, "pending", "lead@r");
+    // Control: the same row with a monotonic clock (blocked at 11:29). It waits from 11:30 too, so the two rows differ
+    // only in the order of the ts.
+    insert("q-low-monotonic", "low", 180);
+    transition("q-low-monotonic", 180, "pending", "lead@r");
+    transition("q-low-monotonic", 31, "blocked", "dev-impl@r");
+    transition("q-low-monotonic", 30, "pending", "lead@r");
+    // Control: a low row pending since 09:00 does age (the default priority_aging_s of 2 h is on).
+    insert("q-low-aged", "low", 180);
+    transition("q-low-aged", 180, "pending", "lead@r");
+    insert("q-routine-new", "routine", 10);
+    const read = () => readSeatPoolState({
+      db, slots,
+      openRows: () => [],
+      sessionAddresses: (session) => [session],
+      heldMessages: () => 0,
+      seatStopped: () => false,
+      seatState: () => ({ activity: "idle-at-prompt", needsInput: { count: 0, reason: null }, backgroundWork: null, changedAt: "2026-11-09T10:00:00.000Z" }) as never,
+      restoring: () => false,
+      demand: () => null,
+      now: () => T0,
+    }, { jobId: JOB, targetSession: "dev-impl@r", spec: spec() }).pending;
+
+    // The aged low row goes before the newer routine one; the reopened low rows, clock back or not, wait as low after it.
+    expect(read().map((row) => row.qitemId)).toEqual(["q-low-aged", "q-routine-new", "q-low-clock-back", "q-low-monotonic"]);
+  });
+
   it("refuses a priority_aging_s that is not a whole number of seconds from 0 to 7 days (T-010078)", () => {
     for (const bad of [-1, 1.5, "7200", 604_801, null]) {
       const parsed = parseSeatPoolSpec({ max: 3, cwd_template: "/work/{rig}/{slot}", priority_aging_s: bad });
