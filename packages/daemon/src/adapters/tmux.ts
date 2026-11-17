@@ -521,16 +521,21 @@ export class TmuxAdapter {
   private seatScopeBusFailedAt?: { at: number; reason: string };
 
   /** T-009602 (SH-1): a restart in place keeps its own command and brings no seat env, so it is not reinterpreted and runs
-   *  outside a seat scope; with terminal.seat_scope on, the operator is told (the policy is read only for that). */
+   *  outside a seat scope; with terminal.seat_scope on, the operator is told (the policy is read only for that).
+   *  T-010908 (SH-1 of the PR #23 second review): also with terminal.inherit_tmux_environment on, since the seat may have
+   *  been launched in a scope before that policy was turned on; the text then says the next launch stays out of a seat
+   *  scope too. Quiet only where the seat could never have been in a seat scope (not Linux, no user manager). */
   private seatScopeOnRestartInPlace(warnings: string[]): void {
-    let on = false;
+    let policy: ReturnType<NonNullable<TmuxAdapter["launchEnvironment"]>> | undefined;
     try {
-      const policy = this.launchEnvironment?.();
-      on = Boolean(policy?.seatScope) && !policy?.inheritTmuxEnvironment;
+      policy = this.launchEnvironment?.();
     } catch { return; }
-    // Where no launch would put the seat in a scope (not Linux, no user manager, the inherit_tmux_environment policy),
-    // there is nothing to say.
-    if (on && this.userScopeUnavailable() === null) this.seatScopeWarning(warnings, "Seat scope not applied on a restart in place: the restarted command runs in the shared terminal server scope, without this seat's own TasksMax, until the seat's next launch with terminal.seat_scope still on puts it back in a seat scope (rig seat launch <seat>@<rig> --fresh --stop --reason \"…\" starts a blank conversation; or the next relaunch). With the key off by then, that launch leaves it out of a seat scope too.");
+    if (!policy?.seatScope || this.userScopeUnavailable() !== null) return;
+    if (policy.inheritTmuxEnvironment) {
+      this.seatScopeWarning(warnings, "Seat scope not applied on a restart in place: the restarted command runs in the shared terminal server scope, without this seat's own TasksMax. With terminal.inherit_tmux_environment on, the seat's next launch stays out of a seat scope too; turn that policy off to have launches put seats back in their scopes.");
+      return;
+    }
+    this.seatScopeWarning(warnings, "Seat scope not applied on a restart in place: the restarted command runs in the shared terminal server scope, without this seat's own TasksMax, until the seat's next launch with terminal.seat_scope still on puts it back in a seat scope (rig seat launch <seat>@<rig> --fresh --stop --reason \"…\" starts a blank conversation; or the next relaunch). With the key off by then, that launch leaves it out of a seat scope too.");
   }
 
   private seatScopeWarning(warnings: string[], warning: string): void {
