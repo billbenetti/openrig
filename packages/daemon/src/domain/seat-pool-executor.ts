@@ -24,6 +24,7 @@ import {
   seatPoolHeldByProcess,
   seatPoolReceives,
   seatPoolRefusedCooldown,
+  seatPoolPriorityAging,
   seatPoolDrainEpisode,
   seatPoolReapable,
   seatPoolRoom,
@@ -487,8 +488,8 @@ function readRefusedBy(ctx: SeatPoolRefusalContext, qitemId: string, chain: stri
 /** The dispatch rank of a queue priority, lower first (T-009034): critical, then urgent (and high), then routine (and
  *  normal, and any value the queue does not know), then low. The queue writes only routine, urgent and critical; the
  *  other names rank as they read (in any case: the CLI keeps a value it does not know as typed), so a row from an older or
- *  a foreign writer is never put first or dropped. The rank is strict, with no aging: with the pool at its max and
- *  urgent rows arriving as fast as it hands them out, a routine row waits; below the max it is demand and the pool grows. */
+ *  a foreign writer is never put first or dropped. With the pool at its max and urgent rows arriving as fast as it hands
+ *  them out, a routine row waits; below the max it is demand and the pool grows. A low row ages (seatPoolEffectiveRank). */
 export function seatPoolPriorityRank(priority: string | null | undefined): number {
   switch (priority?.toLowerCase()) {
     case "critical": return 0;
@@ -499,14 +500,29 @@ export function seatPoolPriorityRank(priority: string | null | undefined): numbe
   }
 }
 
+/** The rank a pending row is handed out by (T-010078): its priority's rank, one level up once it has waited
+ *  `agingSeconds` or more (since: its latest reroute, or its creation), never above routine. So a low row that waited
+ *  2 h (the default) goes before newer routine rows (FIFO among routine), and never before an urgent or critical one;
+ *  a routine row never ages into urgent. agingSeconds 0, or a since the clock cannot read, keeps the plain rank. */
+export function seatPoolEffectiveRank(priority: string | null | undefined, since: string, nowMs: number, agingSeconds: number): number {
+  const rank = seatPoolPriorityRank(priority);
+  const routine = seatPoolPriorityRank("routine");
+  if (agingSeconds <= 0 || rank <= routine) return rank;
+  const sinceMs = Date.parse(since);
+  if (!Number.isFinite(sinceMs) || nowMs - sinceMs < agingSeconds * 1000) return rank;
+  return Math.max(routine, rank - 1);
+}
+
 /** Pending rows addressed to any of `sessions` (in any of their addresses), by priority rank (seatPoolPriorityRank:
  *  the planner hands rows out in this order, so an urgent row goes before older routine ones, T-009034), then longest
  *  waiting first, then by id. With every row at the same rank the order is the plain FIFO it always was. A row waits
  *  from its latest reroute, or from its creation. Only pending rows: a claimed, blocked or closed row is never the
  *  pool's to move. With `refusal` (read only with `refused_cooldown_s` above 0: the job, its model and the pool's
- *  seats), each row says which of those seats refused it, or a row it succeeds (refusedBy). */
+ *  seats), each row says which of those seats refused it, or a row it succeeds (refusedBy). With `aging` (the job's
+ *  priority_aging_s above 0), the rank is the effective one: a low row that waited that long ranks as routine. */
 function readPendingRows(
   deps: SeatPoolStateReaderDeps, sessions: string[], refusal: { ctx: SeatPoolRefusalContext; seats: ReadonlySet<string> } | null = null,
+  aging: { seconds: number; nowMs: number } | null = null,
 ): SeatPoolPendingRow[] {
   const sessionOf = new Map<string, string>();
   for (const session of sessions) {
@@ -521,7 +537,9 @@ function readPendingRows(
       ORDER BY since, q.qitem_id`,
   ).all(FALLBACK_ACTOR, ...sessionOf.keys()) as Array<{ qitem_id: string; destination_session: string; tags: string | null; chain_of_record: string | null; priority: string | null; since: string }>;
   // A stable sort over the SQL order: within a rank, the rows keep since, then qitem_id.
-  rows.sort((a, b) => seatPoolPriorityRank(a.priority) - seatPoolPriorityRank(b.priority));
+  const rankOf = (row: { priority: string | null; since: string }) =>
+    aging ? seatPoolEffectiveRank(row.priority, row.since, aging.nowMs, aging.seconds) : seatPoolPriorityRank(row.priority);
+  rows.sort((a, b) => rankOf(a) - rankOf(b));
   return rows.map((row) => {
     const refusedBy = refusal ? readRefusedBy(refusal.ctx, row.qitem_id, row.chain_of_record, refusal.seats) : [];
     return {
@@ -644,6 +662,7 @@ export function readSeatPoolState(deps: SeatPoolStateReaderDeps, job: { jobId: s
     pending: readPendingRows(
       deps, [model.sessionName, ...slots.map((slot) => slot.sessionName), ...retired],
       refusedCooldown > 0 ? { ctx: refusalCtx, seats: new Set(slots.map((slot) => slot.sessionName)) } : null,
+      seatPoolPriorityAging(job.spec) > 0 ? { seconds: seatPoolPriorityAging(job.spec), nowMs } : null,
     ),
     demand: job.spec.demandCmd ? deps.demand(job.jobId) : null,
     lastScaleAt: deps.slots.lastScaleAt(job.jobId),
