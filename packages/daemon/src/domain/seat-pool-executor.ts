@@ -501,7 +501,7 @@ export function seatPoolPriorityRank(priority: string | null | undefined): numbe
 }
 
 /** The rank a pending row is handed out by (T-010078): its priority's rank, one level up once it has waited
- *  `agingSeconds` or more (since: its latest reroute, or its creation), never above routine. So a low row that waited
+ *  `agingSeconds` or more (since: when it became pending, T-010932), never above routine. So a low row that waited
  *  2 h (the default) goes before newer routine rows (FIFO among routine), and never before an urgent or critical one;
  *  a routine row never ages into urgent. agingSeconds 0, or a since the clock cannot read, keeps the plain rank. */
 export function seatPoolEffectiveRank(priority: string | null | undefined, since: string, nowMs: number, agingSeconds: number): number {
@@ -529,17 +529,38 @@ function readPendingRows(
     for (const address of deps.sessionAddresses(session)) if (!sessionOf.has(address)) sessionOf.set(address, session);
   }
   if (sessionOf.size === 0) return [];
+  // since: the FIFO, from the latest reroute of the queue-fallback, or the creation. pending_since: the age the aging
+  // reads (T-010932, S1 of the REVISAO of the PR #26): from the latest move INTO pending made outside the pool (a
+  // resolve, an unblock: the transition before it was not pending), or the creation. What the pool itself does keeps
+  // it: the reroute pending -> pending and the unpark of the queue-fallback, and the unclaim of its reap or drain (the
+  // slot's own session writes it, "unclaimed: reap:<slot>"); so does a pending -> pending transition (a note, a summary,
+  // a wake-ladder marker). None of them sends an aged low row back.
   const rows = deps.db.prepare(
     `SELECT q.qitem_id, q.destination_session, q.tags, q.chain_of_record, q.priority,
-            COALESCE((SELECT MAX(t.ts) FROM queue_transitions t WHERE t.qitem_id = q.qitem_id AND t.actor_session = ?), q.ts_created) AS since
+            COALESCE((SELECT MAX(t.ts) FROM queue_transitions t WHERE t.qitem_id = q.qitem_id AND t.actor_session = ?), q.ts_created) AS since,
+            COALESCE((SELECT MAX(t.ts) FROM queue_transitions t
+                       WHERE t.qitem_id = q.qitem_id AND t.state = 'pending' AND t.actor_session <> ?
+                         AND COALESCE(t.transition_note, '') NOT LIKE 'unclaimed: ${SEAT_POOL_REAP_REASON}%'
+                         AND COALESCE(t.transition_note, '') NOT LIKE 'unclaimed: ${SEAT_POOL_DRAIN_REASON}%'
+                         AND COALESCE((SELECT p.state FROM queue_transitions p
+                                        WHERE p.qitem_id = t.qitem_id
+                                          AND (p.ts < t.ts OR (p.ts = t.ts AND p.transition_id < t.transition_id))
+                                        ORDER BY p.ts DESC, p.transition_id DESC LIMIT 1), '') <> 'pending'),
+                     q.ts_created) AS pending_since
        FROM queue_items q
       WHERE q.state = 'pending' AND q.destination_session IN (${[...sessionOf.keys()].map(() => "?").join(",")})
       ORDER BY since, q.qitem_id`,
-  ).all(FALLBACK_ACTOR, ...sessionOf.keys()) as Array<{ qitem_id: string; destination_session: string; tags: string | null; chain_of_record: string | null; priority: string | null; since: string }>;
-  // A stable sort over the SQL order: within a rank, the rows keep since, then qitem_id.
-  const rankOf = (row: { priority: string | null; since: string }) =>
-    aging ? seatPoolEffectiveRank(row.priority, row.since, aging.nowMs, aging.seconds) : seatPoolPriorityRank(row.priority);
-  rows.sort((a, b) => rankOf(a) - rankOf(b));
+  ).all(FALLBACK_ACTOR, FALLBACK_ACTOR, ...sessionOf.keys()) as Array<{ qitem_id: string; destination_session: string; tags: string | null; chain_of_record: string | null; priority: string | null; since: string; pending_since: string }>;
+  // A stable sort over the SQL order: within a rank, the rows keep since, then qitem_id; a row that aged into its rank
+  // is placed by pending_since, how long it really waited (a low row of 3 h rerouted 1 min ago goes before a routine
+  // row of 10 min).
+  const keyed = rows.map((row) => {
+    const plain = seatPoolPriorityRank(row.priority);
+    const rank = aging ? seatPoolEffectiveRank(row.priority, row.pending_since, aging.nowMs, aging.seconds) : plain;
+    return { row, rank, key: rank < plain ? row.pending_since : row.since };
+  });
+  keyed.sort((a, b) => a.rank - b.rank || (a.key < b.key ? -1 : a.key > b.key ? 1 : 0));
+  rows.splice(0, rows.length, ...keyed.map((k) => k.row));
   return rows.map((row) => {
     const refusedBy = refusal ? readRefusedBy(refusal.ctx, row.qitem_id, row.chain_of_record, refusal.seats) : [];
     return {
