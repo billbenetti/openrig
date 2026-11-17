@@ -33,6 +33,12 @@ interface RigSummary {
 
 async function resolveRigId(client: DaemonClient, rigName: string): Promise<string> {
   const res = await client.get<RigSummary[]>("/api/rigs/summary");
+  // T-011538: a busy daemon answers 503 with { error, message, retryAfterSeconds } instead of the list
+  if (!Array.isArray(res.data)) {
+    const body = res.data as { message?: string; retryAfterSeconds?: number } | null;
+    throw new Error(`the daemon could not list the rigs (HTTP ${res.status})${body?.message ? `: ${body.message}` : ""}`
+      + `${body?.retryAfterSeconds ? `; try again in ${body.retryAfterSeconds} s` : ""}`);
+  }
   const matches = res.data.filter((r) => r.name === rigName);
 
   if (matches.length === 0) {

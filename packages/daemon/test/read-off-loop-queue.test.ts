@@ -2,12 +2,15 @@
 // replaced, the request lane has a ceiling, the wake ladder's per-tick read goes ahead of the requests, a message that
 // cannot be read is a lost worker, and the fallbacks are counted per site in the slow-operation log. Each case runs a
 // stand-in worker script (one that never answers, answers late, or fails) against a real WAL file, so the queue is
-// what is exercised, and the caller always gets the synchronous read when the worker does not answer.
+// what is exercised. When the worker fails, the caller gets the synchronous read; when a request runs out of time (in
+// the queue or in the worker) or the daemon shuts down, it gets ReadOffLoopUnavailableError, a 503 at the routes, and the
+// read never starts again on the event loop (T-011538); a tick still reads synchronously.
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import type Database from "better-sqlite3";
+import { Hono } from "hono";
 import { createDb } from "../src/db/connection.js";
 import { migrate } from "../src/db/migrate.js";
 import { ALL_MIGRATIONS } from "../src/db/all-migrations.js";
@@ -15,6 +18,7 @@ import {
   closeReadOffLoop,
   flushReadOffLoopFallbacks,
   readOffLoop,
+  ReadOffLoopUnavailableError,
   readOffLoopWorkerForTest,
   reopenReadOffLoopForTest,
   setReadOffLoopFallbackIntervalForTest,
@@ -23,6 +27,7 @@ import {
 } from "../src/domain/read-off-loop.js";
 import { configureSyncSiteRecorder } from "../src/domain/sync-site-wrap.js";
 import { readPromptRefusalCandidatesOffLoop } from "../src/domain/queue-wake-ladder.js";
+import { telemetryRoutes } from "../src/routes/telemetry.js";
 
 /** A worker script as a data: URL. */
 function script(body: string): URL {
@@ -41,6 +46,15 @@ type Read = Promise<unknown>;
 /** One request-lane read through the queue (the job name only types the call; the stand-in worker ignores it). */
 function read(db: Database.Database, args: Record<string, unknown>, sync: () => unknown, site = "test.read", lane?: "tick" | "request"): Read {
   return readOffLoop(db, "rigSummaries", args as never, sync as never, { site, record: "whenSlow", lane });
+}
+/** The read's outcome: its value, or the name of the error it failed with. */
+function outcome(p: Promise<unknown>): Promise<unknown> {
+  return p.then((value) => value, (error: Error) => `${error.name}`);
+}
+/** Holds the event loop for `ms` (a stall: the timers and the worker's messages wait behind it). */
+function stall(ms: number): void {
+  const end = Date.now() + ms;
+  while (Date.now() < end) { /* busy */ }
 }
 /** Resolves to "pending" if `p` has not settled within `ms`. */
 function within<T>(p: Promise<T>, ms: number): Promise<T | "pending"> {
@@ -72,42 +86,49 @@ describe("the read worker's queue", () => {
     fs.rmSync(dir, { recursive: true, force: true });
   });
 
-  it("a job the worker does not answer in time falls back to the synchronous read, and the stuck worker is replaced", async () => {
+  it("a request the worker does not answer in time fails as unavailable without the synchronous read, and the stuck worker is replaced", async () => {
     vi.spyOn(console, "error").mockImplementation(() => undefined);
     setReadOffLoopLimitsForTest({ source: STUCK, deadlineMs: 150 });
-    const first = read(db, {}, () => "sync-1");
+    let syncCalls = 0;
+    const first = outcome(read(db, {}, () => { syncCalls += 1; return "sync-1"; }));
     // the ask dispatches at once: the worker is up before the deadline can run
     const stuck = readOffLoopWorkerForTest()!;
     expect(stuck).not.toBeNull();
     const exited = new Promise((resolve) => stuck.once("exit", resolve));
-    expect(await within(first, 3000)).toBe("sync-1");
+    expect(await within(first, 3000)).toBe("ReadOffLoopUnavailableError");
+    // T-011538 (S1): the read that ran out of time in the worker never runs again on the event loop
+    expect(syncCalls).toBe(0);
     // the stuck worker was terminated, not only forgotten
     expect(await within(exited, 3000)).not.toBe("pending");
     // the stuck worker is gone; the next read starts another
     expect(readOffLoopWorkerForTest()).not.toBe(stuck);
-    const second = read(db, {}, () => "sync-2");
+    const second = outcome(read(db, {}, () => "sync-2"));
     const next = readOffLoopWorkerForTest();
     expect(next).not.toBeNull();
     expect(next).not.toBe(stuck);
-    expect(await within(second, 3000)).toBe("sync-2");
+    expect(await within(second, 3000)).toBe("ReadOffLoopUnavailableError");
   });
 
   it("after a stuck job's deadline, the job waiting behind it is answered by the new worker", async () => {
     vi.spyOn(console, "error").mockImplementation(() => undefined);
     setReadOffLoopLimitsForTest({ source: HANGS, deadlineMs: 300 });
-    const stuck = read(db, { tag: "hang" }, () => "sync-hang");
+    const stuck = outcome(read(db, { tag: "hang" }, () => "sync-hang"));
     // the job behind it has a long deadline of its own: only the restart can answer it, and its fallback throws
     setReadOffLoopLimitsForTest({ deadlineMs: 10_000 });
     const behind = read(db, { tag: "behind" }, () => { throw new Error("the job behind fell back"); });
-    expect(await within(stuck, 3000)).toBe("sync-hang");
+    expect(await within(stuck, 3000)).toBe("ReadOffLoopUnavailableError");
     expect(await within(behind, 5000)).toBe("behind");
   });
 
   it("a job still waiting behind a stuck one also gets its answer by the deadline: no promise stays pending", async () => {
     vi.spyOn(console, "error").mockImplementation(() => undefined);
     setReadOffLoopLimitsForTest({ source: STUCK, deadlineMs: 200 });
-    const reads = [read(db, {}, () => "a"), read(db, {}, () => "b"), read(db, {}, () => "c")];
-    expect(await within(Promise.all(reads), 3000)).toEqual(["a", "b", "c"]);
+    let syncCalls = 0;
+    const sync = () => { syncCalls += 1; return "sync"; };
+    const reads = [read(db, {}, sync), read(db, {}, sync), read(db, {}, sync)].map(outcome);
+    expect(await within(Promise.all(reads), 3000)).toEqual(Array(3).fill("ReadOffLoopUnavailableError"));
+    // the ones that waited past their deadline in the queue do not read on the loop either
+    expect(syncCalls).toBe(0);
   });
 
   it("a job that waits past its deadline leaves the queue alone: the worker running a healthy read is kept", async () => {
@@ -116,8 +137,8 @@ describe("the read worker's queue", () => {
     const running = read(db, { tag: "w-0", ms: 400 }, () => "s-0");
     const worker = readOffLoopWorkerForTest()!;
     setReadOffLoopLimitsForTest({ deadlineMs: 100 });
-    const behind = read(db, { tag: "w-1" }, () => "s-1");
-    expect(await within(behind, 300)).toBe("s-1");
+    const behind = outcome(read(db, { tag: "w-1" }, () => "s-1"));
+    expect(await within(behind, 300)).toBe("ReadOffLoopUnavailableError");
     expect(readOffLoopWorkerForTest()).toBe(worker);
     expect(await running).toBe("w-0");
   });
@@ -175,15 +196,64 @@ describe("the read worker's queue", () => {
     expect(readOffLoopWorkerForTest()).not.toBe(worker);
   });
 
-  it("the daemon's shutdown closes the reads: a stuck job reads synchronously at once, and no worker starts again", async () => {
+  it("the daemon's shutdown closes the reads: a stuck request fails at once without reading again, and no worker starts again", async () => {
+    vi.spyOn(console, "error").mockImplementation(() => undefined);
     setReadOffLoopLimitsForTest({ source: STUCK, deadlineMs: 10_000 });
-    const stuck = read(db, {}, () => "sync-at-shutdown");
-    const waitingOne = read(db, {}, () => "sync-waiting-at-shutdown");
+    let syncCalls = 0;
+    const stuck = outcome(read(db, {}, () => { syncCalls += 1; return "sync-at-shutdown"; }));
+    const waitingOne = outcome(read(db, {}, () => { syncCalls += 1; return "sync-waiting-at-shutdown"; }));
+    const tick = readOffLoop(db, "promptRefusalCandidates", {} as never, (() => "tick-sync-at-shutdown") as never,
+      { site: "test.tick.shutdown", record: "always" });
     expect(readOffLoopWorkerForTest()).not.toBeNull();
     await closeReadOffLoop();
-    expect(await within(Promise.all([stuck, waitingOne]), 1000)).toEqual(["sync-at-shutdown", "sync-waiting-at-shutdown"]);
-    expect(await read(db, {}, () => "sync-after-close")).toBe("sync-after-close");
+    expect(await within(Promise.all([stuck, waitingOne]), 1000)).toEqual(Array(2).fill("ReadOffLoopUnavailableError"));
+    expect(syncCalls).toBe(0);
+    // the wake ladder's tick still gets its answer, read synchronously
+    expect(await within(tick, 1000)).toBe("tick-sync-at-shutdown");
+    // a request that comes after the shutdown began fails too (it would hold the shutdown on the loop), a tick reads
+    let afterClose = 0;
+    expect(await outcome(read(db, {}, () => { afterClose += 1; return "sync-after-close"; }))).toBe("ReadOffLoopUnavailableError");
+    expect(afterClose).toBe(0);
+    expect(await readOffLoop(db, "promptRefusalCandidates", {} as never, (() => "tick-after-close") as never,
+      { site: "test.tick.after-close", record: "always" })).toBe("tick-after-close");
     expect(readOffLoopWorkerForTest()).toBeNull();
+  });
+
+  it("a request out of time is a 503 with Retry-After at the route, and the route never reads the series on the loop", async () => {
+    vi.spyOn(console, "error").mockImplementation(() => undefined);
+    setReadOffLoopLimitsForTest({ source: STUCK, deadlineMs: 150 });
+    const app = new Hono();
+    app.route("/api/telemetry", telemetryRoutes({ db: () => db, nowIso: () => "2026-11-17T12:00:00.000Z" }));
+    const res = await app.request("/api/telemetry/usage/series?seat=x%40r");
+    expect(res.status).toBe(503);
+    expect(res.headers.get("Retry-After")).toBe("1");
+    expect(((await res.json()) as { error: string }).error).toBe("read_unavailable");
+  });
+
+  it("the tick lane keeps the synchronous read when its worker runs out of time", async () => {
+    vi.spyOn(console, "error").mockImplementation(() => undefined);
+    setReadOffLoopLimitsForTest({ source: STUCK, deadlineMs: 150 });
+    const tick = readOffLoop(db, "promptRefusalCandidates", {} as never, (() => "tick-sync") as never,
+      { site: "test.tick.deadline", record: "always" });
+    expect(await within(tick, 3000)).toBe("tick-sync");
+  });
+
+  it("a job whose answer is in when the loop comes back from a stall longer than the deadline gets the worker's answer, and the worker is kept", async () => {
+    vi.spyOn(console, "error").mockImplementation(() => undefined);
+    // a warm worker first, with a long deadline (its boot counts against the run's), so the stalled job only waits on
+    // the reply; then the short deadline for the job
+    setReadOffLoopLimitsForTest({ source: LATE, deadlineMs: 10_000 });
+    expect(await outcome(read(db, { tag: "warm" }, () => "sync-warm"))).toBe("warm");
+    const worker = readOffLoopWorkerForTest()!;
+    setReadOffLoopLimitsForTest({ deadlineMs: 300 });
+    let syncCalls = 0;
+    const job = outcome(read(db, { tag: "worker-answer", ms: 10 }, () => { syncCalls += 1; return "sync"; }));
+    // T-011538 (S2): the worker answers at ~10 ms; the loop stops (in the check phase) past the 300 ms deadline, so the
+    // next turn starts with the timers phase, where the deadline is due, before the poll phase that reads the answer
+    setImmediate(() => stall(1200));
+    expect(await within(job, 3000)).toBe("worker-answer");
+    expect(syncCalls).toBe(0);
+    expect(readOffLoopWorkerForTest()).toBe(worker);
   });
 
   it("the fallbacks are counted per site in the slow-operation log, and each site says so once on the console", async () => {
