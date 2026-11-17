@@ -42,6 +42,10 @@ export function freshRecoveryId(db: Database.Database, qitemId: string, overdueD
  * idx_queue_items_recovery_tags' WHERE clause (migration 099) byte for byte, which is what lets the
  * planner read that small index instead of scanning and parsing every row. */
 const RECOVERY_TAG_ROWS = `(tags LIKE '%"recovery-for:%' OR tags LIKE '%\\%')`;
+/** The rows whose tag text may hold one given tag (the bound parameter is that tag as JSON writes it, quoted): the
+ * quoted text itself, or any escape, under which the same value can be written another way (\u…, \/). A superset of the
+ * rows with that exact value, so the json_each test that follows decides as before. */
+const RECOVERY_TAG_TEXT = `(instr(tags, ?) > 0 OR tags LIKE '%\\%')`;
 // Unary + preserves the numeric CASE order but prevents a prefix match on the full-history listing
 // index. Both standalone lookups and the batch need the small recovery-tag index instead.
 const RECOVERY_ORDER = "ORDER BY +CASE WHEN state IN ('pending','in-progress','blocked') THEN 0 ELSE 1 END, ts_updated DESC, qitem_id DESC LIMIT 1";
@@ -87,12 +91,15 @@ export function findQueueRecovery(db: Database.Database, qitemId: string, exclud
     const byTag = scope.byTag ??= buildRecoveryIndex(db);
     row = pickFromIndex(byTag, qitemId, excludeTag);
   } else {
+    // RECOVERY_TAG_TEXT first: only a row whose tag text holds this tag verbatim (or has an escape) reaches json_each,
+    // so one lookup no longer parses every recovery-tagged row's tags (T-010555: each getById's waiting view asks this,
+    // ~10 times per handoff, and the parsing held the loop for most of a handoff).
     row = db.prepare(`SELECT qitem_id, state, ts_updated FROM queue_items
-    WHERE ${RECOVERY_TAG_ROWS} AND json_valid(tags) AND EXISTS (SELECT 1 FROM json_each(tags) WHERE value = ?)
+    WHERE ${RECOVERY_TAG_ROWS} AND ${RECOVERY_TAG_TEXT} AND json_valid(tags) AND EXISTS (SELECT 1 FROM json_each(tags) WHERE value = ?)
     AND NOT EXISTS (SELECT 1 FROM json_each(tags) WHERE value = '${BACKLOG_FOLDED_TAG}')
     ${excludeTag ? "AND NOT EXISTS (SELECT 1 FROM json_each(tags) WHERE value = ?)" : ""}
     ${RECOVERY_ORDER}`)
-      .get(...(excludeTag ? [tag, excludeTag] : [tag])) as { qitem_id: string; state: string; ts_updated: string } | undefined;
+      .get(...(excludeTag ? [JSON.stringify(tag), tag, excludeTag] : [JSON.stringify(tag), tag])) as { qitem_id: string; state: string; ts_updated: string } | undefined;
   }
   return settleRecovery(db, qitemId, row);
 }
