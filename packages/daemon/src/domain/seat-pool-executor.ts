@@ -22,6 +22,10 @@ import {
   seatPoolCanReceive,
   seatPoolParkedLoadOver,
   seatPoolHeldByProcess,
+  seatPoolContextLimit,
+  seatPoolContextOver,
+  seatPoolHeldByContext,
+  type SeatPoolContextReading,
   seatPoolReceives,
   seatPoolRefusedCooldown,
   seatPoolPriorityAging,
@@ -310,6 +314,17 @@ export interface SeatPoolStateReaderDeps {
   busyProcess?(sessionName: string): string | null | undefined;
   /** The clock the parked refusal is read against (`refused_cooldown_s`). Absent: Date.now. */
   now?(): number;
+  /** A seat's context usage, as the status-line sidecar of its current occupant reads it (a sample of an earlier
+   *  occupant reads as none); null with no reading. Asked only for a seat the pool added, its node present, while
+   *  `context_limit_percent` is above 0 (T-012383); absent, no seat is held back by its context. */
+  contextUsage?(nodeId: string, sessionName: string): { usedPercentage: number | null; sampledAt: string | null } | null;
+}
+
+/** The view's `context` (T-012383), only for a reading with a percentage and a time. */
+function contextOf(reading: { usedPercentage: number | null; sampledAt: string | null } | null | undefined): { context?: SeatPoolContextReading } {
+  return reading && typeof reading.usedPercentage === "number" && Number.isFinite(reading.usedPercentage) && typeof reading.sampledAt === "string"
+    ? { context: { usedPercentage: reading.usedPercentage, sampledAt: reading.sampledAt } }
+    : {};
 }
 
 /** load1 per CPU, in percent; null when the host gives no reading. */
@@ -627,6 +642,8 @@ export function readSeatPoolState(deps: SeatPoolStateReaderDeps, job: { jobId: s
   const busyRule = parkedRule && (job.spec.dispatchToParked?.busyProcesses?.length ?? 0) > 0 && deps.busyProcess;
   // refused_cooldown_s above 0: each seat's parked refusal and each waiting row's refusing seats (T-008296).
   const refusedCooldown = seatPoolRefusedCooldown(job.spec);
+  // context_limit_percent above 0 (absent: 40): each seat the pool added carries its context reading (T-012383).
+  const readContext = seatPoolContextLimit(job.spec) > 0 && deps.contextUsage ? deps.contextUsage : null;
   const nowMs = deps.now?.() ?? Date.now();
   const poolMoves = refusedCooldown > 0 ? readPoolMoves(db, job.jobId, nowMs) : [];
   const seatAddresses = new Map<string, string[]>();
@@ -666,6 +683,7 @@ export function readSeatPoolState(deps: SeatPoolStateReaderDeps, job: { jobId: s
       ...(facts?.parkedRows ? { parkedRows: facts.parkedRows } : {}),
       ...busyOf(busyRule && present ? deps.busyProcess!(sessionName) : undefined),
       ...(refusal ? { parkedRefusal: refusal } : {}),
+      ...(readContext && present && slot.opId !== null ? contextOf(readContext(slot.nodeId!, sessionName)) : {}),
     };
   });
   const adoptable = job.spec.adopt.flatMap((logicalId) => {
@@ -1902,6 +1920,15 @@ export class SeatPoolExecutor {
       this.record(jobId, false, "seat_pool_dispatch_skipped", { ...base, code: "refused_row" });
       return true;
     }
+    // Past its context limit since the plan (T-012383): it would give the row straight back. Said once, with the reading.
+    if (mode === null && seatPoolContextOver(ctx.spec, slot, nowMs)
+      && seatPoolReceives(ctx.spec, { ...slot, context: undefined }, nowMs, { usageLimited: limited }) === (intent.mode === "parked" ? "parked" : "free")) {
+      this.record(jobId, false, "seat_pool_dispatch_skipped", {
+        ...base, code: intent.mode === "parked" ? "parked_context" : "free_context",
+        usedPercentage: slot.context!.usedPercentage, sampledAt: slot.context!.sampledAt, limit: seatPoolContextLimit(ctx.spec),
+      });
+      return true;
+    }
     if (intent.mode !== "parked") {
       if (mode !== "free") {
         // Free as the plan read it, but busy with heavy local work it does not track (T-006251, B1): said once here.
@@ -2078,6 +2105,8 @@ export class SeatPoolExecutor {
     const loadPerCpuPercent = this.parkedLoadNow(ctx.spec);
     // `held: "busy"` (T-007527): the free seat in usage held only by a busy_processes program the read found, the one
     // the plan counts as occupied for it; absent for every other seat (a null `receives` says no more than "no row now").
+    // `held: "context"` (T-012383): a quiet seat in usage past `context_limit_percent`, also occupied in the plan (a
+    // seat held both ways says "busy").
     // T-008466 SH-B: a row a parked seat refused never goes to it while it is parked (refusedBy), so while such a row
     // waits that seat is given to the demand command as receiving nothing: counted as a receiver, the row it refused
     // would wait for it with no seat added, up to max_claim_age_s. A seat that is free takes the row, and stays one.
@@ -2089,7 +2118,9 @@ export class SeatPoolExecutor {
       return {
         session: seatSessionName(slot.logicalId, ctx.model.rigName), phase: slot.phase,
         receives: receives === "parked" && refusing.has(slot.sessionName) ? null : receives,
-        ...(seatPoolHeldByProcess(ctx.spec, read, { usageLimited: limited }) ? { held: "busy" as const } : {}),
+        ...(seatPoolHeldByProcess(ctx.spec, read, { usageLimited: limited })
+          ? { held: "busy" as const }
+          : seatPoolHeldByContext(ctx.spec, read, nowMs, { usageLimited: limited }) ? { held: "context" as const } : {}),
       };
     });
     const result = await this.deps.effects.runCommand(ctx.spec.demandCmd, this.commandEnv(ctx, { OPENRIG_SEAT_POOL_SLOTS: JSON.stringify(slots) }), run.controller.signal);

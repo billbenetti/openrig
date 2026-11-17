@@ -63,6 +63,11 @@ export interface SeatPoolSpec {
    *  more (seatPoolCanReceive).
    *  Absent (no such property) when the key is not in the context: the rule is off, as before the key. */
   dispatchToParked?: SeatPoolDispatchToParked;
+  /** `context_limit_percent` (T-012383): a seat the pool added whose context usage, as its status-line sample reads it
+   *  (SeatPoolSlotView.context), is at this percent or above, sampled less than SEAT_POOL_CONTEXT_MAX_AGE_SECONDS ago,
+   *  takes no row, free or parked (seatPoolContextOver). Absent (no property) when not given: read as
+   *  SEAT_POOL_CONTEXT_LIMIT_DEFAULT_PERCENT (40); 0 turns it off. */
+  contextLimitPercent?: number;
 }
 
 /** `dispatch_to_parked` in the job's context: when a seat parked on its own wait counts as a receiver of one more row. */
@@ -105,7 +110,7 @@ export interface SeatPoolDispatchToParked {
 const SPEC_KEYS = new Set([
   "min", "max", "cooldown_s", "idle_grace_s", "dispatch_after_s", "dispatch_tag", "drain", "drain_deadline_s", "no_seat_grace_s", "adopt", "cwd_template",
   "demand_cmd", "release_cmd", "prepare_cmd", "reap_cmd", "remove_cmd", "escalation_owner", "dispatch_to_parked",
-  "priority_aging_s",
+  "priority_aging_s", "context_limit_percent",
 ]);
 const DEFAULT_COOLDOWN_SECONDS = 60;
 const DEFAULT_IDLE_GRACE_SECONDS = 300;
@@ -153,6 +158,17 @@ export const SEAT_POOL_NO_SEAT_GRACE_DEFAULT_SECONDS = 1800;
 /** `priority_aging_s`: its bounds (0 turns the aging off; at most 7 days) and the value when it is not given (T-010078). */
 const PRIORITY_AGING = { min: 0, max: 604_800 } as const;
 export const SEAT_POOL_PRIORITY_AGING_DEFAULT_SECONDS = 7200;
+
+/** `context_limit_percent`: its bounds (0 turns it off) and the value when it is not given (T-012383). */
+const CONTEXT_LIMIT = { min: 0, max: 100 } as const;
+export const SEAT_POOL_CONTEXT_LIMIT_DEFAULT_PERCENT = 40;
+/** A context sample at least this old says nothing about the seat (the freshness of the status-line sidecar, 10 min). */
+export const SEAT_POOL_CONTEXT_MAX_AGE_SECONDS = 600;
+
+/** The context usage at which a seat the pool added takes no row (T-012383); 0 when the limit is off. */
+export function seatPoolContextLimit(spec: Pick<SeatPoolSpec, "contextLimitPercent">): number {
+  return spec.contextLimitPercent ?? SEAT_POOL_CONTEXT_LIMIT_DEFAULT_PERCENT;
+}
 
 /** How long a low row waits before it is handed out as routine (T-010078); 0 when the aging is off. */
 export function seatPoolPriorityAging(spec: Pick<SeatPoolSpec, "priorityAgingSeconds">): number {
@@ -313,6 +329,11 @@ export function parseSeatPoolSpec(context: Record<string, unknown>): { spec: Sea
     && (!Number.isInteger(priorityAging) || (priorityAging as number) < PRIORITY_AGING.min || (priorityAging as number) > PRIORITY_AGING.max)) {
     return { problem: { field: "priority_aging_s", message: `seat-pool: priority_aging_s must be a whole number of seconds from ${PRIORITY_AGING.min} (off) to ${PRIORITY_AGING.max}` } };
   }
+  const contextLimit = context["context_limit_percent"];
+  if (contextLimit !== undefined
+    && (!Number.isInteger(contextLimit) || (contextLimit as number) < CONTEXT_LIMIT.min || (contextLimit as number) > CONTEXT_LIMIT.max)) {
+    return { problem: { field: "context_limit_percent", message: `seat-pool: context_limit_percent must be a whole number from ${CONTEXT_LIMIT.min} (off) to ${CONTEXT_LIMIT.max}` } };
+  }
   const adopt = context["adopt"] ?? [];
   if (!Array.isArray(adopt) || adopt.some((id) => typeof id !== "string" || !id.trim())) {
     return { problem: { field: "adopt", message: "seat-pool: adopt must be a list of logical ids" } };
@@ -349,6 +370,7 @@ export function parseSeatPoolSpec(context: Record<string, unknown>): { spec: Sea
       ...(parkedRule ? { dispatchToParked: parkedRule } : {}),
       ...(noSeatGrace !== undefined ? { noSeatGraceSeconds: noSeatGrace as number } : {}),
       ...(priorityAging !== undefined ? { priorityAgingSeconds: priorityAging as number } : {}),
+      ...(contextLimit !== undefined ? { contextLimitPercent: contextLimit as number } : {}),
     },
   };
 }
@@ -519,6 +541,16 @@ export interface SeatPoolSlotView {
    *  within the cooldown, that the seat gave straight back without taking it (seatPoolCanReceive). `at`: when it gave it
    *  back. `openRowIds`: the seat's parked rows when the row was moved to it (null when the record does not say). */
   parkedRefusal?: { at: string; openRowIds: string[] | null };
+  /** Only for a seat the pool added (not adopted), its node present and `context_limit_percent` above 0: its context
+   *  usage as the status-line sidecar of its current occupant reads it (a sample of a previous occupant, or one with no
+   *  percentage, is none). Absent: no reading, which holds nothing back (seatPoolContextOver). */
+  context?: SeatPoolContextReading;
+}
+
+/** A seat's context usage as its status-line sample reads it: `used_percentage` and `sampled_at` (T-012383). */
+export interface SeatPoolContextReading {
+  usedPercentage: number;
+  sampledAt: string;
 }
 
 /** The park of a seat's only open row, a blocked one: what seatPoolCanReceive checks to call it the seat's own wait. */
@@ -633,6 +665,36 @@ function seatPoolHeldBusy(spec: SeatPoolSpec, slot: SeatPoolSlotView): boolean {
 }
 
 /**
+ * Whether a seat the pool added is too full of context to take a row (T-012383): `context_limit_percent` above 0 (absent:
+ * 40), and its reading (SeatPoolSlotView.context) at that percent or above, sampled less than 10 minutes ago
+ * (SEAT_POOL_CONTEXT_MAX_AGE_SECONDS; a sample stamped ahead of the clock counts as just taken), as the Billverso's
+ * orchestration gate reads the same sidecar (portao._contexto: used_percentage >= 40, sampled_at under 10 min). Such a
+ * seat would take the row and give it straight back (its own rule: no new work past the limit), and the pool would hand
+ * the row to the next full seat. No reading, an unreadable or stale one, an adopted seat and a limit of 0 hold nothing
+ * back, as before the field.
+ */
+export function seatPoolContextOver(spec: Pick<SeatPoolSpec, "contextLimitPercent">, slot: SeatPoolSlotView, nowMs: number): boolean {
+  const limit = seatPoolContextLimit(spec);
+  const reading = slot.context;
+  if (limit <= 0 || slot.adopted || !reading) return false;
+  if (typeof reading.usedPercentage !== "number" || !Number.isFinite(reading.usedPercentage) || reading.usedPercentage < limit) return false;
+  const sampledMs = Date.parse(reading.sampledAt);
+  // Written so that an unreadable time (NaN) holds nothing back.
+  return Number.isFinite(sampledMs) && Math.max(0, nowMs - sampledMs) < SEAT_POOL_CONTEXT_MAX_AGE_SECONDS * 1000;
+}
+
+/**
+ * Whether a quiet seat is held only by its context (seatPoolContextOver): live, in usage, no open row, no held message,
+ * idle since a known time, and past the limit. The plan counts these as occupied (the pool grows for the row they can't
+ * take, and never drains them as free), and the demand command is told so as `held: "context"`. A seat with an open row
+ * is occupied already; one out of provider usage says nothing, as for `held: "busy"` (seatPoolHeldByProcess).
+ */
+export function seatPoolHeldByContext(spec: SeatPoolSpec, slot: SeatPoolSlotView, nowMs: number, facts: { usageLimited?: boolean } = {}): boolean {
+  if (facts.usageLimited || slot.cause === "usage_limit") return false;
+  return seatPoolLive(slot) && seatPoolQuiet(slot) && seatPoolContextOver(spec, slot, nowMs);
+}
+
+/**
  * Whether a free seat is held only by a `busy_processes` program the read found under its pane (an orphaned suite-flock
  * or congelar-eval): quiet, live, in usage, and its `busyProcess` a process (seatPoolBusyFromProcess), not a failed read.
  * These are the quiet seats the plan counts as occupied (heldBusy && !heldUnread), and the demand command is told so as
@@ -648,7 +710,8 @@ export function seatPoolHeldByProcess(spec: SeatPoolSpec, slot: SeatPoolSlotView
  * Whether a seat may receive a waiting row now, and how; null when it may not. The planner, the executor's check just
  * before the move and the slots the demand command is given (`receives`) all ask this one function.
  *
- * Both ways need the pool not draining, the seat live, its node present, not to be reaped and no held message.
+ * Both ways need the pool not draining, the seat live, its node present, not to be reaped, no held message and, for a
+ * seat the pool added, its context under `context_limit_percent` (seatPoolContextOver, T-012383).
  * `free`: no open row and idle at its prompt (the rule from before `dispatch_to_parked`), and, with
  * `dispatch_to_parked.busy_processes`, no such program of the seat's (`busyProcess`, T-006251). `parked`, only with
  * `dispatch_to_parked`: a seat the pool added (not adopted), at its prompt (idle, or working only through a background
@@ -661,6 +724,8 @@ export function seatPoolHeldByProcess(spec: SeatPoolSpec, slot: SeatPoolSlotView
  */
 export function seatPoolCanReceive(spec: SeatPoolSpec, slot: SeatPoolSlotView, nowMs: number): SeatPoolReceiveMode | null {
   if (spec.drain || slot.phase !== "live" || !slot.nodeExists || seatPoolReapable(slot) || slot.heldMessages !== 0) return null;
+  // A seat past its context limit takes no row, free or parked: it would give it straight back (T-012383).
+  if (seatPoolContextOver(spec, slot, nowMs)) return null;
   const rule = spec.dispatchToParked;
   if (slot.openRows === 0 && slot.idleSince !== null && slot.cause === "idle") {
     // A free seat with heavy local work its runtime does not track (a suite-flock or congelar-eval orphaned by the shell
@@ -799,7 +864,11 @@ export function planSeatPool(spec: SeatPoolSpec, state: SeatPoolState, nowMs: nu
   // seat) and is never drained as free while its suite runs (REVISAO lente de lógica, wf_fff3f5f2).
   const heldBusy = (slot: SeatPoolSlotView) => seatPoolHeldBusy(spec, slot);
   const quiet = seatPoolQuiet;
-  const idle = (slot: SeatPoolSlotView) => quiet(slot) && !heldBusy(slot);
+  // A quiet seat past its context limit (seatPoolContextOver, T-012383) takes no row either: it is occupied, as a busy
+  // one, so the pool grows for the row it can't take instead of leaving the row at the model, and it is not drained as
+  // free (it leaves the pool by its own release, or a relaunch gives it a fresh context).
+  const heldContext = (slot: SeatPoolSlotView) => seatPoolContextOver(spec, slot, nowMs);
+  const idle = (slot: SeatPoolSlotView) => quiet(slot) && !heldBusy(slot) && !heldContext(slot);
   // T-006251 S6: a quiet seat held only because its processes could not be read (a timeout under load, an unreadable
   // environment, its pane not found) takes no row and is never drained, but it is no occupant either: counting it grew
   // the pool to `max` with no row dispatched (every seat added failed the same read). It still holds its place in the
@@ -808,7 +877,7 @@ export function planSeatPool(spec: SeatPoolSpec, state: SeatPoolState, nowMs: nu
   // review of the volta 1). Without demand_cmd it grows to the rows waiting + the occupied seats + 1 (R + 1 when no seat
   // holds work; up to `max`), never by one per failed read: a read failing for every free seat, with more rows waiting
   // than seats, still reaches that with nothing dispatched (T-007205 S14).
-  const heldUnread = (slot: SeatPoolSlotView) => quiet(slot) && heldBusy(slot) && !seatPoolBusyFromProcess(slot.busyProcess);
+  const heldUnread = (slot: SeatPoolSlotView) => quiet(slot) && heldBusy(slot) && !seatPoolBusyFromProcess(slot.busyProcess) && !heldContext(slot);
   const usageLimited = seatPoolOutOfUsage(state);
 
   const waiting = state.pending.filter((row) => nowMs - Date.parse(row.waitingSince) >= spec.dispatchAfterSeconds * 1000);
