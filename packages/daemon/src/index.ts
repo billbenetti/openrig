@@ -472,8 +472,9 @@ export async function startServer(port?: number) {
       ["seat-identity", () => deps.seatIdentityReconciler?.stop()],
       ["periodic-snapshot", () => deps.periodicSnapshotScheduler?.stop()],
       ["gateway", () => deps.gatewaySubsystem?.stop()],
-      // T-010440: the read worker goes before the wake ladder waits for its tick: a read stuck on the worker reads
-      // synchronously now, instead of holding the shutdown for the job's deadline, and no worker starts again.
+      // T-010440: the read worker goes before the wake ladder waits for its tick: a read stuck on the worker ends now
+      // (a request fails as a 503, T-011538; the tick reads synchronously), instead of holding the shutdown for the
+      // job's deadline, and no worker starts again.
       ["read-worker", () => closeReadOffLoop()],
       ["wake-ladder", () => wakeLadderScheduler?.stop()],
       ["event-loop-monitor", () => { eventLoopMonitor.stop(); stopLongGcObserver?.(); }],

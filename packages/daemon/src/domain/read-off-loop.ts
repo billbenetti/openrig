@@ -16,8 +16,8 @@ import type { ReadJobArgs, ReadJobName, ReadJobResult } from "./read-off-loop-jo
 // a memory database (every test that does not opt in), a temporary database, a non-WAL file, or a read asked inside
 // an open transaction, whose uncommitted writes only the main handle sees. It also falls back to the synchronous read
 // when the worker cannot answer (it failed to start, to import, or to open the file, a job threw, or the queue below
-// refused or timed out the job), so a failure here never changes what a caller gets; it only costs the loop the read
-// it would have paid anyway.
+// refused the job), so a failure here never changes what a caller gets; it only costs the loop the read it would have
+// paid anyway. The exception is the request that ran out of time (T-011538): see ReadOffLoopUnavailableError below.
 const SOURCE = new URL(`data:text/javascript,${encodeURIComponent(`
 import { parentPort, workerData } from "node:worker_threads";
 let jobs;
@@ -45,10 +45,19 @@ parentPort.on("message", async ({ id, file, job, args }) => {
 //   routes answer; the ceiling bounds the queue, not the reads); the tick lane is one job per tick and never refused;
 // - a job waits at most JOB_DEADLINE_MS in its queue (then it leaves the queue), and runs at most JOB_DEADLINE_MS
 //   from the moment its worker gets it (then the worker is presumed stuck, is terminated, and the next job starts
-//   another); either way its caller reads synchronously, and no promise stays pending on a worker that stopped
-//   answering. The run's deadline counts from the dispatch, so a job that waited long never takes a healthy worker
+//   another); either way a request's caller gets ReadOffLoopUnavailableError (a 503; T-011538, below) and a tick's
+//   caller reads synchronously, and no promise stays pending on a worker that stopped answering. The run's deadline counts from the dispatch, so a job that waited long never takes a healthy worker
 //   down for the time it spent in the queue;
 // - a message from the worker that cannot be deserialized (messageerror) is a lost worker, like an error or an exit.
+//
+// T-011538 (S1 and S2 of the REVISAO of openrig#28): on the request lane, a deadline that passes (in the queue or in
+// the run) and the daemon's shutdown fail the read with ReadOffLoopUnavailableError, which the routes (/api/ps,
+// /api/rigs/summary, /usage/series) answer as a 503 with Retry-After: the read that already took JOB_DEADLINE_MS in the
+// worker (or waited that long) is never started again from scratch on the event loop, the case the worker exists for.
+// The synchronous read stays for the database a second connection cannot serve, for the worker that fails (to start,
+// to import, a job that throws, a lost worker) and for the full queue; the tick lane keeps it for every failure, since
+// the wake ladder needs its answer. A run deadline that fires as the loop comes back from a stall first lets the poll
+// phase deliver an answer the worker already sent (one setImmediate), and then keeps that worker.
 const JOB_DEADLINE_MS = 15_000;
 const MAX_WAITING = 16;
 
@@ -76,11 +85,36 @@ const lanes: Record<Lane, LaneState> = {
 };
 let lastAsk = 0;
 let enabled = true;
-/** Set by the daemon's shutdown: every read from then on is synchronous, and no worker starts again. */
+/** Set by the daemon's shutdown: no worker starts again, a tick reads synchronously, and a request that a worker would
+ *  have served fails with ReadOffLoopUnavailableError (a 503; T-011538). */
 let closed = false;
 let deadlineMs = JOB_DEADLINE_MS;
 let maxWaiting = MAX_WAITING;
 let source: URL = SOURCE;
+
+/** A request-lane read the daemon will not run now (its deadline passed, in the queue or in the worker, or the daemon
+ *  is shutting down): the route answers 503 with Retry-After, and the caller never reads synchronously instead. The
+ *  error carries its own response, which the daemon's error handler (and Hono's default one) sends as is. */
+export class ReadOffLoopUnavailableError extends Error {
+  readonly retryAfterSeconds: number;
+  constructor(message: string, retryAfterSeconds: number) {
+    super(message);
+    this.name = "ReadOffLoopUnavailableError";
+    this.retryAfterSeconds = retryAfterSeconds;
+  }
+  getResponse(): Response {
+    return new Response(JSON.stringify({ error: "read_unavailable", message: this.message, retryAfterSeconds: this.retryAfterSeconds }), {
+      status: 503,
+      headers: { "Content-Type": "application/json", "Retry-After": String(this.retryAfterSeconds) },
+    });
+  }
+}
+
+/** The error of a job that ran out of time or was cut by the shutdown: unavailable on the request lane, a plain error
+ *  (the synchronous read) on the tick lane. */
+function outOfTime(lane: Lane, message: string): Error {
+  return lane === "request" ? new ReadOffLoopUnavailableError(message, Math.max(1, Math.ceil(deadlineMs / 1000))) : new Error(message);
+}
 
 /** Tests turn the worker off to compare against the synchronous read on the same file, and back on. */
 export function setReadOffLoopEnabledForTest(next: boolean): void {
@@ -97,7 +131,8 @@ export function setReadOffLoopLimitsForTest(next: { deadlineMs?: number | null; 
 }
 
 /** The daemon's shutdown, before it waits for the readers' consumers (the wake ladder's tick): the workers go, what
- *  they ran and what waited read synchronously, and every read after this is synchronous, so the shutdown never waits
+ *  they ran and what waited fails (a request: ReadOffLoopUnavailableError, a 503, never the read again on the loop;
+ *  T-011538) or reads synchronously (a tick), and so does every read after this (closed, in readOffLoop), so the shutdown never waits
  *  a job's deadline on a stuck worker nor starts another one. */
 export async function closeReadOffLoop(): Promise<void> {
   closed = true;
@@ -133,19 +168,22 @@ function arm(job: Job): void {
   job.timer = timer;
 }
 
-/** Ends the workers (tests, shutdown) and fails what they ran and what waited for them, so those callers read
- *  synchronously; the next read starts another. */
+/** Ends the workers (tests, shutdown) and fails what they ran and what waited for them: those callers read
+ *  synchronously, but at the shutdown (closed) a request fails with ReadOffLoopUnavailableError (a 503; T-011538); the
+ *  next read starts another worker. */
 export async function stopReadOffLoopWorker(): Promise<void> {
-  const stopped = new Error("the read worker was stopped");
+  // at the daemon's shutdown (closed), a request's read fails (503) instead of starting again on the loop
+  const stopped = (job: Job) => closed ? outOfTime(job.lane, "the daemon is shutting down; the read worker was closed")
+    : new Error("the read worker was stopped");
   const workers: Worker[] = [];
   for (const state of Object.values(lanes)) {
     if (state.reader !== null) workers.push(state.reader);
     state.reader = null;
-    for (const job of state.waiting.splice(0)) settle(job, { error: stopped });
+    for (const job of state.waiting.splice(0)) settle(job, { error: stopped(job) });
     if (state.running !== null) {
       const job = state.running;
       state.running = null;
-      settle(job, { error: stopped });
+      settle(job, { error: stopped(job) });
     }
   }
   await Promise.all(workers.map((worker) => worker.terminate()));
@@ -195,8 +233,7 @@ function startReader(state: LaneState): Worker {
 function dispatch(state: LaneState): void {
   if (state.running !== null) return;
   if (closed) {
-    const stopped = new Error("the read worker was closed");
-    for (const job of state.waiting.splice(0)) settle(job, { error: stopped });
+    for (const job of state.waiting.splice(0)) settle(job, { error: outOfTime(job.lane, "the daemon is shutting down; the read worker was closed") });
     return;
   }
   const job = state.waiting.shift();
@@ -225,23 +262,32 @@ function dispatch(state: LaneState): void {
   }
 }
 
-/** The job's deadline passed: out of the queue if it still waits; if it runs, the worker is presumed stuck and goes. */
+/** The job's deadline passed: out of the queue if it still waits; if it runs, the worker is presumed stuck and goes,
+ *  unless its answer is already in: after a stall of the loop the timer phase runs before the poll phase that would read
+ *  the worker's message, so the run's deadline first waits one setImmediate (after the poll) and looks again (S2). */
 function expire(job: Job): void {
   job.timer = null;
   const state = lanes[job.lane];
   const at = state.waiting.indexOf(job);
   if (at >= 0) {
     state.waiting.splice(at, 1);
-    settle(job, { error: new Error(`the read job ${job.job} waited ${deadlineMs} ms for the read worker`) });
+    settle(job, { error: outOfTime(job.lane, `the read job ${job.job} waited ${deadlineMs} ms for the read worker`) });
     return;
   }
+  if (state.running !== job) return;
+  setImmediate(() => stopRun(job));
+}
+
+/** The run's deadline, one turn of the loop later: the job still runs on the same worker, so the worker goes. */
+function stopRun(job: Job): void {
+  const state = lanes[job.lane];
   if (state.running !== job) return;
   const worker = job.worker!;
   state.running = null;
   if (state.reader === worker) state.reader = null;
   worker.unref();
   void worker.terminate();
-  settle(job, { error: new Error(`the read worker did not answer ${job.job} in ${deadlineMs} ms; it was stopped`) });
+  settle(job, { error: outOfTime(job.lane, `the read worker did not answer ${job.job} in ${deadlineMs} ms; it was stopped`) });
   dispatch(state);
 }
 
@@ -284,7 +330,7 @@ function recordFallbacks(site: string, at: number): void {
   fallbacksSinceRecord.delete(site);
   if (pending === undefined || pending.count === 0) return;
   lastFallbackRecord.set(site, at);
-  recordSlowDiagnostic(Number.POSITIVE_INFINITY, { site: `${site}.fallback`, fallbacks: pending.count, error: pending.error });
+  recordSlowDiagnostic(Number.POSITIVE_INFINITY, { site, fallbacks: pending.count, error: pending.error });
 }
 
 /** Offers every site's fallbacks not yet recorded (the daemon's shutdown, tests). */
@@ -330,19 +376,27 @@ export async function readOffLoop<J extends ReadJobName>(
   sync: () => ReadJobResult<J>,
   options: ReadOffLoopOptions,
 ): Promise<ReadJobResult<J>> {
-  const file = enabled && !closed ? cooperativeReadFile(db) : null;
+  const file = enabled ? cooperativeReadFile(db) : null;
   if (file === null) return sync();
+  const lane = options.lane ?? (options.record === "always" ? "tick" : "request");
+  // after the shutdown began, a tick reads synchronously, and a request the worker would have served fails (a 503)
+  // instead of holding the shutdown with the read on the loop (T-011538, S1 of the revisao-cruzada)
+  if (closed && lane === "tick") return sync();
   try {
-    const lane = options.lane ?? (options.record === "always" ? "tick" : "request");
+    if (closed) throw outOfTime(lane, "the daemon is shutting down; the read worker was closed");
     const run = () => askWorker(file, job, args, lane);
     return await (options.record === "always" ? runAsyncSite(options.site, run) : runAsyncSiteWhenSlow(options.site, run));
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    if (!reportedSites.has(options.site)) {
-      reportedSites.add(options.site);
-      console.error(`[read-off-loop] ${options.site}: the read worker could not answer; reading on the main thread instead (reported once per site): ${message}`);
+    const unavailable = error instanceof ReadOffLoopUnavailableError;
+    const key = `${options.site}.${unavailable ? "unavailable" : "fallback"}`;
+    if (!reportedSites.has(key)) {
+      reportedSites.add(key);
+      console.error(`[read-off-loop] ${options.site}: the read worker could not answer; ${unavailable
+        ? "the route answers 503, never the read again on the main thread" : "reading on the main thread instead"} (reported once per site): ${message}`);
     }
-    countFallback(options.site, message);
+    countFallback(key, message);
+    if (unavailable) throw error;
     return sync();
   }
 }
