@@ -5,10 +5,9 @@ import { WAL_AUTOCHECKPOINT_PAGES } from "./connection.js";
 import { cooperativeReadFile } from "../domain/execution-candidate-reader.js";
 import { recordSlowDiagnostic } from "../domain/sync-site-wrap.js";
 
-/** How often the worker checkpoints the WAL (PASSIVE). Short enough that the WAL stays near the size the commit-time
- *  autocheckpoint kept it at (1000 pages, ~4 MB). */
+/** How often the worker checkpoints the WAL (PASSIVE), ahead of the commit-time autocheckpoint (1000 pages, ~4 MB). */
 export const WAL_CHECKPOINT_INTERVAL_MS = 10_000;
-/** A checkpoint still unanswered after this long gives the checkpoint back to the commits (see stall below). */
+/** A checkpoint still unanswered after this long is reported once (the commits checkpoint anyway). */
 export const WAL_CHECKPOINT_STALL_MS = 60_000;
 /** How long stop() waits for the worker to exit: a checkpoint in native code is not interrupted by terminate(), and a
  *  slow one (a saturated disk) must not spend the shutdown's whole budget before the recorder's drain. */
@@ -38,68 +37,77 @@ const CHECKPOINTER_SOURCE = String.raw`
 type Answer = { id: number; busy: number; log: number; checkpointed: number; ms: number } | { id: number; error: string };
 
 export interface WalCheckpointer {
-  /** True while the worker checkpoints and the commits do not (wal_autocheckpoint = 0 on the daemon's connection). */
+  /** True while the worker answers its checkpoints (it advances the copy; the commits keep their autocheckpoint). */
   readonly offLoop: boolean;
   stop(): Promise<void>;
 }
 
+/** The constructor of the worker thread (a seam for the test of the failure path). */
+export type WorkerFactory = (source: string, options: ConstructorParameters<typeof Worker>[1]) => Worker;
+
 /**
- * T-010230 (item 5 of the supervisor's ask): the WAL checkpoint off the daemon's event loop. better-sqlite3 runs the
- * autocheckpoint inside the commit that crosses WAL_AUTOCHECKPOINT_PAGES, on the loop, with its fsync. Here a worker
- * thread with its own connection checkpoints every intervalMs, and only after its first answer does the daemon's
- * connection stop checkpointing on commit (wal_autocheckpoint = 0). Any failure gives the checkpoint back to the
- * commits (WAL_AUTOCHECKPOINT_PAGES) before anything else, so the WAL is never left without a checkpointer: a failed
- * or busy checkpoint, the worker's error or exit, an answer owed for longer than WAL_CHECKPOINT_STALL_MS, and stop(). A good
- * answer later hands it to the worker again. Returns null, and changes nothing, for a memory or non-WAL database.
+ * T-010230, volta 1 (REVISAO-openrig-25, B1, the lead's choice (a)): a worker thread with its own connection runs a
+ * PASSIVE checkpoint every intervalMs, so most WAL frames are already copied into the database when a commit crosses
+ * WAL_AUTOCHECKPOINT_PAGES; the daemon's connection KEEPS its wal_autocheckpoint (never 0), and the commit's own
+ * PASSIVE checkpoint is only the residue. That commit-time checkpoint is the one that can find the whole WAL copied
+ * and lets the next writer reset the log (and journal_size_limit truncate the file): with the autocheckpoint at 0 and
+ * the worker alone, the commits during each checkpoint kept the WAL from ever resetting (59 MB against 3.9 MB in the
+ * revisor's experiment). Nothing here ever changes the connection's pragmas.
+ * B2: a worker that cannot start (ERR_WORKER_INIT_FAILED, no memory or no process left) logs once and returns null,
+ * the daemon goes on with the commit-time checkpoint as before; the same for a worker that fails or exits later (it
+ * stops being asked). Returns null for a memory or non-WAL database too.
  */
-export function startWalCheckpointer(db: Database.Database, opts: { intervalMs?: number; stallMs?: number } = {}): WalCheckpointer | null {
+export function startWalCheckpointer(db: Database.Database,
+  opts: { intervalMs?: number; stallMs?: number; createWorker?: WorkerFactory } = {}): WalCheckpointer | null {
   const file = cooperativeReadFile(db);
   if (!file) return null;
   const intervalMs = opts.intervalMs ?? WAL_CHECKPOINT_INTERVAL_MS;
   const stallMs = opts.stallMs ?? WAL_CHECKPOINT_STALL_MS;
-  const worker = new Worker(CHECKPOINTER_SOURCE, {
-    eval: true, execArgv: [],
-    workerData: { file, module: createRequire(import.meta.url).resolve("better-sqlite3") },
-  });
+  const createWorker: WorkerFactory = opts.createWorker ?? ((source, options) => new Worker(source, options));
+  let worker: Worker;
+  try {
+    worker = createWorker(CHECKPOINTER_SOURCE, {
+      eval: true, execArgv: [],
+      workerData: { file, module: createRequire(import.meta.url).resolve("better-sqlite3") },
+    });
+  } catch (error) {
+    console.error(`[wal-checkpointer] not started, the commits keep checkpointing the WAL: ${error instanceof Error ? error.message : String(error)}`);
+    return null;
+  }
   worker.unref();
   let offLoop = false;
   let stopped = false;
+  let dead = false;
   let lastAsk = 0;
   let owedSince: number | null = null;
+  let warned = false;
 
-  const backToCommits = (why: string): void => {
-    if (!offLoop) return;
+  const warnOnce = (why: string): void => {
     offLoop = false;
-    try { db.pragma(`wal_autocheckpoint = ${WAL_AUTOCHECKPOINT_PAGES}`); } catch { /* the connection is gone */ }
-    if (!stopped) console.error(`[wal-checkpointer] the commits checkpoint the WAL again: ${why}`);
+    if (warned || stopped) return;
+    warned = true;
+    console.error(`[wal-checkpointer] ${why}; the commits keep checkpointing the WAL (wal_autocheckpoint ${WAL_AUTOCHECKPOINT_PAGES})`);
   };
 
   worker.on("message", (answer: Answer) => {
     if (answer.id !== lastAsk) return;
     owedSince = null;
-    if ("error" in answer) { backToCommits(`checkpoint failed: ${answer.error}`); return; }
-    // busy = the checkpoint lock was held by another checkpointer (the commit's own autocheckpoint before the hand-over,
-    // or another process): nothing was copied, so it is not an answer that can take the checkpoint off the commits
-    if (answer.busy !== 0) { backToCommits("checkpoint busy (another checkpointer holds the lock)"); return; }
-    if (stopped) return;
-    if (!offLoop) {
-      db.pragma("wal_autocheckpoint = 0");
-      offLoop = true;
-    }
-    // Named in the slow-operation log when it took the slow threshold, with the pages a reader's snapshot left behind
-    // (log above checkpointed) in the same record.
+    if ("error" in answer) { warnOnce(`checkpoint failed: ${answer.error}`); return; }
+    offLoop = true;
+    // Named in the slow-operation log when it took the slow threshold, with the pages a reader's snapshot or a busy
+    // lock left behind (log above checkpointed) in the same record.
     recordSlowDiagnostic(answer.ms, { schema: "openrig.wal-checkpoint/v1", utc: new Date().toISOString(),
       phase: "wal_checkpoint", ms: Math.round(answer.ms), busy: answer.busy, log: answer.log,
       checkpointed: answer.checkpointed });
   });
-  worker.on("error", (error) => backToCommits(`worker error: ${error.message}`));
-  worker.on("exit", (code) => backToCommits(`worker exited (code ${code})`));
+  worker.on("error", (error) => { dead = true; warnOnce(`worker error: ${error.message}`); });
+  worker.on("exit", (code) => { dead = true; warnOnce(`worker exited (code ${code})`); });
 
   const tick = (): void => {
-    if (stopped) return;
+    if (stopped || dead) return;
     if (owedSince !== null) {
-      // One checkpoint at a time; a stalled one gives the checkpoint back to the commits until it answers.
-      if (performance.now() - owedSince >= stallMs) backToCommits(`checkpoint unanswered for ${Math.round(stallMs / 1000)} s`);
+      // One checkpoint at a time; a stalled one is only reported (the commits checkpoint anyway).
+      if (performance.now() - owedSince >= stallMs) warnOnce(`checkpoint unanswered for ${Math.round(stallMs / 1000)} s`);
       return;
     }
     owedSince = performance.now();
@@ -114,9 +122,9 @@ export function startWalCheckpointer(db: Database.Database, opts: { intervalMs?:
     async stop() {
       if (stopped) return;
       stopped = true;
+      offLoop = false;
       clearInterval(timer);
-      backToCommits("stopped");
-      // The commits checkpoint again before any wait; the worker's exit is waited for a bounded time only.
+      // The worker's exit is waited for a bounded time only (a checkpoint in native code is not interrupted).
       let waitCap: ReturnType<typeof setTimeout> | undefined;
       await Promise.race([worker.terminate(), new Promise<void>((resolve) => {
         waitCap = setTimeout(resolve, WAL_CHECKPOINTER_STOP_WAIT_MS);
