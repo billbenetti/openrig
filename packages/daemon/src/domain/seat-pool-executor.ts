@@ -535,17 +535,20 @@ function readPendingRows(
   // it: the reroute pending -> pending and the unpark of the queue-fallback, and the unclaim of its reap or drain (the
   // slot's own session writes it, "unclaimed: reap:<slot>"); so does a pending -> pending transition (a note, a summary,
   // a wake-ladder marker). None of them sends an aged low row back.
+  // Both the transition before an entry and the latest entry are found in insertion (transition_id) order, never by
+  // the wall-clock ts, which cannot stand in for it when the clock moves backwards (T-011880; as migration 098 and
+  // pendingSince in queue-waiting.ts): pending at 09:00, blocked at 11:31, pending again at 11:30 waits from 11:30.
   const rows = deps.db.prepare(
     `SELECT q.qitem_id, q.destination_session, q.tags, q.chain_of_record, q.priority,
             COALESCE((SELECT MAX(t.ts) FROM queue_transitions t WHERE t.qitem_id = q.qitem_id AND t.actor_session = ?), q.ts_created) AS since,
-            COALESCE((SELECT MAX(t.ts) FROM queue_transitions t
+            COALESCE((SELECT t.ts FROM queue_transitions t
                        WHERE t.qitem_id = q.qitem_id AND t.state = 'pending' AND t.actor_session <> ?
                          AND COALESCE(t.transition_note, '') NOT LIKE 'unclaimed: ${SEAT_POOL_REAP_REASON}%'
                          AND COALESCE(t.transition_note, '') NOT LIKE 'unclaimed: ${SEAT_POOL_DRAIN_REASON}%'
                          AND COALESCE((SELECT p.state FROM queue_transitions p
-                                        WHERE p.qitem_id = t.qitem_id
-                                          AND (p.ts < t.ts OR (p.ts = t.ts AND p.transition_id < t.transition_id))
-                                        ORDER BY p.ts DESC, p.transition_id DESC LIMIT 1), '') <> 'pending'),
+                                        WHERE p.qitem_id = t.qitem_id AND p.transition_id < t.transition_id
+                                        ORDER BY p.transition_id DESC LIMIT 1), '') <> 'pending'
+                       ORDER BY t.transition_id DESC LIMIT 1),
                      q.ts_created) AS pending_since
        FROM queue_items q
       WHERE q.state = 'pending' AND q.destination_session IN (${[...sessionOf.keys()].map(() => "?").join(",")})
