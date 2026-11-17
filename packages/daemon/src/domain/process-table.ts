@@ -5,6 +5,7 @@ import { pathToFileURL } from "node:url";
 import { Worker } from "node:worker_threads";
 import { lstart, procRows, type ProcFile, type ProcessTableRow } from "./process-table-rows.js";
 import { markProcessTableRead } from "./process-table-reads.js";
+import { recordSlowDiagnostic } from "./sync-site-wrap.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -79,13 +80,13 @@ async function readPsTable(): Promise<ProcessTableRow[]> {
 
 /** Part of a /proc's table, as the reader sends it: the boot time, then the rows of up to PIDS_PER_PART pids, parsed on
  *  the reader's thread. Only when that thread could not load the rows module does a part carry the files instead
- *  (pids with their stat and cmdline, null once the stat could not be read), and the loop parses them with the same
- *  code. Either kind names the part's pids whose stat /proc hid from this user (EPERM, EACCES: `hidden`), which the
- *  census keeps apart from the processes that exited (v0.7.18). The last part is `done`; a read that failed whole
- *  sends its error instead. */
+ *  (pids with their stat and cmdline, null once the stat could not be read), with why the load failed, and the loop
+ *  parses them with the same code. Either kind names the part's pids whose stat /proc hid from this user (EPERM,
+ *  EACCES: `hidden`), which the census keeps apart from the processes that exited (v0.7.18). The last part is `done`;
+ *  a read that failed whole sends its error instead. */
 type ProcPart =
   | { id: number; bootTime: number; rows: ProcessTableRow[]; starts: number[]; hidden: number[]; done: boolean }
-  | { id: number; bootTime: number; files: Array<[pid: string, stat: ProcFile, cmdline: ProcFile | null]>; hidden: number[]; done: boolean }
+  | { id: number; bootTime: number; files: Array<[pid: string, stat: ProcFile, cmdline: ProcFile | null]>; hidden: number[]; loadError: string; done: boolean }
   | { id: number; error: string };
 
 // The reader's thread. It reads every file synchronously, the cheapest way: as many asynchronous reads cost ten times
@@ -115,14 +116,21 @@ const READER_SOURCE = new URL(`data:text/javascript,${encodeURIComponent(String.
   }
 
   parentPort.on("message", async ({ id, root }) => {
-    // The rows module, loaded once; a failed load sends the files for the loop to parse, and the next read tries again.
+    // The rows module, loaded once; a failed load sends the files for the loop to parse, with why (the loop names it,
+    // T-011108), and the next read tries again. A tsx loader the loop could not resolve fails the load the same way.
     let parse = null;
+    let loadError = "";
     try {
+      if (workerData.loaderError) throw new Error(workerData.loaderError);
       rows ??= (workerData.url.endsWith(".ts")
         ? import(workerData.loaderUrl).then((api) => api.tsImport(workerData.url, workerData.parent))
         : import(workerData.url)).catch((error) => { rows = undefined; throw error; });
       parse = (await rows).procRowsForLoop;
-    } catch {}
+      if (typeof parse !== "function") throw new Error(workerData.url + " has no procRowsForLoop");
+    } catch (error) {
+      parse = null;
+      loadError = error instanceof Error ? error.message : String(error);
+    }
     try {
       const bootTime = Number(/^btime (\d+)$/m.exec(fs.readFileSync(root + "/stat", "utf8"))?.[1]);
       if (!Number.isFinite(bootTime)) throw new Error(root + "/stat has no btime");
@@ -137,7 +145,7 @@ const READER_SOURCE = new URL(`data:text/javascript,${encodeURIComponent(String.
         const hidden = files.filter(([, stat]) => typeof stat !== "string" && (stat.code === "EPERM" || stat.code === "EACCES"))
           .map(([pid]) => Number(pid));
         const done = start + PIDS_PER_PART >= pids.length;
-        parentPort.postMessage(parse ? { id, bootTime, ...parse(files, bootTime), hidden, done } : { id, bootTime, files, hidden, done });
+        parentPort.postMessage(parse ? { id, bootTime, ...parse(files, bootTime), hidden, done } : { id, bootTime, files, hidden, loadError, done });
       }
     } catch (error) {
       parentPort.postMessage({ id, error: error instanceof Error ? error.message : String(error) });
@@ -147,6 +155,49 @@ const READER_SOURCE = new URL(`data:text/javascript,${encodeURIComponent(String.
 
 let reader: Worker | null = null;
 let lastAsk = 0;
+/** The rows module the reader loads and how the tsx loader is found (for a .ts source); a test replaces them. */
+let rowsUrlOverride: string | undefined;
+let resolveLoader = (): string => createRequire(import.meta.url).resolve("tsx/esm/api");
+const defaultResolveLoader = resolveLoader;
+/** Parts received since the reader started, by kind: a test reads that the rows came parsed (T-011108). */
+const partsSeen = { rows: 0, files: 0 };
+// The parse on the loop is named once a minute at most (a diagnostic record) and once on stderr (T-011108,
+// SH-1 of the openrig#27 review: the reader that could not load the rows module sent the files with no sign).
+const PARSE_ON_LOOP_RECORD_INTERVAL_MS = 60_000;
+let lastParseOnLoopRecord = -Infinity;
+let parseOnLoopReported = false;
+
+function parseOnLoop(loadError: string): void {
+  const error = loadError.split("\n")[0]!.slice(0, 200);
+  if (!parseOnLoopReported) {
+    parseOnLoopReported = true;
+    console.error(`[process-table] the /proc reader could not load the rows module; the event loop parses the table instead (reported once): ${error}`);
+  }
+  const at = performance.now();
+  if (at - lastParseOnLoopRecord < PARSE_ON_LOOP_RECORD_INTERVAL_MS) return;
+  lastParseOnLoopRecord = at;
+  recordSlowDiagnostic(Number.POSITIVE_INFINITY, { site: "process-table.parse-on-loop", error });
+}
+
+/** Test seam (T-011108): stops the reader, idle (the next read starts another), and forgets the parts and the
+ *  parse-on-loop record, so the next one reads with `rowsUrl` as its rows module and `resolveLoader` finding the tsx
+ *  loader; no option puts the real ones back. */
+export async function restartProcReaderForTest(options: { rowsUrl?: string; resolveLoader?: () => string } = {}): Promise<void> {
+  const worker = reader;
+  reader = null;
+  if (worker) await worker.terminate();
+  rowsUrlOverride = options.rowsUrl;
+  resolveLoader = options.resolveLoader ?? defaultResolveLoader;
+  partsSeen.rows = 0;
+  partsSeen.files = 0;
+  lastParseOnLoopRecord = -Infinity;
+  parseOnLoopReported = false;
+}
+
+/** Test seam (T-011108): the parts received since the reader started, by kind. */
+export function procTablePartsForTest(): { rows: number; files: number } {
+  return { ...partsSeen };
+}
 const asked = new Map<number, { worker: Worker; census: ProcessTableCensus; resolve: (census: ProcessTableCensus) => void; reject: (error: Error) => void }>();
 
 /** The process table read from /proc (`root` for tests): the rows ps would print, without a process of its own. The
@@ -158,7 +209,14 @@ export function readProcTable(root = "/proc"): Promise<ProcessTableRow[]> {
 
 /** A /proc read whose permission omissions stay distinct from processes that have exited. */
 export function readProcCensus(root = "/proc"): Promise<ProcessTableCensus> {
-  const worker = reader ??= startReader();
+  let worker: Worker;
+  try {
+    worker = reader ??= startReader();
+  } catch (error) {
+    // A reader that cannot start rejects the read, as every other failure does, never a throw the callers' .catch
+    // misses (T-011108, SH-2 of the openrig#27 review).
+    return Promise.reject(error instanceof Error ? error : new Error(String(error)));
+  }
   const id = ++lastAsk;
   // Idle, the reader keeps no process up; while an answer is owed it does.
   worker.ref();
@@ -170,13 +228,21 @@ export function readProcCensus(root = "/proc"): Promise<ProcessTableCensus> {
 
 function startReader(): Worker {
   const extension = import.meta.url.endsWith(".ts") ? "ts" : "js";
+  const url = rowsUrlOverride ?? new URL(`./process-table-rows.${extension}`, import.meta.url).href;
+  // A .ts source (dev, tests) loads the rows module through tsx; without it the reader sends the files and the loop
+  // parses them (T-011108, SH-2: the resolve threw here, synchronously, out of every caller's .catch).
+  let loaderUrl: string | undefined;
+  let loaderError: string | undefined;
+  if (url.endsWith(".ts")) {
+    try {
+      loaderUrl = pathToFileURL(resolveLoader()).href;
+    } catch (error) {
+      loaderError = `the tsx loader could not be resolved: ${error instanceof Error ? error.message : String(error)}`;
+    }
+  }
   const worker = new Worker(READER_SOURCE, {
     execArgv: [],
-    workerData: {
-      url: new URL(`./process-table-rows.${extension}`, import.meta.url).href,
-      parent: import.meta.url,
-      loaderUrl: extension === "ts" ? pathToFileURL(createRequire(import.meta.url).resolve("tsx/esm/api")).href : undefined,
-    },
+    workerData: { url, parent: import.meta.url, loaderUrl, loaderError },
   });
   worker.unref();
   worker.on("message", (part: ProcPart) => {
@@ -189,9 +255,12 @@ function startReader(): Worker {
       return;
     }
     if ("rows" in part) {
+      partsSeen.rows += 1;
       // The start times are formatted here, in the loop's local time (lstart); the rest of each row came parsed.
       part.rows.forEach((row, index) => { row.startedAt = lstart(part.starts[index]!); ask.census.rows.push(row); });
     } else {
+      partsSeen.files += 1;
+      parseOnLoop(part.loadError);
       for (const row of procRows(part.files, part.bootTime)) ask.census.rows.push(row);
     }
     ask.census.permissionHiddenPids.push(...part.hidden);
