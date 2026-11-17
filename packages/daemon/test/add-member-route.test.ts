@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import type Database from "better-sqlite3";
 import { createFullTestDb, createTestApp } from "./helpers/test-app.js";
 import type { ExpansionRequest } from "../src/domain/types.js";
@@ -57,6 +57,33 @@ describe("POST /api/rigs/:rigId/pods/:podNamespace/members", () => {
     // The new node is in the live rig under the existing pod.
     const updatedRig = setup.rigRepo.getRig(rig.id)!;
     expect(updatedRig.nodes.some((n) => n.logicalId === "infra.server2")).toBe(true);
+  });
+
+  it("creates the node without launching it when launch is false", async () => {
+    const rig = await seedRigWithPod();
+    vi.mocked(setup.tmuxAdapter.createSession).mockClear();
+    const res = await setup.app.request(`/api/rigs/${rig.id}/pods/infra/members`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ member: terminalMember("server2"), launch: false }),
+    });
+    expect(res.status).toBe(201);
+    const body = await res.json();
+    expect(body.result.node).toMatchObject({ logicalId: "infra.server2", status: "materialized" });
+    expect(body.result.node.sessionName).toBeUndefined();
+    expect(setup.tmuxAdapter.createSession).not.toHaveBeenCalled();
+  });
+
+  it("returns 400 for a non-boolean launch and creates nothing", async () => {
+    const rig = await seedRigWithPod();
+    const res = await setup.app.request(`/api/rigs/${rig.id}/pods/infra/members`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ member: terminalMember("server2"), launch: "no" }),
+    });
+    expect(res.status).toBe(400);
+    expect(await res.json()).toMatchObject({ code: "validation_failed" });
+    expect(setup.rigRepo.getRig(rig.id)!.nodes.some((n) => n.logicalId === "infra.server2")).toBe(false);
   });
 
   it("returns 404 for a nonexistent rig", async () => {

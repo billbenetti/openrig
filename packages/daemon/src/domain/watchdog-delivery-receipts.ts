@@ -4,7 +4,11 @@ import { resolveWakeRetryCap, resolveWakeRetryIntervalSeconds } from "./queue-wa
 import type { DeliveryFn, DeliveryOutcome, WatchdogDeliverySource } from "./watchdog-policy-engine.js";
 
 const PREFIX = "watchdog-occurrence-";
-type Receipt = { attempts: number; retryAt?: string; message: string; nextAction?: string; terminalReason?: string; ended?: boolean; error?: string; heldIds?: string[] };
+type Receipt = { attempts: number; retryAt?: string; message: string; nextAction?: string; terminalReason?: string; ended?: boolean; error?: string; heldIds?: string[];
+  /** The queue row the occurrence became at a queue-only seat (T-006857); outbox `delivered` is custody, not typed input. */
+  queuedAs?: string;
+  /** The occurrence was a parked row's own wake timer at a queue-only seat, recorded on that row (T-006857, SH-1). */
+  notedOnParkedRow?: true };
 
 /** Occurrence custody uses the existing outbox. The watchdog's own loop is its only retry driver.
  * Condition policies keep their existing receipts; this is for scheduled periodic reminders, including digests. */
@@ -31,7 +35,10 @@ export function withWatchdogReceipts(send: DeliveryFn, deps: {
     if (!selected.length) return null;
     const entries = selected.map(m => outbox.getById(m.id));
     if (entries.every(e => e?.deliveryState === "delivered")) {
-      return { status: "ok", occurrenceTracked: true, reconciled: true, outboxIds: selected.map(m => m.id), sentMessage: read(selected[0]!.id)?.message };
+      const first = read(selected[0]!.id);
+      return { status: "ok", occurrenceTracked: true, reconciled: true, outboxIds: selected.map(m => m.id), sentMessage: first?.message,
+        ...(first?.queuedAs ? { code: "queued_as_row" as const, queuedQitemId: first.queuedAs }
+          : first?.notedOnParkedRow ? { code: "noted_on_parked_row" as const } : {}) };
     }
     if (entries.every(e => e?.deliveryState === "retained" || e?.deliveryState === "retired")) {
       return { status: "retained", occurrenceTracked: true, reconciled: true,
@@ -119,6 +126,8 @@ export function withWatchdogReceipts(send: DeliveryFn, deps: {
         const ended = result.status === "failed" && (!noInput || unavailable || exhausted);
         outbox.finalizeDelivery(member.id, state);
         save(member.id, { ...receipt, ...(ended ? { ended: true, error: result.error } : {}), ...(result.status === "retained" ? { heldIds: result.outboxIds ?? [] } : {}),
+          ...(result.status === "ok" && result.code === "queued_as_row" && result.queuedQitemId ? { queuedAs: result.queuedQitemId } : {}),
+          ...(result.status === "ok" && result.code === "noted_on_parked_row" ? { notedOnParkedRow: true as const } : {}),
           ...(retryAt ? { retryAt } : {}), ...(nextAction ? { nextAction } : {}),
           ...(terminalReason ? { terminalReason } : {}) });
         memberOutcomes[member.jobId] = { ...result, occurrenceTracked: true, ...(ended ? { occurrenceComplete: true } : {}),

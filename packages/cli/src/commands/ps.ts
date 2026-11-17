@@ -105,6 +105,8 @@ export interface NodeEntry {
   heldReason?: string | null;
   /** #2456: the required startup files this occupant's handover started it without. */
   startedWithoutRequired?: string[];
+  /** The logical id of the model seat whose seat pool holds this seat. Missing for other seats and on an older daemon. */
+  seatPoolModel?: string;
   agentActivity?: {
     state: "running" | "needs_input" | "idle" | "unknown";
     reason: string;
@@ -248,6 +250,7 @@ const ALLOWED_NODE_FIELDS = new Set([
   "contextUsage",
   "heldReason",
   "startedWithoutRequired",
+  "seatPoolModel",
   "storedSessionStatus",
   "identityVerdict",
 ]);
@@ -805,11 +808,43 @@ export function compactNodeProjection(nodes: NodeEntry[]): Array<Record<string, 
     // held/attention reason (short) when present.
     if (n.heldReason) compact.heldReason = n.heldReason;
     if (n.startedWithoutRequired?.length) compact.startedWithoutRequired = n.startedWithoutRequired;
+    if (n.seatPoolModel) compact.seatPoolModel = n.seatPoolModel;
     if (keepDiagnostics && n.latestError) {
       compact.latestError = n.latestError;
     }
     return compact;
   });
+}
+
+const seatKey = (rigId: string, logicalId: string) => `${rigId}\0${logicalId}`;
+
+/** Whether a seat is shown under its seat pool's model: the model is listed too. */
+function inSeatPoolGroup(node: NodeEntry, listed: ReadonlySet<string>): boolean {
+  return !!node.seatPoolModel && node.seatPoolModel !== node.logicalId && listed.has(seatKey(node.rigId, node.seatPoolModel));
+}
+
+/** The nodes in their order, except that each seat a seat pool holds follows its model, after any earlier such seat.
+ *  A seat whose model isn't listed (filtered out, or past a limit) keeps its place. */
+export function groupSeatPoolSeats(nodes: NodeEntry[]): NodeEntry[] {
+  const listed = new Set(nodes.map((n) => seatKey(n.rigId, n.logicalId)));
+  const seatsOf = new Map<string, NodeEntry[]>();
+  for (const n of nodes) {
+    if (!inSeatPoolGroup(n, listed)) continue;
+    const model = seatKey(n.rigId, n.seatPoolModel!);
+    seatsOf.set(model, [...(seatsOf.get(model) ?? []), n]);
+  }
+  const out: NodeEntry[] = [];
+  const placed = new Set<NodeEntry>();
+  const place = (n: NodeEntry) => {
+    if (placed.has(n)) return;
+    placed.add(n);
+    out.push(n);
+    for (const seat of seatsOf.get(seatKey(n.rigId, n.logicalId)) ?? []) place(seat);
+  };
+  for (const n of nodes) if (!inSeatPoolGroup(n, listed)) place(n);
+  // Pools that hold each other's models have no seat to start from; they keep their order.
+  for (const n of nodes) place(n);
+  return out;
 }
 
 function summarizeRigs(entries: PsEntry[]): {
@@ -978,7 +1013,7 @@ Exit codes:
   cmd
     .option("--json", "JSON output for agents")
     .option("--no-cleanup", "Preserve stale daemon state files during observation")
-    .option("--resources", "Show this host’s load and transcript capture cost (also supports --host)")
+    .option("--resources", "Show this host’s load, memory and transcript capture cost (also supports --host)")
     .option("--nodes", "Show per-node detail (current rig; -A for all rigs)")
     .option("--full", "Show all rig rows without cell truncation, or all node-list fields with --nodes (recoveryGuidance/currentUsage live on node detail)")
     .option("--verbose", "Alias for --full")
@@ -1429,7 +1464,11 @@ async function handleNodes(
     return;
   }
 
-  const humanList = (opts.full || limit !== null) ? limited : limited.slice(0, HUMAN_NODE_BUDGET);
+  const grouped = groupSeatPoolSeats(limited);
+  const humanList = (opts.full || limit !== null) ? grouped : grouped.slice(0, HUMAN_NODE_BUDGET);
+  const listed = new Set(limited.map((n) => seatKey(n.rigId, n.logicalId)));
+  // A seat a seat pool holds is shown under its model.
+  const underModel = (n: NodeEntry, name: string) => inSeatPoolGroup(n, listed) ? `└ ${name}` : name;
   const humanTruncated = !opts.full && limit === null && filtered.length > HUMAN_NODE_BUDGET;
 
   if (useCompact) {
@@ -1445,7 +1484,7 @@ async function handleNodes(
         : livenessUnconfirmed(n) ? "liveness unconfirmed" : "—");
       console.log(padCompactNodeRow(
         n.rigName,
-        n.canonicalSessionName ?? "—",
+        underModel(n, n.canonicalSessionName ?? "—"),
         abbrevNodeLifecycle(n.lifecycleState),
         formatActivity(n),
         formatHasWork(n.hasAssignedWork, n.assignedWorkCount ?? n.pendingWorkCount),
@@ -1464,7 +1503,7 @@ async function handleNodes(
       console.log(padNodeRow(
         rig,
         pod,
-        member,
+        underModel(n, member),
         n.canonicalSessionName ?? "—",
         n.runtime ?? "—",
         formatDeclaredModel(n.model),
@@ -1968,6 +2007,8 @@ async function runFanOutPs(
 interface HostResources {
   sampledAt: string; cpuCount: number; runningSeats: number;
   loadAverage: number[] | null; loadPerCpu: number[] | null;
+  /** Absent from daemons that predate memory reporting. */
+  memory?: { totalBytes: number; freeBytes: number };
   capture: {
     rotatingSeats: number; idleSeats: number; captures: number; failures: number;
     capturedBytes: number; captureDurationMs: number;
@@ -1993,6 +2034,10 @@ async function handleResources(client: DaemonClient, json?: boolean, headers?: R
   console.log(data.loadAverage && data.loadPerCpu
     ? `Load (1/5/15m): ${data.loadAverage.map((n) => n.toFixed(2)).join(" / ")} · per CPU: ${data.loadPerCpu.map((n) => n.toFixed(2)).join(" / ")} (not CPU utilization)`
     : "Load average: unavailable on this platform");
+  const gib = (bytes: number) => `${(bytes / 2 ** 30).toFixed(1)} GiB`;
+  console.log(data.memory
+    ? `Memory: ${gib(data.memory.freeBytes)} free of ${gib(data.memory.totalBytes)}`
+    : "Memory: not reported by this daemon");
   const capture = data.capture;
   console.log(`Transcript capture: ${capture.rotatingSeats} rotating · ${capture.idleSeats} backed off · ${capture.captures} attempts · ${capture.failures} failures`);
   console.log(`Capture cost for currently rotating seats: ${capture.capturedBytes} bytes · ${capture.captureDurationMs.toFixed(1)} ms elapsed across captures (not daemon CPU time)`);

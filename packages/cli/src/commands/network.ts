@@ -1,6 +1,6 @@
 import { Command } from "commander";
 import { lstatSync, readFileSync } from "node:fs";
-import { DaemonClient, operatorAuthHeaders } from "../client.js";
+import { DaemonClient, withOperatorBearerRetry } from "../client.js";
 import { getDaemonStatus, getDaemonUrl, daemonStatusGuard, type LifecycleDeps } from "../daemon-lifecycle.js";
 import { realDeps } from "./daemon.js";
 
@@ -63,6 +63,14 @@ export function networkCommand(depsOverride?: NetworkDeps): Command {
     if (!daemonStatusGuard(daemon)) return null;
     return deps.clientFactory(getDaemonUrl(daemon));
   };
+  /** The operator writes: the client and the URL it was made for, the target the bearer retry checks (T-007930). */
+  const writer = async () => {
+    const deps = getDeps();
+    const daemon = await getDaemonStatus(deps.lifecycleDeps);
+    if (!daemonStatusGuard(daemon)) return null;
+    const url = getDaemonUrl(daemon);
+    return { daemon: deps.clientFactory(url), url };
+  };
   const finish = (status: number, data: unknown, json: boolean | undefined, ok: (data: Record<string, unknown>) => string) => {
     if (status >= 400) {
       const error = data as { error?: string; message?: string };
@@ -81,10 +89,12 @@ export function networkCommand(depsOverride?: NetworkDeps): Command {
     .option("--replace", "Replace this daemon's enrollment at the site, once the account accepts the new code (after a lost key or a removed installation)")
     .option("--json", "Print JSON")
     .action(async (code: string, opts: { site: string; allowHttp?: boolean; replace?: boolean; json?: boolean }) => {
-      const daemon = await client();
-      if (!daemon) return;
-      const res = await daemon.post<Record<string, unknown>>("/api/network/installations", { code, site: opts.site, allowHttp: opts.allowHttp === true, replace: opts.replace === true },
-        { headers: operatorAuthHeaders(), timeoutMs: ACCOUNT_WRITE_TIMEOUT_MS });
+      const w = await writer();
+      if (!w) return;
+      const { daemon, url } = w;
+      const res = await withOperatorBearerRetry(url, undefined, (headers) => daemon.post<Record<string, unknown>>("/api/network/installations",
+        { code, site: opts.site, allowHttp: opts.allowHttp === true, replace: opts.replace === true },
+        { headers, timeoutMs: ACCOUNT_WRITE_TIMEOUT_MS }), { fallback: "terminal" });
       finish(res.status, res.data, opts.json, (i) => {
         const replaced = (i as { replaced?: { endedBindings?: Array<{ id: string; localSession: string; participantName: string | null }>; problems?: string[] } }).replaced;
         const ended = replaced?.endedBindings ?? [];
@@ -123,9 +133,11 @@ export function networkCommand(depsOverride?: NetworkDeps): Command {
         }
         body = { session: seat, hubUrl: opts.hub, hubSeat: opts.as, token, allowHttp: opts.allowHttp === true };
       }
-      const daemon = await client();
-      if (!daemon) return;
-      const res = await daemon.post<Record<string, unknown>>("/api/network/bindings", body, { headers: operatorAuthHeaders(), timeoutMs: ACCOUNT_WRITE_TIMEOUT_MS });
+      const w = await writer();
+      if (!w) return;
+      const { daemon, url } = w;
+      const res = await withOperatorBearerRetry(url, undefined, (headers) => daemon.post<Record<string, unknown>>("/api/network/bindings", body,
+        { headers, timeoutMs: ACCOUNT_WRITE_TIMEOUT_MS }), { fallback: "terminal" });
       finish(res.status, res.data, opts.json, (b) => `Connected ${line(b as unknown as Binding)}\nWork for ${(b as unknown as Binding).hubSeat} reaches ${seat} once the connector runs; rig network status shows its last contact.`);
     });
 
@@ -149,10 +161,12 @@ export function networkCommand(depsOverride?: NetworkDeps): Command {
     .option("--reason <text>", "Why, for the record")
     .option("--json", "Print JSON")
     .action(async (ref: string, opts: { reason?: string; json?: boolean }) => {
-      const daemon = await client();
-      if (!daemon) return;
-      const res = await daemon.post<Record<string, unknown>>(`/api/network/bindings/${encodeURIComponent(ref)}/disconnect`, { reason: opts.reason },
-        { headers: operatorAuthHeaders(), timeoutMs: ACCOUNT_WRITE_TIMEOUT_MS });
+      const w = await writer();
+      if (!w) return;
+      const { daemon, url } = w;
+      const res = await withOperatorBearerRetry(url, undefined, (headers) => daemon.post<Record<string, unknown>>(
+        `/api/network/bindings/${encodeURIComponent(ref)}/disconnect`, { reason: opts.reason },
+        { headers, timeoutMs: ACCOUNT_WRITE_TIMEOUT_MS }), { fallback: "terminal" });
       finish(res.status, res.data, opts.json, (raw) => {
         const b = raw as unknown as Binding;
         if (b.accountRemoval === "confirmed") return `Disconnected ${line(b)}\nThe account stopped listing ${b.participantName}, which revokes it there.`;

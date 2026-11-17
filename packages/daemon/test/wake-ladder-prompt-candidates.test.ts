@@ -5,6 +5,7 @@ import { ALL_MIGRATIONS } from "../src/db/all-migrations.js";
 import { REFUSED_PREFIX } from "../src/domain/policies/parked-owner-consumer.js";
 import { PROMPT_ALERT_TAG, PROMPT_REFUSAL_CANDIDATES_SQL, readPromptRefusalCandidates } from "../src/domain/queue-wake-ladder.js";
 import { configureSyncSiteRecorder } from "../src/domain/sync-site-wrap.js";
+import { PROMPT_REFUSAL_NOTE_PREDICATE } from "../src/db/migrations/171_queue_transitions_prompt_refusal_index.js";
 
 // The candidate read the wake ladder used before it read from the open rows: every transition's note matched against
 // the refusal prefix. Kept here as the oracle the new read must agree with, row for row. It has no ORDER BY, so its
@@ -106,10 +107,12 @@ describe("the wake ladder's prompt-refusal candidates", () => {
     expect(sites).toEqual(["queue.wake_ladder.prompt_candidates"]);
   });
 
-  it("reads each candidate's own transitions through the qitem index, never the whole transition log", () => {
+  it("reads each candidate's first refusal from the refusal-note index, never the whole transition log", () => {
+    // T-010230: the read's refusal term is the 171 partial index's own predicate, which is the consumer's prefix
+    expect(PROMPT_REFUSAL_NOTE_PREDICATE).toBe(`transition_note LIKE '${REFUSED_PREFIX}%'`);
     const plan = (db.prepare(`EXPLAIN QUERY PLAN ${PROMPT_REFUSAL_CANDIDATES_SQL}`)
-      .all({ refused: `${REFUSED_PREFIX}%`, alertTag: PROMPT_ALERT_TAG }) as Array<{ detail: string }>).map((step) => step.detail);
-    expect(plan.some((detail) => /^SEARCH t USING INDEX idx_queue_transitions_qitem/.test(detail))).toBe(true);
+      .all({ alertTag: PROMPT_ALERT_TAG }) as Array<{ detail: string }>).map((step) => step.detail);
+    expect(plan.some((detail) => /^SEARCH t USING (COVERING )?INDEX idx_queue_transitions_prompt_refusal\b/.test(detail))).toBe(true);
     expect(plan.filter((detail) => /^SCAN (t|queue_transitions)\b/.test(detail))).toEqual([]);
   });
 });

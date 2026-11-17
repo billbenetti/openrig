@@ -61,6 +61,9 @@ export interface AgentRow {
    * within the daemon's silence window — the substrate whose false→true
    * transition means real new pane output; null = no signal */
   paneActive?: boolean | null;
+  /** The name of the model seat whose seat pool holds this seat, when the model is in the same pod: the seat follows
+   *  it in the pod's `agents` and is drawn under it. */
+  seatPoolModel?: string;
 }
 
 export interface PodNode {

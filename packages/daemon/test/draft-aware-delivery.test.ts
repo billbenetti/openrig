@@ -1370,4 +1370,15 @@ describe("#3076: a draft typed between the guard's read and the paste", () => {
     expect(f.submissions).toEqual([notice]);
     expect(f.bodies.a).toBe("");
   });
+
+  it("T-008302: the hold for unreadable client activity carries its own input-read diagnostic, so a caller never keeps an older one", async () => {
+    const f = fixture(undefined, { runtime: "claude-code", appendPaste: true });
+    await f.enable();
+    vi.spyOn(f.tmux, "lastClientActivity").mockRejectedValue(new Error("PRIVATE_INPUT command timed out"));
+    const held = await f.send("activity-unreadable-diagnostic", notice, { openrigNotice: true, verify: false });
+    expect(held).toMatchObject({ sent: false, reason: "draft_input_unknown",
+      inputReadFailure: { check: "draft-aware", reason: "client_activity_unavailable", timedOut: null } });
+    expect(JSON.stringify(held.inputReadFailure)).not.toMatch(/PRIVATE_INPUT/);
+    expect(pasted(f)).toEqual([]);
+  });
 });

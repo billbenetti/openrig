@@ -859,6 +859,21 @@ describe("parked reminders after a positive no-input quota rejection", () => {
     expect(store.nudges).toHaveLength(1);
     expect((await policy(store, [], quotaState, false).evaluate(makeJob())).action).toBe("send");
   });
+
+  it("T-006631: a queue-only seat gets no typed parked reminder, recorded once, and its rows stay the reminder", async () => {
+    const store = new RowStore();
+    const queueOnly = (q: boolean) => makeParkedOwnerConsumerPolicy({ ...makeDeps([parkedSeat()], store, []), retentionState: () => quotaState,
+      isQueueOnlySeat: () => q } as ParkedOwnerConsumerDeps);
+    const first = await queueOnly(true).evaluate(makeJob());
+    expect(first).toMatchObject({ action: "skip", notes: { skippedSeats: [{ seat: SEAT, why: "queue-only-seat" }] } });
+    expect(store.nudges).toHaveLength(1);
+    expect(store.nudges[0]?.result).toContain("skipped:queue-only-seat:");
+    const writes = store.appended.length;
+    for (let i = 0; i < 20; i++) expect((await queueOnly(true).evaluate(makeJob())).action).toBe("skip");
+    expect(store.appended).toHaveLength(writes);
+    expect(store.nudges).toHaveLength(1);
+    expect((await queueOnly(false).evaluate(makeJob())).action).toBe("send");
+  });
 });
 
 

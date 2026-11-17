@@ -6,15 +6,24 @@ operators and monitoring tools. This view is host-scoped; rig/node filters and
 multi-host fan-out do not apply. Ordinary `rig ps` output is unchanged.
 
 The view reports available CPU count, host load averages (1/5/15 minutes),
-load divided by CPU count, running seats, the number of rotating seats and how
-many of them are backed off, and transcript capture attempts, failures, UTF8
-bytes and elapsed capture time for currently rotating seats.
+load divided by CPU count, total and free memory, running seats, the number of
+rotating seats and how many of them are backed off, and transcript capture
+attempts, failures, UTF8 bytes and elapsed capture time for currently rotating
+seats.
 Load is not CPU utilization; capture elapsed time includes waiting for tmux,
 and is not daemon CPU time. Load averages are unavailable on Windows, rather
 than reported as zero. Counters reset when a rotation is restarted/stopped or
 the daemon restarts, so they are observations rather than a durable billing log.
 When no seat is capturing, the active interval, idle ceiling and line count are
 unavailable (`null` in JSON), not zero.
+
+Memory is `memory.totalBytes` and `memory.freeBytes` in JSON. On Linux, free
+memory is the kernel's `MemAvailable` estimate, which counts reclaimable page
+cache, so it is the figure to compare against what a new seat needs; kernels
+older than 3.14 report `MemFree` instead. On macOS it counts free pages only and
+reads lower than Activity Monitor's available memory. Neither figure accounts
+for a container or cgroup memory limit. A daemon that predates memory reporting
+omits the field, and the human view says so instead of showing zero.
 
 ## Reduce idle capture cost
 

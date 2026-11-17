@@ -357,7 +357,9 @@ export type RigEvent =
   // edge-artifact-required); workflow-keepalive deferred to Phase D.
   // Pure `not_due` polls are NOT recorded in history and NOT emitted
   // as events; only meaningful evaluations + lifecycle transitions are.
-  | { type: "watchdog.evaluation_fired"; jobId: string; policy: string; targetSession: string; deliveryStatus: string }
+  | { type: "watchdog.evaluation_fired"; jobId: string; policy: string; targetSession: string; deliveryStatus: string;
+      /** With deliveryStatus queued_as_row: the queue row the reminder became (T-006857). */
+      queuedQitemId?: string }
   | { type: "watchdog.evaluation_skipped"; jobId: string; policy: string; skipReason: string }
   | { type: "watchdog.evaluation_terminal"; jobId: string; policy: string; terminalReason: string }
   | { type: "watchdog.job_registered"; jobId: string; policy: string; targetSession: string; registeredBy: string }
@@ -941,6 +943,9 @@ export interface NodeInventoryEntry {
   /** #2456: the required startup files this occupant started without, from the latest `seat.handover_completed` event while
    *  its successor session is the seat's current one. A later launch or handover starts a new session, which clears it. */
   startedWithoutRequired?: string[];
+  /** The logical id of the model seat whose seat pool holds this seat (seat-pools.md), from the pool's `seat_pool_slots`
+   *  row, never from the seat's name. Absent for a seat no pool holds. */
+  seatPoolModel?: string;
   /** PL-007: per-node workspace block when the rig declares a workspace.
    *  workspaceRoot mirrors RigSpec.workspace.workspaceRoot. activeRepo is
    *  the repo whose path contains the node's cwd, or RigSpec.workspace.
