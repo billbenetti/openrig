@@ -2489,6 +2489,12 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
       hostSample: sampleHost,
       // Read only for a spec with dispatch_to_parked.busy_processes: the seats busy with heavy local work (T-006090).
       busyProcess: busy ? (sessionName) => busy.get(sessionName) : undefined,
+      // Read for a seat the pool added while context_limit_percent is above 0 (T-012383): its live occupant's
+      // status-line sidecar, the one the Billverso's orchestration gate reads (portao._contexto).
+      contextUsage: (nodeId, sessionName) => {
+        const usage = contextUsageStore.readSidecarForNode(nodeId, sessionName);
+        return usage.availability === "known" ? { usedPercentage: usage.usedPercentage, sampledAt: usage.sampledAt } : null;
+      },
     }, job);
     // A seat's bound pane (`%12`), or null.
     const poolPaneId = (sessionName: string): string | null => (db.prepare(

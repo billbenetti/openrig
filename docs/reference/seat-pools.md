@@ -38,6 +38,7 @@ context:
   reap_cmd:    { argv: [/usr/local/bin/pool-reap], timeout_s: 60 }
   remove_cmd:  { argv: [/usr/local/bin/pool-remove], timeout_s: 60 }
   escalation_owner: lead@my-rig     # where the pool's escalations go (default: the model's escalation owner)
+  context_limit_percent: 40         # a seat the pool added at this context usage or above takes no row (0..100, default 40; 0: off)
   dispatch_to_parked:               # absent (the default): only a free seat receives a row; see "A seat parked on its own wait"
     max_wake_s: 3600                # the longest park timer that still counts (60..86400, default 3600)
     max_claim_age_s: 21600          # how long ago the seat may have taken the parked row (600..172800, default 21600)
@@ -65,7 +66,7 @@ environment plus:
 | `OPENRIG_SEAT_POOL_SLOT` | `prepare_cmd`, `release_cmd`, `reap_cmd`, `remove_cmd` | the seat's session name |
 | `OPENRIG_SEAT_POOL_SLOT_CWD` | `prepare_cmd` | the seat's working directory |
 | `OPENRIG_SEAT_POOL_RELEASE_REASON` | `release_cmd` | why it is asked: `idle` (a free seat drained, by `drain` or by `idle_grace_s`), `drain-deadline` (the forced pass at a drain's deadline) or `reap` (a seat whose session is gone) |
-| `OPENRIG_SEAT_POOL_SLOTS` | `demand_cmd` | JSON list of `{session, phase, receives, held?}` for the pool's seats; `receives` is how the seat may take a waiting row now: `"free"`, `"parked"` (see [A seat parked on its own wait](#a-seat-parked-on-its-own-wait)) or `null`: a seat out of provider usage, a parked seat while the load is above `parked_max_load_per_cpu_percent` and a free or parked seat with a `busy_processes` program running say `null`, as the plan reads it; one more `null` is the demand command's alone: a parked seat that a waiting row was refused by (the plan still gives it other rows, never that one), so the refused row is demand ([A seat parked on its own wait](#a-seat-parked-on-its-own-wait)); `held` is `"busy"` only for a free seat (no open row, no held message) whose `busy_processes` read found a program under its pane, the seat the plan counts as occupied for it, and is absent for every other seat (out of usage, a held message, to be reaped, a failed process read) |
+| `OPENRIG_SEAT_POOL_SLOTS` | `demand_cmd` | JSON list of `{session, phase, receives, held?}` for the pool's seats; `receives` is how the seat may take a waiting row now: `"free"`, `"parked"` (see [A seat parked on its own wait](#a-seat-parked-on-its-own-wait)) or `null`: a seat out of provider usage, a parked seat while the load is above `parked_max_load_per_cpu_percent` and a free or parked seat with a `busy_processes` program running say `null`, as the plan reads it; one more `null` is the demand command's alone: a parked seat that a waiting row was refused by (the plan still gives it other rows, never that one), so the refused row is demand ([A seat parked on its own wait](#a-seat-parked-on-its-own-wait)); `held` is `"busy"` only for a free seat (no open row, no held message) whose `busy_processes` read found a program under its pane, the seat the plan counts as occupied for it, `"context"` for a quiet seat (no open row, no held message, idle at its prompt) past `context_limit_percent` (see [A seat past its context limit](#a-seat-past-its-context-limit)), also occupied in the plan (a seat held both ways says `"busy"`), and is absent for every other seat (out of usage, a held message, to be reaped, a failed process read) |
 
 A command that runs past `timeout_s` is killed and counts as failed. Each command has its own `timeout_s` (default 60),
 so a slow `release_cmd` can be given longer than `demand_cmd`; `release_cmd` runs under the seat's lifecycle lease,
@@ -125,6 +126,22 @@ isn't taking it:
 | needs input (a permission prompt or a question) | opens one row to the pool's escalation owner, tagged `seat-pool-needs-input:<seat>`; no other is opened about that seat while it is open, and a row that waits at the seat later is added to it as a note. With `dispatch_tag`, the model and an adopted seat are escalated only for waiting rows that carry the tag: their other rows are their own work |
 | is out of provider usage | nothing: the row waits |
 | is working | nothing: the row waits, and counts as demand if it is the model's |
+
+### A seat past its context limit
+
+A seat the pool added whose context usage is at `context_limit_percent` or above (default 40; 0 turns the rule off)
+takes no row, free or parked. The usage is the `used_percentage` of the status-line sidecar its current occupant writes
+(`$OPENRIG_HOME/state/context-usage/<session>.json`), read only while its `sampled_at` is less than 10 minutes old. No
+sidecar, an unreadable one, one with no percentage, a stale one, or one a previous occupant left under the same name
+(sampled before the live occupant booted, with no generation of its own) holds nothing back, as before the field. An
+adopted seat is never held back by its context: the pool never replaces it.
+
+Such a seat counts as occupied, so the pool adds a seat for the row it can't take rather than leave the row at the
+model, and it is never drained as free: it leaves the pool by its own release, or a relaunch gives it a fresh context.
+The executor reads the sidecar again just before the move: a seat that passed the limit since the plan keeps the row at
+its seat and records `seat_pool_dispatch_skipped` with `code: free_context` (or `parked_context`), the reading and the
+limit. Without the rule, a seat that stops taking new work past a context threshold of its own takes the row, gives it
+straight back to the model, and the next plan hands it to the next full seat.
 
 ### A seat parked on its own wait
 
