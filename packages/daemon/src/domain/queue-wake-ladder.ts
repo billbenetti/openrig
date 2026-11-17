@@ -9,12 +9,13 @@ import { quietHoldCustody } from "./quiet-hold-custody.js";
 import { latestHookMovedOn, latestHookPermissionPending, latestHookWaitsOnPerson } from "./agent-activity-store.js";
 import type { AgentActivity } from "./types.js";
 import type { OperatorDeliveryEngine } from "./gateway/operator-delivery-engine.js";
-import { openPromptRefusals, CLOSE_PREFIX, PARKED_OWNER_POLICY_NAME, QUEUE_ONLY_SKIP_RESULT_PREFIX, REFUSED_PREFIX } from "./policies/parked-owner-consumer.js";
+import { openPromptRefusals, CLOSE_PREFIX, PARKED_OWNER_POLICY_NAME, QUEUE_ONLY_SKIP_RESULT_PREFIX } from "./policies/parked-owner-consumer.js";
 import { findQueueRecovery, recoveryTag } from "./queue-recovery.js";
 import { lastMeaningfulTransition, type WaitingView } from "./queue-waiting.js";
 import { readWakeOutcome } from "./connection-contract.js";
 import { runSyncSite } from "./sync-site-wrap.js";
 import { readOffLoop } from "./read-off-loop.js";
+import { PROMPT_REFUSAL_NOTE_PREDICATE } from "../db/migrations/171_queue_transitions_prompt_refusal_index.js";
 // S01 (OPR.0.5.5.1) — WAKE OR ESCALATE ON BATONS. A handoff whose wake fails must never
 // silently park: today one failed nudge is recorded and nothing follows (the measured
 // dominant 0.5.3 failure class — a perfect surviving packet, a recipient never woken).
@@ -1077,11 +1078,13 @@ const PROMPT_ALERT_ROWS = `(tags LIKE '%"${PROMPT_ALERT_TAG}"%' OR tags LIKE '%\
  * (the state index) and then each candidate's own transitions (the qitem index), not by matching the note across the
  * whole transition log, which only grows. Ordered by each row's first refusal: the order the whole-log read returned
  * under its observed plan (it had no ORDER BY), now explicit. A recovered id is cut after the 13-byte ASCII prefix as
- * bytes, because text substr stops at a NUL, which a caller-supplied id can hold; the join then compares it exactly. */
+ * bytes, because text substr stops at a NUL, which a caller-supplied id can hold; the join then compares it exactly.
+ * T-010230: the refusal term is the 171 index's own predicate, so each row's first refusal is read from that partial
+ * index (refusal notes only), never from the note text of all its transitions. */
 export const PROMPT_REFUSAL_CANDIDATES_SQL = `WITH scored AS MATERIALIZED (
     SELECT q.qitem_id, q.destination_session,
       (SELECT min(t.transition_id) FROM queue_transitions t
-        WHERE t.qitem_id = q.qitem_id AND t.transition_note LIKE @refused) AS first_refusal
+        WHERE t.qitem_id = q.qitem_id AND t.${PROMPT_REFUSAL_NOTE_PREDICATE}) AS first_refusal
     FROM (
       SELECT qitem_id FROM queue_items WHERE state IN ('pending','in-progress','blocked')
       UNION
@@ -1096,7 +1099,7 @@ export const PROMPT_REFUSAL_CANDIDATES_SQL = `WITH scored AS MATERIALIZED (
 /** Named in the slow-operation log, so a stall during it is attributed to this read: one begin and one end record per tick. */
 export function readPromptRefusalCandidates(db: Database.Database): Array<{ qitem_id: string; destination_session: string }> {
   return runSyncSite("queue.wake_ladder.prompt_candidates", () => db.prepare(PROMPT_REFUSAL_CANDIDATES_SQL)
-    .all({ refused: `${REFUSED_PREFIX}%`, alertTag: PROMPT_ALERT_TAG }) as Array<{ qitem_id: string; destination_session: string }>);
+    .all({ alertTag: PROMPT_ALERT_TAG }) as Array<{ qitem_id: string; destination_session: string }>);
 }
 
 /** Active watchdog jobs whose latest attempt was refused at a target's prompt. A run of refusals starts

@@ -16,6 +16,7 @@ import {
 import nodePath from "node:path";
 import { parse as parseYaml } from "yaml";
 import { memoizeScan, parseSkillFrontmatter, type ScanCache } from "./skill-discovery.js";
+import { runSyncSiteWhenSlow } from "./sync-site-wrap.js";
 
 const CATALOG_SCHEMA = "openrig.skill-catalog/v1";
 const MANIFEST_SCHEMA = "openrig.skill-loadout/v1";
@@ -701,7 +702,9 @@ function replaceGitIgnoreBlock(original: string, begin: string, end: string, pat
 
 function isGitIgnored(repoRoot: string, path: string): boolean {
   try {
-    execFileSync("git", ["-C", repoRoot, "check-ignore", "-q", "--no-index", "--", path], { stdio: "ignore" });
+    // T-010230: bounded like the catalog's other Git reads; a timeout throws (status null), never "not ignored"
+    execFileSync("git", ["-C", repoRoot, "check-ignore", "-q", "--no-index", "--", path],
+      { stdio: "ignore", timeout: CATALOG_GIT_TIMEOUT_MS });
     return true;
   } catch (err) {
     if ((err as { status?: number | null }).status === 1) return false;
@@ -712,7 +715,8 @@ function isGitIgnored(repoRoot: string, path: string): boolean {
 function isGitTracked(repoRoot: string, path: string): boolean {
   const relative = nodePath.relative(repoRoot, path);
   try {
-    execFileSync("git", ["-C", repoRoot, "ls-files", "--error-unmatch", "--", relative], { stdio: "ignore" });
+    execFileSync("git", ["-C", repoRoot, "ls-files", "--error-unmatch", "--", relative],
+      { stdio: "ignore", timeout: CATALOG_GIT_TIMEOUT_MS });
     return true;
   } catch (err) {
     if ((err as { status?: number | null }).status === 1) return false;
@@ -764,8 +768,13 @@ function planGitIgnores(input: {
     repoRoot = execFileSync("git", ["-C", input.cwd, "rev-parse", "--show-toplevel"], {
       encoding: "utf8",
       stdio: ["ignore", "pipe", "ignore"],
+      timeout: CATALOG_GIT_TIMEOUT_MS,
     }).trim();
-  } catch {
+  } catch (err) {
+    // T-010230: only "not a Git work tree" means there is nothing to ignore; a Git that timed out or was killed
+    // must not pass as "no repo" (the skills would land untracked in the project's git status)
+    const e = err as { code?: string; signal?: string | null };
+    if (e.code === "ETIMEDOUT" || e.signal) throw err;
     return [];
   }
   const canonicalRepoRoot = realpathSync(repoRoot);
@@ -1157,7 +1166,9 @@ export function reconcileSkillLoadout(input: {
   let gitIgnorePlans: GitIgnorePlan[];
   try {
     // A loadout outside the cwd adds nothing to the checkout, so it has nothing to hide from Git.
-    gitIgnorePlans = input.location ? [] : planGitIgnores({ cwd, runtime: input.runtime, targetRoot, manifestPath, owned: nextOwned });
+    // T-010230: its Git calls are synchronous; named in the slow-operation log when slow
+    gitIgnorePlans = input.location ? [] : runSyncSiteWhenSlow("skill_catalog.plan_git_ignores",
+      () => planGitIgnores({ cwd, runtime: input.runtime, targetRoot, manifestPath, owned: nextOwned }));
   } catch (err) {
     return {
       ok: false,
