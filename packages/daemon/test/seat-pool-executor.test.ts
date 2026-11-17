@@ -2298,7 +2298,8 @@ describe("readSeatPoolState", () => {
       seatState: () => ({ activity: "idle-at-prompt", needsInput: { count: 0, reason: null }, backgroundWork: null, changedAt: "2026-11-09T10:00:00.000Z" }) as never,
       restoring: () => false,
       demand: () => null,
-    }, { jobId: JOB, targetSession: "dev-impl@r", spec: spec() });
+      now: () => T0,
+    }, { jobId: JOB, targetSession: "dev-impl@r", spec: spec({ priority_aging_s: 0 }) }); // the rank alone (T-010078: no aging)
 
     expect(state.pending.map((row) => row.qitemId)).toEqual([
       "q-critical", "q-urgent", "q-high", "q-routine-a", "q-routine-b", "q-normal", "q-unknown", "q-routine-new", "q-low",
@@ -2306,6 +2307,58 @@ describe("readSeatPoolState", () => {
     // The plan hands rows out in that order: with two free seats, the critical and the urgent row go first.
     const dispatched = planSeatPool(spec(), state, T0, 120_000).intents.filter((intent) => intent.kind === "dispatch");
     expect(dispatched.map((intent) => (intent as { qitemId: string }).qitemId)).toEqual(["q-critical", "q-urgent"]);
+  });
+
+  it("ages a low row pending for priority_aging_s up to routine, never past it (T-010078)", () => {
+    db = createFullTestDb();
+    const rigRepo = new RigRepository(db);
+    const rig = rigRepo.createRig("r");
+    const pod = new PodRepository(db).createPod(rig.id, "dev", "Dev");
+    const model = rigRepo.addNode(rig.id, "dev.impl", { runtime: "claude-code", cwd: "/tmp", podId: pod.id });
+    db.prepare("INSERT INTO sessions (id, node_id, session_name, status) VALUES ('s-model', ?, 'dev-impl@r', 'running')").run(model.id);
+    const slots = new SeatPoolSlots(db);
+    const insert = (id: string, priority: string, minutesAgo: number) => {
+      const ts = new Date(T0 - minutesAgo * 60_000).toISOString();
+      db.prepare(
+        `INSERT INTO queue_items (qitem_id, ts_created, ts_updated, source_session, destination_session, state, priority, body)
+         VALUES (?, ?, ?, 'lead@r', 'dev-impl@r', 'pending', ?, 'work')`,
+      ).run(id, ts, ts, priority);
+    };
+    insert("q-routine-old", "routine", 180); // 3 h: a routine row never ages into urgent
+    insert("q-low-old", "low", 121); // 2 h 1 min: ages to routine
+    insert("q-low-2h", "LOW", 120); // exactly 2 h: ages too (2 h or more), in any case
+    insert("q-routine-new", "routine", 10);
+    insert("q-low-young", "low", 30); // 30 min: still low
+    insert("q-urgent-new", "urgent", 1);
+    const read = (overrides: Record<string, unknown> = {}) => readSeatPoolState({
+      db, slots,
+      openRows: () => [],
+      sessionAddresses: (session) => [session],
+      heldMessages: () => 0,
+      seatStopped: () => false,
+      seatState: () => ({ activity: "idle-at-prompt", needsInput: { count: 0, reason: null }, backgroundWork: null, changedAt: "2026-11-09T10:00:00.000Z" }) as never,
+      restoring: () => false,
+      demand: () => null,
+      now: () => T0,
+    }, { jobId: JOB, targetSession: "dev-impl@r", spec: spec(overrides) }).pending.map((row) => row.qitemId);
+
+    // Default 2 h: the aged low rows go before the newer routine one (FIFO among routine), never before the urgent one.
+    expect(read()).toEqual(["q-urgent-new", "q-routine-old", "q-low-old", "q-low-2h", "q-routine-new", "q-low-young"]);
+    // Configurable: with 1 h only, a 30-min low row still waits; with 20 min it ages too.
+    expect(read({ priority_aging_s: 3600 })).toEqual(["q-urgent-new", "q-routine-old", "q-low-old", "q-low-2h", "q-routine-new", "q-low-young"]);
+    expect(read({ priority_aging_s: 1200 })).toEqual(["q-urgent-new", "q-routine-old", "q-low-old", "q-low-2h", "q-low-young", "q-routine-new"]);
+    // 0 turns it off: the strict rank of T-009034.
+    expect(read({ priority_aging_s: 0 })).toEqual(["q-urgent-new", "q-routine-old", "q-routine-new", "q-low-old", "q-low-2h", "q-low-young"]);
+  });
+
+  it("refuses a priority_aging_s that is not a whole number of seconds from 0 to 7 days (T-010078)", () => {
+    for (const bad of [-1, 1.5, "7200", 604_801, null]) {
+      const parsed = parseSeatPoolSpec({ max: 3, cwd_template: "/work/{rig}/{slot}", priority_aging_s: bad });
+      expect("problem" in parsed && parsed.problem.field).toBe("priority_aging_s");
+    }
+    for (const good of [0, 7200, 604_800]) {
+      expect("spec" in parseSeatPoolSpec({ max: 3, cwd_template: "/work/{rig}/{slot}", priority_aging_s: good })).toBe(true);
+    }
   });
 
   it("reads the pending rows to the model, its seats and the seats it removed, and each seat's cause", () => {
