@@ -2351,6 +2351,58 @@ describe("readSeatPoolState", () => {
     expect(read({ priority_aging_s: 0 })).toEqual(["q-urgent-new", "q-routine-old", "q-routine-new", "q-low-old", "q-low-2h", "q-low-young"]);
   });
 
+  it("ages a low row by when it became pending, not by its latest reroute of the queue-fallback (T-010932)", () => {
+    db = createFullTestDb();
+    const rigRepo = new RigRepository(db);
+    const rig = rigRepo.createRig("r");
+    const pod = new PodRepository(db).createPod(rig.id, "dev", "Dev");
+    const model = rigRepo.addNode(rig.id, "dev.impl", { runtime: "claude-code", cwd: "/tmp", podId: pod.id });
+    db.prepare("INSERT INTO sessions (id, node_id, session_name, status) VALUES ('s-model', ?, 'dev-impl@r', 'running')").run(model.id);
+    const slots = new SeatPoolSlots(db);
+    const ago = (minutes: number) => new Date(T0 - minutes * 60_000).toISOString();
+    const insert = (id: string, priority: string, minutesAgo: number) => db.prepare(
+      `INSERT INTO queue_items (qitem_id, ts_created, ts_updated, source_session, destination_session, state, priority, body)
+       VALUES (?, ?, ?, 'lead@r', 'dev-impl@r', 'pending', ?, 'work')`,
+    ).run(id, ago(minutesAgo), ago(minutesAgo), priority);
+    const transition = (id: string, minutesAgo: number, actor: string) => db.prepare(
+      "INSERT INTO queue_transitions (qitem_id, ts, state, actor_session) VALUES (?, ?, 'pending', ?)",
+    ).run(id, ago(minutesAgo), actor);
+    insert("q-low-rerouted", "low", 180); // created 3 h ago, rerouted pending -> pending by the pool 1 min ago
+    transition("q-low-rerouted", 1, "system:queue-fallback");
+    insert("q-low-reopened", "low", 180); // created 3 h ago, blocked, made pending again from outside the pool 30 min ago
+    db.prepare("INSERT INTO queue_transitions (qitem_id, ts, state, actor_session) VALUES ('q-low-reopened', ?, 'blocked', 'dev-impl@r')").run(ago(60));
+    transition("q-low-reopened", 30, "lead@r");
+    insert("q-low-noted", "low", 180); // created 3 h ago, a note appended 1 min ago (pending -> pending, outside the pool)
+    db.prepare("INSERT INTO queue_transitions (qitem_id, ts, state, actor_session) VALUES ('q-low-noted', ?, 'pending', 'lead@r')").run(ago(180));
+    transition("q-low-noted", 1, "lead@r");
+    insert("q-low-reaped", "low", 180); // created 3 h ago, claimed by a slot, unclaimed by the reap and rerouted 1 min ago
+    db.prepare("INSERT INTO queue_transitions (qitem_id, ts, state, actor_session) VALUES ('q-low-reaped', ?, 'in-progress', 'dev-impl-s1@r')").run(ago(120));
+    db.prepare("INSERT INTO queue_transitions (qitem_id, ts, state, actor_session, transition_note) VALUES ('q-low-reaped', ?, 'pending', 'dev-impl-s1@r', 'unclaimed: reap:dev-impl-s1@r')").run(ago(1));
+    transition("q-low-reaped", 1, "system:queue-fallback");
+    insert("q-routine-new", "routine", 10);
+    insert("q-urgent-new", "urgent", 1);
+    const read = () => readSeatPoolState({
+      db, slots,
+      openRows: () => [],
+      sessionAddresses: (session) => [session],
+      heldMessages: () => 0,
+      seatStopped: () => false,
+      seatState: () => ({ activity: "idle-at-prompt", needsInput: { count: 0, reason: null }, backgroundWork: null, changedAt: "2026-11-09T10:00:00.000Z" }) as never,
+      restoring: () => false,
+      demand: () => null,
+      now: () => T0,
+    }, { jobId: JOB, targetSession: "dev-impl@r", spec: spec() }).pending;
+
+    const pending = read();
+    // The reroute does not reset the age: the 3-h low row goes before the newer routine one, never before the urgent
+    // one; the low row made pending again 30 min ago from outside the pool waits as low.
+    // A note on a pending row is no entry into pending: it keeps its age too.
+    // The unclaim of the pool's own reap keeps it as well.
+    expect(pending.map((row) => row.qitemId)).toEqual(["q-urgent-new", "q-low-noted", "q-low-reaped", "q-low-rerouted", "q-routine-new", "q-low-reopened"]);
+    // The FIFO's waitingSince is still the latest reroute.
+    expect(pending.find((row) => row.qitemId === "q-low-rerouted")?.waitingSince).toBe(ago(1));
+  });
+
   it("refuses a priority_aging_s that is not a whole number of seconds from 0 to 7 days (T-010078)", () => {
     for (const bad of [-1, 1.5, "7200", 604_801, null]) {
       const parsed = parseSeatPoolSpec({ max: 3, cwd_template: "/work/{rig}/{slot}", priority_aging_s: bad });
