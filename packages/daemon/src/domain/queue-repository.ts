@@ -752,6 +752,11 @@ const INBOX_CHECKIN_WRITE_INTERVAL_MS = 60_000;
 /** The states the listing's active-first order puts first (its CASE WHEN state IN (...) THEN 0). */
 const OPEN_LISTING_STATES: ReadonlySet<string> = new Set(["pending", "in-progress", "blocked"]);
 
+/** T-010555: a read inside the repository's own acts (the handoff, its wake) that uses only the row's stored fields
+ *  skips the waiting view: building it asks the recovery lookup, which scans every recovery-tagged row, and a handoff
+ *  made ~10 such reads, most of the loop time it held. The rows an act returns keep the full face. */
+const NO_WAITING = { waiting: false } as const;
+
 export class QueueRepositoryError extends Error {
   readonly code: string;
   readonly meta: Record<string, unknown> | undefined;
@@ -1430,7 +1435,7 @@ export class QueueRepository {
   /** A wake's source and urgency at the seat's level: the trigger decides the source; the row's priority (urgent or
    *  critical) makes it urgent, marked by whoever created the row. */
   private wakeAdmission(qitemId: string, trigger: WakeTrigger): import("./seat-delivery-guard.js").AdmissionInput & { urgentBy?: string } {
-    const row = this.getById(qitemId);
+    const row = this.getById(qitemId, NO_WAITING);
     const urgent = row?.priority === "urgent" || row?.priority === "critical";
     // OpenRig's own row is marked urgent by OpenRig, not by the person whose obligation it's about.
     return { source: trigger, urgent, ...(urgent && row ? { urgentBy: trigger === "openrig" ? "OpenRig" : row.sourceSession } : {}) };
@@ -1555,7 +1560,7 @@ export class QueueRepository {
     if (nudge === false) return;
     // The successor row is already written in this txn, so its stored summary is
     // read here rather than threaded through every staging caller.
-    const successor = this.getById(successorQitemId);
+    const successor = this.getById(successorQitemId, NO_WAITING);
     this.recordWakeIntent({
       outboxId: `${WAKE_INTENT_PREFIX}${successorQitemId}`,
       auditPointer: successorQitemId,
@@ -1693,11 +1698,11 @@ export class QueueRepository {
       );
     }
     // Reads the txn-visible (uncommitted) state on this connection.
-    const src = this.getById(sourceQitemId);
+    const src = this.getById(sourceQitemId, NO_WAITING);
     if (!src || !isTerminalState(src.state)) return; // not a terminal close
     const intent = this.outbox.getById(`${WAKE_INTENT_PREFIX}${successorQitemId}`);
     // A successor whose wake a full held-message quota refused records that instead, and stands (#2430).
-    if (!intent && !this.getById(successorQitemId)?.lastNudgeResult?.startsWith(WAKE_NOT_RETAINED)) {
+    if (!intent && !this.getById(successorQitemId, NO_WAITING)?.lastNudgeResult?.startsWith(WAKE_NOT_RETAINED)) {
       throw new QueueRepositoryError(
         "terminal_close_without_wake_intent",
         `terminal closure of ${sourceQitemId} committed without staging its wake intent for ${successorQitemId} — one act or none is violated`,
@@ -1829,7 +1834,7 @@ export class QueueRepository {
     // target qitem is missing — a caller-recorded id under this prefix (the route
     // no longer refuses those), or a successor already swept — is finalized
     // `failed`, never sent as a real wake.
-    if (!intent.auditPointer || !this.getById(intent.auditPointer)) {
+    if (!intent.auditPointer || !this.getById(intent.auditPointer, NO_WAITING)) {
       this.outbox.finalizeDelivery(outboxId, "failed");
       return "failed";
     }
@@ -2285,7 +2290,7 @@ export class QueueRepository {
     }
     // A hosted member with a trigger: ring it. Accepted is indeterminate, never verified: pickup is its claim.
     if (destClass.class === "hosted") {
-      const row = this.getById(qitemId);
+      const row = this.getById(qitemId, NO_WAITING);
       return ringHostedWake({ qitemId, destination: destinationSession, summary: row?.summary ?? null, source: sourceSession ?? row?.sourceSession ?? null },
         destClass.wake, { fetchImpl: this.hostedWakeFetch });
     }
@@ -2826,7 +2831,7 @@ export class QueueRepository {
   }
 
   private handoffWithin(input: QueueHandoffInput): { closed: QueueItem; created: QueueItem } {
-    const source = this.getById(input.qitemId);
+    const source = this.getById(input.qitemId, NO_WAITING);
     if (!source) {
       throw new QueueRepositoryError(
         "qitem_not_found",
@@ -3014,7 +3019,7 @@ export class QueueRepository {
    * tracking needed against the source qitem.
    */
   async handoffAndComplete(input: QueueHandoffAndCompleteInput): Promise<{ closed: QueueItem; created: QueueItem }> {
-    const source = this.getById(input.qitemId);
+    const source = this.getById(input.qitemId, NO_WAITING);
     if (!source) {
       throw new QueueRepositoryError(
         "qitem_not_found",
