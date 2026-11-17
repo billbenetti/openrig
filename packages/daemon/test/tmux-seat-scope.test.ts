@@ -254,13 +254,22 @@ describe("seat scope on, but no user scope can be made: today's launch, with a w
     const off = makeAdapter({});
     const quiet = await off.adapter.respawnPane("%1", "codex resume", { cwd: "/private", restartInPlace: true });
     expect(quiet.ok && quiet.warnings).toBeUndefined();
-    // with the key on and the inherit_tmux_environment policy, launches skip the seat scope: quiet (N3)
+    // with the key on and the inherit_tmux_environment policy turned on after the seat's launch, the restart also leaves
+    // the scope: it says so, and that the next launch stays out too (T-010908, SH-1); quiet where no scope is possible
     const inherit = makeAdapter({ seatScope: { tasksMax: 2048 }, inherit: true });
     const inherited = await inherit.adapter.respawnPane("%1", "codex resume", { cwd: "/private", restartInPlace: true });
-    expect(inherited.ok && inherited.warnings).toBeUndefined();
+    if (process.platform === "linux") {
+      expect(inherited.ok && inherited.warnings).toHaveLength(1);
+      expect(inherited.ok && inherited.warnings?.[0]).toMatch(/^Seat scope not applied on a restart in place: .*without this seat's own TasksMax\. With terminal\.inherit_tmux_environment on, the seat's next launch stays out of a seat scope too/);
+    } else {
+      expect(inherited.ok && inherited.warnings).toBeUndefined();
+    }
+    expect(probes(inherit.shellCalls)).toEqual([]);
     // with the key on but no user manager (no MANAGERPID), no launch would scope the seat either: quiet (N3)
     vi.stubEnv("MANAGERPID", "");
     const noManager = await on.adapter.respawnPane("%1", "codex resume", { cwd: "/private", restartInPlace: true });
     expect(noManager.ok && noManager.warnings).toBeUndefined();
+    const noManagerInherit = await inherit.adapter.respawnPane("%1", "codex resume", { cwd: "/private", restartInPlace: true });
+    expect(noManagerInherit.ok && noManagerInherit.warnings).toBeUndefined();
   });
 });
