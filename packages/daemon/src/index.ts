@@ -41,6 +41,7 @@ import { SettingsStore } from "./domain/user-settings/settings-store.js";
 import { startSeatPollers } from "./domain/seat-activity-service.js";
 import { startIdentityReconciler } from "./domain/seat-identity-reconciler.js";
 import { startLongGcObserver } from "./domain/sync-site-wrap.js";
+import { closeReadOffLoop } from "./domain/read-off-loop.js";
 import { startWalCheckpointer, type WalCheckpointer } from "./db/wal-checkpointer.js";
 import {
   ensureOpenRigInstance,
@@ -525,6 +526,9 @@ export async function startServer(port?: number) {
       ["seat-identity", () => deps.seatIdentityReconciler?.stop()],
       ["periodic-snapshot", () => deps.periodicSnapshotScheduler?.stop()],
       ["gateway", () => deps.gatewaySubsystem?.stop()],
+      // T-010440: the read worker goes before the wake ladder waits for its tick: a read stuck on the worker reads
+      // synchronously now, instead of holding the shutdown for the job's deadline, and no worker starts again.
+      ["read-worker", () => closeReadOffLoop()],
       ["wake-ladder", () => wakeLadderScheduler?.stop()],
       ["event-loop-monitor", () => { eventLoopMonitor.stop(); stopLongGcObserver?.(); }],
       ["connections", () => Promise.all(servers.map((srv) => closeHttpServer(srv)))],
