@@ -188,8 +188,8 @@ Keys:
                          launches as before, with a warning, and launches skip asking again for 60 s; a wave of
                          launches (a boot) that hits that stays out of the scope until each seat's next launch. A
                          restart in place keeps its own command and brings no seat environment: it runs out of the seat
-                         scope, with a warning, until the seat's next launch. Never stop a seat's scope by hand: use rig
-                         seat stop.
+                         scope, with a warning, until the seat's next launch (with terminal.inherit_tmux_environment on,
+                         that launch stays out too). Never stop a seat's scope by hand: use rig seat stop.
   terminal.seat_scope_tasks_max  TasksMax of each seat scope (default 2048, integer in [64, 4194304])
   terminal.fixed_geometry  use 90x27 web geometry while subscribed (default off; other viewers share the pinned size)
   terminal.status_bar    show the inner tmux status bar on launch (default off)
