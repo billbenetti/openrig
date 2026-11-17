@@ -5,6 +5,7 @@ import { runAsyncSite } from "./sync-site-wrap.js";
 import { readNativeExecutablePaths } from "./native-process-executable.js";
 import { readNativeProcessArguments } from "./native-process-arguments.js";
 import { readProcessChildrenNow, readProcessTable, readProcessTableCensusNow } from "./process-table.js";
+import { isProcessTableRead } from "./process-table-reads.js";
 
 export interface NativeProcessRow {
   pid: number;
@@ -24,7 +25,7 @@ export interface NativeProcessRow {
 
 export type NativeRuntime = "claude-code" | "codex";
 
-function tokens(command: string): string[] {
+function tokens(command: string, limit = Infinity): string[] {
   // ps flattens argv: inline settings JSON retains its string delimiters.
   // A quote inside a name or filename is literal, not a shell span delimiter.
   // A `--settings` or `--mcp-config` JSON value keeps the spaces between its members too, as in
@@ -60,12 +61,40 @@ function tokens(command: string): string[] {
     } else if (/\s/.test(char) && depth === 0) {
       append(index);
       start = index + 1;
+      // Each token depends only on the text before its end, so the first `limit` tokens are the same as the full split's.
+      if (result.length >= limit) return result;
     }
   }
   // Keep an unfinished structured value opaque too. Re-splitting it could
   // promote text inside settings into apparent top-level identity options.
   append(command.length);
   return result;
+}
+
+// argv[0] of a row, as tokens(row.command)[0] gives it, read once per row: the rows of a table read are frozen and
+// shared by every reader of that read (process-table.ts), so the many observers that look at the same table pay one
+// split per row and only up to the first token (T-010555: each listing split every command line in full, twice).
+const argv0ByRow = new WeakMap<object, string>();
+function argv0Of(row: { command: string }): string {
+  if (!Object.isFrozen(row)) return tokens(row.command, 1)[0] ?? "";
+  let argv0 = argv0ByRow.get(row);
+  if (argv0 === undefined) argv0ByRow.set(row, argv0 = tokens(row.command, 1)[0] ?? "");
+  return argv0;
+}
+
+// The rows by pid (the last row of a repeated pid, as a Map built from the rows gives it), built once per listing a
+// caller holds: one observation asks it several times over the same rows (each candidate search, the launcher chain).
+// Kept only for an array of shared frozen rows (a table read or a listing from one), and rebuilt when the array was
+// edited since (a different length, or another row at either end); the Map is never handed out to be written.
+const pidIndexByRows = new WeakMap<object, { index: ReadonlyMap<number, NativeProcessRow>; length: number; first: unknown; last: unknown }>();
+const sharedListings = new WeakSet<object>();
+function pidIndex(rows: readonly NativeProcessRow[]): ReadonlyMap<number, NativeProcessRow> {
+  if (!sharedListings.has(rows) && !isProcessTableRead(rows)) return new Map(rows.map((row) => [row.pid, row]));
+  const kept = pidIndexByRows.get(rows);
+  if (kept && kept.length === rows.length && kept.first === rows[0] && kept.last === rows.at(-1)) return kept.index;
+  const index = new Map(rows.map((row) => [row.pid, row]));
+  pidIndexByRows.set(rows, { index, length: rows.length, first: rows[0], last: rows.at(-1) });
+  return index;
 }
 
 function executableName(token: string): string {
@@ -110,7 +139,7 @@ function nixWrappedClaudeExecutable(path: string, selectedExecutable?: string): 
 }
 
 function claudeProcess(row: NativeProcessRow, selectedExecutable?: string): boolean {
-  const argv0 = tokens(row.command)[0] ?? "";
+  const argv0 = argv0Of(row);
   if (!claudeExecutable(argv0, selectedExecutable)) return false;
   const osName = row.executableName ?? "";
   if (executableName(osName) === executableName(argv0)) return true;
@@ -124,7 +153,7 @@ function claudeProcess(row: NativeProcessRow, selectedExecutable?: string): bool
 }
 
 function needsClaudeExecutablePath(row: NativeProcessRow): boolean {
-  const argv0 = tokens(row.command)[0] ?? "";
+  const argv0 = argv0Of(row);
   const osName = row.executableName ?? "";
   return claudeExecutable(argv0)
     && executableName(osName) !== executableName(argv0)
@@ -143,14 +172,14 @@ function claudeProcessAfterScript(row: NativeProcessRow): boolean {
   // The OS name is the file's own name, or `claude`, which the native installer's versioned binary sets for itself when
   // a launcher execs it through its `claude` symlink (#2341).
   const osName = executableName(row.executableName ?? "");
-  return claudeExecutable(tokens(row.command)[0] ?? "") && claudeExecutable(path)
+  return claudeExecutable(argv0Of(row)) && claudeExecutable(path)
     && (executableName(path) === osName || osName === "claude");
 }
 
 // The rows whose OS path the script rule reads: a foreground process whose argv[0] is a path named `claude` and
 // whose OS name is `claude`. A bare `claude` title carries no path and keeps today's result without a read.
 function mayBeClaudeAfterScript(row: NativeProcessRow): boolean {
-  const argv0 = tokens(row.command)[0] ?? "";
+  const argv0 = argv0Of(row);
   return argv0.startsWith("/") && executableName(argv0) === "claude" && executableName(row.executableName ?? "") === "claude"
     && row.pgid !== undefined && row.pgid > 0 && row.pgid === row.tpgid;
 }
@@ -473,7 +502,7 @@ export function unwitnessedClaudeRow(row: NativeProcessRow): boolean {
 function directClaudeChildren(parent: NativeProcessRow, processes: NativeProcessRow[], byPid: Map<number, NativeProcessRow>): Map<string, NativeProcessRow> {
   const children = new Map<string, NativeProcessRow>();
   if (parent.pgid === undefined) return children;
-  const isShell = (row: NativeProcessRow) => isShellForeground(executableName(tokens(row.command)[0]?.replace(/^-/, "") ?? ""));
+  const isShell = (row: NativeProcessRow) => isShellForeground(executableName(argv0Of(row).replace(/^-/, "")));
   for (const row of processes) {
     if (row === parent || row.pgid !== parent.pgid || !witnessedClaudeRow(row)) continue;
     const identity = claudeSessionIdentity(tokens(row.command).slice(1));
@@ -600,33 +629,66 @@ export async function listNativeProcesses(options: { claudeLaunchPaths?: boolean
 /** The same listing, but a failed enumeration rejects instead of reading as an empty table. A caller that shares or
  *  reuses one listing needs this: an empty array is a legitimate success, so it cannot also mean "failed". */
 export async function listNativeProcessesOrThrow(options: { claudeLaunchPaths?: boolean; frozenExecutable?: string } = {}): Promise<NativeProcessRow[]> {
-  // Copies: the table is shared with concurrent readers, and executable paths are added below.
-  const rows: NativeProcessRow[] = (await runAsyncSite("codex.runtime.list_processes", readProcessTable)).map((row) => ({ ...row }));
+  const table: NativeProcessRow[] = await runAsyncSite("codex.runtime.list_processes", readProcessTable);
+  // A table read is shared by all who asked while it was read: they get one enriched listing per set of options, computed
+  // once (T-010555). Before, each of them copied and filtered the whole table on the loop, one after the other, and a
+  // hundred observers sharing one read held the loop for seconds. Each caller still gets an array of its own.
+  if (!isProcessTableRead(table)) return enrichNativeProcesses(table, options);
+  const key = `${options.claudeLaunchPaths === true}\0${options.frozenExecutable ?? ""}`;
+  let byOptions = enrichedByTable.get(table);
+  if (!byOptions) enrichedByTable.set(table, byOptions = new Map());
+  let listing = byOptions.get(key);
+  if (!listing) {
+    // A failed enrichment is not kept: a later caller of the same table tries again.
+    listing = enrichNativeProcesses(table, options).catch((error) => { byOptions!.delete(key); throw error; });
+    byOptions.set(key, listing);
+  }
+  const own = (await listing).slice();
+  sharedListings.add(own);
+  return own;
+}
+
+const enrichedByTable = new WeakMap<object, Map<string, Promise<NativeProcessRow[]>>>();
+
+/** The table with the OS facts a caller's proof needs: executable paths, and macOS Codex argv. The rows of a table read
+ *  are shared, so a row that gains a fact is a copy and every other row is the table's own, holding the same values the
+ *  copies of all its rows held before. */
+async function enrichNativeProcesses(table: NativeProcessRow[], options: { claudeLaunchPaths?: boolean; frozenExecutable?: string }): Promise<NativeProcessRow[]> {
   // `claudeLaunchPaths`: the caller is proving a launch through a `#!` script, which needs the OS path of the
   // foreground path-named Claude too. `frozenExecutable`: the caller is proving a launch that froze that file (the
   // installer's symlink resolved to its versioned file), which needs the path only of a path-named Claude whose
   // argv[0] isn't already the file; an exact launch is proved without it, and a helper timeout can't change its
   // fingerprint. Every other listing skips that read (on macOS it starts a helper process).
-  const candidates = rows.filter(row => needsClaudeExecutablePath(row) || (mayBeClaudeAfterScript(row) && (options.claudeLaunchPaths === true
-    || (!!options.frozenExecutable && tokens(row.command)[0] !== options.frozenExecutable))));
-  if (candidates.length > 0) {
-    const paths = await readNativeExecutablePaths(candidates.map(row => row.pid));
-    for (const row of candidates) row.executablePath = paths.get(row.pid);
-  }
+  const pathCandidates = table.filter(row => needsClaudeExecutablePath(row) || (mayBeClaudeAfterScript(row) && (options.claudeLaunchPaths === true
+    || (!!options.frozenExecutable && argv0Of(row) !== options.frozenExecutable))));
   // Linux argv was captured with this same /proc table sample; never read real /proc
   // again after a caller has selected a fixture or alternate process-table root.
   // Only foreground rows can be selected below. Skip macOS helper reads for
   // background Codex processes; every foreground seat still gets fresh argv.
   const codexCandidates = process.platform === "darwin"
-    ? rows.filter(row => row.executableName === "codex" && row.pgid !== undefined && row.pgid > 0 && row.pgid === row.tpgid)
+    ? table.filter(row => row.executableName === "codex" && row.pgid !== undefined && row.pgid > 0 && row.pgid === row.tpgid)
     : [];
+  const shared = isProcessTableRead(table);
+  // The facts each row gains, by the row itself (a repeated pid keeps its own).
+  const facts = new Map<NativeProcessRow, Partial<Pick<NativeProcessRow, "executablePath" | "argv">>>();
+  if (pathCandidates.length > 0) {
+    const paths = await readNativeExecutablePaths(pathCandidates.map(row => row.pid));
+    for (const row of pathCandidates) facts.set(row, { executablePath: paths.get(row.pid) });
+  }
   if (codexCandidates.length > 0) {
     // A failed or timed-out helper read loses argv evidence, not the process table.
     // The foreground Codex still participates in delivery's uniqueness check.
     const argumentsByPid = await readNativeProcessArguments(codexCandidates.map(row => row.pid)).catch(() => new Map<number, string[]>());
-    for (const row of codexCandidates) row.argv = argumentsByPid.get(row.pid) ?? null;
+    for (const row of codexCandidates) facts.set(row, { ...facts.get(row), argv: argumentsByPid.get(row.pid) ?? null });
   }
-  return rows;
+  // A shared table's rows are frozen and every caller's: a row that gains a fact is a frozen copy, the others are the
+  // table's own. Any other table (a test's lister) keeps today's copy of every row.
+  return table.map((row) => {
+    const added = facts.get(row);
+    if (!added) return shared ? row : { ...row };
+    const copy = { ...row, ...added };
+    return shared ? Object.freeze(copy) : copy;
+  });
 }
 
 export type NativeProcessLister = () => NativeProcessRow[] | Promise<NativeProcessRow[]>;
@@ -656,7 +718,7 @@ function runsFrozenScript(row: NativeProcessRow, selectedExecutable: string): bo
 
 /** A process whose argv[0] is an absolute path named `claude` and whose OS executable path is exactly the frozen file. */
 function runsFrozenFile(row: NativeProcessRow, selectedExecutable: string): boolean {
-  const argv0 = tokens(row.command)[0] ?? "";
+  const argv0 = argv0Of(row);
   const path = row.executablePath;
   return !!path && path === selectedExecutable && path.startsWith("/") && !path.split("/").some(part => part === "." || part === "..")
     && argv0.startsWith("/") && executableName(argv0) === "claude";
@@ -675,7 +737,7 @@ function nativeProcessCandidates(rows: NativeProcessRow[], panePid: number, runt
   // #2341: a wrapper that starts Claude without `exec` keeps running the frozen script as the foreground parent, and
   // Claude can run under any name. That script's direct child naming a Claude conversation is the launched runtime;
   // the caller still requires the launch's own token, one candidate and a stable fingerprint.
-  const byPid = new Map(rows.map(row => [row.pid, row]));
+  const byPid = pidIndex(rows);
   return candidatesMatching(rows, panePid, runtime, row => {
     const parent = byPid.get(row.ppid);
     return !!parent && runsFrozenScript(parent, selectedExecutable) && claudeSessionToken(tokens(row.command).slice(1)) !== null;
@@ -683,17 +745,17 @@ function nativeProcessCandidates(rows: NativeProcessRow[], panePid: number, runt
 }
 
 function candidatesMatching(rows: NativeProcessRow[], panePid: number, runtime: NativeRuntime, claudeRow: (row: NativeProcessRow) => boolean): NativeProcessObservation[] {
-  const byPid = new Map(rows.map((row) => [row.pid, row]));
+  const byPid = pidIndex(rows);
   const root = byPid.get(panePid);
   if (byPid.size !== rows.length || !root?.startedAt || !root.tpgid || root.tpgid <= 0) return [];
   const matches: { process: NativeProcessRow; chain: NativeProcessRow[] }[] = [];
   const executable = runtime === "claude-code" ? "claude" : "codex";
   for (const row of rows) {
-    const osExecutable = runtime === "claude-code" ? executableName(row.executableName ?? "") : row.executableName;
     if (row.pgid !== root.tpgid || row.tpgid !== root.tpgid) continue;
     // A zombie (an exited child nobody reaped) can't take input or run anything, and its argv is gone. Only a state read
     // as `Z` excludes it: an unread state is no evidence.
     if (row.state === "Z") continue;
+    const osExecutable = runtime === "claude-code" ? executableName(row.executableName ?? "") : row.executableName;
     if (runtime === "claude-code" ? !claudeRow(row) : osExecutable !== executable) continue;
     // OS-named Codex with unreadable argv still competes for the foreground.
     // A readable argv[0] naming a different executable is positive contrary evidence.
@@ -750,7 +812,7 @@ function selectNativeProcess(rows: NativeProcessRow[], panePid: number, expected
 export function subtreeNamesClaudeExecutable(rows: NativeProcessRow[], panePid: number): boolean {
   const byParent = new Map<number, NativeProcessRow[]>();
   for (const row of rows) byParent.set(row.ppid, [...(byParent.get(row.ppid) ?? []), row]);
-  const byPid = new Map(rows.map((row) => [row.pid, row]));
+  const byPid = pidIndex(rows);
   const queue = [panePid];
   const seen = new Set<number>();
   while (queue.length > 0) {
@@ -900,7 +962,7 @@ export async function claudeHookFromLaunchedProcess(input: {
     const rows = await (input.listProcesses ?? listNativeProcesses)();
     const launched = selectNativeProcess(rows, panePid, input.launchToken, false, "claude-code");
     if (!launched) return null;
-    const byPid = new Map(rows.map((row) => [row.pid, row]));
+    const byPid = pidIndex(rows);
     let current = byPid.get(input.hookPid);
     if (!current) return null;
     for (let hop = 0; hop < 2; hop++) {
@@ -910,7 +972,7 @@ export async function claudeHookFromLaunchedProcess(input: {
         return current.startedAt && current.startedAt === launched.process.startedAt
           ? { pid: current.pid, startedAt: current.startedAt } : null;
       }
-      if (claudeExecutable(tokens(current.command)[0] ?? "") || /claude/i.test(current.executableName ?? "")) return null;
+      if (claudeExecutable(argv0Of(current)) || /claude/i.test(current.executableName ?? "")) return null;
     }
     return null;
   } catch { return null; }
@@ -974,7 +1036,7 @@ export async function observeClaudePaneStartedAt(input: Parameters<typeof observ
  * branches, which stays ambiguous. */
 function launcherChain(candidates: NativeProcessObservation[], rows: NativeProcessRow[]): NativeProcessObservation[] | null {
   if (candidates.length <= 1) return candidates;
-  const byPid = new Map(rows.map((row) => [row.pid, row]));
+  const byPid = pidIndex(rows);
   const ancestors = (observation: NativeProcessObservation): Set<number> => {
     const seen = new Set<number>();
     let current = byPid.get(observation.process.ppid);
@@ -1001,10 +1063,10 @@ function launcherChain(candidates: NativeProcessObservation[], rows: NativeProce
  * child. A background child/helper in another group does not receive terminal input. Any runtime. */
 function idleShellRoot(rows: NativeProcessRow[], pid: number): NativeProcessRow | null {
   const root = rows.find(row => row.pid === pid);
-  return new Set(rows.map(row => row.pid)).size === rows.length && root?.startedAt
+  return pidIndex(rows).size === rows.length && root?.startedAt
     && root.pgid === pid && root.tpgid === pid
     && isShellForeground(executableName(root.executableName ?? ""))
-    && isShellForeground(executableName(tokens(root.command)[0]?.replace(/^-/, "") ?? ""))
+    && isShellForeground(executableName(argv0Of(root).replace(/^-/, "")))
     && !rows.some(row => row.pid !== pid && row.pgid === root.tpgid) ? root : null;
 }
 
