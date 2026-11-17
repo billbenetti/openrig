@@ -254,6 +254,10 @@ describe("seat scope on, but no user scope can be made: today's launch, with a w
     const off = makeAdapter({});
     const quiet = await off.adapter.respawnPane("%1", "codex resume", { cwd: "/private", restartInPlace: true });
     expect(quiet.ok && quiet.warnings).toBeUndefined();
+    // with the key on and the inherit_tmux_environment policy, launches skip the seat scope: quiet (N3)
+    const inherit = makeAdapter({ seatScope: { tasksMax: 2048 }, inherit: true });
+    const inherited = await inherit.adapter.respawnPane("%1", "codex resume", { cwd: "/private", restartInPlace: true });
+    expect(inherited.ok && inherited.warnings).toBeUndefined();
     // with the key on but no user manager (no MANAGERPID), no launch would scope the seat either: quiet (N3)
     vi.stubEnv("MANAGERPID", "");
     const noManager = await on.adapter.respawnPane("%1", "codex resume", { cwd: "/private", restartInPlace: true });
