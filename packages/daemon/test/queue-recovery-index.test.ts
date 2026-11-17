@@ -31,6 +31,9 @@ describe("recovery and dedup lookups use the partial tag index (migration 099)",
   }
   const plan = (sql: string, ...args: unknown[]) =>
     (db.prepare(`EXPLAIN QUERY PLAN ${sql}`).all(...args) as Array<{ detail: string }>).map((r) => r.detail).join(" | ");
+  /** The values the recovery lookup binds for one tag: since T-010555 it first matches the tag's JSON text (instr), then
+   *  the parsed value, so it takes the tag twice, quoted and plain. */
+  const lookupArgs = (sql: string, tag: string) => ((sql.match(/\?/g) ?? []).length === 2 ? [JSON.stringify(tag), tag] : [tag]);
   const isRecoveryLookup = (sql: string) => sql.includes("json_each(tags) WHERE value = ?") && sql.includes("qitem_id DESC LIMIT 1");
 
   beforeEach(() => {
@@ -43,15 +46,15 @@ describe("recovery and dedup lookups use the partial tag index (migration 099)",
     row("source", "pending");
     const [sql] = preparedDuring(isRecoveryLookup, () => findQueueRecovery(db, "source"));
     expect(sql).toBeDefined();
-    expect(plan(sql!, recoveryTag("source"))).toContain(INDEX);
-    expect(plan(sql!, recoveryTag("source"))).not.toMatch(/SCAN queue_items(?! USING)/);
+    expect(plan(sql!, ...lookupArgs(sql!, recoveryTag("source")))).toContain(INDEX);
+    expect(plan(sql!, ...lookupArgs(sql!, recoveryTag("source")))).not.toMatch(/SCAN queue_items(?! USING)/);
   });
 
   it("the projection path (getById of a pending row, and so list and whoami) reads the index", () => {
     row("source", "pending");
     const seen = preparedDuring(isRecoveryLookup, () => repo.getById("source"));
     expect(seen.length).toBeGreaterThan(0);
-    for (const sql of seen) expect(plan(sql, recoveryTag("source"))).toContain(INDEX);
+    for (const sql of seen) expect(plan(sql, ...lookupArgs(sql, recoveryTag("source")))).toContain(INDEX);
   });
 
   it("the stuck sweep's dedup lookup reads the index", async () => {
@@ -121,7 +124,7 @@ describe("recovery and dedup lookups use the partial tag index (migration 099)",
     for (const id of [...ids, "absent"]) {
       const reference = db.prepare(UNINDEXED).get(recoveryTag(id)) as { qitem_id: string; state: string } | undefined;
       // The chosen row, open or closed, is identical; the later transition check is shared code.
-      expect(db.prepare(indexed!).get(recoveryTag(id))).toEqual(reference);
+      expect(db.prepare(indexed!).get(...lookupArgs(indexed!, recoveryTag(id)))).toEqual(reference);
       if (reference && ["pending", "in-progress", "blocked"].includes(reference.state)) {
         expect(findQueueRecovery(db, id)).toEqual({ qitemId: reference.qitem_id, state: reference.state });
       }
