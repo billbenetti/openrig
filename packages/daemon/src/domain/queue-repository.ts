@@ -5182,16 +5182,18 @@ export class QueueRepository {
    * getCurrentParkStatus says whether that wake is still armed and live. The row was taken at its claim, or else at its first move
    * to in-progress by one of its destination's addresses (a seat that takes a row by update, with no claim).
    */
-  listPoolSeatRowFacts(sessionName: string, maxBlocked = 1): PoolSeatRowFacts {
+  listPoolSeatRowFacts(sessionName: string, maxBlocked = 1, opts: { returnTo?: string } = {}): PoolSeatRowFacts {
     const rows = this.listOpenObligations(sessionName, 500).map((row) => ({ qitemId: row.qitemId, state: row.state }));
     if (rows.length === 0 || rows.length > Math.max(1, maxBlocked) || rows.some((row) => row.state !== "blocked")) return { rows, parked: null };
-    if (rows.length === 1) return { rows, parked: this.poolSeatParkFacts(rows[0]!.qitemId) };
-    const parks = rows.map((row) => this.poolSeatParkFacts(row.qitemId));
+    if (rows.length === 1) return { rows, parked: this.poolSeatParkFacts(rows[0]!.qitemId, opts) };
+    const parks = rows.map((row) => this.poolSeatParkFacts(row.qitemId, opts));
     return parks.every((park): park is ParkFacts => park !== null) ? { rows, parked: null, parkedRows: parks } : { rows, parked: null };
   }
 
-  /** The park facts of one blocked row (listPoolSeatRowFacts); null when the row is not there. */
-  private poolSeatParkFacts(qitemId: string): ParkFacts | null {
+  /** The park facts of one blocked row (listPoolSeatRowFacts); null when the row is not there. With `returnTo` (a seat
+   *  pool with `return_long_gates`, T-012673) also `blockedSince`, `wakeFiredAt` and `returnRefusal` (whether the row
+   *  could be handed to that seat as it is), so the facts of any other read are the ones from before. */
+  private poolSeatParkFacts(qitemId: string, opts: { returnTo?: string } = {}): ParkFacts | null {
     const item = this.db.prepare("SELECT blocked_on, claimed_at, destination_session FROM queue_items WHERE qitem_id = ?")
       .get(qitemId) as { blocked_on: string | null; claimed_at: string | null; destination_session: string } | undefined;
     if (!item) return null;
@@ -5224,8 +5226,166 @@ export class QueueRepository {
       parkActor: armed?.actor_session ?? null,
       parkedAt: armed?.ts ?? null,
       takenAt: item.claimed_at ?? firstTake?.ts ?? null,
+      ...(opts.returnTo !== undefined
+        ? {
+          blockedSince: this.blockedSinceMs(qitemId),
+          wakeFiredAt: this.lastWakeFiredMs(qitemId),
+          returnRefusal: this.parkedHandoffRefusal(qitemId, opts.returnTo)?.code ?? null,
+        }
+        : {}),
     };
     return parked;
+  }
+
+  /** T-012673: since when a blocked row has been blocked without leaving `blocked` (ms), on any gate: its first move to
+   *  blocked after its latest transition to another state (the unbroken park, as current-park-arm.ts reads it). A
+   *  re-park, a note and a change of gate keep it: the age counts the unbroken block on any gate, so a row that waited on
+   *  one gate and was parked again on a long one may be returned soon after (no new schema column for the gate of each
+   *  park, to keep the rebase on 0.7.18 clean). Null when the record has no such transition. */
+  private blockedSinceMs(qitemId: string): number | null {
+    const row = this.db.prepare(
+      `SELECT MIN(t.ts) AS ts FROM queue_transitions t
+        WHERE t.qitem_id = @qitem AND t.state = 'blocked' AND t.transition_id > COALESCE((SELECT MAX(o.transition_id)
+          FROM queue_transitions o WHERE o.qitem_id = @qitem AND o.state <> 'blocked'), 0)`,
+    ).get({ qitem: qitemId }) as { ts: string | null } | undefined;
+    const ms = row?.ts ? Date.parse(row.ts) : NaN;
+    return Number.isFinite(ms) ? ms : null;
+  }
+
+  /** T-012673: when a wake of the row last fired (ms; its fire receipt), null when none did or the records are absent. */
+  private lastWakeFiredMs(qitemId: string): number | null {
+    let row: { ts: string | null } | undefined;
+    try {
+      row = this.db.prepare(
+        `SELECT MAX(t.ts) AS ts FROM queue_transition_wakes w JOIN queue_transitions t ON t.transition_id = w.transition_id
+          WHERE w.qitem_id = ? AND w.phase = 'fired'`,
+      ).get(qitemId) as typeof row;
+    } catch {
+      row = undefined; // a database without the wake records
+    }
+    const ms = row?.ts ? Date.parse(row.ts) : NaN;
+    return Number.isFinite(ms) ? ms : null;
+  }
+
+  /**
+   * T-012673: why a blocked row can't be handed to `toSession` and parked there again as it is, or null. Read by the
+   * seat pool's facts (so the plan never asks for it) and again inside handoffParkedRows (so nothing is moved then).
+   * - `wake_kind_unsupported`: what wakes it now (its CURRENT park, T-007715) is not a park timer of its own or nothing:
+   *   a watchdog attached to it, a repeating queue wait or a blocker row would be lost or changed by the move.
+   * - `dependent_at_target`: a row of `toSession` (any of its addresses) waits on it. The handoff would hand that row its
+   *   own blocker's result (propagateBlockerCompletion releases a waiter at the successor's destination: pending, woken),
+   *   though its wait goes on: the successor parks again at once.
+   */
+  private parkedHandoffRefusal(qitemId: string, toSession: string): { code: string; message: string } | null {
+    const armed = this.wakeRepo.getCurrentParkStatus(qitemId);
+    if (armed) {
+      const jobs = this.watchdogJobsRepo ?? new WatchdogJobsRepository(this.db);
+      const job = armed.kind === "timer" ? jobs.getById(armed.ref) : null;
+      if (!job || job.policy !== "periodic-reminder" || isQueueWait(job.specYaml)) {
+        return { code: "wake_kind_unsupported", message: `qitem ${qitemId} is woken by a ${armed.kind} ${armed.ref}, not a park timer of its own` };
+      }
+    }
+    const targets = new Set(this.resolveSessionAddresses(toSession));
+    const waiting = this.db.prepare("SELECT qitem_id, destination_session FROM queue_items WHERE blocked_on = ? AND state = 'blocked'")
+      .all(qitemId) as Array<{ qitem_id: string; destination_session: string }>;
+    const own = waiting.find((row) => targets.has(row.destination_session));
+    if (own) return { code: "dependent_at_target", message: `qitem ${own.qitem_id} of ${own.destination_session} waits on qitem ${qitemId}` };
+    return null;
+  }
+
+  /**
+   * T-012673: hands the rows a seat pool's seat holds parked on long waits (`return_long_gates`) to the fixed seat
+   * `toSession`, each parked there on the same gate, all in one transaction under one notify envelope: a refusal of any
+   * row moves none (the seat's rows are never split between it and the fixed seat). A handoff then an update, in two
+   * transactions, would leave a successor pending in between, for the fixed seat to take.
+   *
+   * Refused, with nothing written, when the open rows of `expectDestination` are not exactly the rows given
+   * (`open_rows_mismatch`: the plan would move part of what the seat holds), or when a row is no longer blocked
+   * (`fallback_state_mismatch`), no longer addressed to `expectDestination` (`fallback_destination_mismatch`), gone
+   * (`qitem_not_found`), on another gate than its `blockedOn` (`blocked_on_mismatch`: the seat parked it again
+   * elsewhere), or can't go as it is (parkedHandoffRefusal: `wake_kind_unsupported`, `dependent_at_target`).
+   *
+   * Otherwise, for each row: it closes `handed-off` (its timer retired with it), with its `note` on that transition; the
+   * successor at `toSession`, with no wake sent (`nudge: false`), carries the row's chain of record ending in the row,
+   * so the work done so far is reached from it, and its tags but `dropTags`; it is parked at once on the same gate, with
+   * a timer of the same interval and message (a default message names the successor; a new interval counts from now)
+   * when the row had one, and with none when it had none. Rows of other seats that waited on the row wait on the
+   * successor (the handoff's propagateBlockerCompletion). The successor's park note is the row's recorded continuation
+   * when it had one (so the fixed seat's wake previews it), else the row's `note`.
+   */
+  handoffParkedRows(
+    rows: ReadonlyArray<{ qitemId: string; blockedOn: string; note: string }>,
+    toSession: string,
+    opts: { expectDestination: string; dropTags?: readonly string[]; actorSession: string },
+  ): { ok: true; moved: Array<{ qitemId: string; newQitemId: string; wakeAfterSeconds: number | null }> }
+    | { ok: false; code: string; error: string; qitemId?: string } {
+    const jobs = this.watchdogJobsRepo ?? new WatchdogJobsRepository(this.db);
+    let current: string | undefined;
+    try {
+      return this.eventBus.withNotifyEnvelope((register) => {
+        const open = this.listOpenObligations(opts.expectDestination, 500).map((row) => row.qitemId).sort();
+        const expected = rows.map((row) => row.qitemId).sort();
+        if (expected.length === 0 || open.length !== expected.length || open.some((id, i) => id !== expected[i])) {
+          throw new QueueRepositoryError("open_rows_mismatch",
+            `${opts.expectDestination} holds ${open.join(", ") || "no row"}, not ${expected.join(", ") || "no row"}; nothing was handed on`);
+        }
+        const drop = new Set(opts.dropTags ?? []);
+        const moved: Array<{ qitemId: string; newQitemId: string; wakeAfterSeconds: number | null }> = [];
+        for (const row of rows) {
+          current = row.qitemId;
+          const { qitemId } = row;
+          const source = this.getById(qitemId, NO_WAITING);
+          if (!source) throw new QueueRepositoryError("qitem_not_found", `qitem ${qitemId} not found`);
+          if (source.state !== "blocked") {
+            throw new QueueRepositoryError("fallback_state_mismatch", `qitem ${qitemId} is ${source.state}, not blocked; nothing was handed on`);
+          }
+          if (!this.resolveSessionAddresses(opts.expectDestination).includes(source.destinationSession)) {
+            throw new QueueRepositoryError("fallback_destination_mismatch",
+              `qitem ${qitemId} is addressed to ${source.destinationSession}, not ${opts.expectDestination}; nothing was handed on`);
+          }
+          if (source.blockedOn !== row.blockedOn) {
+            throw new QueueRepositoryError("blocked_on_mismatch",
+              `qitem ${qitemId} is blocked on ${source.blockedOn ?? "nothing"}, not ${row.blockedOn}; nothing was handed on`);
+          }
+          const refusal = this.parkedHandoffRefusal(qitemId, toSession);
+          if (refusal) throw new QueueRepositoryError(refusal.code, `${refusal.message}; nothing was handed on`);
+          // A park timer of its own is carried over by its interval and message (parkedHandoffRefusal admits only that
+          // or no wake).
+          const armed = this.wakeRepo.getCurrentParkStatus(qitemId);
+          let wake: { seconds: number; message: string | null } | null = null;
+          if (armed) {
+            const job = jobs.getById(armed.ref)!;
+            let message: string | null = null;
+            try {
+              const spec = parseYaml(job.specYaml) as { message?: unknown; context?: { message?: unknown } } | null;
+              const written = spec?.message ?? spec?.context?.message;
+              if (typeof written === "string" && written.trim() && !isDefaultParkWakeMessage(written)) message = written;
+            } catch { /* the default message, for the successor */ }
+            wake = { seconds: job.intervalSeconds, message };
+          }
+          const continuation = this.currentParkContinuation(qitemId);
+          const { created } = this.handoffWithin({
+            qitemId, fromSession: opts.actorSession, toSession, transitionNote: row.note, nudge: false,
+            ...(source.tags ? { tags: source.tags.filter((tag) => !drop.has(tag)) } : {}),
+          });
+          const parked = this.updateInTransactionalContext({
+            qitemId: created.qitemId, actorSession: opts.actorSession, state: "blocked", blockedOn: row.blockedOn,
+            transitionNote: continuation !== null ? `continuation: ${continuation}` : row.note,
+            ...(wake ? { wakeAfterSeconds: wake.seconds, ...(wake.message !== null ? { wakeMessage: wake.message } : {}) } : {}),
+          });
+          for (const event of parked.persistedEvents) register(event);
+          moved.push({ qitemId, newQitemId: created.qitemId, wakeAfterSeconds: wake?.seconds ?? null });
+        }
+        current = undefined;
+        return { ok: true as const, moved };
+      });
+    } catch (error) {
+      const code = (error as { code?: unknown }).code;
+      return {
+        ok: false, code: typeof code === "string" ? code : "handoff_parked_failed", error: (error as Error).message,
+        ...(current !== undefined ? { qitemId: current } : {}),
+      };
+    }
   }
 
   /** The open rows of a session with their claim time (listOpenObligations' rows and order): a seat pool's forced pass
