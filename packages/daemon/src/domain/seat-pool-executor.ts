@@ -30,6 +30,8 @@ import {
   seatPoolRefusedCooldown,
   seatPoolPriorityAging,
   seatPoolDrainEpisode,
+  seatPoolLongGateOf,
+  seatPoolLongGateRows,
   seatPoolReapable,
   seatPoolRoom,
   slotWorkingDirectory,
@@ -304,8 +306,13 @@ export interface SeatPoolStateReaderDeps {
   restoring(rigId: string): boolean;
   demand(jobId: string): { desired: number; sampledAt: string } | null;
   /** A seat's open rows with the park of its only open row when that row is blocked (QueueRepository.
-   *  listPoolSeatRowFacts). Read only with `dispatch_to_parked` in the spec; absent, no seat is ever "parked". */
-  rowFacts?(sessionName: string, maxBlocked?: number): PoolSeatRowFacts;
+   *  listPoolSeatRowFacts). Read only with `dispatch_to_parked` or `return_long_gates` in the spec, the second asking
+   *  with `returnTo` (its `to`) for what it reads of each park too (T-012673); absent, no seat is ever "parked" and none
+   *  hands rows back. */
+  rowFacts?(sessionName: string, maxBlocked?: number, opts?: { returnTo?: string }): PoolSeatRowFacts;
+  /** Whether the queue takes a session as a destination (QueueRepository.acceptsDestination), read once per plan for
+   *  the `to` of `return_long_gates` (SeatPoolState.returnLongGatesRefused, T-012673). Absent: not read. */
+  acceptsDestination?(sessionName: string): boolean;
   /** The host's load, read for a spec whose `dispatch_to_parked` sets `parked_max_load_per_cpu_percent`, so the plan
    *  holds a parked seat back as the executor's recheck would (SeatPoolState.hostLoadPerCpuPercent). Absent: not read. */
   hostSample?(): HostSample;
@@ -602,7 +609,10 @@ export function readSeatPoolBusyCandidates(
 ): Promise<ReadonlyMap<string, string | null>> | undefined {
   const programs = spec.dispatchToParked?.busyProcesses;
   if (!programs?.length) return undefined;
-  const candidates = slots.filter((slot) => seatPoolCanReceive(spec, slot, nowMs) !== null).map((slot) => slot.sessionName);
+  // A seat the plan may empty by return_long_gates is read too (T-012673, S1 of the cross review): its rows must not move
+  // while it runs a busy program, so the return's recheck asks this read like a move does.
+  const candidates = slots.filter((slot) => seatPoolCanReceive(spec, slot, nowMs) !== null
+    || seatPoolLongGateRows(spec, { ...slot, busyProcess: null }, nowMs) !== null).map((slot) => slot.sessionName);
   return readSeatPoolBusySessions(candidates, programs, deps, {
     ...(timeoutMs !== undefined ? { timeoutMs } : {}),
     ...(spec.dispatchToParked?.busyOrphanMaxAgeSeconds !== undefined ? { orphanMaxAgeSeconds: spec.dispatchToParked.busyOrphanMaxAgeSeconds } : {}),
@@ -638,7 +648,11 @@ export function readSeatPoolState(deps: SeatPoolStateReaderDeps, job: { jobId: s
   // dispatch_to_parked: the view gains what seatPoolCanReceive reads for a parked seat. Without the key the view is the
   // one from before it, field for field.
   const parkedRule = job.spec.dispatchToParked !== undefined;
-  const maxOpenRows = job.spec.dispatchToParked?.maxOpenRows ?? 1;
+  // return_long_gates (T-012673): the same facts, with each park's blockedSince, up to max_rows blocked rows. Without
+  // either key nothing more is read.
+  const longGates = job.spec.returnLongGates;
+  const readFacts = parkedRule || longGates !== undefined;
+  const maxOpenRows = Math.max(job.spec.dispatchToParked?.maxOpenRows ?? 1, longGates?.maxRows ?? 1);
   const busyRule = parkedRule && (job.spec.dispatchToParked?.busyProcesses?.length ?? 0) > 0 && deps.busyProcess;
   // refused_cooldown_s above 0: each seat's parked refusal and each waiting row's refusing seats (T-008296).
   const refusedCooldown = seatPoolRefusedCooldown(job.spec);
@@ -659,7 +673,9 @@ export function readSeatPoolState(deps: SeatPoolStateReaderDeps, job: { jobId: s
     const state = present ? deps.seatState(slot.nodeId!) : null;
     const idle = state?.activity === "idle-at-prompt" && state.needsInput.count === 0 && !state.backgroundWork;
     const sessionName = seatSessionName(slot.logicalId, model.rigName);
-    const facts = present && parkedRule && deps.rowFacts ? deps.rowFacts(sessionName, maxOpenRows) : null;
+    const facts = present && readFacts && deps.rowFacts
+      ? (longGates ? deps.rowFacts(sessionName, maxOpenRows, { returnTo: longGates.to }) : deps.rowFacts(sessionName, maxOpenRows))
+      : null;
     const refusal = present && refusedCooldown > 0 && slot.opId !== null
       ? parkedRefusalOf(refusalCtx, poolMoves, sessionName, refusedCooldown, nowMs) : null;
     return {
@@ -676,7 +692,7 @@ export function readSeatPoolState(deps: SeatPoolStateReaderDeps, job: { jobId: s
       // A seat of the pool whose session is gone is reaped, which a usage limit doesn't hold, so for it a stopped session
       // comes before its account's usage; for the model, which the pool can only launch, the usage limit comes first.
       cause: !present || deps.seatStopped(slot.nodeId!) ? "stopped" : causeOf(slot.nodeId!, sessionName, state),
-      ...(present && parkedRule
+      ...(present && readFacts
         ? { atPrompt: state?.activity === "idle-at-prompt" && state.needsInput.count === 0, backgroundWork: !!state?.backgroundWork }
         : {}),
       ...(facts?.parked ? { parked: facts.parked } : {}),
@@ -706,6 +722,7 @@ export function readSeatPoolState(deps: SeatPoolStateReaderDeps, job: { jobId: s
     demand: job.spec.demandCmd ? deps.demand(job.jobId) : null,
     lastScaleAt: deps.slots.lastScaleAt(job.jobId),
     ...(readLoad ? { hostLoadPerCpuPercent: hostLoadPerCpuPercent(deps.hostSample!()) } : {}),
+    ...(longGates && deps.acceptsDestination && !deps.acceptsDestination(longGates.to) ? { returnLongGatesRefused: true as const } : {}),
   };
 }
 
@@ -756,6 +773,17 @@ export interface SeatPoolEffects {
    */
   moveRow(input: { qitemId: string; from: string; to: string; reason: string; state?: "pending" | "blocked" }):
     SeatPoolEffectResult & { park?: SeatPoolReparkOutcome };
+  /**
+   * T-012673: hands the rows a seat holds parked on long waits to the fixed seat `to`, each parked there on the same
+   * gate, all or none in one transaction (QueueRepository.handoffParkedRows), only while `from` holds exactly these
+   * rows and each is still blocked on its `blockedOn`, addressed to `from`; no wake goes to `to`. A destination the
+   * queue does not accept is refused (`destination_refused`) before anything is read.
+   */
+  handoffParked(input: { rows: ReadonlyArray<{ qitemId: string; blockedOn: string; note: string }>; from: string; to: string; dropTags: readonly string[] }):
+    SeatPoolEffectResult & { moved?: Array<{ qitemId: string; newQitemId: string; wakeAfterSeconds: number | null }>; qitemId?: string };
+  /** T-012673: whether the queue takes a session as a destination (QueueRepository.acceptsDestination): the
+   *  `return_long_gates.to` is checked with it at each run. Absent: not checked. */
+  acceptsDestination?(sessionName: string): boolean;
   /** Launches a seat whose session stopped, as `rig launch` does for it. */
   relaunchSeat(input: { rigId: string; logicalId: string }): Promise<SeatPoolEffectResult>;
   /**
@@ -792,7 +820,7 @@ export function seatPoolQueueEffects(deps: {
   queueRepo: QueueRepository;
   /** Where an escalation about a seat of the pool goes: the model's escalation owner, or why it has none. */
   escalationOwner(modelSession: string): { owner: string | null; reason: string };
-}): Pick<SeatPoolEffects, "openRows" | "queueMark" | "seatActedSince" | "unclaimRow" | "reapCount" | "moveRow" | "escalationOwner" | "escalate"> {
+}): Pick<SeatPoolEffects, "openRows" | "queueMark" | "seatActedSince" | "unclaimRow" | "reapCount" | "moveRow" | "handoffParked" | "acceptsDestination" | "escalationOwner" | "escalate"> {
   const { queueRepo } = deps;
   const ownerOf = (modelSession: string, override?: string | null): { owner: string | null; reason: string } => {
     if (!override) return deps.escalationOwner(modelSession);
@@ -826,6 +854,14 @@ export function seatPoolQueueEffects(deps: {
         return { ok: false, code: errorCode(error, "fallback_failed"), error: (error as Error).message };
       }
     },
+    handoffParked: ({ rows, from, to, dropTags }) => {
+      if (!queueRepo.acceptsDestination(to)) {
+        return { ok: false, code: "destination_refused", error: `return_long_gates.to ${to} is not a destination the queue accepts` };
+      }
+      const moved = queueRepo.handoffParkedRows(rows, to, { expectDestination: from, dropTags, actorSession: OPENRIG_SENDER });
+      return moved.ok ? { ok: true, moved: moved.moved } : moved;
+    },
+    acceptsDestination: (sessionName) => queueRepo.acceptsDestination(sessionName),
     escalationOwner: ownerOf,
     escalate: async ({ jobId, seat, model, qitemIds, owner }) => {
       const tag = `${SEAT_POOL_NEEDS_INPUT_TAG}:${seat}`;
@@ -962,6 +998,11 @@ const STOPPED_CODES = new Set(["session_not_live", "no_session"]);
 const SEAT_POOL_DRAIN_MOVE_PASSES = 20;
 /** A reroute refused because the row was claimed, closed or moved since the plan: nothing failed. */
 const ROW_MOVED_ON = new Set(["fallback_state_mismatch", "fallback_destination_mismatch", "qitem_not_found"]);
+/** A long-gate handoff refused because the rows or the seat changed since the plan (T-012673), or because a row can't go
+ *  as it is (what wakes it, a row of the fixed seat waiting on it; the plan reads both, so only a change since then):
+ *  nothing failed, and the rows stay. A destination the queue does not take is a failure (the spec's `to` is wrong),
+ *  said once while it lasts (SeatPoolExecutor.longGateTarget). */
+const LONG_GATE_SKIPPED = new Set([...ROW_MOVED_ON, "blocked_on_mismatch", "open_rows_mismatch", "wake_kind_unsupported", "dependent_at_target"]);
 /** An unclaim refused because the row was closed or released since it was read: the move that follows decides. */
 const UNCLAIM_MOVED_ON = new Set(["qitem_not_in_progress", "qitem_not_found"]);
 const NO_SESSIONS: ReadonlySet<string> = new Set();
@@ -1036,6 +1077,8 @@ export class SeatPoolExecutor {
    * holds no waiting row) forgets it.
    */
   private readonly relaunchBackoff = new Map<string, RelaunchBackoff>();
+  /** The `return_long_gates.to` said refused, by job (longGateTarget): said once while the queue refuses it. */
+  private readonly longGateRefusedTo = new Map<string, string>();
   private readonly now: () => Date;
   private readonly effectTimeoutMs: number;
   private stopping = false;
@@ -1222,6 +1265,7 @@ export class SeatPoolExecutor {
   private async apply(jobId: string, intents: SeatPoolIntent[], run: Run): Promise<void> {
     this.forgetRelaunchBackoff(jobId, intents);
     if (!(await this.drainClock(jobId, run))) return;
+    this.longGateTarget(jobId);
     for (const intent of intents) {
       if (!this.fresh(jobId, run)) return;
       if (intent.kind === "adopt") this.adopt(jobId, run, intent);
@@ -1275,10 +1319,17 @@ export class SeatPoolExecutor {
         if (!this.dispatch(jobId, run, intent, usageLimited, busy)) return;
       } else if (intent.kind === "reap") {
         if (!(await this.reap(jobId, run, intent.slotId))) return;
+      } else if (intent.kind === "return_long_gate") {
+        // The processes are read before the synchronous recheck and move (no await inside them), as a dispatch reads them.
+        const busy = await this.busyNow(jobId);
+        if (!this.returnLongGate(jobId, run, intent, busy)) return;
       } else if (!(await this.wake(jobId, run, intent))) return;
-      // Every step but adopt, unlink and dispatch awaits a lifecycle effect (a command, a launch, a stop) that can take
-      // minutes: an account may run out meanwhile, so the next move or the demand command reads the usage again (S3).
-      if (intent.kind !== "adopt" && intent.kind !== "unlink" && intent.kind !== "dispatch") run.usageLimited = undefined;
+      // Every step but adopt, unlink, dispatch and return_long_gate awaits a lifecycle effect (a command, a launch, a
+      // stop) that can take minutes: an account may run out meanwhile, so the next move or the demand command reads the
+      // usage again (S3).
+      if (intent.kind !== "adopt" && intent.kind !== "unlink" && intent.kind !== "dispatch" && intent.kind !== "return_long_gate") {
+        run.usageLimited = undefined;
+      }
     }
     await this.refreshDemand(jobId, run);
   }
@@ -1888,6 +1939,96 @@ export class SeatPoolExecutor {
     }
     if (outcome.reason) this.record(jobId, outcome.failed === true, outcome.reason, { slot: slot.logicalId, ...outcome.notes });
     return outcome.removed ? this.forget(jobId, run, slotId) : !outcome.stop;
+  }
+
+  /**
+   * T-012673: hands the rows of a seat parked on a long wait (return_long_gates) to the fixed seat, each parked there
+   * on the same gate. Synchronous from the read to the last write, with no await between them: nothing of the daemon
+   * (a CLI write comes through its HTTP, in this process) runs between the recheck and the move. The recheck is the
+   * planner's own predicate (seatPoolLongGateRows) on the state read now: a seat that took work, got a row, was woken
+   * or parked a row elsewhere since the plan keeps its rows (`seat_pool_long_gate_skipped`, code `seat_changed` or
+   * `rows_changed`), as does the pool set to drain. All the rows go in one transaction, which checks again that the
+   * seat holds exactly them and that each is still blocked on its gate, addressed to the seat and free to go: a refusal
+   * of any row moves none. False stops the run.
+   */
+  private returnLongGate(
+    jobId: string, run: Run, intent: Extract<SeatPoolIntent, { kind: "return_long_gate" }>, busy: BusyRead,
+  ): boolean {
+    const ctx = this.fresh(jobId, run);
+    if (!ctx) return false;
+    const rule = ctx.spec.returnLongGates;
+    const found = ctx.state.slots.find((s) => s.slotId === intent.slotId);
+    // The busy read just made (busyNow): a seat running a busy program keeps its rows (`busy`, with what it runs).
+    const slot = found ? withBusy(found, busy) : undefined;
+    const nowMs = this.now().getTime();
+    const usable = rule && slot && !ctx.state.returnLongGatesRefused;
+    const parks = usable ? seatPoolLongGateRows(ctx.spec, slot, nowMs) : null;
+    const base = { slot: slot?.sessionName ?? null, to: intent.to };
+    if (usable && !parks && slot.busyProcess && seatPoolLongGateRows(ctx.spec, { ...slot, busyProcess: null }, nowMs)) {
+      this.record(jobId, false, "seat_pool_long_gate_skipped", { ...base, qitemIds: intent.qitemIds, code: "busy", busyProcess: slot.busyProcess });
+      return true;
+    }
+    if (!rule || !slot || !parks || rule.to !== intent.to) {
+      this.record(jobId, false, "seat_pool_long_gate_skipped", { ...base, qitemIds: intent.qitemIds, code: "seat_changed" });
+      return true;
+    }
+    const planned = [...intent.qitemIds].sort();
+    const now = parks.map((park) => park.qitemId).sort();
+    if (planned.length !== now.length || planned.some((id, i) => id !== now[i])) {
+      this.record(jobId, false, "seat_pool_long_gate_skipped", { ...base, qitemIds: intent.qitemIds, code: "rows_changed" });
+      return true;
+    }
+    const rows = parks.map((park) => {
+      const since = new Date(park.blockedSince!).toISOString();
+      return {
+        qitemId: park.qitemId, blockedOn: park.blockedOn, gate: seatPoolLongGateOf(rule, park.blockedOn)!, blockedSince: since,
+        note: `seat-pool ${jobId}: returned from ${slot.sessionName}, parked on ${park.blockedOn} since ${since}; the successor `
+          + `waits on the same gate at ${intent.to}, and the work done so far stays on ${park.qitemId} (its chainOfRecord)`,
+      };
+    });
+    const moved = this.deps.effects.handoffParked({
+      rows: rows.map(({ qitemId, blockedOn, note }) => ({ qitemId, blockedOn, note })), from: slot.sessionName, to: intent.to,
+      dropTags: ctx.spec.dispatchTag !== null ? [ctx.spec.dispatchTag] : [],
+    });
+    if (!moved.ok) {
+      const notes = { slot: slot.sessionName, to: intent.to, qitemIds: intent.qitemIds, ...(moved.qitemId ? { qitemId: moved.qitemId } : {}), code: moved.code };
+      if (moved.code === "destination_refused") this.longGateTargetRefusedOnce(jobId, intent.to, moved.error ?? null);
+      else if (LONG_GATE_SKIPPED.has(moved.code)) this.record(jobId, false, "seat_pool_long_gate_skipped", notes);
+      else this.record(jobId, true, "seat_pool_long_gate_failed", { ...notes, error: moved.error });
+      return true;
+    }
+    for (const row of rows) {
+      const done = moved.moved?.find((m) => m.qitemId === row.qitemId);
+      this.record(jobId, false, "seat_pool_long_gate_returned", {
+        slot: slot.sessionName, qitemId: row.qitemId, to: intent.to, gate: row.gate, blockedOn: row.blockedOn, blockedSince: row.blockedSince,
+        newQitemId: done?.newQitemId ?? null, wakeAfterSeconds: done?.wakeAfterSeconds ?? null,
+      });
+    }
+    return true;
+  }
+
+  /**
+   * T-012673: a `return_long_gates.to` the queue does not take (a wrong address in the spec, a seat gone from its rig)
+   * fails the rule for every seat, on every pass. The plan leaves the seats alone then (SeatPoolState.
+   * returnLongGatesRefused); this says it once, as `seat_pool_long_gate_failed` (code `destination_refused`), and again
+   * only after the queue took it and refused it anew. Read at each run from the job and the queue, without the state.
+   */
+  private longGateTarget(jobId: string): void {
+    const to = this.deps.readJob(jobId)?.spec?.returnLongGates?.to;
+    const accepts = this.deps.effects.acceptsDestination;
+    if (!to || !accepts || accepts(to)) {
+      this.longGateRefusedTo.delete(jobId);
+      return;
+    }
+    this.longGateTargetRefusedOnce(jobId, to, null);
+  }
+
+  private longGateTargetRefusedOnce(jobId: string, to: string, error: string | null): void {
+    if (this.longGateRefusedTo.get(jobId) === to) return;
+    this.longGateRefusedTo.set(jobId, to);
+    this.record(jobId, true, "seat_pool_long_gate_failed", {
+      to, code: "destination_refused", error: error ?? `return_long_gates.to ${to} is not a destination the queue accepts`,
+    });
   }
 
   /**

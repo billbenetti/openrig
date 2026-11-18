@@ -68,6 +68,23 @@ export interface SeatPoolSpec {
    *  takes no row, free or parked (seatPoolContextOver). Absent (no property) when not given: read as
    *  SEAT_POOL_CONTEXT_LIMIT_DEFAULT_PERCENT (40); 0 turns it off. */
   contextLimitPercent?: number;
+  /** `return_long_gates` (T-012673): a seat the pool added whose open rows are all parked on one of these long waits (a
+   *  PR waiting for a person's review) for at least `min_blocked_s` hands them to a fixed seat and is free again
+   *  (seatPoolLongGateRows). Absent (no such property) when the key is not in the context: the rule is off. */
+  returnLongGates?: SeatPoolReturnLongGates;
+}
+
+/** `return_long_gates` in the job's context (T-012673): where a seat's rows parked on a long wait go. */
+export interface SeatPoolReturnLongGates {
+  /** `gates`: the waits that count, each an `external:` gate; a row's blocked_on matches one when it is that gate, or
+   *  that gate followed by `-`, `:` or `/` and more (`external:github-review-<T>`). */
+  gates: string[];
+  /** `min_blocked_s` (default 1800): how long each row must have been blocked, without leaving `blocked`. */
+  minBlockedSeconds: number;
+  /** `to`: the fixed seat the rows go to (`<session>@<rig>`). */
+  to: string;
+  /** `max_rows` (default 4): the most open rows a seat may hold and still hand them all back. */
+  maxRows: number;
 }
 
 /** `dispatch_to_parked` in the job's context: when a seat parked on its own wait counts as a receiver of one more row. */
@@ -110,7 +127,7 @@ export interface SeatPoolDispatchToParked {
 const SPEC_KEYS = new Set([
   "min", "max", "cooldown_s", "idle_grace_s", "dispatch_after_s", "dispatch_tag", "drain", "drain_deadline_s", "no_seat_grace_s", "adopt", "cwd_template",
   "demand_cmd", "release_cmd", "prepare_cmd", "reap_cmd", "remove_cmd", "escalation_owner", "dispatch_to_parked",
-  "priority_aging_s", "context_limit_percent",
+  "priority_aging_s", "context_limit_percent", "return_long_gates",
 ]);
 const DEFAULT_COOLDOWN_SECONDS = 60;
 const DEFAULT_IDLE_GRACE_SECONDS = 300;
@@ -293,6 +310,56 @@ function dispatchToParked(value: unknown): SeatPoolDispatchToParked | SpecProble
   };
 }
 
+const RETURN_LONG_GATES = "return_long_gates";
+/** The fields of `return_long_gates`: the bounds of each whole number, and its default (T-012673). */
+const RETURN_LONG_GATES_NUMBERS = {
+  min_blocked_s: { min: 0, max: 604_800, fallback: 1800 },
+  max_rows: { min: 1, max: 32, fallback: 4 },
+} as const;
+const RETURN_LONG_GATES_KEYS = new Set([...Object.keys(RETURN_LONG_GATES_NUMBERS), "gates", "to"]);
+/** The most gates `return_long_gates.gates` may list, and the longest one. */
+const RETURN_LONG_GATES_LIST_MAX = 32;
+const RETURN_LONG_GATES_ENTRY_MAX = 128;
+
+/** `return_long_gates`: an object with `gates` and `to` (T-012673). Only a field left out takes its default. */
+function returnLongGates(value: unknown): SeatPoolReturnLongGates | SpecProblem {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return { field: RETURN_LONG_GATES, message: `seat-pool: ${RETURN_LONG_GATES} must be an object with gates and to` };
+  }
+  const record = value as Record<string, unknown>;
+  const unknown = Object.keys(record).filter((key) => !RETURN_LONG_GATES_KEYS.has(key));
+  if (unknown.length > 0) {
+    return {
+      field: RETURN_LONG_GATES,
+      message: `seat-pool: ${RETURN_LONG_GATES} has unknown field ${unknown.join(", ")}; known fields are ${[...RETURN_LONG_GATES_KEYS].join(", ")}`,
+    };
+  }
+  const gates = record["gates"];
+  const gatesField = `${RETURN_LONG_GATES}.gates`;
+  if (!Array.isArray(gates) || gates.length === 0 || gates.length > RETURN_LONG_GATES_LIST_MAX
+    || gates.some((gate) => typeof gate !== "string" || gate.length > RETURN_LONG_GATES_ENTRY_MAX || /\s/.test(gate)
+      || !gate.startsWith("external:") || gate.length === "external:".length)) {
+    return {
+      field: gatesField,
+      message: `seat-pool: ${gatesField} must be a list of 1 to ${RETURN_LONG_GATES_LIST_MAX} gates, each external:<name> without whitespace, at most ${RETURN_LONG_GATES_ENTRY_MAX} characters`,
+    };
+  }
+  const to = record["to"];
+  if (typeof to !== "string" || !/^[^\s@]+@[^\s@]+$/.test(to)) {
+    return { field: `${RETURN_LONG_GATES}.to`, message: `seat-pool: ${RETURN_LONG_GATES}.to must be a seat address (<session>@<rig>)` };
+  }
+  const numbers: Record<string, number> = {};
+  for (const [key, { min, max, fallback }] of Object.entries(RETURN_LONG_GATES_NUMBERS)) {
+    const field = record[key];
+    if (field === undefined) { numbers[key] = fallback; continue; }
+    if (!Number.isInteger(field) || (field as number) < min || (field as number) > max) {
+      return { field: `${RETURN_LONG_GATES}.${key}`, message: `seat-pool: ${RETURN_LONG_GATES}.${key} must be a whole number from ${min} to ${max}` };
+    }
+    numbers[key] = field as number;
+  }
+  return { gates: [...new Set(gates as string[])], minBlockedSeconds: numbers["min_blocked_s"]!, to, maxRows: numbers["max_rows"]! };
+}
+
 const isProblem = (value: unknown): value is SpecProblem =>
   !!value && typeof value === "object" && "message" in value && "field" in value;
 
@@ -360,6 +427,12 @@ export function parseSeatPoolSpec(context: Record<string, unknown>): { spec: Sea
     if (isProblem(parsed)) return { problem: parsed };
     parkedRule = parsed;
   }
+  let longGates: SeatPoolReturnLongGates | undefined;
+  if (context[RETURN_LONG_GATES] !== undefined) {
+    const parsed = returnLongGates(context[RETURN_LONG_GATES]);
+    if (isProblem(parsed)) return { problem: parsed };
+    longGates = parsed;
+  }
   return {
     spec: {
       min: min as number, max: max as number, cooldownSeconds: cooldownSeconds as number, idleGraceSeconds: idleGraceSeconds as number,
@@ -371,6 +444,8 @@ export function parseSeatPoolSpec(context: Record<string, unknown>): { spec: Sea
       ...(noSeatGrace !== undefined ? { noSeatGraceSeconds: noSeatGrace as number } : {}),
       ...(priorityAging !== undefined ? { priorityAgingSeconds: priorityAging as number } : {}),
       ...(contextLimit !== undefined ? { contextLimitPercent: contextLimit as number } : {}),
+      // Only a pool that sets the key carries it, so the spec of one that doesn't reads as before it (T-012673).
+      ...(longGates ? { returnLongGates: longGates } : {}),
     },
   };
 }
@@ -522,15 +597,18 @@ export interface SeatPoolSlotView {
   idleSince: string | null;
   /** Meaningful for a live seat whose node exists. */
   cause: SeatPoolSeatCause;
-  /** Only with `dispatch_to_parked` in the spec and the node present: idle at its prompt with no needs-input, whatever
-   *  runs in the background. */
+  /** Only with `dispatch_to_parked` or `return_long_gates` in the spec and the node present: idle at its prompt with no
+   *  needs-input, whatever runs in the background. */
   atPrompt?: boolean;
-  /** Only with `dispatch_to_parked` in the spec and the node present: a background shell runs in the seat. */
+  /** Only with `dispatch_to_parked` or `return_long_gates` in the spec and the node present: a background shell runs in
+   *  the seat. */
   backgroundWork?: boolean;
-  /** Only with `dispatch_to_parked` in the spec, the row facts read and exactly one open row, blocked: that row's park. */
+  /** Only with `dispatch_to_parked` or `return_long_gates` in the spec, the row facts read and exactly one open row,
+   *  blocked: that row's park. */
   parked?: ParkFacts;
-  /** Only with `dispatch_to_parked.max_open_rows` above 1, the row facts read and 2 or more open rows, all blocked (at
-   *  most that many): the park of each (T-007036). A seat with one open row carries `parked` instead. */
+  /** Only with `dispatch_to_parked.max_open_rows` or `return_long_gates.max_rows` above 1, the row facts read and 2 or
+   *  more open rows, all blocked (at most the larger of the two): the park of each (T-007036, T-012673). A seat with one
+   *  open row carries `parked` instead. */
   parkedRows?: ParkFacts[];
   /** Only with `dispatch_to_parked.busy_processes` in the spec, for a seat the process read looked at: why the seat
    *  counts as busy for a row (the matching process, or that its processes could not be read), or null when no
@@ -569,6 +647,21 @@ export interface ParkFacts {
   parkedAt: string | null;
   /** When the row was taken: its claim, or else its first move to in-progress by one of its destination's addresses. */
   takenAt: string | null;
+  /** Only when the reader asks for it (`return_long_gates` in the spec, T-012673): since when the row has been blocked
+   *  without leaving `blocked` (ms), on any gate: its first move to blocked after its latest transition to any other
+   *  state. A re-park, a note, a wake timer that fired and a change of gate keep it (a row parked on one gate for hours,
+   *  then on a long one, is as old as its first park: no schema column records the gate of each park, to keep the rebase
+   *  on 0.7.18 clean). Null when the record does not say. `parkedAt` can't tell it: it is null with no wake and moves
+   *  with each re-park. Absent (no property) otherwise, so the facts read as before the field. */
+  blockedSince?: number | null;
+  /** Only with `blockedSince`: when a wake of the row last fired (ms), null when none did. A wake that fired a moment
+   *  ago was typed into the seat's pane, which may not read as working yet (T-012673). */
+  wakeFiredAt?: number | null;
+  /** Only with `blockedSince`: why the row can't be handed to the fixed seat as it is (QueueRepository.
+   *  handoffParkedRows refuses the same): `wake_kind_unsupported` (woken by a watchdog attached to it, a repeating
+   *  wait or a blocker row, not a park timer of its own or nothing) or `dependent_at_target` (a row of the fixed seat
+   *  waits on it); null when it can go. */
+  returnRefusal?: string | null;
 }
 
 /** How a seat may receive a waiting row: `free` (no open row, idle at its prompt) or `parked` (dispatch_to_parked). */
@@ -609,6 +702,9 @@ export interface SeatPoolState {
    *  `parked_max_load_per_cpu_percent`; null when the host gives no reading. Absent: not read, and no seat is held back
    *  by the load in the plan. */
   hostLoadPerCpuPercent?: number | null;
+  /** T-012673: present (true) only when the spec has `return_long_gates` and the queue does not take its `to` as a
+   *  destination (a wrong address, a seat gone from its rig): no seat's rows are planned back. Absent otherwise. */
+  returnLongGatesRefused?: true;
 }
 
 export type SeatPoolIntent =
@@ -630,7 +726,10 @@ export type SeatPoolIntent =
   /** Tell the model's escalation owner that a seat holding waiting rows needs input. */
   | { kind: "escalate"; seat: string; qitemIds: string[] }
   /** Take out a seat the pool added whose session is gone (see seatPoolReapable). */
-  | { kind: "reap"; slotId: number };
+  | { kind: "reap"; slotId: number }
+  /** Hand the rows a seat holds parked on a long wait to the fixed seat `to`, each parked again there on the same gate,
+   *  so the seat is free (seatPoolLongGateRows, T-012673). */
+  | { kind: "return_long_gate"; slotId: number; qitemIds: string[]; to: string };
 
 export interface SeatPoolPlan {
   intents: SeatPoolIntent[];
@@ -777,6 +876,54 @@ function seatPoolOwnPark(rule: SeatPoolDispatchToParked, sessionName: string, pa
   return parkedMs >= takenMs && nowMs - takenMs <= rule.maxClaimAgeSeconds * 1000;
 }
 
+/** The gate of `return_long_gates.gates` a row's blocked_on matches, or null: the gate itself, or the gate followed by
+ *  `-`, `:` or `/` and more (a gate named per task, `external:github-review-T-012673`), never a longer name
+ *  (`external:github-reviewer`). */
+export function seatPoolLongGateOf(rule: Pick<SeatPoolReturnLongGates, "gates">, blockedOn: string): string | null {
+  return rule.gates.find((gate) => blockedOn === gate
+    || (blockedOn.length > gate.length + 1 && blockedOn.startsWith(gate) && "-:/".includes(blockedOn[gate.length]!))) ?? null;
+}
+
+/**
+ * The rows a seat hands back to the fixed seat of `return_long_gates` (T-012673), or null when it hands none. The case
+ * (17/11 23:06Z): 6 of the 10 seats of the reviewer pool each held one row parked on `external:github-review` (a PR
+ * waiting for a person's review, for hours), so they counted as occupied, and the pool dispatched nothing for half an
+ * hour. Such a seat's rows go to the fixed seat, still parked on the same gate, and the seat is free.
+ *
+ * Every condition must hold: the rule on and the pool not draining; a live seat the pool added (an adopted seat is a
+ * fixed seat already), not to be reaped, its node present; no held message; idle at its prompt (`cause` idle and
+ * `atPrompt`) for at least SEAT_POOL_LONG_GATE_QUIET_MS, with no background shell and no `busy_processes` program under
+ * its pane, so nothing of the seat's is running; between 1 and `max_rows` open rows, ALL blocked (a pending or
+ * in-progress row means the seat is working); and each of them on one of `gates`, blocked (on any gate, unbroken) for
+ * at least `min_blocked_s` (`blockedSince`; unknown refuses), with no wake of it fired within SEAT_POOL_LONG_GATE_QUIET_MS and
+ * nothing that keeps it from going as it is (`returnRefusal` null; unknown refuses). The planner and the executor's
+ * recheck just before the move both ask this.
+ */
+export function seatPoolLongGateRows(spec: SeatPoolSpec, slot: SeatPoolSlotView, nowMs: number): ParkFacts[] | null {
+  const rule = spec.returnLongGates;
+  if (!rule || spec.drain || slot.adopted || !seatPoolLive(slot) || slot.nodeId === null || !slot.nodeExists) return null;
+  if (slot.heldMessages !== 0 || slot.cause !== "idle" || slot.atPrompt !== true || slot.backgroundWork === true || slot.busyProcess) return null;
+  // The seat's state is observed, so it lags: a seat a wake was just typed into (its own row's timer firing) can still
+  // read as idle since hours. A quiet seat has been idle a while and no wake of its rows fired a moment ago, so the
+  // move never lands under a turn the seat just began on one of them. Written so that an unknown time refuses.
+  const idleMs = slot.idleSince !== null ? Date.parse(slot.idleSince) : NaN;
+  if (!(nowMs - idleMs >= SEAT_POOL_LONG_GATE_QUIET_MS)) return null;
+  const parks = slot.openRows === 1 ? (slot.parked ? [slot.parked] : []) : (slot.parkedRows ?? []);
+  if (slot.openRows < 1 || slot.openRows > rule.maxRows || parks.length !== slot.openRows) return null;
+  // Written so that an unknown or unreadable time (null, NaN) refuses.
+  const old = (park: ParkFacts) => typeof park.blockedSince === "number" && nowMs - park.blockedSince >= rule.minBlockedSeconds * 1000;
+  const unwoken = (park: ParkFacts) => park.wakeFiredAt === undefined || park.wakeFiredAt === null
+    || nowMs - park.wakeFiredAt >= SEAT_POOL_LONG_GATE_QUIET_MS;
+  // A row the queue would refuse to move (a watchdog or a repeating wait wakes it, a row of the fixed seat waits on it)
+  // is never planned: the plan would be refused on every pass, and the seat would lose its turn as a parked receiver.
+  return parks.every((park) => seatPoolLongGateOf(rule, park.blockedOn) !== null && old(park) && unwoken(park) && park.returnRefusal === null)
+    ? parks : null;
+}
+
+/** How long a seat must have been idle, and since a wake of its rows last fired, before return_long_gates moves its rows
+ *  (seatPoolLongGateRows, T-012673): well past the lag of the observed seat state (a hook, a 1 s pane sample). */
+export const SEAT_POOL_LONG_GATE_QUIET_MS = 120_000;
+
 /** Whether the host's load keeps a seat parked on its own wait from a 2nd row: `parked_max_load_per_cpu_percent` is set
  *  and the load per CPU is above it. An unknown load (null) holds nothing back. */
 export function seatPoolParkedLoadOver(spec: SeatPoolSpec, loadPerCpuPercent: number | null): boolean {
@@ -852,6 +999,18 @@ export function planSeatPool(spec: SeatPoolSpec, state: SeatPoolState, nowMs: nu
   for (const slot of present.filter((s) => s.phase === "draining")) intents.push({ kind: "drain", slotId: slot.slotId, idleSince: slot.idleSince });
   for (const slot of present.filter(seatPoolReapable)) intents.push({ kind: "reap", slotId: slot.slotId });
   if (spec.drain) for (const slot of present.filter((s) => s.adopted)) intents.push({ kind: "unlink", slotId: slot.slotId });
+  // T-012673: a seat holding only rows parked on a long wait hands them to the fixed seat. In this plan it still counts
+  // as occupied (its rows are open) and receives nothing, also as a parked seat (a github-review wait with a short timer
+  // of its own would read as one under dispatch_to_parked); once its rows are gone the next plan finds it free.
+  // A fixed seat the queue does not take (state.returnLongGatesRefused) gets no plan at all: every move would be refused,
+  // and the seats would lose their turn as parked receivers; the executor says so once.
+  const returning = new Set<SeatPoolSlotView>();
+  if (!state.returnLongGatesRefused) for (const slot of present) {
+    const parks = seatPoolLongGateRows(spec, slot, nowMs);
+    if (!parks) continue;
+    returning.add(slot);
+    intents.push({ kind: "return_long_gate", slotId: slot.slotId, qitemIds: parks.map((park) => park.qitemId), to: spec.returnLongGates!.to });
+  }
 
   const starting = present.filter((slot) => slot.phase === "adding" || slot.phase === "added");
   // A stopped adopted seat takes no row and is not reaped: it isn't one of the pool's seats until it runs again. A seat
@@ -889,7 +1048,7 @@ export function planSeatPool(spec: SeatPoolSpec, state: SeatPoolState, nowMs: nu
   // before a seat that is really free. A parked seat stays out of `idle`, so it is neither free nor drained. While the
   // host's load is above the parked limit no parked seat receives: the row is demand, as with no seat to take it.
   const loadPerCpuPercent = state.hostLoadPerCpuPercent ?? null;
-  const modes = new Map(live.map((slot) => [slot, spec.drain ? null : seatPoolReceives(spec, slot, nowMs, { loadPerCpuPercent })]));
+  const modes = new Map(live.map((slot) => [slot, spec.drain || returning.has(slot) ? null : seatPoolReceives(spec, slot, nowMs, { loadPerCpuPercent })]));
   const receivers = [
     ...live.filter((slot) => modes.get(slot) === "free"),
     ...live.filter((slot) => modes.get(slot) === "parked").sort((a, b) => a.slotId - b.slotId),

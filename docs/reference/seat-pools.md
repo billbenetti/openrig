@@ -49,6 +49,11 @@ context:
     busy_orphan_max_age_s: 43200    # only with busy_processes: the oldest a process that left the pane's tree may be and still hold the seat (60..172800, default 43200)
     max_open_rows: 4                # a seat with up to this many open rows, ALL parked on its own waits, may receive (1..20, default 1)
     refused_cooldown_s: 1800        # a parked seat that gave a row straight back untaken gets no row as parked for this long, or until its open rows change (0..86400, default 1800; 0: off)
+  return_long_gates:                # absent (the default): off; see "A seat holding only a long wait"
+    gates: [external:github-review] # required: the long waits, each external:<name> (1..32)
+    min_blocked_s: 1800             # how long each row must have been blocked, unbroken, on any gate (0..604800, default 1800)
+    to: dev-review@my-rig           # required: the fixed seat the rows go to (<session>@<rig>)
+    max_rows: 4                     # the most open rows a seat may hold and still hand them all (1..32, default 4)
 ```
 
 Registration and `rig watchdog update --spec` refuse a spec with an unknown field, `max` below `min`, a relative
@@ -56,7 +61,8 @@ Registration and `rig watchdog update --spec` refuse a spec with an unknown fiel
 address (`<session>@<rig>`), or a `dispatch_to_parked` that isn't an object, has an unknown field or a value out of its
 range (`dispatch_to_parked: {}` turns it on with every default; `refuse_gates` and `busy_processes` are lists of at most
 32 strings of 1 to 128 characters with no whitespace, and a `busy_processes` entry has no `/`; `busy_orphan_max_age_s` is
-refused without `busy_processes`). Commands run without a shell, with the daemon's
+refused without `busy_processes`), or a `return_long_gates` that isn't an object, has an unknown field, a gate that
+isn't `external:<name>`, a `to` that isn't a seat address or a number out of its range. Commands run without a shell, with the daemon's
 environment plus:
 
 | Variable | Set for | Value |
@@ -142,6 +148,45 @@ The executor reads the sidecar again just before the move: a seat that passed th
 its seat and records `seat_pool_dispatch_skipped` with `code: free_context` (or `parked_context`), the reading and the
 limit. Without the rule, a seat that stops taking new work past a context threshold of its own takes the row, gives it
 straight back to the model, and the next plan hands it to the next full seat.
+
+### A seat holding only a long wait
+
+With `return_long_gates`, a seat the pool added whose open rows are all blocked on one of its `gates` hands them to the
+fixed seat `to` and is free again. A row matches a gate when its `blocked_on` is that gate, or that gate followed by
+`-`, `:` or `/` and more (`external:github-review-T-42`), never a longer name (`external:github-reviewer`). Without the
+rule, a seat whose row waits hours on a person's review counts as occupied the whole time: on 17/11 six of a reviewer
+pool's ten seats each held one row on `external:github-review`, and the pool dispatched nothing for half an hour.
+
+The seat hands its rows on only when every one of these holds: the pool is not draining; the seat was added by the pool
+(an adopted seat is a fixed seat already) and is live; it has no held message and has been idle at its prompt for at
+least 2 minutes, with no background shell and no `busy_processes` program; it holds 1 to `max_rows` open rows, all
+blocked (one pending or in progress means it is working); and each of them is on one of `gates`, has been blocked for
+at least `min_blocked_s`, had no wake fire in the last 2 minutes, and can go as it is. The age counts the unbroken block
+on any gate: from the row's first move to blocked after its latest move to any other state. A re-park, a note, a wake
+timer that fired and a change of gate keep the count, so a row parked on `external:suite-flock-T-1` for two hours and
+then on `external:github-review` may be handed on at once; the age only keeps a row that is about to be resolved from
+moving. The 2 minutes are a margin over the lag of the observed
+seat state: a seat a wake was just typed into may still read as idle. A row can't go as it is when it is woken by an
+attached watchdog, a repeating wait or a blocker row, not a park timer of its own or nothing, or when a row of `to`
+waits on it (the move would release that row as if its blocker were done); the plan never asks for such a seat, so it
+keeps its turn as a parked receiver.
+
+The plan asks for the move (`return_long_gate`) and gives that seat nothing else in the same plan, also as a parked seat;
+it still counts as occupied there. The executor checks the seat again just before, with the same rule, and hands all its
+rows on in one transaction, so a refusal of any row moves none: each row closes `handed-off`, with a note that names the
+seat, the gate and since when, and its successor at `to` is parked at once on the same gate. A park timer the row had is
+armed again with the same interval and message (a default message names the successor; the interval counts from the
+move); a row with no timer gets none. No wake is sent to `to`. The successor carries the row's tags but `dispatch_tag`,
+so it is never moved back into the pool, and its `chainOfRecord` ends with the row, where the work done so far stays; a
+row of another seat that waited on the row waits on the successor. Each row moved is recorded as
+`seat_pool_long_gate_returned` (`slot`, `qitemId`, `newQitemId`, `to`, `gate`, `blockedOn`, `blockedSince`,
+`wakeAfterSeconds`). A seat that changed since the plan keeps its rows and records `seat_pool_long_gate_skipped`
+(`code: seat_changed` or `rows_changed`); rows that changed in between stay too, with the code of the first:
+`fallback_state_mismatch`, `fallback_destination_mismatch`, `qitem_not_found`, `blocked_on_mismatch`,
+`open_rows_mismatch`, `wake_kind_unsupported` or `dependent_at_target`. A `to` the queue does not accept as a destination
+(a wrong address, a seat gone from its rig) plans no move for any seat and is recorded once, as
+`seat_pool_long_gate_failed` (`code: destination_refused`), until the queue takes it again. The next plan, with the
+seat's rows gone, finds it free.
 
 ### A seat parked on its own wait
 
