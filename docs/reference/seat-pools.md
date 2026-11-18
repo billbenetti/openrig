@@ -51,7 +51,7 @@ context:
     refused_cooldown_s: 1800        # a parked seat that gave a row straight back untaken gets no row as parked for this long, or until its open rows change (0..86400, default 1800; 0: off)
   return_long_gates:                # absent (the default): off; see "A seat holding only a long wait"
     gates: [external:github-review] # required: the long waits, each external:<name> (1..32)
-    min_blocked_s: 1800             # how long each row must have been blocked, unbroken, on any gate (0..604800, default 1800)
+    min_blocked_s: 1800             # how long each row must have been blocked, unbroken, on these gates (0..604800, default 1800)
     to: dev-review@my-rig           # required: the fixed seat the rows go to (<session>@<rig>)
     max_rows: 4                     # the most open rows a seat may hold and still hand them all (1..32, default 4)
 ```
@@ -161,11 +161,14 @@ The seat hands its rows on only when every one of these holds: the pool is not d
 (an adopted seat is a fixed seat already) and is live; it has no held message and has been idle at its prompt for at
 least 2 minutes, with no background shell and no `busy_processes` program; it holds 1 to `max_rows` open rows, all
 blocked (one pending or in progress means it is working); and each of them is on one of `gates`, has been blocked for
-at least `min_blocked_s`, had no wake fire in the last 2 minutes, and can go as it is. The age counts the unbroken block
-on any gate: from the row's first move to blocked after its latest move to any other state. A re-park, a note, a wake
-timer that fired and a change of gate keep the count, so a row parked on `external:suite-flock-T-1` for two hours and
-then on `external:github-review` may be handed on at once; the age only keeps a row that is about to be resolved from
-moving. The 2 minutes are a margin over the lag of the observed
+at least `min_blocked_s`, had no wake fire in the last 2 minutes, and can go as it is. The age counts only the
+unbroken block on the listed gates: each blocked transition records the gate the row was on (`queue_transitions.blocked_on`),
+and the count starts at the earliest of the row's latest run of blocked transitions on a listed gate. A re-park on a
+listed gate, a note and a wake timer that fired keep the count; a row parked on `external:suite-flock-T-1` for two hours
+and then on `external:github-review` counts from its move to `external:github-review`, so it waits `min_blocked_s` there
+before it is handed on. A blocked transition written before the daemon recorded the gate counts only when it is the
+row's newest (its gate is the row's current one); an older one ends the count, so the age can come out shorter than the
+truth, never longer. The age keeps a row that is about to be resolved from moving. The 2 minutes are a margin over the lag of the observed
 seat state: a seat a wake was just typed into may still read as idle. A row can't go as it is when it is woken by an
 attached watchdog, a repeating wait or a blocker row, not a park timer of its own or nothing, or when a row of `to`
 waits on it (the move would release that row as if its blocker were done); the plan never asks for such a seat, so it
@@ -175,12 +178,14 @@ The plan asks for the move (`return_long_gate`) and gives that seat nothing else
 it still counts as occupied there. The executor checks the seat again just before, with the same rule, and hands all its
 rows on in one transaction, so a refusal of any row moves none: each row closes `handed-off`, with a note that names the
 seat, the gate and since when, and its successor at `to` is parked at once on the same gate. A park timer the row had is
-armed again with the same interval and message (a default message names the successor; the interval counts from the
-move); a row with no timer gets none. No wake is sent to `to`. The successor carries the row's tags but `dispatch_tag`,
+armed again with the same interval and message (a default message names the successor) and falls due when the row's
+own would have: a wake due in one minute is due in one minute at `to`, and one already due is due now; like every park
+timer, it fires once. A timer that already fired (delivered, or with its retry pending) has no due of its own, and its
+successor's counts a full interval from the move. A row with no timer gets none. No wake is sent to `to`. The successor carries the row's tags but `dispatch_tag`,
 so it is never moved back into the pool, and its `chainOfRecord` ends with the row, where the work done so far stays; a
 row of another seat that waited on the row waits on the successor. Each row moved is recorded as
 `seat_pool_long_gate_returned` (`slot`, `qitemId`, `newQitemId`, `to`, `gate`, `blockedOn`, `blockedSince`,
-`wakeAfterSeconds`). A seat that changed since the plan keeps its rows and records `seat_pool_long_gate_skipped`
+`wakeAfterSeconds`, `wakeDueAt`: when the successor's wake falls due, null with no wake). A seat that changed since the plan keeps its rows and records `seat_pool_long_gate_skipped`
 (`code: seat_changed` or `rows_changed`); rows that changed in between stay too, with the code of the first:
 `fallback_state_mismatch`, `fallback_destination_mismatch`, `qitem_not_found`, `blocked_on_mismatch`,
 `open_rows_mismatch`, `wake_kind_unsupported` or `dependent_at_target`. A `to` the queue does not accept as a destination
