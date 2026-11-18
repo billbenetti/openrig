@@ -8,6 +8,7 @@ import { eventsSchema } from "../src/db/migrations/003_events.js";
 import { watchdogJobsSchema } from "../src/db/migrations/031_watchdog_jobs.js";
 import { watchdogHistorySchema } from "../src/db/migrations/032_watchdog_history.js";
 import { seatPoolSlotsSchema } from "../src/db/migrations/158_seat_pool_slots.js";
+import { forkSeatPoolSlotsRenameSchema } from "../src/db/migrations/160_fork_seat_pool_slots_rename.js";
 import { EventBus } from "../src/domain/event-bus.js";
 import { WatchdogJobsRepository } from "../src/domain/watchdog-jobs-repository.js";
 import { WatchdogHistoryLog } from "../src/domain/watchdog-history-log.js";
@@ -445,7 +446,7 @@ describe("seat-pool registration, update and stop", () => {
 
   beforeEach(() => {
     db = createDb();
-    migrate(db, [coreSchema, eventsSchema, watchdogJobsSchema, watchdogHistorySchema, seatPoolSlotsSchema]);
+    migrate(db, [coreSchema, eventsSchema, watchdogJobsSchema, watchdogHistorySchema, seatPoolSlotsSchema, forkSeatPoolSlotsRenameSchema]);
     jobsRepo = new WatchdogJobsRepository(db);
     const bus = new EventBus(db);
     const log = new WatchdogHistoryLog(db);
@@ -534,7 +535,7 @@ describe("F3s: the stop says which seats were left stopped, and the show and the
   const SPEC = "policy: seat-pool\ncontext:\n  max: 3\n  cwd_template: /w/{slot}\n  drain: true\n";
   beforeEach(() => {
     db = createDb();
-    migrate(db, [coreSchema, eventsSchema, watchdogJobsSchema, watchdogHistorySchema, seatPoolSlotsSchema]);
+    migrate(db, [coreSchema, eventsSchema, watchdogJobsSchema, watchdogHistorySchema, seatPoolSlotsSchema, forkSeatPoolSlotsRenameSchema]);
     jobsRepo = new WatchdogJobsRepository(db);
     app = new Hono();
     const log = new WatchdogHistoryLog(db);
