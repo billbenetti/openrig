@@ -5,7 +5,7 @@ import type { StopPrecondition } from "./seat-lifecycle-service.js";
 import type { ArbitratedSeatState } from "./activity-taxonomy.js";
 import { deriveCanonicalSessionName } from "./session-name.js";
 import { physicalSessionName } from "./session-registry.js";
-import { FALLBACK_ACTOR, type PoolSeatRowFacts, type QueueRepository } from "./queue-repository.js";
+import { FALLBACK_ACTOR, type PoolSeatReturnOpts, type PoolSeatRowFacts, type QueueRepository } from "./queue-repository.js";
 import { OPENRIG_SENDER } from "../lib/pane-envelope.js";
 import type { Node } from "./types.js";
 import { sampleHost, type HostSample, type LaunchBudget, type LaunchTick } from "./launch-budget.js";
@@ -307,9 +307,9 @@ export interface SeatPoolStateReaderDeps {
   demand(jobId: string): { desired: number; sampledAt: string } | null;
   /** A seat's open rows with the park of its only open row when that row is blocked (QueueRepository.
    *  listPoolSeatRowFacts). Read only with `dispatch_to_parked` or `return_long_gates` in the spec, the second asking
-   *  with `returnTo` (its `to`) for what it reads of each park too (T-012673); absent, no seat is ever "parked" and none
-   *  hands rows back. */
-  rowFacts?(sessionName: string, maxBlocked?: number, opts?: { returnTo?: string }): PoolSeatRowFacts;
+   *  with `returnTo` (its `to`) and `returnGates` (its `gates`: the age counts only the time on them, T-012748) for what
+   *  it reads of each park too (T-012673); absent, no seat is ever "parked" and none hands rows back. */
+  rowFacts?(sessionName: string, maxBlocked?: number, opts?: PoolSeatReturnOpts): PoolSeatRowFacts;
   /** Whether the queue takes a session as a destination (QueueRepository.acceptsDestination), read once per plan for
    *  the `to` of `return_long_gates` (SeatPoolState.returnLongGatesRefused, T-012673). Absent: not read. */
   acceptsDestination?(sessionName: string): boolean;
@@ -677,7 +677,7 @@ export function readSeatPoolState(deps: SeatPoolStateReaderDeps, job: { jobId: s
     const idle = state?.activity === "idle-at-prompt" && state.needsInput.count === 0 && !state.backgroundWork;
     const sessionName = seatSessionName(slot.logicalId, model.rigName);
     const facts = present && readFacts && deps.rowFacts
-      ? (longGates ? deps.rowFacts(sessionName, maxOpenRows, { returnTo: longGates.to }) : deps.rowFacts(sessionName, maxOpenRows))
+      ? (longGates ? deps.rowFacts(sessionName, maxOpenRows, { returnTo: longGates.to, returnGates: longGates.gates }) : deps.rowFacts(sessionName, maxOpenRows))
       : null;
     const refusal = present && refusedCooldown > 0 && slot.opId !== null
       ? parkedRefusalOf(refusalCtx, poolMoves, sessionName, refusedCooldown, nowMs) : null;
@@ -783,7 +783,7 @@ export interface SeatPoolEffects {
    * queue does not accept is refused (`destination_refused`) before anything is read.
    */
   handoffParked(input: { rows: ReadonlyArray<{ qitemId: string; blockedOn: string; note: string }>; from: string; to: string; dropTags: readonly string[] }):
-    SeatPoolEffectResult & { moved?: Array<{ qitemId: string; newQitemId: string; wakeAfterSeconds: number | null }>; qitemId?: string };
+    SeatPoolEffectResult & { moved?: Array<{ qitemId: string; newQitemId: string; wakeAfterSeconds: number | null; wakeDueAt?: string | null }>; qitemId?: string };
   /** T-012673: whether the queue takes a session as a destination (QueueRepository.acceptsDestination): the
    *  `return_long_gates.to` is checked with it at each run. Absent: not checked. */
   acceptsDestination?(sessionName: string): boolean;
@@ -2004,7 +2004,7 @@ export class SeatPoolExecutor {
       const done = moved.moved?.find((m) => m.qitemId === row.qitemId);
       this.record(jobId, false, "seat_pool_long_gate_returned", {
         slot: slot.sessionName, qitemId: row.qitemId, to: intent.to, gate: row.gate, blockedOn: row.blockedOn, blockedSince: row.blockedSince,
-        newQitemId: done?.newQitemId ?? null, wakeAfterSeconds: done?.wakeAfterSeconds ?? null,
+        newQitemId: done?.newQitemId ?? null, wakeAfterSeconds: done?.wakeAfterSeconds ?? null, wakeDueAt: done?.wakeDueAt ?? null,
       });
     }
     return true;
