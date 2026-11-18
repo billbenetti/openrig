@@ -1132,16 +1132,16 @@ function buildInventoryEntry(
 }
 
 /**
- * The model seat's logical id for each node a seat pool holds, keyed by node id. The pool's `seat_pool_slots` row is
+ * The model seat's logical id for each node a seat pool holds, keyed by node id. The pool's `fork_seat_pool_slots` row is
  * the only link, as it is for the pool itself: a seat is never matched to a model by its name. The model is the seat
  * the pool's watchdog job targets, and only in the seat's own rig. Empty on a database without seat pools.
  */
 function readSeatPoolModels(db: Database.Database): Map<string, string> {
   const out = new Map<string, string>();
-  if (!db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'seat_pool_slots'").get()) return out;
+  if (!db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'fork_seat_pool_slots'").get()) return out;
   const slots = db.prepare(
     `SELECT sl.node_id, n.rig_id, j.target_session
-       FROM seat_pool_slots sl
+       FROM fork_seat_pool_slots sl
        JOIN nodes n ON n.id = sl.node_id
        JOIN watchdog_jobs j ON j.job_id = sl.pool_job_id
       WHERE sl.retired_at IS NULL`,

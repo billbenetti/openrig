@@ -1339,7 +1339,7 @@ describe("Node inventory seatPoolModel projection", () => {
   });
 
   it("reads a database without seat pools", () => {
-    db.exec("DROP TABLE seat_pool_slots");
+    db.exec("DROP TABLE fork_seat_pool_slots");
     expect(getNodeInventory(db, rigId).map((e) => e.seatPoolModel)).toEqual([undefined]);
   });
 });

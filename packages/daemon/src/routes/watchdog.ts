@@ -271,7 +271,7 @@ export function watchdogRoutes(): Hono {
     }
   });
 
-  // A seat pool's job also carries its drain and its seats as the pool holds them (seat_pool_slots), not as the rig's
+  // A seat pool's job also carries its drain and its seats as the pool holds them (fork_seat_pool_slots), not as the rig's
   // nodes show them: a seat whose node is gone but which the pool still holds is listed.
   app.get("/:job_id", (c) => {
     const jobId = c.req.param("job_id");

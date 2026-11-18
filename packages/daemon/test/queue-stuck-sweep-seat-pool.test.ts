@@ -74,7 +74,7 @@ describe("stuck sweep: rows waiting in an active seat pool's queue (T-007029, #2
       db.prepare("INSERT INTO sessions (id, node_id, session_name, status) VALUES (?, ?, ?, ?)")
         .run(`session-${n}`, nodeId, `impl-s${n}@dev`, opts.session ?? "running");
     }
-    db.prepare(`INSERT INTO seat_pool_slots (pool_job_id, node_id, logical_id, phase, intent, op_id, created_at, retired_at)
+    db.prepare(`INSERT INTO fork_seat_pool_slots (pool_job_id, node_id, logical_id, phase, intent, op_id, created_at, retired_at)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`).run(jobId, nodeId, `impl-s${n}`, opts.live ? "live" : "retired",
       opts.neverLive ? "never_live" : null, opts.adopted ? null : "op", minutesAgo(500),
       opts.live ? null : minutesAgo(opts.retiredMinutesAgo ?? 300));
@@ -159,7 +159,7 @@ describe("stuck sweep: rows waiting in an active seat pool's queue (T-007029, #2
     await sweep();
     expect(findingFor(within)).toBe(false);
     db.prepare("DELETE FROM watchdog_jobs").run();
-    db.prepare("DELETE FROM seat_pool_slots").run();
+    db.prepare("DELETE FROM fork_seat_pool_slots").run();
     slot(pool({}), { live: false, retiredMinutesAgo: 45 });
     const past = await work();
     await sweep();
@@ -190,7 +190,7 @@ describe("stuck sweep: rows waiting in an active seat pool's queue (T-007029, #2
     const added = slots.insert({ poolJobId: jobId, logicalId: "impl-b", nodeId: "node-b", phase: "added", intent: "launch", opId: "op-b", at });
     const live = slots.insert({ poolJobId: jobId, logicalId: "impl-c", nodeId: "node-c", phase: "live", intent: null, opId: "op-c", at });
     for (const s of [adding, added, live]) slots.retire(s.slotId, at);
-    const intents = db.prepare("SELECT logical_id, phase, intent FROM seat_pool_slots WHERE pool_job_id = ? ORDER BY logical_id").all(jobId);
+    const intents = db.prepare("SELECT logical_id, phase, intent FROM fork_seat_pool_slots WHERE pool_job_id = ? ORDER BY logical_id").all(jobId);
     expect(intents).toEqual([
       { logical_id: "impl-a", phase: "retired", intent: "never_live" },
       { logical_id: "impl-b", phase: "retired", intent: "never_live" },
@@ -258,10 +258,10 @@ describe("stuck sweep: rows waiting in an active seat pool's queue (T-007029, #2
     slot(jobId, { live: true, session: "exited" });
     const t0 = new Date();
     await sweep(t0);
-    expect(db.prepare("SELECT stopped_since FROM seat_pool_slots WHERE pool_job_id = ?").get(jobId)).not.toEqual({ stopped_since: null });
+    expect(db.prepare("SELECT stopped_since FROM fork_seat_pool_slots WHERE pool_job_id = ?").get(jobId)).not.toEqual({ stopped_since: null });
     db.prepare("UPDATE sessions SET status = 'running'").run();
     await sweep(new Date(t0.getTime() + 60_000));
-    expect(db.prepare("SELECT stopped_since FROM seat_pool_slots WHERE pool_job_id = ?").get(jobId)).toEqual({ stopped_since: null });
+    expect(db.prepare("SELECT stopped_since FROM fork_seat_pool_slots WHERE pool_job_id = ?").get(jobId)).toEqual({ stopped_since: null });
   });
 
   // B1 of the REVISAO-T-007545 (SD2): the crash loop through the reap's real path. The launch works (the slot goes live,
@@ -288,7 +288,7 @@ describe("stuck sweep: rows waiting in an active seat pool's queue (T-007029, #2
       const added = slots.insert({ poolJobId: jobId, logicalId: `impl-loop${turn}`, nodeId: node.id, phase: "added", intent: null, opId: `op-${turn}`, at: iso(t) });
       // the launch works at t + 20 s: live, with its start recorded (SeatPoolSlots.markLive)
       slots.update(added.slotId, { phase: "live" });
-      db.prepare("UPDATE seat_pool_slots SET live_at = ? WHERE id = ?").run(iso(t + 20_000), added.slotId);
+      db.prepare("UPDATE fork_seat_pool_slots SET live_at = ? WHERE id = ?").run(iso(t + 20_000), added.slotId);
       db.prepare("INSERT INTO sessions (id, node_id, session_name, status) VALUES (?, ?, ?, 'running')").run(`s-loop${turn}`, node.id, `impl-loop${turn}@dev`);
       // it dies at t + 30 s with no record; the reap at t + 90 s marks the stop, then the clean writes the session exited
       slots.markStopped(added.slotId, iso(t + 90_000));
@@ -303,7 +303,7 @@ describe("stuck sweep: rows waiting in an active seat pool's queue (T-007029, #2
   it("B1: a pool seat that stopped a minute after its start (not reaped yet) doesn't hold the queue either", async () => {
     const jobId = pool({});
     slot(jobId, { live: true, session: "exited" });
-    db.prepare("UPDATE seat_pool_slots SET live_at = ? WHERE pool_job_id = ?").run(minutesAgo(1), jobId);
+    db.prepare("UPDATE fork_seat_pool_slots SET live_at = ? WHERE pool_job_id = ?").run(minutesAgo(1), jobId);
     const row = await work();
     await sweep();
     expect(findingFor(row)).toBe(true);
@@ -312,7 +312,7 @@ describe("stuck sweep: rows waiting in an active seat pool's queue (T-007029, #2
   it("B1: a pool seat that ran longer than a sweep period and then stopped holds the queue for the grace, as before", async () => {
     const jobId = pool({});
     slot(jobId, { live: true, session: "exited" });
-    db.prepare("UPDATE seat_pool_slots SET live_at = ? WHERE pool_job_id = ?").run(minutesAgo(45), jobId);
+    db.prepare("UPDATE fork_seat_pool_slots SET live_at = ? WHERE pool_job_id = ?").run(minutesAgo(45), jobId);
     const row = await work();
     await sweep();
     expect(findingFor(row)).toBe(false);
@@ -323,7 +323,7 @@ describe("stuck sweep: rows waiting in an active seat pool's queue (T-007029, #2
   // created_at), started at `liveAt` and seen stopped (and reaped) at `stoppedAt`.
   function retiredPoolSeat(jobId: string, at: { createdAt: string; liveAt: string | null; stoppedAt: string }): void {
     const n = ++nodeSeq;
-    db.prepare(`INSERT INTO seat_pool_slots (pool_job_id, node_id, logical_id, phase, intent, op_id, created_at, live_at, stopped_since, retired_at)
+    db.prepare(`INSERT INTO fork_seat_pool_slots (pool_job_id, node_id, logical_id, phase, intent, op_id, created_at, live_at, stopped_since, retired_at)
                 VALUES (?, ?, ?, 'retired', NULL, 'op', ?, ?, ?, ?)`).run(jobId, `node-gone-${n}`, `impl-s${n}`, at.createdAt, at.liveAt, at.stoppedAt, at.stoppedAt);
   }
 
@@ -335,7 +335,7 @@ describe("stuck sweep: rows waiting in an active seat pool's queue (T-007029, #2
       old.exec("ALTER TABLE seat_pool_slots ADD COLUMN stopped_since TEXT");
       old.prepare("INSERT INTO schema_migrations (name) VALUES ('159_seat_pool_slots_stopped_since.sql')").run();
       migrate(old, ALL_MIGRATIONS);
-      const columns = (old.prepare("PRAGMA table_info(seat_pool_slots)").all() as Array<{ name: string }>).map((c) => c.name);
+      const columns = (old.prepare("PRAGMA table_info(fork_seat_pool_slots)").all() as Array<{ name: string }>).map((c) => c.name);
       expect(columns).toEqual(expect.arrayContaining(["stopped_since", "live_at"]));
     } finally {
       old.close();
@@ -389,7 +389,7 @@ describe("stuck sweep: rows waiting in an active seat pool's queue (T-007029, #2
   it("B1: a live pool seat without live_at, added 3 min ago and seen stopped: doesn't count", async () => {
     const jobId = pool({});
     slot(jobId, { live: true, session: "exited" });
-    db.prepare("UPDATE seat_pool_slots SET created_at = ?, live_at = NULL WHERE pool_job_id = ?").run(minutesAgo(3), jobId);
+    db.prepare("UPDATE fork_seat_pool_slots SET created_at = ?, live_at = NULL WHERE pool_job_id = ?").run(minutesAgo(3), jobId);
     const row = await work();
     await sweep();
     expect(findingFor(row)).toBe(true);
@@ -398,7 +398,7 @@ describe("stuck sweep: rows waiting in an active seat pool's queue (T-007029, #2
   it("B1: a live seat of the pool seen stopped 8 min after its start (not reaped yet) doesn't count", async () => {
     const jobId = pool({});
     slot(jobId, { live: true, session: "exited" });
-    db.prepare("UPDATE seat_pool_slots SET live_at = ? WHERE pool_job_id = ?").run(minutesAgo(8), jobId);
+    db.prepare("UPDATE fork_seat_pool_slots SET live_at = ? WHERE pool_job_id = ?").run(minutesAgo(8), jobId);
     const row = await work();
     await sweep();
     expect(findingFor(row)).toBe(true);
@@ -412,7 +412,7 @@ describe("stuck sweep: rows waiting in an active seat pool's queue (T-007029, #2
     db.prepare("INSERT INTO sessions (id, node_id, session_name, status) VALUES ('s-ok', ?, 'impl-ok@dev', 'running')").run(node.id);
     const slots = new SeatPoolSlots(db);
     const live = slots.insert({ poolJobId: jobId, logicalId: "impl-ok", nodeId: node.id, phase: "live", intent: null, opId: "op-1", at: minutesAgo(45) });
-    db.prepare("UPDATE seat_pool_slots SET live_at = ? WHERE id = ?").run(minutesAgo(44), live.slotId);   // it ran 39 min
+    db.prepare("UPDATE fork_seat_pool_slots SET live_at = ? WHERE id = ?").run(minutesAgo(44), live.slotId);   // it ran 39 min
     slots.markStopped(live.slotId, minutesAgo(5));
     db.prepare("DELETE FROM nodes WHERE id = ?").run(node.id);
     slots.retire(live.slotId, minutesAgo(5));

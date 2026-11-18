@@ -783,9 +783,11 @@ describe("qa T-004870 F3: the seat pool's drain ends at a deadline, with its row
     expect(h.events(DRAIN_EXPIRED)).toHaveLength(1);
 
     // The real shape: every production column is still there, and the drain events are ordinary history rows.
+    // The capture names the fork's pool table as it was then; it is fork_seat_pool_slots since T-013304 (its 160).
+    const DB_TABLE = { seat_pool_slots: "fork_seat_pool_slots", watchdog_history: "watchdog_history", watchdog_jobs: "watchdog_jobs" } as const;
     const columns = (table: string) => (h.db.prepare(`PRAGMA table_info(${table})`).all() as RealColumn[]).map((c) => c.name);
     for (const table of ["seat_pool_slots", "watchdog_history", "watchdog_jobs"] as const) {
-      expect(columns(table), table).toEqual(expect.arrayContaining(REAL_SHAPE.tables[table].columns.map((c) => c.name)));
+      expect(columns(DB_TABLE[table]), table).toEqual(expect.arrayContaining(REAL_SHAPE.tables[table].columns.map((c) => c.name)));
     }
     const isoMs = /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z$/;
     expect(REAL_SHAPE.example_history_row_shape.evaluated_at).toMatch(isoMs);
