@@ -527,7 +527,7 @@ seat never holds the stop of a draining pool.
 
 To prove a pool is empty, read the pool, not the rig's nodes: `rig watchdog show <jobId> --json` carries `seatPool`,
 with `drain` (`startedAt`, `deadlineAt`, `expired`) and `slots` (`logicalId`, `phase`, `adopted`, `nodeExists`,
-`openRows`), every seat the pool still holds, from `seat_pool_slots`. A seat whose node is gone but whose `remove_cmd`
+`openRows`), every seat the pool still holds, from `fork_seat_pool_slots`. A seat whose node is gone but whose `remove_cmd`
 refused is still listed. The pool is empty when `seatPool.slots` is `[]`, or once the stop is accepted with its
 `leftRunning`.
 
@@ -540,7 +540,7 @@ back to such a version to avoid this.
 
 ## Restarts and restores
 
-The pool records each seat in `seat_pool_slots`, and records each step on the seat before it runs. After a daemon
+The pool records each seat in `fork_seat_pool_slots`, and records each step on the seat before it runs. After a daemon
 restart it resumes from those records: an add is resolved through its Operation-Id, a seat that was added but not
 launched is prepared and launched (or removed if it is no longer wanted), and a drain finishes. A seat whose launch
 completed but wasn't recorded is recognized by its running session. The pool acts only on seats it created or adopted
@@ -558,7 +558,7 @@ A seat the pool added whose session died is reaped, unless its release command r
 
 `rig ps --nodes` lists each seat a pool holds right after its model seat, marked `└` in the SESSION column (MEMBER
 with `--full`). With `--json` the daemon's order is kept, and such a seat carries `seatPoolModel`, the model's logical
-id (also selectable with `--fields seatPoolModel`). The link is the pool's `seat_pool_slots` row, as it is for the pool
+id (also selectable with `--fields seatPoolModel`). The link is the pool's `fork_seat_pool_slots` row, as it is for the pool
 itself: an adopted seat is listed under the model whatever its name, and a node named like a pool seat that no pool
 holds is not. A seat whose model isn't listed, because `--session`, `--filter` or `--limit` left the model out, keeps
 its place unmarked.

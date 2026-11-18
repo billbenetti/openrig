@@ -339,7 +339,7 @@ describe("seat-pool executor", () => {
   // T-007545 (SD2 and the cross review): every removal of a seat that ran marks on its slot when it stopped, before the
   // node (and its sessions) go, and a relaunch that works clears it: the stuck sweep's grace counts from the real stop.
   const stoppedSince = (slotId: number) =>
-    (db.prepare("SELECT stopped_since FROM seat_pool_slots WHERE id = ?").get(slotId) as { stopped_since: string | null }).stopped_since;
+    (db.prepare("SELECT stopped_since FROM fork_seat_pool_slots WHERE id = ?").get(slotId) as { stopped_since: string | null }).stopped_since;
 
   it("T-007545: the drain's removal marks when the seat stopped before its node goes", async () => {
     jobSpec = spec({ release_cmd: { argv: ["release"] } });
@@ -356,7 +356,7 @@ describe("seat-pool executor", () => {
     const executor = makeExecutor();
     await run(executor, [{ kind: "add", count: 1 }]);
     const [slot] = slots.listOpen(JOB);
-    db.prepare("UPDATE seat_pool_slots SET phase = 'draining', intent = 'remove' WHERE id = ?").run(slot!.slotId);
+    db.prepare("UPDATE fork_seat_pool_slots SET phase = 'draining', intent = 'remove' WHERE id = ?").run(slot!.slotId);
     world.nodes.get(slot!.nodeId!)!.session = "stopped";
     await run(executor, [drainOf(slot!.slotId)]);
     expect(slots.listOpen(JOB)).toEqual([]);
@@ -364,7 +364,7 @@ describe("seat-pool executor", () => {
   });
 
   const liveAt = (slotId: number) =>
-    (db.prepare("SELECT live_at FROM seat_pool_slots WHERE id = ?").get(slotId) as { live_at: string | null }).live_at;
+    (db.prepare("SELECT live_at FROM fork_seat_pool_slots WHERE id = ?").get(slotId) as { live_at: string | null }).live_at;
 
   it("T-007545 (B1): a launch that works records when the pool started the seat", async () => {
     const executor = makeExecutor();
@@ -388,7 +388,7 @@ describe("seat-pool executor", () => {
     const executor = makeExecutor();
     await run(executor, [{ kind: "add", count: 1 }]);
     const [slot] = slots.listOpen(JOB);
-    db.prepare("UPDATE seat_pool_slots SET stopped_since = '2026-11-13T10:00:00.000Z', live_at = '2026-11-13T09:00:00.000Z' WHERE id = ?").run(slot!.slotId);
+    db.prepare("UPDATE fork_seat_pool_slots SET stopped_since = '2026-11-13T10:00:00.000Z', live_at = '2026-11-13T09:00:00.000Z' WHERE id = ?").run(slot!.slotId);
     world.nodes.get(slot!.nodeId!)!.session = "stopped";
     world.relaunchResult = { ok: true };
     await run(executor, [{ kind: "relaunch", seat: "dev-impl-s1@r", nodeId: slot!.nodeId! }]);
@@ -401,7 +401,7 @@ describe("seat-pool executor", () => {
     const executor = makeExecutor();
     await run(executor, [{ kind: "add", count: 1 }]);
     const [slot] = slots.listOpen(JOB);
-    db.prepare("UPDATE seat_pool_slots SET stopped_since = '2026-11-13T10:00:00.000Z' WHERE id = ?").run(slot!.slotId);
+    db.prepare("UPDATE fork_seat_pool_slots SET stopped_since = '2026-11-13T10:00:00.000Z' WHERE id = ?").run(slot!.slotId);
     world.nodes.get(slot!.nodeId!)!.session = "stopped";
     world.relaunchResult = { ok: false, code: "resume_failed", error: "no resumable session" };
     await run(executor, [{ kind: "relaunch", seat: "dev-impl-s1@r", nodeId: slot!.nodeId! }]);
@@ -927,7 +927,7 @@ describe("seat-pool executor", () => {
       world.onClean = () => { markedBeforeClean = stoppedSince(dead.slotId) !== null; };
       await run(executor, [{ kind: "reap", slotId: dead.slotId }]);
       expect(markedBeforeClean).toBe(true);
-      const row = db.prepare("SELECT stopped_since, retired_at FROM seat_pool_slots WHERE id = ?").get(dead.slotId) as
+      const row = db.prepare("SELECT stopped_since, retired_at FROM fork_seat_pool_slots WHERE id = ?").get(dead.slotId) as
         { stopped_since: string | null; retired_at: string | null };
       expect(row.stopped_since).not.toBeNull();
       expect(row.retired_at).not.toBeNull();
@@ -1666,7 +1666,7 @@ describe("seat-pool executor", () => {
       const slot = liveSeat();
       await toDeadline(executorWith(world.effects()));
       expect(slots.get(slot.slotId)?.retiredAt).not.toBeNull();
-      expect((db.prepare("SELECT stopped_since FROM seat_pool_slots WHERE id = ?").get(slot.slotId) as { stopped_since: string | null })
+      expect((db.prepare("SELECT stopped_since FROM fork_seat_pool_slots WHERE id = ?").get(slot.slotId) as { stopped_since: string | null })
         .stopped_since).not.toBeNull();
     });
 

@@ -112,31 +112,31 @@ const toSlot = (row: SlotRow): SeatPoolSlot => ({
 /** A slot row whose pool's job is no longer active: no evaluation acts on it again, so its seat is free. A job that
  *  stops or finishes with seats still in it leaves them running (a daemon without the seat-pool policy marks the job
  *  terminal, `unknown_policy:seat-pool`). */
-const POOL_ENDED = "EXISTS (SELECT 1 FROM watchdog_jobs j WHERE j.job_id = seat_pool_slots.pool_job_id AND j.state <> 'active')";
+const POOL_ENDED = "EXISTS (SELECT 1 FROM watchdog_jobs j WHERE j.job_id = fork_seat_pool_slots.pool_job_id AND j.state <> 'active')";
 
-/** The `seat_pool_slots` rows: the only link between a pool and its seats. */
+/** The `fork_seat_pool_slots` rows: the only link between a pool and its seats. */
 export class SeatPoolSlots {
   constructor(private readonly db: Database.Database) {}
 
   /** The pool's seats that are not retired, oldest first. */
   listOpen(poolJobId: string): SeatPoolSlot[] {
-    return (this.db.prepare("SELECT * FROM seat_pool_slots WHERE pool_job_id = ? AND retired_at IS NULL ORDER BY id")
+    return (this.db.prepare("SELECT * FROM fork_seat_pool_slots WHERE pool_job_id = ? AND retired_at IS NULL ORDER BY id")
       .all(poolJobId) as SlotRow[]).map(toSlot);
   }
 
   get(slotId: number): SeatPoolSlot | null {
-    const row = this.db.prepare("SELECT * FROM seat_pool_slots WHERE id = ?").get(slotId) as SlotRow | undefined;
+    const row = this.db.prepare("SELECT * FROM fork_seat_pool_slots WHERE id = ?").get(slotId) as SlotRow | undefined;
     return row ? toSlot(row) : null;
   }
 
   /** Whether a pool holds this node. A pool that has ended (its job stopped or finished) holds nothing. */
   isLinked(nodeId: string): boolean {
-    return !!this.db.prepare(`SELECT 1 FROM seat_pool_slots WHERE node_id = ? AND retired_at IS NULL AND NOT ${POOL_ENDED}`).get(nodeId);
+    return !!this.db.prepare(`SELECT 1 FROM fork_seat_pool_slots WHERE node_id = ? AND retired_at IS NULL AND NOT ${POOL_ENDED}`).get(nodeId);
   }
 
   /** The logical ids of the seats the pool added and removed; an adopted seat it gave back is still there. */
   listRetired(poolJobId: string): string[] {
-    return (this.db.prepare("SELECT logical_id FROM seat_pool_slots WHERE pool_job_id = ? AND retired_at IS NOT NULL AND op_id IS NOT NULL ORDER BY id")
+    return (this.db.prepare("SELECT logical_id FROM fork_seat_pool_slots WHERE pool_job_id = ? AND retired_at IS NOT NULL AND op_id IS NOT NULL ORDER BY id")
       .all(poolJobId) as Array<{ logical_id: string }>).map((row) => row.logical_id);
   }
 
@@ -158,7 +158,7 @@ export class SeatPoolSlots {
   lastScaleAt(poolJobId: string): string | null {
     const row = this.db.prepare(
       `SELECT MAX(CASE WHEN op_id IS NOT NULL THEN created_at END) AS added, MAX(CASE WHEN op_id IS NOT NULL THEN retired_at END) AS retired
-         FROM seat_pool_slots WHERE pool_job_id = ?`,
+         FROM fork_seat_pool_slots WHERE pool_job_id = ?`,
     ).get(poolJobId) as { added: string | null; retired: string | null };
     const times = [row.added, row.retired].filter((t): t is string => t !== null).sort();
     return times.at(-1) ?? null;
@@ -171,7 +171,7 @@ export class SeatPoolSlots {
   nextLogicalId(model: Pick<SeatPoolModel, "rigId" | "logicalId">): string {
     const prefix = `${model.logicalId}-s`;
     let n = 0;
-    const rows = this.db.prepare("SELECT logical_id FROM seat_pool_slots WHERE substr(logical_id, 1, ?) = ?")
+    const rows = this.db.prepare("SELECT logical_id FROM fork_seat_pool_slots WHERE substr(logical_id, 1, ?) = ?")
       .all(prefix.length, prefix) as Array<{ logical_id: string }>;
     for (const { logical_id } of rows) {
       const suffix = logical_id.slice(prefix.length);
@@ -184,7 +184,7 @@ export class SeatPoolSlots {
 
   insert(input: { poolJobId: string; logicalId: string; nodeId: string | null; phase: SeatPoolSlotPhase; intent: string | null; opId: string | null; at: string }): SeatPoolSlot {
     const id = this.db.prepare(
-      `INSERT INTO seat_pool_slots (pool_job_id, node_id, logical_id, phase, intent, op_id, created_at)
+      `INSERT INTO fork_seat_pool_slots (pool_job_id, node_id, logical_id, phase, intent, op_id, created_at)
        VALUES (?, ?, ?, ?, ?, ?, ?)`,
     ).run(input.poolJobId, input.nodeId, input.logicalId, input.phase, input.intent, input.opId, input.at).lastInsertRowid;
     return this.get(Number(id))!;
@@ -196,7 +196,7 @@ export class SeatPoolSlots {
     if (fields.nodeId !== undefined) { sets.push("node_id = ?"); values.push(fields.nodeId); }
     if (fields.phase !== undefined) { sets.push("phase = ?"); values.push(fields.phase); }
     if (fields.intent !== undefined) { sets.push("intent = ?"); values.push(fields.intent); }
-    if (sets.length > 0) this.db.prepare(`UPDATE seat_pool_slots SET ${sets.join(", ")} WHERE id = ?`).run(...values, slotId);
+    if (sets.length > 0) this.db.prepare(`UPDATE fork_seat_pool_slots SET ${sets.join(", ")} WHERE id = ?`).run(...values, slotId);
   }
 
   /** T-007545 (SD1, SD2): marks when a live seat stopped running, once (a later call keeps the first): the stop the
@@ -207,34 +207,34 @@ export class SeatPoolSlots {
    *  (the sweep, the drain or the reap), not after it. */
   markStopped(slotId: number, at: string): void {
     this.db.prepare(`
-      UPDATE seat_pool_slots SET stopped_since = COALESCE(stopped_since, (
+      UPDATE fork_seat_pool_slots SET stopped_since = COALESCE(stopped_since, (
         SELECT CASE WHEN ses.status NOT IN ('running', 'idle', 'unknown') AND ses.last_seen_at IS NOT NULL
                     THEN MIN(strftime('%Y-%m-%dT%H:%M:%fZ', ses.last_seen_at), ?) END
-          FROM sessions ses WHERE ses.node_id = seat_pool_slots.node_id ORDER BY ses.id DESC LIMIT 1), ?)
+          FROM sessions ses WHERE ses.node_id = fork_seat_pool_slots.node_id ORDER BY ses.id DESC LIMIT 1), ?)
        WHERE id = ?`).run(at, at, slotId);
   }
 
   /** T-007545: the seat runs again; the next time it stops starts afresh. */
   clearStopped(slotId: number): void {
-    this.db.prepare("UPDATE seat_pool_slots SET stopped_since = NULL WHERE id = ? AND stopped_since IS NOT NULL").run(slotId);
+    this.db.prepare("UPDATE fork_seat_pool_slots SET stopped_since = NULL WHERE id = ? AND stopped_since IS NOT NULL").run(slotId);
   }
 
   /** T-007545 (B1 of its review): the pool started the seat (its launch or relaunch worked) at `at`: it counts as a seat
    *  the pool had only once it ran for a sweep period from then, and its next stop starts afresh. */
   markLive(slotId: number, at: string): void {
-    this.db.prepare("UPDATE seat_pool_slots SET live_at = ?, stopped_since = NULL WHERE id = ?").run(at, slotId);
+    this.db.prepare("UPDATE fork_seat_pool_slots SET live_at = ?, stopped_since = NULL WHERE id = ?").run(at, slotId);
   }
 
   /** The same, for the open slot of a seat a relaunch brought back (by its logical id; T-007545 cross review S2). */
   markLiveFor(poolJobId: string, logicalId: string, at: string): void {
-    this.db.prepare("UPDATE seat_pool_slots SET live_at = ?, stopped_since = NULL WHERE pool_job_id = ? AND logical_id = ? AND retired_at IS NULL")
+    this.db.prepare("UPDATE fork_seat_pool_slots SET live_at = ?, stopped_since = NULL WHERE pool_job_id = ? AND logical_id = ? AND retired_at IS NULL")
       .run(at, poolJobId, logicalId);
   }
 
   /** Retires a seat. One retired before it was ever live (still adding or added) keeps `intent = 'never_live'`, so a
    *  reader of retired seats (the stuck sweep's grace over the pool's queue, T-007029) can tell it never had a seat. */
   retire(slotId: number, at: string): void {
-    this.db.prepare("UPDATE seat_pool_slots SET phase = 'retired', intent = CASE WHEN phase IN ('adding', 'added') THEN 'never_live' ELSE NULL END, retired_at = ? WHERE id = ?").run(at, slotId);
+    this.db.prepare("UPDATE fork_seat_pool_slots SET phase = 'retired', intent = CASE WHEN phase IN ('adding', 'added') THEN 'never_live' ELSE NULL END, retired_at = ? WHERE id = ?").run(at, slotId);
   }
 
   /**
@@ -243,7 +243,7 @@ export class SeatPoolSlots {
    */
   adopt(input: { poolJobId: string; logicalId: string; nodeId: string; at: string }): SeatPoolSlot {
     return this.db.transaction(() => {
-      const ended = this.db.prepare(`SELECT id, op_id, created_at FROM seat_pool_slots WHERE node_id = ? AND retired_at IS NULL AND ${POOL_ENDED}`)
+      const ended = this.db.prepare(`SELECT id, op_id, created_at FROM fork_seat_pool_slots WHERE node_id = ? AND retired_at IS NULL AND ${POOL_ENDED}`)
         .get(input.nodeId) as { id: number; op_id: string | null; created_at: string } | undefined;
       if (ended) this.retire(ended.id, input.at);
       const added = ended?.op_id ? { opId: ended.op_id, at: ended.created_at } : { opId: null, at: input.at };
