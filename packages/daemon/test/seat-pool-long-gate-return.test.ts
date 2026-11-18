@@ -17,6 +17,8 @@ import { EventBus } from "../src/domain/event-bus.js";
 import { OutboxHandler } from "../src/domain/outbox-handler.js";
 import { defaultParkWakeMessage, QueueRepository } from "../src/domain/queue-repository.js";
 import { WatchdogJobsRepository } from "../src/domain/watchdog-jobs-repository.js";
+import { nextDueAt } from "../src/domain/watchdog-due.js";
+import { archiveAgedTerminalTransitions } from "../src/domain/queue-retention.js";
 import { WatchdogHistoryLog } from "../src/domain/watchdog-history-log.js";
 import { parseWatchdogSpec, watchdogJobTarget } from "../src/domain/watchdog-policy-engine.js";
 import {
@@ -485,6 +487,8 @@ describe("T-012673: the executor (real queue, reader and history)", () => {
     const n = h.successorOf(a);
     expect(returned[0]).toEqual({
       slot: s1.session, qitemId: a, to: FIXED, gate: GATE, blockedOn: GATE, blockedSince: iso(T0 - 3_600_000), newQitemId: n, wakeAfterSeconds: 7200,
+      // T-012748: the wake parked at T0 - 1 h for 2 h still falls due at T0 + 1 h, at the fixed seat.
+      wakeDueAt: iso(T0 + 3_600_000),
     });
     // The old row: handed off, the passage on its last transition.
     expect(h.get(a).state).toBe("handed-off");
@@ -769,20 +773,40 @@ describe("T-012673: the executor (real queue, reader and history)", () => {
     expect(h.notes("seat_pool_long_gate_returned")).toEqual([expect.objectContaining({ qitemId: a, blockedSince: iso(T0 - 3_600_000) })]);
   });
 
-  it("the age counts the unbroken block on any gate: a row parked again on github-review after hours on another gate is as old as its first park", async () => {
+  it("T-012748: the age counts only the block on a listed gate: 2 h on suite-flock then 1 min on github-review does not go", async () => {
     h.register(BASE);
     const s1 = h.poolSeat("qualidade.revisor-s1");
-    const a = await h.park(s1, { gate: "external:suite-flock-T-1", parkAgoS: 7200 });
-    // The change of gate (suite-flock -> github-review, blocked -> blocked) does not reset the count.
+    const a = await h.park(s1, { gate: "external:suite-flock-x", parkAgoS: 7200 });
+    // The change of gate (suite-flock -> github-review, blocked -> blocked) starts the count on the listed gate.
     h.nowMs = T0 - 60_000;
     h.queue.update({ qitemId: a, actorSession: s1.session, state: "blocked", blockedOn: GATE, wakeAfterSeconds: 7200, transitionNote: "waiting for the review" } as never);
-    // A note on the row (blocked -> blocked, no gate) keeps it too.
+    // A note on the row (blocked -> blocked, no gate) keeps the count where it is.
     h.nowMs = T0 - 30_000;
     h.queue.update({ qitemId: a, actorSession: s1.session, transitionNote: "still waiting" } as never);
-    expect(h.queue.listPoolSeatRowFacts(s1.session, 1, { returnTo: FIXED }).parked!.blockedSince).toBe(T0 - 7_200_000);
+    expect(h.queue.listPoolSeatRowFacts(s1.session, 1, { returnTo: FIXED, returnGates: [GATE] }).parked!.blockedSince).toBe(T0 - 60_000);
     await h.tickAt(61);
-    expect(h.notes("seat_pool_long_gate_returned")).toEqual([expect.objectContaining({ qitemId: a, gate: GATE, blockedOn: GATE, blockedSince: iso(T0 - 7_200_000) })]);
+    expect(h.notes("seat_pool_long_gate_returned")).toEqual([]);
+    expect(h.get(a)).toMatchObject({ destinationSession: s1.session, state: "blocked", blockedOn: GATE });
+    // min_blocked_s (1800) after the move to github-review, it goes.
+    await h.tickAt(1741);
+    expect(h.notes("seat_pool_long_gate_returned")).toEqual([expect.objectContaining({ qitemId: a, gate: GATE, blockedOn: GATE, blockedSince: iso(T0 - 60_000) })]);
     expect(h.get(h.successorOf(a))).toMatchObject({ destinationSession: FIXED, state: "blocked", blockedOn: GATE });
+  });
+
+  it("T-012748: 1 h on github-review with re-parks and notes on listed gates goes, counted from the first listed park", async () => {
+    h.register(BASE);
+    const s1 = h.poolSeat("qualidade.revisor-s1");
+    const a = await h.park(s1, { parkAgoS: 3600 });
+    // A re-park on the same gate with a new timer, one on a listed gate named per task, and a note: none resets it.
+    h.nowMs = T0 - 1_200_000;
+    h.queue.update({ qitemId: a, actorSession: s1.session, state: "blocked", blockedOn: GATE, wakeAfterSeconds: 7200, transitionNote: "still no review" } as never);
+    h.nowMs = T0 - 900_000;
+    h.queue.update({ qitemId: a, actorSession: s1.session, state: "blocked", blockedOn: `${GATE}-T-1`, wakeAfterSeconds: 7200, transitionNote: "the PR of T-1" } as never);
+    h.nowMs = T0 - 600_000;
+    h.queue.update({ qitemId: a, actorSession: s1.session, transitionNote: "pinged the reviewer" } as never);
+    expect(h.queue.listPoolSeatRowFacts(s1.session, 1, { returnTo: FIXED, returnGates: [GATE] }).parked!.blockedSince).toBe(T0 - 3_600_000);
+    await h.tickAt(61);
+    expect(h.notes("seat_pool_long_gate_returned")).toEqual([expect.objectContaining({ qitemId: a, gate: GATE, blockedOn: `${GATE}-T-1`, blockedSince: iso(T0 - 3_600_000) })]);
   });
 
   it("the age restarts when the row leaves blocked: taken back and parked again, it waits min_blocked_s from the new park", async () => {
@@ -793,7 +817,7 @@ describe("T-012673: the executor (real queue, reader and history)", () => {
     h.queue.update({ qitemId: a, actorSession: s1.session, state: "in-progress", transitionNote: "the review came" } as never);
     h.nowMs = T0 - 60_000;
     h.queue.update({ qitemId: a, actorSession: s1.session, state: "blocked", blockedOn: GATE, wakeAfterSeconds: 7200, transitionNote: "a 2nd round" } as never);
-    expect(h.queue.listPoolSeatRowFacts(s1.session, 1, { returnTo: FIXED }).parked!.blockedSince).toBe(T0 - 60_000);
+    expect(h.queue.listPoolSeatRowFacts(s1.session, 1, { returnTo: FIXED, returnGates: [GATE] }).parked!.blockedSince).toBe(T0 - 60_000);
     await h.tickAt(61);
     expect(h.notes("seat_pool_long_gate_returned")).toEqual([]);
     await h.tickAt(1741);
@@ -808,7 +832,7 @@ describe("T-012673: the executor (real queue, reader and history)", () => {
     expect(view).not.toHaveProperty("atPrompt");
     expect(view).not.toHaveProperty("parked");
     expect(h.queue.listPoolSeatRowFacts(s1.session).parked).not.toHaveProperty("blockedSince");
-    expect(h.queue.listPoolSeatRowFacts(s1.session, 1, { returnTo: FIXED }).parked).toMatchObject({
+    expect(h.queue.listPoolSeatRowFacts(s1.session, 1, { returnTo: FIXED, returnGates: [GATE] }).parked).toMatchObject({
       blockedSince: T0 - 3_600_000, wakeFiredAt: null, returnRefusal: null,
     });
   });
@@ -827,5 +851,103 @@ describe("T-012673: the executor (real queue, reader and history)", () => {
     expect(h.notes("seat_pool_long_gate_returned")).toEqual([]);
     expect(h.get(a)).toMatchObject({ destinationSession: s1.session, state: "blocked" });
     expect(h.state().returnLongGatesRefused).toBe(true);
+  });
+
+  // T-012748 (S1 of the review of #36): the successor's wake falls due when the row's own would have, not a full
+  // interval after the move.
+  it("T-012748: a 1 h wake due in ~1 min at the slot is due in ~1 min at the fixed seat; a row with no wake keeps none", async () => {
+    h.register({ ...BASE, max: 2 });
+    const s1 = h.poolSeat("qualidade.revisor-s1");
+    const s2 = h.poolSeat("qualidade.revisor-s2");
+    // Parked 58 min ago with --wake-after 1 h: due at T0 + 2 min.
+    const a = await h.park(s1, { wakeAfter: 3600, parkAgoS: 3480 });
+    const c = await h.park(s2, { wakeAfter: null });
+    expect(nextDueAt(h.jobs.getById(h.queue.getParkWakeStatus(a)!.ref)!)).toBe(T0 + 120_000);
+    await h.tickAt(61);
+    const n = h.successorOf(a);
+    const job = h.jobs.getById(h.queue.getParkWakeStatus(n)!.ref)!;
+    expect(job.state).toBe("active");
+    expect(job.intervalSeconds).toBe(3600);
+    // Due ~59 s after the move (T0 + 61 s), within a few seconds of the row's own due time; not 1 h after it.
+    const due = nextDueAt(job)!;
+    expect(Math.abs(due - (T0 + 120_000))).toBeLessThanOrEqual(2_000);
+    expect(due - h.nowMs).toBeLessThan(120_000);
+    const returned = h.notes("seat_pool_long_gate_returned");
+    expect(returned.find((r) => r["qitemId"] === a)).toMatchObject({ wakeAfterSeconds: 3600, wakeDueAt: iso(T0 + 120_000) });
+    // The row with no wake: its successor has none, and nothing falls due.
+    expect(h.queue.getParkWakeStatus(h.successorOf(c))).toBeNull();
+    expect(returned.find((r) => r["qitemId"] === c)).toMatchObject({ wakeAfterSeconds: null, wakeDueAt: null });
+  });
+
+  it("T-012748: a wake already due (overdue, or marked due now) is due now at the fixed seat", async () => {
+    h.register({ ...BASE, max: 2 });
+    const s1 = h.poolSeat("qualidade.revisor-s1");
+    const s2 = h.poolSeat("qualidade.revisor-s2");
+    // Overdue by 100 s (the scheduler has not fired it yet).
+    const a = await h.park(s1, { wakeAfter: 3600, parkAgoS: 3700 });
+    // Marked due now (the epoch, #860's wake-now marker).
+    const c = await h.park(s2, { wakeAfter: 3600 });
+    h.jobs.recordEvaluation(h.queue.getParkWakeStatus(c)!.ref, new Date(0).toISOString(), false);
+    expect(nextDueAt(h.jobs.getById(h.queue.getParkWakeStatus(c)!.ref)!)).toBeNull();
+    await h.tickAt(61);
+    const ja = h.jobs.getById(h.queue.getParkWakeStatus(h.successorOf(a))!.ref)!;
+    expect(nextDueAt(ja)).toBe(T0 - 100_000);
+    const jc = h.jobs.getById(h.queue.getParkWakeStatus(h.successorOf(c))!.ref)!;
+    expect(jc.intervalSeconds).toBe(3600);
+    expect(nextDueAt(jc)).toBeNull();
+    // Its wake is armed and live at the fixed seat, for the scheduler's next scan.
+    expect(h.queue.getParkWakeStatus(h.successorOf(c))).toMatchObject({ kind: "timer", phase: "armed", live: true });
+  });
+
+  // T-012748 (S2): the gate of each blocked transition is recorded, so the age reads only the listed gates.
+  it("T-012748: the migration gives queue_transitions and its archive blocked_on; a blocked transition records its gate", async () => {
+    const columns = (table: string) => (h.db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>).map((c) => c.name);
+    expect(columns("queue_transitions")).toContain("blocked_on");
+    expect(columns("queue_transitions_archive")).toContain("blocked_on");
+    h.register(BASE);
+    const s1 = h.poolSeat("qualidade.revisor-s1");
+    const a = await h.park(s1, { gate: "external:suite-flock-x" });
+    h.queue.update({ qitemId: a, actorSession: s1.session, state: "blocked", blockedOn: GATE, transitionNote: "on review" } as never);
+    // A note on the blocked row records the gate it is on.
+    h.queue.update({ qitemId: a, actorSession: s1.session, transitionNote: "a note" } as never);
+    const rows = h.db.prepare("SELECT state, blocked_on FROM queue_transitions WHERE qitem_id = ? ORDER BY transition_id").all(a);
+    expect(rows).toEqual([
+      { state: "pending", blocked_on: null },
+      { state: "in-progress", blocked_on: null },
+      { state: "blocked", blocked_on: "external:suite-flock-x" },
+      { state: "blocked", blocked_on: GATE },
+      { state: "blocked", blocked_on: GATE },
+    ]);
+    // Moved to the fixed seat and archived, the old row's transitions keep their gate.
+    await h.tickAt(3000);
+    expect(h.get(a).state).toBe("handed-off");
+    archiveAgedTerminalTransitions(h.db, { nowIso: iso(T0 + 400 * 86_400_000), transitionsRetentionDays: 30 });
+    expect(h.db.prepare("SELECT blocked_on FROM queue_transitions_archive WHERE qitem_id = ? AND state = 'blocked' ORDER BY transition_id").all(a))
+      .toEqual([{ blocked_on: "external:suite-flock-x" }, { blocked_on: GATE }, { blocked_on: GATE }]);
+  });
+
+  it("T-012748: a blocked transition written before the migration (blocked_on NULL) counts only as the row's newest", async () => {
+    h.register({ ...BASE, max: 3 });
+    const s1 = h.poolSeat("qualidade.revisor-s1");
+    const s2 = h.poolSeat("qualidade.revisor-s2");
+    const s3 = h.poolSeat("qualidade.revisor-s3");
+    const facts = (session: string) => h.queue.listPoolSeatRowFacts(session, 1, { returnTo: FIXED, returnGates: [GATE] }).parked!.blockedSince;
+    // Its only blocked transition, unrecorded: its gate is the row's current one, listed, so it counts from it.
+    const a = await h.park(s1, { parkAgoS: 3600 });
+    h.db.prepare("UPDATE queue_transitions SET blocked_on = NULL WHERE qitem_id = ?").run(a);
+    expect(facts(s1.session)).toBe(T0 - 3_600_000);
+    // An older unrecorded one before a recorded re-park on the listed gate: the count starts at the recorded one.
+    const b = await h.park(s2, { parkAgoS: 7200 });
+    h.db.prepare("UPDATE queue_transitions SET blocked_on = NULL WHERE qitem_id = ?").run(b);
+    h.nowMs = T0 - 600_000;
+    h.queue.update({ qitemId: b, actorSession: s2.session, state: "blocked", blockedOn: GATE, wakeAfterSeconds: 7200, transitionNote: "again" } as never);
+    h.nowMs = T0;
+    expect(facts(s2.session)).toBe(T0 - 600_000);
+    // The newest unrecorded, the row now on a gate out of the list: it does not count.
+    const c = await h.park(s3, { gate: "external:suite-flock-x", parkAgoS: 7200 });
+    h.db.prepare("UPDATE queue_transitions SET blocked_on = NULL WHERE qitem_id = ?").run(c);
+    expect(facts(s3.session)).toBeNull();
+    await h.tickAt(61);
+    expect(h.notes("seat_pool_long_gate_returned").map((r) => r["qitemId"])).toEqual([a]);
   });
 });

@@ -648,11 +648,13 @@ export interface ParkFacts {
   /** When the row was taken: its claim, or else its first move to in-progress by one of its destination's addresses. */
   takenAt: string | null;
   /** Only when the reader asks for it (`return_long_gates` in the spec, T-012673): since when the row has been blocked
-   *  without leaving `blocked` (ms), on any gate: its first move to blocked after its latest transition to any other
-   *  state. A re-park, a note, a wake timer that fired and a change of gate keep it (a row parked on one gate for hours,
-   *  then on a long one, is as old as its first park: no schema column records the gate of each park, to keep the rebase
-   *  on 0.7.18 clean). Null when the record does not say. `parkedAt` can't tell it: it is null with no wake and moves
-   *  with each re-park. Absent (no property) otherwise, so the facts read as before the field. */
+   *  on one of the rule's `gates` without leaving `blocked` (ms), T-012748: the unbroken run of its latest blocked
+   *  transitions whose recorded gate (queue_transitions.blocked_on, migration 174) is listed. A re-park on a listed gate,
+   *  a note and a wake timer that fired keep it; a row parked on another gate for hours, then on a listed one, counts
+   *  from its move to the listed gate. A transition recorded before the column counts only as the row's newest (its gate
+   *  is the row's current one), so the age is never longer than the truth. Null when nothing counts or the record does
+   *  not say. `parkedAt` can't tell it: it is null with no wake and moves with each re-park. Absent (no property)
+   *  otherwise, so the facts read as before the field. */
   blockedSince?: number | null;
   /** Only with `blockedSince`: when a wake of the row last fired (ms), null when none did. A wake that fired a moment
    *  ago was typed into the seat's pane, which may not read as working yet (T-012673). */
@@ -894,8 +896,8 @@ export function seatPoolLongGateOf(rule: Pick<SeatPoolReturnLongGates, "gates">,
  * fixed seat already), not to be reaped, its node present; no held message; idle at its prompt (`cause` idle and
  * `atPrompt`) for at least SEAT_POOL_LONG_GATE_QUIET_MS, with no background shell and no `busy_processes` program under
  * its pane, so nothing of the seat's is running; between 1 and `max_rows` open rows, ALL blocked (a pending or
- * in-progress row means the seat is working); and each of them on one of `gates`, blocked (on any gate, unbroken) for
- * at least `min_blocked_s` (`blockedSince`; unknown refuses), with no wake of it fired within SEAT_POOL_LONG_GATE_QUIET_MS and
+ * in-progress row means the seat is working); and each of them on one of `gates`, blocked on those gates (unbroken) for
+ * at least `min_blocked_s` (`blockedSince`, T-012748; unknown refuses), with no wake of it fired within SEAT_POOL_LONG_GATE_QUIET_MS and
  * nothing that keeps it from going as it is (`returnRefusal` null; unknown refuses). The planner and the executor's
  * recheck just before the move both ask this.
  */

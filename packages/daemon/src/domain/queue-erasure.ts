@@ -176,6 +176,16 @@ class Statements {
   count(sql: string, params: Record<string, unknown>): number {
     return (this.get(sql).get(params) as { n: number }).n;
   }
+  private columns = new Map<string, Set<string>>();
+  /** Whether a table has a column (read once per table): a column a later migration added may be absent. */
+  hasColumn(table: string, column: string): boolean {
+    let names = this.columns.get(table);
+    if (!names) {
+      names = new Set((this.db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>).map((c) => c.name));
+      this.columns.set(table, names);
+    }
+    return names.has(column);
+  }
 }
 
 /** Rows a workflow still references (a step trail, a frontier binding or a failure record point at them by key, or
@@ -263,7 +273,9 @@ function scrubRows(st: Statements, ids: string[], nowIso: string): void {
       chain_of_record = NULL, evidence_ref = NULL, human_detail = NULL, human_questions = NULL, human_answers = NULL,
       delegated_decision = NULL, last_nudge_input_box = NULL, content_erased_at = @now WHERE qitem_id IN ${IDS}`).run({ ...params, now: nowIso });
   for (const table of ["queue_transitions", "queue_transitions_archive"]) {
-    st.get(`UPDATE ${table} SET transition_note = NULL, identity_principal = NULL WHERE qitem_id IN ${IDS}`).run(params);
+    // T-012748: the gate of each park (migration 174) goes with the row's blocked_on.
+    const gate = st.hasColumn(table, "blocked_on") ? ", blocked_on = NULL" : "";
+    st.get(`UPDATE ${table} SET transition_note = NULL, identity_principal = NULL${gate} WHERE qitem_id IN ${IDS}`).run(params);
   }
   st.get(`UPDATE mission_control_actions SET before_state_json = NULL, after_state_json = NULL, reason = NULL,
       annotation = NULL, notify_result = NULL, audit_notes_json = NULL WHERE qitem_id IN ${IDS}`).run(params);
