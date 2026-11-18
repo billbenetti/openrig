@@ -215,7 +215,7 @@ function detectWatchdogColumn(db: Database.Database, columnName: string): boolea
   }
 }
 
-/** A seat-pool job's own view of its drain and seats, read from its history and `seat_pool_slots` (never the rig's
+/** A seat-pool job's own view of its drain and seats, read from its history and `fork_seat_pool_slots` (never the rig's
  *  nodes), so a seat whose node is gone but which the pool still holds is shown. */
 export interface SeatPoolJobView {
   /** `retryUntil` and `waiting`: while the forced pass asks again the seats whose release command did not answer, until
@@ -264,7 +264,7 @@ export class WatchdogJobsRepository {
     this.hasContextUsageColumns = detectWatchdogColumn(db, "last_fired_generation_uuid");
     this.hasWatchedFileGenerationColumn = detectWatchdogColumn(db, "watched_file_generation_uuid");
     this.hasThresholdUnitsColumns = detectWatchdogColumn(db, "threshold_tokens");
-    this.hasSeatPoolSlotsTable = !!db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'seat_pool_slots'").get();
+    this.hasSeatPoolSlotsTable = !!db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'fork_seat_pool_slots'").get();
   }
 
   /**
@@ -1012,7 +1012,7 @@ export class WatchdogJobsRepository {
    * holds the stop of a draining pool: its link is retired, and the seat is left as it is.
    */
   private stopSeatPool(job: WatchdogJob, reason: string): WatchdogJob & { leftRunning?: SeatPoolLeftRunning[] } {
-    const open = this.db.prepare("SELECT id, logical_id, op_id FROM seat_pool_slots WHERE pool_job_id = ? AND retired_at IS NULL ORDER BY id")
+    const open = this.db.prepare("SELECT id, logical_id, op_id FROM fork_seat_pool_slots WHERE pool_job_id = ? AND retired_at IS NULL ORDER BY id")
       .all(job.jobId) as Array<{ id: number; logical_id: string; op_id: string | null }>;
     const pool = this.seatPoolDrainSpec(job);
     const episode: SeatPoolDrainEpisode | null = pool?.drain ? seatPoolDrainEpisode(this.seatPoolDrainEvents(job.jobId)) : null;
@@ -1058,7 +1058,7 @@ export class WatchdogJobsRepository {
     };
     this.db.transaction(() => {
       for (const slot of open) {
-        this.db.prepare("UPDATE seat_pool_slots SET phase = 'retired', intent = CASE WHEN phase IN ('adding', 'added') THEN 'never_live' ELSE NULL END, retired_at = ? WHERE id = ?").run(at, slot.id);
+        this.db.prepare("UPDATE fork_seat_pool_slots SET phase = 'retired', intent = CASE WHEN phase IN ('adding', 'added') THEN 'never_live' ELSE NULL END, retired_at = ? WHERE id = ?").run(at, slot.id);
         if (slot.op_id === null) note("seat_pool_unlinked", { slot: slot.logical_id });
       }
       for (const left of leftRunning) note(SEAT_POOL_LEFT, { ...left });
@@ -1070,7 +1070,7 @@ export class WatchdogJobsRepository {
   }
 
   /**
-   * A seat-pool job's drain and its seats that are not retired, read from its history and `seat_pool_slots`, not from
+   * A seat-pool job's drain and its seats that are not retired, read from its history and `fork_seat_pool_slots`, not from
    * the rig's nodes. `openRows` counts a seat's pending, in-progress and blocked rows (default: the rows addressed to
    * its canonical session). Null for a job that isn't a seat pool.
    */
@@ -1084,7 +1084,7 @@ export class WatchdogJobsRepository {
     ).get(sessionName) as { n: number }).n : 0));
     const slots = (this.db.prepare(
       `SELECT s.logical_id, s.phase, s.op_id, s.node_id, (n.id IS NOT NULL) AS node_exists
-         FROM seat_pool_slots s LEFT JOIN nodes n ON n.id = s.node_id
+         FROM fork_seat_pool_slots s LEFT JOIN nodes n ON n.id = s.node_id
         WHERE s.pool_job_id = ? AND s.retired_at IS NULL ORDER BY s.id`,
     ).all(jobId) as Array<{ logical_id: string; phase: string; op_id: string | null; node_id: string | null; node_exists: number }>)
       .map((slot) => ({

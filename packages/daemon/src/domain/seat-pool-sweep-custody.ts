@@ -42,13 +42,13 @@ export function seatPoolQueueCustody(
 ): (row: { destinationSession: string | null; tags?: string[] | null }) => boolean {
   const pools = new Map<string, PoolQueueFacts[]>();
   try {
-    const tables = new Set((db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('watchdog_jobs', 'seat_pool_slots', 'nodes')")
+    const tables = new Set((db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('watchdog_jobs', 'fork_seat_pool_slots', 'nodes')")
       .all() as Array<{ name: string }>).map((t) => t.name));
     if (tables.size === 3) {
       const jobs = db.prepare("SELECT job_id, spec_yaml, target_session, registered_at FROM watchdog_jobs WHERE policy = 'seat-pool' AND state = 'active'")
         .all() as Array<{ job_id: string; spec_yaml: string; target_session: string; registered_at: string }>;
       const liveSlots = db.prepare(
-        `SELECT s.id, s.node_id, s.op_id, s.live_at, s.created_at FROM seat_pool_slots s JOIN nodes n ON n.id = s.node_id
+        `SELECT s.id, s.node_id, s.op_id, s.live_at, s.created_at FROM fork_seat_pool_slots s JOIN nodes n ON n.id = s.node_id
           WHERE s.pool_job_id = ? AND s.retired_at IS NULL AND s.phase = 'live'`,
       );
       const latestStatus = db.prepare("SELECT status FROM sessions WHERE node_id = ? ORDER BY id DESC LIMIT 1");
@@ -59,7 +59,7 @@ export function seatPoolQueueCustody(
         && !nodeExecutorConfirmedStopped(db, nodeId);
       const slots = new SeatPoolSlots(db);
       const nowIso = new Date(nowMs).toISOString();
-      const stoppedSince = db.prepare("SELECT stopped_since FROM seat_pool_slots WHERE id = ?");
+      const stoppedSince = db.prepare("SELECT stopped_since FROM fork_seat_pool_slots WHERE id = ?");
       // A retired seat counts as one the pool had unless it was retired before it was ever live (intent 'never_live',
       // SeatPoolSlots.retire: an add or a launch that failed) or before it got a node. The slot's own row, not the job's
       // history (whose retention keeps only the newest evaluations), so the grace holds as long as the row does.
@@ -68,7 +68,7 @@ export function seatPoolQueueCustody(
       // julianday is a double, so a run of exactly SEAT_POOL_MIN_RUN_MS can come out a fraction of a ms short).
       const stopOf = "CASE WHEN s.stopped_since IS NOT NULL AND s.stopped_since < s.retired_at THEN s.stopped_since ELSE s.retired_at END";
       const lastRetired = db.prepare(
-        `SELECT MAX(${stopOf}) AS at FROM seat_pool_slots s
+        `SELECT MAX(${stopOf}) AS at FROM fork_seat_pool_slots s
           WHERE s.pool_job_id = ? AND s.retired_at IS NOT NULL
             AND (s.op_id IS NULL OR (s.node_id IS NOT NULL AND COALESCE(s.intent, '') <> 'never_live'))
             AND (s.op_id IS NULL OR (julianday(${stopOf}) - julianday(COALESCE(s.live_at, s.created_at))) * 86400000.0 >= ? - 1)`,
