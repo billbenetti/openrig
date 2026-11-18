@@ -45,6 +45,7 @@ import { sessionCommunityHarnessSelect } from "./session-registry.js";
 import { claudeMcpArgs, readSeatClaudeMcp, type ClaudeMcp } from "./claude-mcp.js";
 import { isLaunchWrapperRuntime, parseStoredLaunchWrapper } from "./launch-wrapper.js";
 import { shellQuote } from "../adapters/shell-quote.js";
+import { runSyncSiteWhenSlow } from "./sync-site-wrap.js";
 
 // -- Row types for SQL results --
 
@@ -789,6 +790,7 @@ function projectRigInventoryItems(db: Database.Database, rigId: string): Project
   const currentLaunchObservations = new AppliedLaunchObservationStore(db).readCurrentObservations();
   const permissionSelections = readPermissionSelectionsMap(db);
   const customPolicyCache = new Map<string, string | null>();
+  const seatPoolModels = readSeatPoolModels(db);
 
   const rows = queryInventoryRows(db, rigId);
 
@@ -802,6 +804,7 @@ function projectRigInventoryItems(db: Database.Database, rigId: string): Project
       currentLaunchObservations,
       permissionSelections,
       customPolicyCache,
+      seatPoolModels,
     }),
   );
 }
@@ -944,6 +947,8 @@ interface InventoryBuildContext {
   permissionSelections: PermissionSelectionsLookup;
   /** Per-inventory-build custom-policy target cache so shared targets are probed/read at most once per build. */
   customPolicyCache: Map<string, string | null>;
+  /** The model seat of each node a seat pool holds (one read per projection). */
+  seatPoolModels: Map<string, string>;
 }
 
 interface ProjectedNodeInventoryItem {
@@ -971,6 +976,7 @@ function buildInventoryItem(
     currentLaunchObservations,
     permissionSelections,
     customPolicyCache,
+    seatPoolModels,
   } = ctx;
   const launchWrapper = parseStoredLaunchWrapper(row.launch_wrapper, `Seat ${row.node_id} launch_wrapper`);
   if (launchWrapper && !isLaunchWrapperRuntime(row.runtime)) {
@@ -1108,6 +1114,7 @@ function buildInventoryItem(
     identityVerdict,
     heldReason: deriveHeldReason(db, row.rig_id, row.node_id, sessionStatus),
     ...(row.handover_at ? startedWithoutRequired(db, row.node_id, row.session_id) : {}),
+    ...(seatPoolModels.has(row.node_id) ? { seatPoolModel: seatPoolModels.get(row.node_id)! } : {}),
   };
   return {
     entry,
@@ -1122,6 +1129,36 @@ function buildInventoryEntry(
   ctx: InventoryBuildContext,
 ): NodeInventoryEntry {
   return buildInventoryItem(db, row, ctx).entry;
+}
+
+/**
+ * The model seat's logical id for each node a seat pool holds, keyed by node id. The pool's `fork_seat_pool_slots` row is
+ * the only link, as it is for the pool itself: a seat is never matched to a model by its name. The model is the seat
+ * the pool's watchdog job targets, and only in the seat's own rig. Empty on a database without seat pools.
+ */
+function readSeatPoolModels(db: Database.Database): Map<string, string> {
+  const out = new Map<string, string>();
+  if (!db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'fork_seat_pool_slots'").get()) return out;
+  const slots = db.prepare(
+    `SELECT sl.node_id, n.rig_id, j.target_session
+       FROM fork_seat_pool_slots sl
+       JOIN nodes n ON n.id = sl.node_id
+       JOIN watchdog_jobs j ON j.job_id = sl.pool_job_id
+      WHERE sl.retired_at IS NULL`,
+  ).all() as Array<{ node_id: string; rig_id: string; target_session: string }>;
+  const modelOf = db.prepare(
+    `SELECT n.logical_id, n.rig_id FROM sessions s JOIN nodes n ON n.id = s.node_id
+      WHERE s.session_name = ? ORDER BY s.id DESC LIMIT 1`,
+  );
+  const models = new Map<string, { logical_id: string; rig_id: string } | undefined>();
+  for (const slot of slots) {
+    if (!models.has(slot.target_session)) {
+      models.set(slot.target_session, modelOf.get(physicalSessionName(db, slot.target_session)) as { logical_id: string; rig_id: string } | undefined);
+    }
+    const model = models.get(slot.target_session);
+    if (model && model.rig_id === slot.rig_id) out.set(slot.node_id, model.logical_id);
+  }
+  return out;
 }
 
 /** #2456: the required startup files the seat's current occupant started without, as its handover recorded them. Only
@@ -1176,6 +1213,11 @@ function readAllRigWorkspaceJson(db: Database.Database): Map<string, WorkspaceSp
 // `rows` decides the scope (all rigs vs a selected rig set); entry derivation is
 // identical, so a rig's entries are byte-identical regardless of which caller ran.
 function buildInventoryMapFromRows(db: Database.Database, rows: InventoryRow[]): Map<string, NodeInventoryEntry[]> {
+  // T-010230: named in the slow-operation log when slow, so a stall in it is not a gap without a span
+  return runSyncSiteWhenSlow("node_inventory.build_map", () => readInventoryMapFromRows(db, rows));
+}
+
+function readInventoryMapFromRows(db: Database.Database, rows: InventoryRow[]): Map<string, NodeInventoryEntry[]> {
   const snapshotByRig = findLatestUsableSnapshotsForAllRigs(db);
   const workspaceByRig = readAllRigWorkspaceJson(db);
   const verdictsByRig = new SeatIdentityStore(db).getForAllRigs();
@@ -1187,6 +1229,7 @@ function buildInventoryMapFromRows(db: Database.Database, rows: InventoryRow[]):
   const currentLaunchObservations = new AppliedLaunchObservationStore(db).readCurrentObservations(); // one launch-fact read
   const permissionSelections = readPermissionSelectionsMap(db);
   const customPolicyCache = new Map<string, string | null>();
+  const seatPoolModels = readSeatPoolModels(db);                                                 // one seat-pool read
   const out = new Map<string, NodeInventoryEntry[]>();
   for (const row of rows) {
     const entry = buildInventoryEntry(db, row, {
@@ -1198,6 +1241,7 @@ function buildInventoryMapFromRows(db: Database.Database, rows: InventoryRow[]):
       currentLaunchObservations,
       permissionSelections,
       customPolicyCache,
+      seatPoolModels,
     });
     let list = out.get(row.rig_id);
     if (!list) { list = []; out.set(row.rig_id, list); }
@@ -1518,7 +1562,7 @@ const NEEDS_INPUT_RUNGS: readonly EvidenceRungId[] = ["needs-input-chrome", "lif
  *   - an occupant a handover started without a required startup file (`startedWithoutRequired`, #2456)
  */
 export function seatNeedsAttention(
-  entry: NodeInventoryEntry,
+  entry: Pick<NodeInventoryEntry, "lifecycleState" | "startupStatus" | "heldReason" | "latestError" | "startedWithoutRequired">,
   activity: AgentActivity | null,
   arbitratedNeedsInput: boolean | null = null,
 ): boolean {

@@ -51,7 +51,7 @@ one command away. Your memory of the fleet is a claim about the past.
   positions.
   Since 0.7.16 each human summary line ends with the daemon that answered (`· daemon <address>`),
   and `--nodes --json --fields activityState` returns each seat's whole activity object.
-  **`rig ps --resources`** shows this host's load and transcript capture cost.
+  **`rig ps --resources`** shows this host's load, memory and transcript capture cost.
 - **`rig ps --all-hosts --nodes -A`** — the same across every registered machine. Rollup-only
   unless you ask for nodes.
 - **`rig discover`** — what is running on this box that OpenRig is *not* managing.
@@ -470,7 +470,8 @@ your context, your compaction and your replacement — and it is the only thing 
   A receipt reads `indeterminate`, not delivered or failed, when the text may have reached the
   seat: an unconfirmed send, or a write attempted before an error. Inspect before resending.
 - **`rig queue fallback`** — reroute a row whose destination cannot receive it, without losing it
-  or rewriting its history.
+  or rewriting its history. `--expect-state` and `--expect-destination` move it only if it is still
+  as you read it (refused if it was claimed or moved meanwhile); `--wake` wakes the new destination.
 
 ## Arranging to be woken
 
@@ -805,6 +806,16 @@ not have to tear one down to change it, and you rarely have to start from nothin
   `rig_snapshot_create`, `rig_snapshot_list`, `rig_restore`, `rig_rig_nodes`, `rig_add` and
   `rig_bind`. A name two rigs share returns `rig_ambiguous` with the candidates. Don't look the id
   up first.
+- **`rig watchdog register --policy seat-pool`** — keep extra seats cloned from one model seat
+  (`<member>-s<n>`) and add or drain them with demand, within the spec's `min` and `max`. A pending row
+  left waiting at the model moves to a free seat, and a seat that isn't taking its rows is launched
+  when it stopped and escalated when it needs input. A seat the pool added whose session is gone is reaped
+  (its rows go back to the model and it is removed) once its release command agrees, and launched again
+  when it refuses; an adopted seat is never reaped, drained or removed. `drain: true` empties the pool
+  without killing work and gives adopted seats back as they are; `stop` is refused while it holds
+  seats. Every pool of a daemon launches within one host budget (`policies.seat_pool.*` in
+  `rig config`: launches in flight and per watchdog tick, free memory, load per CPU). `rig ps --nodes` and the TUI list a pool's seats under the model.
+  Spec and behavior: the `seat-pools.md` reference.
 - **`rig remove`** / **`rig shrink`** — take a seat, or an entire pod, out of a running topology.
   If it holds active work, pass `--fallback <live-seat>` to reroute before mutation; without a
   valid fallback the command refuses rather than strand the rows.

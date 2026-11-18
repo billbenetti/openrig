@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import { randomBytes } from "node:crypto";
 import { Command, InvalidArgumentError } from "commander";
-import { DaemonClient, DaemonConnectionError, DaemonTimeoutError, DaemonResponseError, remoteDaemonClient, type DaemonResponse } from "../client.js";
+import { DaemonClient, DaemonConnectionError, DaemonTimeoutError, DaemonResponseError, remoteDaemonClient, withOperatorBearerRetry, type DaemonResponse } from "../client.js";
 import { getDaemonStatus, getDaemonUrl , daemonStatusGuard, resolveOriginSelfHostId } from "../daemon-lifecycle.js";
 import { readOpenRigEnv } from "../openrig-compat.js";
 import { sessionRigOf, isHumanSeatSessionRef, parseSessionName } from "../session-name.js";
@@ -1610,9 +1610,9 @@ workspace home that is deferred/not-imminent belongs in its mission/slice.`)
       // daemon returns 400 actor_required (no seat identity to record; P18 retired the 401 refusal).
       if (!requireSeatSession("actor")) return;
       const deps = getDeps();
-      const bearer = opts.bearer ?? process.env.OPENRIG_AUTH_BEARER_TOKEN;
       await withClient(deps, async (client) => {
-        const res = await client.post<unknown>(
+        // T-007930: a 401 with a stale bearer (rotated since the seat started) is retried once with the operator bearer file.
+        const res = await withOperatorBearerRetry(client.baseUrl, opts.bearer, (headers) => client.post<unknown>(
           "/api/mission-control/action",
           {
             verb: "resolve",
@@ -1621,8 +1621,8 @@ workspace home that is deferred/not-imminent belongs in its mission/slice.`)
             decision: opts.decision,
             notify: opts.notify,
           },
-          bearer ? { headers: { Authorization: `Bearer ${bearer}` } } : undefined,
-        );
+          Object.keys(headers).length ? { headers } : undefined,
+        ));
         await printQueueItemResult(client, qitemId, opts.json ?? false, res.data, res.status);
       });
     });
@@ -1861,13 +1861,19 @@ workspace home that is deferred/not-imminent belongs in its mission/slice.`)
     .description("Reroute a qitem to a fallback destination (e.g. unreachable seat)")
     .requiredOption("--destination <session>", "Fallback destination seat")
     .option("--reason <text>", "Reason for fallback", "manual")
+    .option("--expect-state <state>", "Reroute only if the qitem is still in this state; checked in the same transaction as the move, refused otherwise")
+    .option("--expect-destination <session>", "Reroute only if the qitem is still addressed to this seat; checked in the same transaction as the move, refused otherwise")
+    .option("--wake", "Wake the fallback destination, as a handoff wakes its recipient (the qitem must be pending)")
     .option("--json", "JSON output for agents")
-    .action(async (qitemId: string, opts: { destination: string; reason: string; json?: boolean }) => {
+    .action(async (qitemId: string, opts: { destination: string; reason: string; expectState?: string; expectDestination?: string; wake?: boolean; json?: boolean }) => {
       const deps = getDeps();
       await withClient(deps, async (client) => {
         const res = await client.post<unknown>(`/api/queue/${encodeURIComponent(qitemId)}/fallback`, {
           fallbackDestination: opts.destination,
           reason: opts.reason,
+          ...(opts.expectState !== undefined ? { expectState: opts.expectState } : {}),
+          ...(opts.expectDestination !== undefined ? { expectDestination: opts.expectDestination } : {}),
+          ...(opts.wake ? { wake: true } : {}),
         });
         await printQueueItemResult(client, qitemId, opts.json ?? false, res.data, res.status);
       });

@@ -1,6 +1,8 @@
 import { RigDeliveryDrainStore } from "./rig-delivery-drain.js";
 import { PROMPT_ALERT_TAG, readWakeLadderBackstop } from "./queue-wake-ladder.js";
 import { withUrgentLine } from "./urgent-line.js";
+import { currentParkArmSql } from "./current-park-arm.js";
+import { PARK_WAKE_GUIDANCE } from "./park-wake-text.js";
 import { quietCustodyBackstop, quietHoldCustody } from "./quiet-hold-custody.js";
 import type Database from "better-sqlite3";
 import { cooperativeReadFile, readRowsCooperatively } from "./execution-candidate-reader.js";
@@ -73,7 +75,8 @@ import { physicalSessionName } from "./session-registry.js";
 import type { QueueWakeFacts } from "./draft-aware-delivery.js";
 import { derivePickup, type PickupReceipt } from "./queue-pickup.js";
 import { withRecoveryIndex } from "./queue-recovery.js";
-import { lastMeaningfulTransitionMany, meaningfulFor, readWaitingView, WaitingStatements, type WaitingView, type WaitingActivityReader, type WaitingReads } from "./queue-waiting.js";
+import { escalationOwnerOf, lastMeaningfulTransitionMany, meaningfulFor, readWaitingView, WaitingStatements, type WaitingView, type WaitingActivityReader, type WaitingReads } from "./queue-waiting.js";
+import { CLOSED_STATE_PREDICATE, RECEIPT_NOTE_PREDICATE } from "../db/migrations/170_queue_list_receipt_and_state_indexes.js";
 import { isTypedGateBlocker, typedGateBlockerPrefix } from "./queue-blocker.js";
 export { TYPED_GATE_BLOCKER_PREFIXES, isTypedGateBlocker, typedGateBlockerPrefix } from "./queue-blocker.js";
 import { isOpenRigSender, OPENRIG_SENDER, wrapPaneEnvelope } from "../lib/pane-envelope.js";
@@ -103,6 +106,10 @@ import {
   type ParkWakeStatus,
 } from "./queue-wake-repository.js";
 import { WatchdogJobsRepository } from "./watchdog-jobs-repository.js";
+import { NOTED_ON_PARKED_ROW, QUEUED_AS_ROW } from "./watchdog-history-log.js";
+import { seatPoolLongGateOf, type ParkFacts } from "./policies/seat-pool.js";
+import { nextDueAt } from "./watchdog-due.js";
+import { parse as parseYaml } from "yaml";
 import { armQueueWait, backOffQueueWait, refreshQueueWaits, evaluateQueueWait, retargetQueueWait, isQueueWait } from "./queue-wait-backoff.js";
 import { parseHumanQuestions, unansweredQuestions, describeTypedReplyPlacement, formatHumanAnswers, humanAnswerText, type HumanQuestion, type HumanAnswers, type TypedHumanReply, type RecordHumanAnswerResult } from "./human-questions.js";
 import { slackMicros } from "./gateway/slack/state-store.js";
@@ -185,7 +192,7 @@ export type WakeTrigger = "agent" | "openrig";
 const AUTO_UNPARK_BLOCKER_TAG_PREFIX = "queue:auto-unpark:blocker-ref:";
 
 /** The actor on the transition routeToFallback writes; the row's own history is how a later reroute finds the line it wrote. */
-const FALLBACK_ACTOR = "system:queue-fallback";
+export const FALLBACK_ACTOR = "system:queue-fallback";
 
 /** The actor a terminal act is recorded as when it names no responder: explicitly unattributed, never a person. */
 export const UNATTRIBUTED_ACTOR = "human@host";
@@ -646,6 +653,31 @@ export function defaultParkWakeMessage(qitemId: string): string {
   return `Wake timer fired for parked qitem ${qitemId}. Resume the recorded continuation and update the row.`;
 }
 
+/** T-007715 (delta review N4): a park's default wake, for any row: a job shared by --wake-watchdog carries the default
+ *  of the row that armed it, and a reminder outside a pass carries its continuation's preview after the default
+ *  (park-wake-text.ts withContinuationPreview: the preview's one line, then the guidance). S1 of the delta review of
+ *  7590bf00e: only the default exactly, or with that preview; any other text after it is the reminder's own. */
+const escapeRegExp = (text: string) => text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+const DEFAULT_PARK_WAKE = new RegExp(
+  "^Wake timer fired for parked qitem \\S+\\. Resume the recorded continuation and update the row\\."
+  + "(?:\\nRecorded continuation(?: \\(the first \\d+ of \\d+ characters; read the rest with rig queue show \\S+ --full\\))?: [^\\n]*"
+  + `\\n${escapeRegExp(PARK_WAKE_GUIDANCE)})?$`,
+);
+export function isDefaultParkWakeMessage(message: string): boolean {
+  return DEFAULT_PARK_WAKE.test(message);
+}
+
+/** T-007715 (delta review N3): the most of a reminder's own text one park note keeps; the rest stays in the job's
+ *  history (`rig watchdog show`). Still far below the base, which created a wd- row per fire. */
+export const PARK_NOTE_MESSAGE_MAX = 2000;
+function parkNoteReminder(message: string, jobId: string): string {
+  if (message.length <= PARK_NOTE_MESSAGE_MAX) return message;
+  // N5 of the delta review of 7590bf00e: never split a surrogate pair at the cut (a lone half shows as U+FFFD)
+  const high = message.charCodeAt(PARK_NOTE_MESSAGE_MAX - 1);
+  const cut = high >= 0xd800 && high <= 0xdbff ? PARK_NOTE_MESSAGE_MAX - 1 : PARK_NOTE_MESSAGE_MAX;
+  return `${message.slice(0, cut)}… (full text: rig watchdog show ${jobId})`;
+}
+
 /** A hosted member's trigger, from the authored rosters (`<workspace.root>/rosters`) on this host. Null when it declares
  *  none, or when the rosters or this host's id can't be read: the member then stays unroutable, and its person is told. */
 function defaultHostedWake(destination: string): RosterWake | null {
@@ -683,6 +715,14 @@ export type InboxCheckIn = { state: "seen"; at: string } | { state: "never" } | 
 
 /** A session's check-in is written at most this often; the stuck sweep reads it in units of its unclaimed age. */
 const INBOX_CHECKIN_WRITE_INTERVAL_MS = 60_000;
+
+/** The states the listing's active-first order puts first (its CASE WHEN state IN (...) THEN 0). */
+const OPEN_LISTING_STATES: ReadonlySet<string> = new Set(["pending", "in-progress", "blocked"]);
+
+/** T-010555: a read inside the repository's own acts (the handoff, its wake) that uses only the row's stored fields
+ *  skips the waiting view: building it asks the recovery lookup, which scans every recovery-tagged row, and a handoff
+ *  made ~10 such reads, most of the loop time it held. The rows an act returns keep the full face. */
+const NO_WAITING = { waiting: false } as const;
 
 export class QueueRepositoryError extends Error {
   readonly code: string;
@@ -1068,6 +1108,21 @@ export interface QueueDestinationAdvisory {
   message: string;
 }
 
+/** A seat pool seat's open rows and, when its only open row is blocked, that row's park (listPoolSeatRowFacts). */
+export interface PoolSeatRowFacts {
+  /** The open rows: listOpenObligations' rows, in its order (newest first) and with its limit. */
+  rows: Array<{ qitemId: string; state: "pending" | "in-progress" | "blocked" }>;
+  /** Only when `rows` is exactly one blocked row; null otherwise. */
+  parked: ParkFacts | null;
+  /** Only when asked with maxBlocked above 1 and `rows` is 2 to maxBlocked rows, all blocked: the park of each, in
+   *  `rows`' order (T-007036, dispatch_to_parked.max_open_rows). Absent otherwise. */
+  parkedRows?: ParkFacts[];
+}
+
+/** What a seat pool with `return_long_gates` asks of each park (listPoolSeatRowFacts, T-012673): its `to` (`returnTo`)
+ *  and its `gates` (`returnGates`, T-012748: the age counts only the time blocked on one of them). Both or neither. */
+export type PoolSeatReturnOpts = { returnTo?: undefined; returnGates?: undefined } | { returnTo: string; returnGates: readonly string[] };
+
 export class QueueRepository {
   readonly db: Database.Database;
   readonly deliveryDrains: RigDeliveryDrainStore;
@@ -1324,7 +1379,7 @@ export class QueueRepository {
   /** A wake's source and urgency at the seat's level: the trigger decides the source; the row's priority (urgent or
    *  critical) makes it urgent, marked by whoever created the row. */
   private wakeAdmission(qitemId: string, trigger: WakeTrigger): import("./seat-delivery-guard.js").AdmissionInput & { urgentBy?: string } {
-    const row = this.getById(qitemId);
+    const row = this.getById(qitemId, NO_WAITING);
     const urgent = row?.priority === "urgent" || row?.priority === "critical";
     // OpenRig's own row is marked urgent by OpenRig, not by the person whose obligation it's about.
     return { source: trigger, urgent, ...(urgent && row ? { urgentBy: trigger === "openrig" ? "OpenRig" : row.sourceSession } : {}) };
@@ -1449,7 +1504,7 @@ export class QueueRepository {
     if (nudge === false) return;
     // The successor row is already written in this txn, so its stored summary is
     // read here rather than threaded through every staging caller.
-    const successor = this.getById(successorQitemId);
+    const successor = this.getById(successorQitemId, NO_WAITING);
     this.recordWakeIntent({
       outboxId: `${WAKE_INTENT_PREFIX}${successorQitemId}`,
       auditPointer: successorQitemId,
@@ -1587,11 +1642,11 @@ export class QueueRepository {
       );
     }
     // Reads the txn-visible (uncommitted) state on this connection.
-    const src = this.getById(sourceQitemId);
+    const src = this.getById(sourceQitemId, NO_WAITING);
     if (!src || !isTerminalState(src.state)) return; // not a terminal close
     const intent = this.outbox.getById(`${WAKE_INTENT_PREFIX}${successorQitemId}`);
     // A successor whose wake a full held-message quota refused records that instead, and stands (#2430).
-    if (!intent && !this.getById(successorQitemId)?.lastNudgeResult?.startsWith(WAKE_NOT_RETAINED)) {
+    if (!intent && !this.getById(successorQitemId, NO_WAITING)?.lastNudgeResult?.startsWith(WAKE_NOT_RETAINED)) {
       throw new QueueRepositoryError(
         "terminal_close_without_wake_intent",
         `terminal closure of ${sourceQitemId} committed without staging its wake intent for ${successorQitemId} — one act or none is violated`,
@@ -1691,7 +1746,7 @@ export class QueueRepository {
     // target qitem is missing — a caller-recorded id under this prefix (the route
     // no longer refuses those), or a successor already swept — is finalized
     // `failed`, never sent as a real wake.
-    if (!intent.auditPointer || !this.getById(intent.auditPointer)) {
+    if (!intent.auditPointer || !this.getById(intent.auditPointer, NO_WAITING)) {
       this.outbox.finalizeDelivery(outboxId, "failed");
       return "failed";
     }
@@ -2121,7 +2176,7 @@ export class QueueRepository {
     }
     // A hosted member with a trigger: ring it. Accepted is indeterminate, never verified: pickup is its claim.
     if (destClass.class === "hosted") {
-      const row = this.getById(qitemId);
+      const row = this.getById(qitemId, NO_WAITING);
       return ringHostedWake({ qitemId, destination: destinationSession, summary: row?.summary ?? null, source: sourceSession ?? row?.sourceSession ?? null },
         destClass.wake, { fetchImpl: this.hostedWakeFetch });
     }
@@ -2658,7 +2713,7 @@ export class QueueRepository {
   }
 
   private handoffWithin(input: QueueHandoffInput): { closed: QueueItem; created: QueueItem } {
-    const source = this.getById(input.qitemId);
+    const source = this.getById(input.qitemId, NO_WAITING);
     if (!source) {
       throw new QueueRepositoryError(
         "qitem_not_found",
@@ -2844,7 +2899,7 @@ export class QueueRepository {
    * tracking needed against the source qitem.
    */
   async handoffAndComplete(input: QueueHandoffAndCompleteInput): Promise<{ closed: QueueItem; created: QueueItem }> {
-    const source = this.getById(input.qitemId);
+    const source = this.getById(input.qitemId, NO_WAITING);
     if (!source) {
       throw new QueueRepositoryError(
         "qitem_not_found",
@@ -3804,7 +3859,10 @@ export class QueueRepository {
       if (effectiveBlockedOn === input.qitemId) {
         throw new QueueRepositoryError("wake_self_blocker", "a repeating wait must name an upstream blocker, not its own packet");
       }
-      const oldWake = this.wakeRepo.getStatus(input.qitemId);
+      // The wait of the CURRENT park only (T-007715): read before this transition is appended, so a re-park
+      // blocked → blocked reuses its own wait, and a park after leaving `blocked` never inherits a past park's job
+      // (its doubled interval and old notice), even one a former attachment kept alive.
+      const oldWake = this.wakeRepo.getCurrentParkStatus(input.qitemId);
       const job = armQueueWait(this.db, jobsRepo, {
         // Reusing a shared job would rewrite the attachment's schedule and packet.
         previousJobId: oldWake?.kind === "timer" && this.wakeRepo.findLiveQitemsByAttachedWatchdog(oldWake.ref).length === 0
@@ -3915,6 +3973,8 @@ export class QueueRepository {
       identityPrincipal: input.identityPrincipal ?? null,
       ownerNotificationKind: notification?.kind,
       ownerNotificationLevel: notification?.level,
+      // T-012748: the gate of this park, recorded on the transition (migration 174).
+      ...(input.state === "blocked" ? { blockedOn: nextBlockedOn ?? null } : {}),
     });
     if (parkWake) {
       // OPR.0.5.8.1 S1b addendum — A NEW PARK EPISODE SUPERSEDES THE OLD.
@@ -4018,6 +4078,9 @@ export class QueueRepository {
    * Non-live jobs are left alone, so calling this twice is harmless.
    */
   private retireParkGeneratedTimer(qitemId: string, reason: string): void {
+    // The RAW latest arm (T-007715): this runs after the exit transition is appended, when the park is no longer the
+    // current one. Whether another row's attachment still holds the job is the current-park rule
+    // (findLiveQitemsByAttachedWatchdog).
     const armed = this.wakeRepo.getStatus(qitemId);
     if (armed?.kind !== "timer" || !armed.live) return;
     // An explicit --wake-watchdog attachment gives another continuation custody
@@ -4051,7 +4114,7 @@ export class QueueRepository {
           .run(successor.qitemId, input.ts, r.qitem_id);
         const rebound = this.transitionLog.append({ qitemId: r.qitem_id, state: "blocked", actorSession: input.actorSession,
           transitionNote: `blocker custody moved from ${input.qitemId} to ${successor.qitemId}`,
-          identityProvenance: input.identityProvenance });
+          identityProvenance: input.identityProvenance, blockedOn: successor.qitemId });
         const jobs = this.watchdogJobsRepo ?? new WatchdogJobsRepository(this.db);
         const retainedTimer = oldWake?.kind === "timer" && retargetQueueWait(this.db, jobs, oldWake.ref, successor.qitemId);
         if (!retainedTimer) this.retireParkGeneratedTimer(r.qitem_id, "blocker_custody_moved");
@@ -4104,8 +4167,11 @@ export class QueueRepository {
     return dependentEvents;
   }
 
+  /** What wakes this parked row now: its CURRENT park's wake (QueueWakeRepository.getCurrentParkStatus), never an
+   *  earlier park's job. The read for every diagnosis and backstop (rig parked, activity, the stuck sweep, the wake
+   *  ladder); the exit mechanisms below read the raw latest arm on purpose. */
   getParkWakeStatus(qitemId: string): ParkWakeStatus | null {
-    return this.wakeRepo.getStatus(qitemId);
+    return this.wakeRepo.getCurrentParkStatus(qitemId);
   }
 
   /** For parked diagnosis only (see QueueWakeRepository.servedByOwnRepeatingReminder). */
@@ -4175,10 +4241,20 @@ export class QueueRepository {
     return { qitemId: row.qitemId, summary: row.summary ?? null, continuation: this.currentParkContinuation(row.qitemId) };
   }
 
+  /** T-007715 (SH-A of the REVISAO-openrig-5): the live parked rows of `owner` that this job is the current wake of, by
+   *  the same binding the wake receipt follows (findBlockedQitemsByWatchdog, latest armed only), whatever the job's
+   *  message, policy or cadence. A row owned by another seat is not this reminder's own row. */
+  parkedRowsOwnedBy(jobId: string, owner: string): string[] {
+    return this.wakeRepo.findBlockedQitemsByWatchdog(jobId, true)
+      .map(({ qitemId }) => this.getById(qitemId))
+      .filter((row): row is NonNullable<typeof row> => !!row && row.state === "blocked" && row.destinationSession === owner)
+      .map((row) => row.qitemId);
+  }
+
   /** Called by the watchdog engine after the delivery attempt is durably
    *  audited. The queue transition records that attempt independently of
    *  whether the HELD row's owner consumed it. */
-  recordWatchdogWakeAttempt(jobId: string, deliveryStatus: string, retryAt?: string): void {
+  recordWatchdogWakeAttempt(jobId: string, deliveryStatus: string, retryAt?: string, queuedQitemId?: string, message?: string): void {
     const bindings = this.wakeRepo.findBlockedQitemsByWatchdog(jobId);
     if (bindings.length === 0) return;
     // Both receipt ownership and timer lifecycle follow the current park.
@@ -4190,6 +4266,14 @@ export class QueueRepository {
         actorSession: "watchdog@system",
         transitionNote: retryAt ? `park wake failed: watchdog ${jobId}; delivery=${deliveryStatus}; occurrence remains owed; retry at ${retryAt}` : deliveryStatus === "retained"
           ? `park wake retained: watchdog ${jobId}; not delivered; blocked work unchanged`
+          : deliveryStatus === QUEUED_AS_ROW
+            ? `park wake queued as row: watchdog ${jobId}; delivery=${QUEUED_AS_ROW}${queuedQitemId ? ` ${queuedQitemId}` : ""}; nothing typed; awaiting owner consumption`
+          : deliveryStatus === NOTED_ON_PARKED_ROW
+            ? `park wake noted on this row: watchdog ${jobId}; delivery=${NOTED_ON_PARKED_ROW}; nothing typed; awaiting owner consumption`
+              // T-007715 (B1): the reminder's own text, when it is not the park's default wake (at a queue-only seat
+              // this note is the only place the owner reads it)
+              + (message && message.trim() && !isDefaultParkWakeMessage(message)
+                ? `\nreminder: ${parkNoteReminder(message.trim(), jobId)}` : "")
           : `park wake fired: watchdog ${jobId}; delivery=${deliveryStatus}; awaiting owner consumption`,
       });
       if (!retryAt) this.wakeRepo.record({
@@ -4895,6 +4979,313 @@ export class QueueRepository {
     return rows.map((r) => ({ qitemId: r.qitem_id, state: r.state, summary: r.summary ?? null }));
   }
 
+  /** Every address a session's rows may be addressed to (its canonical session and its aliases), as the queue reads
+   *  them: what a seat pool's dispatch reads for its model (T-007029). */
+  addressesOf(sessionName: string): string[] {
+    return this.resolveSessionAddresses(sessionName);
+  }
+
+  /**
+   * A seat pool's read of one seat's open rows (listOpenObligations' rows, order and limit) and, when the only open row
+   * is blocked, the facts of its park (ParkFacts): the current wake (the arm of its current park, current-park-arm.ts)
+   * gives the transition that armed it (its actor and time) and, for a timer, its job's interval in any state of the job;
+   * getCurrentParkStatus says whether that wake is still armed and live. The row was taken at its claim, or else at its first move
+   * to in-progress by one of its destination's addresses (a seat that takes a row by update, with no claim).
+   * `opts` (a seat pool with `return_long_gates`): its `to` and its `gates`, for poolSeatParkFacts.
+   */
+  listPoolSeatRowFacts(sessionName: string, maxBlocked = 1, opts: PoolSeatReturnOpts = {}): PoolSeatRowFacts {
+    const rows = this.listOpenObligations(sessionName, 500).map((row) => ({ qitemId: row.qitemId, state: row.state }));
+    if (rows.length === 0 || rows.length > Math.max(1, maxBlocked) || rows.some((row) => row.state !== "blocked")) return { rows, parked: null };
+    if (rows.length === 1) return { rows, parked: this.poolSeatParkFacts(rows[0]!.qitemId, opts) };
+    const parks = rows.map((row) => this.poolSeatParkFacts(row.qitemId, opts));
+    return parks.every((park): park is ParkFacts => park !== null) ? { rows, parked: null, parkedRows: parks } : { rows, parked: null };
+  }
+
+  /** The park facts of one blocked row (listPoolSeatRowFacts); null when the row is not there. With `returnTo` (a seat
+   *  pool with `return_long_gates`, T-012673) also `blockedSince` (on `returnGates` only, T-012748), `wakeFiredAt` and
+   *  `returnRefusal` (whether the row could be handed to that seat as it is), so the facts of any other read are the
+   *  ones from before. */
+  private poolSeatParkFacts(qitemId: string, opts: PoolSeatReturnOpts = {}): ParkFacts | null {
+    const item = this.db.prepare("SELECT blocked_on, claimed_at, destination_session FROM queue_items WHERE qitem_id = ?")
+      .get(qitemId) as { blocked_on: string | null; claimed_at: string | null; destination_session: string } | undefined;
+    if (!item) return null;
+    let armed: { wake_kind: string; wake_ref: string; actor_session: string | null; ts: string | null } | undefined;
+    try {
+      // T-007715: the arm of the row's current park; an earlier park's timer, still alive because another row is
+      // attached to it, is not this park's (it would read as a live timer and admit a dispatch to a gated row).
+      armed = this.db.prepare(
+        `SELECT w.wake_kind, w.wake_ref, t.actor_session, t.ts
+           FROM queue_transition_wakes w LEFT JOIN queue_transitions t ON t.transition_id = w.transition_id
+          WHERE w.qitem_id = ? AND ${currentParkArmSql("w")}`,
+      ).get(qitemId) as typeof armed;
+    } catch {
+      armed = undefined; // a database without the wake records: no wake to read
+    }
+    const interval = armed?.wake_kind === "timer"
+      ? (this.db.prepare("SELECT interval_seconds FROM watchdog_jobs WHERE job_id = ?").get(armed.wake_ref) as { interval_seconds: number } | undefined)
+      : undefined;
+    const status = armed ? this.wakeRepo.getCurrentParkStatus(qitemId) : null;
+    const destinations = this.resolveSessionAddresses(item.destination_session);
+    const firstTake = item.claimed_at ? null : this.db.prepare(
+      `SELECT MIN(ts) AS ts FROM queue_transitions
+        WHERE qitem_id = ? AND state = 'in-progress' AND actor_session IN (${destinations.map(() => "?").join(",")})`,
+    ).get(qitemId, ...destinations) as { ts: string | null } | undefined;
+    const parked: ParkFacts = {
+      qitemId,
+      blockedOn: item.blocked_on ?? "",
+      timerIntervalS: interval?.interval_seconds ?? null,
+      timerArmedLive: !!status && status.kind === "timer" && status.phase === "armed" && status.live === true && status.unconsumed === false,
+      parkActor: armed?.actor_session ?? null,
+      parkedAt: armed?.ts ?? null,
+      takenAt: item.claimed_at ?? firstTake?.ts ?? null,
+      ...(opts.returnTo !== undefined
+        ? {
+          blockedSince: this.blockedSinceMs(qitemId, opts.returnGates ?? []),
+          wakeFiredAt: this.lastWakeFiredMs(qitemId),
+          returnRefusal: this.parkedHandoffRefusal(qitemId, opts.returnTo)?.code ?? null,
+        }
+        : {}),
+    };
+    return parked;
+  }
+
+  /**
+   * T-012673, T-012748: since when a blocked row has been blocked on a gate of `gates` (`return_long_gates.gates`, as
+   * seatPoolLongGateOf matches them) without leaving `blocked` (ms). The current blocked episode is the row's transitions
+   * after its latest transition to any other state; walking it from the newest back, each transition whose recorded
+   * gate (queue_transitions.blocked_on, migration 174) is listed moves the start back to it, and the first one on a gate
+   * out of the list ends the walk. A re-park on a listed gate, a note and a wake that fired keep the count (they record
+   * the gate the row is on); a re-park from a gate out of the list (2 h on suite-flock, then github-review) starts it at
+   * the move to the listed gate, so the row is never returned for time it spent on another wait.
+   *
+   * A transition recorded before the column (or in a schema without it: NULL) counts only when it is the row's newest,
+   * whose gate is the row's current blocked_on; an older NULL ends the walk, so the count can only start later than the
+   * truth, never earlier (the row goes back later, never sooner). Null when nothing counts.
+   */
+  private blockedSinceMs(qitemId: string, gates: readonly string[]): number | null {
+    const recorded = this.transitionsHaveBlockedOn();
+    const episode = this.db.prepare(
+      `SELECT t.ts, ${recorded ? "t.blocked_on" : "NULL"} AS blocked_on FROM queue_transitions t
+        WHERE t.qitem_id = @qitem AND t.state = 'blocked' AND t.transition_id > COALESCE((SELECT MAX(o.transition_id)
+          FROM queue_transitions o WHERE o.qitem_id = @qitem AND o.state <> 'blocked'), 0)
+        ORDER BY t.transition_id DESC`,
+    ).all({ qitem: qitemId }) as Array<{ ts: string; blocked_on: string | null }>;
+    if (episode.length === 0 || gates.length === 0) return null;
+    const rule = { gates: [...gates] };
+    const listed = (gate: string | null) => gate !== null && seatPoolLongGateOf(rule, gate) !== null;
+    let since: string | null = null;
+    for (const [i, transition] of episode.entries()) {
+      let gate = transition.blocked_on;
+      if (gate === null) {
+        if (i !== 0) break;
+        gate = (this.db.prepare("SELECT blocked_on FROM queue_items WHERE qitem_id = ?").get(qitemId) as { blocked_on: string | null } | undefined)
+          ?.blocked_on ?? null;
+      }
+      if (!listed(gate)) break;
+      since = transition.ts;
+    }
+    const ms = since ? Date.parse(since) : NaN;
+    return Number.isFinite(ms) ? ms : null;
+  }
+
+  /** T-012748: whether queue_transitions records the gate of each park (migration 174), read once. */
+  private transitionsHaveBlockedOn(): boolean {
+    this.blockedOnRecorded ??= (this.db.prepare("PRAGMA table_info(queue_transitions)").all() as Array<{ name: string }>)
+      .some((column) => column.name === "blocked_on");
+    return this.blockedOnRecorded;
+  }
+  private blockedOnRecorded: boolean | undefined;
+
+  /** T-012673: when a wake of the row last fired (ms; its fire receipt), null when none did or the records are absent. */
+  private lastWakeFiredMs(qitemId: string): number | null {
+    let row: { ts: string | null } | undefined;
+    try {
+      row = this.db.prepare(
+        `SELECT MAX(t.ts) AS ts FROM queue_transition_wakes w JOIN queue_transitions t ON t.transition_id = w.transition_id
+          WHERE w.qitem_id = ? AND w.phase = 'fired'`,
+      ).get(qitemId) as typeof row;
+    } catch {
+      row = undefined; // a database without the wake records
+    }
+    const ms = row?.ts ? Date.parse(row.ts) : NaN;
+    return Number.isFinite(ms) ? ms : null;
+  }
+
+  /**
+   * T-012673: why a blocked row can't be handed to `toSession` and parked there again as it is, or null. Read by the
+   * seat pool's facts (so the plan never asks for it) and again inside handoffParkedRows (so nothing is moved then).
+   * - `wake_kind_unsupported`: what wakes it now (its CURRENT park, T-007715) is not a park timer of its own or nothing:
+   *   a watchdog attached to it, a repeating queue wait or a blocker row would be lost or changed by the move.
+   * - `dependent_at_target`: a row of `toSession` (any of its addresses) waits on it. The handoff would hand that row its
+   *   own blocker's result (propagateBlockerCompletion releases a waiter at the successor's destination: pending, woken),
+   *   though its wait goes on: the successor parks again at once.
+   */
+  private parkedHandoffRefusal(qitemId: string, toSession: string): { code: string; message: string } | null {
+    const armed = this.wakeRepo.getCurrentParkStatus(qitemId);
+    if (armed) {
+      const jobs = this.watchdogJobsRepo ?? new WatchdogJobsRepository(this.db);
+      const job = armed.kind === "timer" ? jobs.getById(armed.ref) : null;
+      if (!job || job.policy !== "periodic-reminder" || isQueueWait(job.specYaml)) {
+        return { code: "wake_kind_unsupported", message: `qitem ${qitemId} is woken by a ${armed.kind} ${armed.ref}, not a park timer of its own` };
+      }
+    }
+    const targets = new Set(this.resolveSessionAddresses(toSession));
+    const waiting = this.db.prepare("SELECT qitem_id, destination_session FROM queue_items WHERE blocked_on = ? AND state = 'blocked'")
+      .all(qitemId) as Array<{ qitem_id: string; destination_session: string }>;
+    const own = waiting.find((row) => targets.has(row.destination_session));
+    if (own) return { code: "dependent_at_target", message: `qitem ${own.qitem_id} of ${own.destination_session} waits on qitem ${qitemId}` };
+    return null;
+  }
+
+  /**
+   * T-012673: hands the rows a seat pool's seat holds parked on long waits (`return_long_gates`) to the fixed seat
+   * `toSession`, each parked there on the same gate, all in one transaction under one notify envelope: a refusal of any
+   * row moves none (the seat's rows are never split between it and the fixed seat). A handoff then an update, in two
+   * transactions, would leave a successor pending in between, for the fixed seat to take.
+   *
+   * Refused, with nothing written, when the open rows of `expectDestination` are not exactly the rows given
+   * (`open_rows_mismatch`: the plan would move part of what the seat holds), or when a row is no longer blocked
+   * (`fallback_state_mismatch`), no longer addressed to `expectDestination` (`fallback_destination_mismatch`), gone
+   * (`qitem_not_found`), on another gate than its `blockedOn` (`blocked_on_mismatch`: the seat parked it again
+   * elsewhere), or can't go as it is (parkedHandoffRefusal: `wake_kind_unsupported`, `dependent_at_target`).
+   *
+   * Otherwise, for each row: it closes `handed-off` (its timer retired with it), with its `note` on that transition; the
+   * successor at `toSession`, with no wake sent (`nudge: false`), carries the row's chain of record ending in the row,
+   * so the work done so far is reached from it, and its tags but `dropTags`; it is parked at once on the same gate, with
+   * a timer of the same interval and message (a default message names the successor) when the row had one, and with
+   * none when it had none. The successor's timer falls due when the row's would have (T-012748: its next due, read
+   * before the handoff retires the row's timer, is set on the new job as its last evaluation one interval earlier, so a
+   * wake due in 1 min is due in 1 min at the fixed seat, and one already due is due now); like every park timer it fires
+   * once. A timer with no next due of its own (one that fired, delivered or with its retry pending, or is no longer
+   * active) gets a full interval from now, as before. `moved[].wakeDueAt` says when the successor's wake falls due (ISO:
+   * the row's own due, past when it was overdue; the move's time when it carried the wake-now marker).
+   * Rows of other seats that waited on the row wait on the successor (the handoff's propagateBlockerCompletion). The successor's park note is the row's recorded continuation
+   * when it had one (so the fixed seat's wake previews it), else the row's `note`.
+   */
+  handoffParkedRows(
+    rows: ReadonlyArray<{ qitemId: string; blockedOn: string; note: string }>,
+    toSession: string,
+    opts: { expectDestination: string; dropTags?: readonly string[]; actorSession: string },
+  ): { ok: true; moved: Array<{ qitemId: string; newQitemId: string; wakeAfterSeconds: number | null; wakeDueAt: string | null }> }
+    | { ok: false; code: string; error: string; qitemId?: string } {
+    const jobs = this.watchdogJobsRepo ?? new WatchdogJobsRepository(this.db);
+    let current: string | undefined;
+    try {
+      return this.eventBus.withNotifyEnvelope((register) => {
+        const open = this.listOpenObligations(opts.expectDestination, 500).map((row) => row.qitemId).sort();
+        const expected = rows.map((row) => row.qitemId).sort();
+        if (expected.length === 0 || open.length !== expected.length || open.some((id, i) => id !== expected[i])) {
+          throw new QueueRepositoryError("open_rows_mismatch",
+            `${opts.expectDestination} holds ${open.join(", ") || "no row"}, not ${expected.join(", ") || "no row"}; nothing was handed on`);
+        }
+        const drop = new Set(opts.dropTags ?? []);
+        const moved: Array<{ qitemId: string; newQitemId: string; wakeAfterSeconds: number | null; wakeDueAt: string | null }> = [];
+        for (const row of rows) {
+          current = row.qitemId;
+          const { qitemId } = row;
+          const source = this.getById(qitemId, NO_WAITING);
+          if (!source) throw new QueueRepositoryError("qitem_not_found", `qitem ${qitemId} not found`);
+          if (source.state !== "blocked") {
+            throw new QueueRepositoryError("fallback_state_mismatch", `qitem ${qitemId} is ${source.state}, not blocked; nothing was handed on`);
+          }
+          if (!this.resolveSessionAddresses(opts.expectDestination).includes(source.destinationSession)) {
+            throw new QueueRepositoryError("fallback_destination_mismatch",
+              `qitem ${qitemId} is addressed to ${source.destinationSession}, not ${opts.expectDestination}; nothing was handed on`);
+          }
+          if (source.blockedOn !== row.blockedOn) {
+            throw new QueueRepositoryError("blocked_on_mismatch",
+              `qitem ${qitemId} is blocked on ${source.blockedOn ?? "nothing"}, not ${row.blockedOn}; nothing was handed on`);
+          }
+          const refusal = this.parkedHandoffRefusal(qitemId, toSession);
+          if (refusal) throw new QueueRepositoryError(refusal.code, `${refusal.message}; nothing was handed on`);
+          // A park timer of its own is carried over by its interval, message and next due (parkedHandoffRefusal admits
+          // only that or no wake). The due is read here: the handoff retires the row's timer.
+          const armed = this.wakeRepo.getCurrentParkStatus(qitemId);
+          let wake: { seconds: number; message: string | null; dueMs: number | null | undefined } | null = null;
+          if (armed) {
+            const job = jobs.getById(armed.ref)!;
+            // undefined: no next due of its own (it fired, delivered or with a retry pending, or is no longer active): a full
+            // interval from now.
+            const dueMs = job.state === "active" && armed.live ? nextDueAt(job) : undefined;
+            let message: string | null = null;
+            try {
+              const spec = parseYaml(job.specYaml) as { message?: unknown; context?: { message?: unknown } } | null;
+              const written = spec?.message ?? spec?.context?.message;
+              if (typeof written === "string" && written.trim() && !isDefaultParkWakeMessage(written)) message = written;
+            } catch { /* the default message, for the successor */ }
+            wake = { seconds: job.intervalSeconds, message, dueMs };
+          }
+          const continuation = this.currentParkContinuation(qitemId);
+          const { created } = this.handoffWithin({
+            qitemId, fromSession: opts.actorSession, toSession, transitionNote: row.note, nudge: false,
+            ...(source.tags ? { tags: source.tags.filter((tag) => !drop.has(tag)) } : {}),
+          });
+          const parked = this.updateInTransactionalContext({
+            qitemId: created.qitemId, actorSession: opts.actorSession, state: "blocked", blockedOn: row.blockedOn,
+            transitionNote: continuation !== null ? `continuation: ${continuation}` : row.note,
+            ...(wake ? { wakeAfterSeconds: wake.seconds, ...(wake.message !== null ? { wakeMessage: wake.message } : {}) } : {}),
+          });
+          for (const event of parked.persistedEvents) register(event);
+          let wakeDueAt: string | null = null;
+          if (wake) {
+            const ref = this.wakeRepo.getCurrentParkStatus(created.qitemId)?.ref;
+            const timer = ref !== undefined ? jobs.getById(ref) : null;
+            if (!timer) throw new QueueRepositoryError("handoff_parked_failed", `qitem ${created.qitemId} was parked with no timer; nothing was handed on`);
+            if (wake.dueMs !== undefined) {
+              // The epoch is #860's wake-now marker (nextDueAt reads it as due now); otherwise the row's own due.
+              const last = wake.dueMs === null ? new Date(0).toISOString() : new Date(wake.dueMs - wake.seconds * 1000).toISOString();
+              jobs.recordEvaluation(timer.jobId, last, false);
+            }
+            const due = nextDueAt(jobs.getById(timer.jobId)!);
+            wakeDueAt = new Date(due ?? Date.now()).toISOString();
+          }
+          moved.push({ qitemId, newQitemId: created.qitemId, wakeAfterSeconds: wake?.seconds ?? null, wakeDueAt });
+        }
+        current = undefined;
+        return { ok: true as const, moved };
+      });
+    } catch (error) {
+      const code = (error as { code?: unknown }).code;
+      return {
+        ok: false, code: typeof code === "string" ? code : "handoff_parked_failed", error: (error as Error).message,
+        ...(current !== undefined ? { qitemId: current } : {}),
+      };
+    }
+  }
+
+  /** The open rows of a session with their claim time (listOpenObligations' rows and order): a seat pool's forced pass
+   *  compares two reads of these to see whether the seat took work in between (a claim, a release, a block, a close). */
+  listOpenObligationClaims(destinationSession: string, limit: number): Array<{ qitemId: string; state: "pending" | "in-progress" | "blocked"; claimedAt: string | null }> {
+    const addresses = this.resolveSessionAddresses(destinationSession);
+    const slots = addresses.map(() => "?").join(",");
+    const rows = this.db.prepare(
+      `SELECT qitem_id, state, claimed_at FROM queue_items
+        WHERE destination_session IN (${slots}) AND state IN ('pending', 'in-progress', 'blocked')
+        ORDER BY ts_created DESC LIMIT ?`,
+    ).all(...addresses, limit) as Array<{ qitem_id: string; state: "pending" | "in-progress" | "blocked"; claimed_at: string | null }>;
+    return rows.map((r) => ({ qitemId: r.qitem_id, state: r.state, claimedAt: r.claimed_at }));
+  }
+
+  /** The latest transition's id: a mark to read later what happened on the queue after it (seatActedSince). */
+  transitionMark(): number {
+    const row = this.db.prepare("SELECT COALESCE(MAX(transition_id), 0) AS mark FROM queue_transitions").get() as { mark: number };
+    return row.mark;
+  }
+
+  /**
+   * Whether `session` (in any of its addresses) moved a row out of pending after `mark` (transitionMark): a claim, a
+   * block, a close or a handoff it made itself, on any row, also one that arrived and was closed after the mark. A
+   * pending transition (a row it created or let go) is not counted, nor anything another actor did.
+   */
+  sessionActedSince(session: string, mark: number): boolean {
+    const addresses = this.resolveSessionAddresses(session);
+    if (!addresses.length) return false;
+    const slots = addresses.map(() => "?").join(",");
+    return !!this.db.prepare(
+      `SELECT 1 FROM queue_transitions WHERE transition_id > ? AND actor_session IN (${slots}) AND state <> 'pending' LIMIT 1`,
+    ).get(mark, ...addresses);
+  }
+
   list(opts: QueueListOptions & { compact: true }): CompactQueueItem[];
   list(opts?: QueueListOptions & { compact?: false }): QueueItem[];
   list(opts?: QueueListOptions): Array<QueueItem | CompactQueueItem>;
@@ -4943,10 +5334,18 @@ export class QueueRepository {
       params.push(opts.targetRepo);
     }
     pushFollowThroughFilters(opts, conditions, params);
+    // T-009903: with a state filter whose states are all open, or all closed, the active-first key is the same for every
+    // row; left in, it keeps SQLite from reading the rows newest first by an index and sorts them all (~85 000 for
+    // "done", ~200 ms) to return the first LIMIT. A filter of closed states only also gets its redundant term, which lets
+    // SQLite read them newest first by the closed-rows index (idx_queue_items_closed_created)
+    const filterStates = opts?.state ? (Array.isArray(opts.state) ? opts.state : [opts.state]) : undefined;
+    const allClosed = !!filterStates && filterStates.length > 0 && filterStates.every((s) => !OPEN_LISTING_STATES.has(s));
+    const allOpen = !!filterStates && filterStates.length > 0 && filterStates.every((s) => OPEN_LISTING_STATES.has(s));
+    if (allClosed) conditions.push(CLOSED_STATE_PREDICATE);
 
     const where = conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "";
     const columns = opts?.compact ? this.compactColumns() : "*";
-    const useActiveFirst = !!(opts?.rig || opts?.asSession || opts?.activeOnly);
+    const useActiveFirst = !!(opts?.rig || opts?.asSession || opts?.activeOnly) && !allOpen && !allClosed;
     const newest = opts?.sortByUpdated ? "ts_updated DESC" : "ts_created DESC";
     const orderBy = useActiveFirst
       ? `CASE WHEN state IN ('pending', 'in-progress', 'blocked') THEN 0 ELSE 1 END, ${newest}`
@@ -5668,11 +6067,9 @@ export class QueueRepository {
   /** The delivery receipt notes of these qitems, newest first, by qitem. */
   private receiptNotesFor(qitemIds: string[]): Map<string, string[]> {
     this.receiptNotesStatement ??= this.db.prepare(
+      // T-009903: the predicate is the partial index's (idx_queue_transitions_receipt_notes), so only receipts are read
       `SELECT qitem_id, transition_note FROM queue_transitions
-        WHERE qitem_id IN (SELECT value FROM json_each(?)) AND (transition_note LIKE 'slack-owner-notification-posted %'
-                             OR transition_note LIKE 'relay-owner-notification-accepted %'
-                             OR transition_note LIKE 'slack-owner-notification-transport-failed %'
-                             OR transition_note LIKE 'relay-owner-notification-transport-failed %')
+        WHERE qitem_id IN (SELECT value FROM json_each(?)) AND ${RECEIPT_NOTE_PREDICATE}
         ORDER BY transition_id DESC`,
     );
     const notes = new Map<string, string[]>();
@@ -5792,28 +6189,82 @@ export class QueueRepository {
   /**
    * Pod-fallback: redirect qitem to a fallback destination (e.g., when a seat
    * is unreachable). Emits qitem.fallback_routed; preserves chain_of_record.
+   *
+   * `expectState` and `expectDestination` make the move conditional: they are checked against the row read inside
+   * the transaction that moves it, so a caller acting on an earlier read (a claim or another reroute may have come
+   * since) is refused rather than moving a row it no longer means. `wake` stages a durable wake for the new
+   * destination in the same transaction, as a handoff stages one for its successor. It is refused for a row that
+   * is not pending: delivery drops a wake whose row is not pending (currentWakeIntent), so it would never arrive.
    */
-  routeToFallback(qitemId: string, fallbackDestination: string, reason: string): QueueItem {
-    const qitem = this.getById(qitemId);
-    if (!qitem) {
-      throw new QueueRepositoryError("qitem_not_found", `qitem ${qitemId} not found`);
+  routeToFallback(
+    qitemId: string,
+    fallbackDestination: string,
+    reason: string,
+    opts: { expectState?: string; expectDestination?: string; wake?: boolean } = {},
+  ): QueueItem {
+    if (opts.expectState !== undefined && !isQueueState(opts.expectState)) {
+      throw new QueueRepositoryError("invalid_state", `expectState=${opts.expectState} not valid; valid: ${QUEUE_STATES.join(", ")}`);
     }
-    const ts = new Date().toISOString();
-    const originalDestination = qitem.destinationSession;
-    const newChain = JSON.stringify([...(qitem.chainOfRecord ?? []), `fallback-from:${originalDestination}`]);
+    if (opts.wake && !this.outbox) {
+      throw new QueueRepositoryError(
+        "wake_intent_store_unavailable",
+        "a fallback with a wake requires an attached wake-intent store to make its wake durable — none attached",
+      );
+    }
+    const routed = this.db.transaction(() => this.routeInTransaction(qitemId, fallbackDestination, reason, opts))();
+    this.eventBus.notifySubscribers(routed.event);
+    if (routed.wakeId) this.deliverWakeIntentAfterCommit(routed.wakeId);
+    return this.getByIdOrThrow(qitemId);
+  }
 
-    // The field held only a fallback line before a close could store an outcome. The line this method last
-    // wrote is replaced, as it always was; anything else in the field is an outcome (possibly after an
-    // earlier fallback line) and stays, with the new line after it. "The line it last wrote" comes from the
-    // row's own transitions, so no marker is stored in the text. When the row has closed since, the field may
-    // end with an outcome that reads like that line, so then only a field that is exactly the line (an
-    // appended outcome would make it longer) is replaced; with no such reroute transition the field is left whole.
-    const fallbackLine = `fallback: ${reason}`;
-    const start = qitem.resolution ? this.fallbackLineStart(qitemId, qitem.resolution) : null;
-    const kept = qitem.resolution && start !== null ? qitem.resolution.slice(0, Math.max(0, start - 1)) : qitem.resolution;
-    const nextResolution = kept ? `${kept}\n${fallbackLine}` : fallbackLine;
+  /** routeToFallback's move, inside the caller's transaction: the event to notify and the wake to deliver after the
+   *  commit, and the reroute's transition. */
+  private routeInTransaction(
+    qitemId: string,
+    fallbackDestination: string,
+    reason: string,
+    opts: { expectState?: string; expectDestination?: string; wake?: boolean },
+  ): { event: PersistedEvent; wakeId: string | null; transitionId: number } {
+      const ts = new Date().toISOString();
+      let wakeId: string | null = null;
+      const qitem = this.getById(qitemId);
+      if (!qitem) {
+        throw new QueueRepositoryError("qitem_not_found", `qitem ${qitemId} not found`);
+      }
+      if (opts.expectState !== undefined && qitem.state !== opts.expectState) {
+        throw new QueueRepositoryError(
+          "fallback_state_mismatch",
+          `qitem ${qitemId} is ${qitem.state}, not ${opts.expectState}; it was not rerouted`,
+          { state: qitem.state, destinationSession: qitem.destinationSession },
+        );
+      }
+      if (opts.expectDestination !== undefined && !this.resolveSessionAddresses(opts.expectDestination).includes(qitem.destinationSession)) {
+        throw new QueueRepositoryError(
+          "fallback_destination_mismatch",
+          `qitem ${qitemId} is addressed to ${qitem.destinationSession}, not ${opts.expectDestination}; it was not rerouted`,
+          { state: qitem.state, destinationSession: qitem.destinationSession },
+        );
+      }
+      if (opts.wake && qitem.state !== "pending") {
+        throw new QueueRepositoryError(
+          "wake_not_admitted",
+          `qitem ${qitemId} is ${qitem.state}; a fallback wakes its new destination only for a pending row (omit the wake, or unclaim the row first)`,
+        );
+      }
+      const originalDestination = qitem.destinationSession;
+      const newChain = JSON.stringify([...(qitem.chainOfRecord ?? []), `fallback-from:${originalDestination}`]);
 
-    const txn = this.db.transaction(() => {
+      // The field held only a fallback line before a close could store an outcome. The line this method last
+      // wrote is replaced, as it always was; anything else in the field is an outcome (possibly after an
+      // earlier fallback line) and stays, with the new line after it. "The line it last wrote" comes from the
+      // row's own transitions, so no marker is stored in the text. When the row has closed since, the field may
+      // end with an outcome that reads like that line, so then only a field that is exactly the line (an
+      // appended outcome would make it longer) is replaced; with no such reroute transition the field is left whole.
+      const fallbackLine = `fallback: ${reason}`;
+      const start = qitem.resolution ? this.fallbackLineStart(qitemId, qitem.resolution) : null;
+      const kept = qitem.resolution && start !== null ? qitem.resolution.slice(0, Math.max(0, start - 1)) : qitem.resolution;
+      const nextResolution = kept ? `${kept}\n${fallbackLine}` : fallbackLine;
+
       this.db
         .prepare(
           `UPDATE queue_items
@@ -5831,7 +6282,7 @@ export class QueueRepository {
       const armedJob = armed?.kind === "timer" ? (this.watchdogJobsRepo ?? new WatchdogJobsRepository(this.db)).getById(armed.ref) : null;
       if (!armedJob || !isQueueWait(armedJob.specYaml)) this.retireParkGeneratedTimer(qitemId, "park_rerouted");
 
-      this.transitionLog.append({
+      const transition = this.transitionLog.append({
         qitemId,
         state: qitem.state,
         actorSession: FALLBACK_ACTOR,
@@ -5839,18 +6290,128 @@ export class QueueRepository {
         closureTarget: qitem.state === "in-progress" ? this.retainedClaimBlocker(qitemId) : undefined,
       });
 
-      return this.eventBus.persistWithinTransaction({
+      // The row keeps its id, so the wake is keyed on this reroute's transition rather than on the row: the wake its
+      // create staged for the old destination stays where it is and is superseded at delivery, since the row is no
+      // longer that seat's. OpenRig moved the row, so the wake comes from OpenRig. As with a handoff's wake, a full
+      // held-message quota at the new destination records the wake as not retained and the reroute stands.
+      if (opts.wake) {
+        const outboxId = `${WAKE_INTENT_PREFIX}fallback-${transition.transitionId}`;
+        try {
+          this.db.transaction(() => this.recordWakeIntent({
+            outboxId,
+            auditPointer: qitemId,
+            qitemId,
+            fromSession: OPENRIG_SENDER,
+            toSession: fallbackDestination,
+            identityProvenance: null,
+            bareBody: renderQueueHandoffNudge(qitemId, qitem.summary),
+            tags: [WAKE_TRIGGER_OPENRIG_TAG],
+          }))();
+          wakeId = outboxId;
+        } catch (err) {
+          if ((err as { code?: string }).code !== "retained_quota_full") throw err;
+          this.recordNudgeAttempt(qitemId, `${WAKE_NOT_RETAINED}${(err as Error).message}`);
+        }
+      }
+
+      const event = this.eventBus.persistWithinTransaction({
         type: "qitem.fallback_routed",
         qitemId,
         originalDestination,
         rerouteDestination: fallbackDestination,
         reason,
       });
-    });
+      return { event, wakeId, transitionId: transition.transitionId };
+  }
 
-    const persistedEvent = txn();
-    this.eventBus.notifySubscribers(persistedEvent);
-    return this.getByIdOrThrow(qitemId);
+  /**
+   * Moves a parked (blocked) row whose owner is going away (a seat pool reaps or drains the seat) to
+   * `fallbackDestination`, keeping what wakes it, in one transaction:
+   * - `queue-wait`: its repeating wait resolves its owner at each delivery; it moves as it is.
+   * - `rearmed`: its `--wake-after` timer aimed at the old owner; the move ends that timer, so a new one with the same
+   *   interval and message is armed for the new owner, and the row stays blocked on the same gate (a live row too).
+   * - `blocker`: it waits on a live row, with no timer of its own; that row wakes whoever holds it when it ends, so it
+   *   moves as it is.
+   * - `person`: it waits on a person, whose answer resumes it; it moves as it is.
+   * - `unparked`: nothing would wake it (a gate that isn't a live row, with no timer of its own, or a watchdog attached
+   *   for the old owner): it goes back to pending with a note naming the blocker it had, and the move wakes the new
+   *   owner.
+   * Refused, as routeToFallback refuses, when the row is no longer blocked or no longer addressed to `expectDestination`.
+   */
+  rerouteParked(
+    qitemId: string,
+    fallbackDestination: string,
+    reason: string,
+    opts: { expectDestination?: string } = {},
+  ): { item: QueueItem; park: "blocker" | "person" | "queue-wait" | "rearmed" | "unparked" } {
+    const jobs = this.watchdogJobsRepo ?? new WatchdogJobsRepository(this.db);
+    const routed = this.db.transaction(() => {
+      const qitem = this.getById(qitemId);
+      if (!qitem) throw new QueueRepositoryError("qitem_not_found", `qitem ${qitemId} not found`);
+      if (qitem.state !== "blocked") {
+        throw new QueueRepositoryError("fallback_state_mismatch", `qitem ${qitemId} is ${qitem.state}, not blocked; it was not rerouted`,
+          { state: qitem.state, destinationSession: qitem.destinationSession });
+      }
+      const blocker = qitem.blockedOn ?? null;
+      const blockerRow = blocker ? this.getById(blocker) : null;
+      // What wakes the row NOW (T-007715, F1 of the lenses on the redesign): its current park's timer. A past park's
+      // timer, still alive because another row was attached to it, is not this row's: rearming it would give a gated
+      // row a new reminder, and moving it as a wait would leave it with nothing once that job ends.
+      const armed = this.wakeRepo.getCurrentParkStatus(qitemId);
+      const armedJob = armed?.kind === "timer" && armed.live ? jobs.getById(armed.ref) : null;
+      const ownTimer = armedJob?.state === "active" && this.wakeRepo.findLiveQitemsByAttachedWatchdog(armedJob.jobId).length === 0
+        ? armedJob : null;
+      // A row parked with both a blocker and a timer (`--on <row> --wake-after <d>`) keeps both: the timer is rearmed.
+      const park = ownTimer && isQueueWait(ownTimer.specYaml) ? "queue-wait" as const
+        : ownTimer?.policy === "periodic-reminder" ? "rearmed" as const
+        : blockerRow && isBlockerLive(blockerRow.state) ? "blocker" as const
+        : blocker && this.isPersonAddress(blocker) ? "person" as const
+        : "unparked" as const;
+      const move = { expectDestination: opts.expectDestination };
+      if (park !== "unparked" && park !== "rearmed") {
+        return { park, ...this.routeInTransaction(qitemId, fallbackDestination, reason, { ...move, expectState: "blocked" }) };
+      }
+      if (park === "rearmed") {
+        let message = defaultParkWakeMessage(qitemId);
+        try {
+          const spec = parseYaml(ownTimer!.specYaml) as { message?: unknown; context?: { message?: unknown } } | null;
+          const written = spec?.message ?? spec?.context?.message;
+          if (typeof written === "string" && written.trim()) message = written;
+        } catch { /* the default message */ }
+        const interval = ownTimer!.intervalSeconds;
+        const result = this.routeInTransaction(qitemId, fallbackDestination, reason, { ...move, expectState: "blocked" });
+        const job = jobs.register({
+          policy: "periodic-reminder",
+          specYaml: ["policy: periodic-reminder", "target:", `  session: ${JSON.stringify(fallbackDestination)}`, `message: ${JSON.stringify(message)}`, ""].join("\n"),
+          targetSession: fallbackDestination,
+          intervalSeconds: interval,
+          registeredBySession: FALLBACK_ACTOR,
+        });
+        jobs.recordEvaluation(job.jobId, job.registeredAt, false);
+        this.wakeRepo.record({ transitionId: result.transitionId, qitemId, phase: "armed", kind: "timer", ref: job.jobId, deliveryStatus: null });
+        return { park, ...result };
+      }
+      if (opts.expectDestination !== undefined && !this.resolveSessionAddresses(opts.expectDestination).includes(qitem.destinationSession)) {
+        throw new QueueRepositoryError("fallback_destination_mismatch",
+          `qitem ${qitemId} is addressed to ${qitem.destinationSession}, not ${opts.expectDestination}; it was not rerouted`,
+          { state: qitem.state, destinationSession: qitem.destinationSession });
+      }
+      if (!this.outbox) {
+        throw new QueueRepositoryError("wake_intent_store_unavailable",
+          "unparking a row for its new owner requires an attached wake-intent store to make its wake durable — none attached");
+      }
+      this.db.prepare("UPDATE queue_items SET state = 'pending', blocked_on = NULL, ts_updated = ? WHERE qitem_id = ?")
+        .run(new Date().toISOString(), qitemId);
+      this.transitionLog.append({
+        qitemId, state: "pending", actorSession: FALLBACK_ACTOR,
+        transitionNote: `unparked for ${fallbackDestination} (${reason}): its owner ${qitem.destinationSession} is gone and nothing would wake it; it was blocked on ${blocker ?? "nothing"}`,
+      });
+      this.retireParkGeneratedTimer(qitemId, "park_ended:owner-gone");
+      return { park, ...this.routeInTransaction(qitemId, fallbackDestination, reason, { ...move, expectState: "pending", wake: true }) };
+    })();
+    this.eventBus.notifySubscribers(routed.event);
+    if (routed.wakeId) this.deliverWakeIntentAfterCommit(routed.wakeId);
+    return { item: this.getByIdOrThrow(qitemId), park: routed.park };
   }
 
   private getByIdOrThrow(qitemId: string): QueueItem {
@@ -6015,7 +6576,14 @@ export class QueueRepository {
       if (!activities.has(session)) activities.set(session, this.ownerActivity(session));
       return activities.get(session) ?? null;
     };
-    return { meaningful: lastMeaningfulTransitionMany(this.db, ids), statements: new WaitingStatements(this.db), activity };
+    // Each destination's escalation owner once per listing (T-009903): ~5 topology reads a row, the same for every row
+    // to that destination; ~60 ms of a listing of the ~320 blocked rows
+    const owners = new Map<string, string | null>();
+    const escalationOwner = (destination: string): string | null => {
+      if (!owners.has(destination)) owners.set(destination, escalationOwnerOf(this.db, destination, (target) => this.acceptsDestination(target)));
+      return owners.get(destination) ?? null;
+    };
+    return { meaningful: lastMeaningfulTransitionMany(this.db, ids), statements: new WaitingStatements(this.db), activity, escalationOwner };
   }
 
   /** listed: the row's owner notifications and ledger, when a listing read them for all its rows. */

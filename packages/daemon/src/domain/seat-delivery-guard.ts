@@ -53,7 +53,7 @@ export const TYPING_GUARD_MODES = ["off", "draft-aware", "hold"] as const;
 export type TypingGuardMode = (typeof TYPING_GUARD_MODES)[number];
 /** The middle interruption levels, and a terminal member's default. `off` is always interrupt and `hold` is full quiet;
  *  these sit between, deciding by the input's source and urgency. */
-export const INTERRUPTION_LEVELS = ["openrig-urgent", "urgent-only", "sends-only"] as const;
+export const INTERRUPTION_LEVELS = ["openrig-urgent", "urgent-only", "sends-only", "queue-only"] as const;
 export type InterruptionLevel = (typeof INTERRUPTION_LEVELS)[number];
 export interface TypingGuardSettings { mode: TypingGuardMode; level?: InterruptionLevel }
 export interface TypingGuardConfig extends TypingGuardSettings { revision: string }
@@ -80,6 +80,9 @@ export interface AdmissionInput { source: "openrig" | "agent"; urgent: boolean; 
 
 /** Whether a level lets this input type. Every other input at the seat is held, never refused or lost. */
 export function levelAdmits(level: InterruptionLevel, input: AdmissionInput): boolean {
+  // queue-only: OpenRig's own notices never type, urgent ones included (no hidden urgent bypass); they are held or
+  // reach the seat as queue rows. Deliberate sends type, draft-aware.
+  if (level === "queue-only") return input.source === "agent";
   if (input.urgent) return true;
   if (level === "openrig-urgent") return input.source === "openrig";
   if (level === "sends-only") return input.source === "agent";
@@ -91,13 +94,14 @@ export function parseTypingGuardSettings(value: unknown): TypingGuardSettings {
   if (!input || typeof input !== "object" || Array.isArray(input)) throw new DeliveryGuardError("invalid_typing_guard", "Supply an enabled boolean or a typing-guard mode.");
   const config = input as Record<string, unknown>;
   // A level is set as a mode name and stored with the coarse mode older daemons understand: `hold` for the middle
-  // levels (an older daemon holds everything there, never typing what the level would hold), `off` for sends-only.
+  // levels (an older daemon holds everything there, never typing what the level would hold), `off` for sends-only,
+  // `draft-aware` for queue-only (the sends it admits never type over a person's draft).
   if ((INTERRUPTION_LEVELS as readonly unknown[]).includes(config.mode)) {
     const level = config.mode as InterruptionLevel;
-    return { mode: level === "sends-only" ? "off" : "hold", level };
+    return { mode: level === "sends-only" ? "off" : level === "queue-only" ? "draft-aware" : "hold", level };
   }
   if (!(TYPING_GUARD_MODES as readonly unknown[]).includes(config.mode)) {
-    throw new DeliveryGuardError("invalid_typing_guard", "mode must be off, draft-aware, openrig-urgent, urgent-only, sends-only or hold.");
+    throw new DeliveryGuardError("invalid_typing_guard", "mode must be off, draft-aware, openrig-urgent, urgent-only, sends-only, queue-only or hold.");
   }
   if (config.holdSeconds !== undefined || config.maxAttempts !== undefined) throw new DeliveryGuardError("invalid_typing_guard", "Draft-aware sends return their result immediately; retry settings are not supported.");
   return { mode: config.mode as TypingGuardMode };
@@ -180,6 +184,12 @@ export class SeatDeliveryGuard {
     return { nodeId, desired: desired.mode === "hold", effective: effective.mode === "hold", pending: desired.revision !== effective.revision,
       desiredMode: desired.mode, effectiveMode: effective.mode,
       ...(desired.level ? { desiredLevel: desired.level } : {}), ...(effective.level ? { effectiveLevel: effective.level } : {}) };
+  }
+
+  /** Whether the seat takes OpenRig's own notices only as queue rows (the queue-only level, desired or effective). */
+  queueOnly(nodeId: string): boolean {
+    const { desired, effective } = this.configuration(nodeId);
+    return desired.level === "queue-only" || effective.level === "queue-only";
   }
 
   /** Whether the seat's configuration would hold this input now (desired or effective, as the operation decides). */
@@ -549,7 +559,9 @@ export class SeatDeliveryGuard {
     const quiet = async () => {
       if (!this.inputActivity) return;
       const last = await this.inputActivity(target).then(at => ({ at }), () => null);
-      if (!last) throw new DeliveryGuardError("draft_input_unknown", "OpenRig couldn't read the recent activity of the seat's terminal clients. Automatic delivery is held; nothing was pasted.");
+      // Its own diagnostic (T-008302): a caller keeps the last one it was given, which would otherwise be an older refusal's.
+      if (!last) throw new DeliveryGuardError("draft_input_unknown", "OpenRig couldn't read the recent activity of the seat's terminal clients. Automatic delivery is held; nothing was pasted.",
+        inputReadDiagnostic("draft-aware", null, "client_activity_unavailable"));
       // tmux reports whole seconds: activity at N.999 s reads as N, so the quiet window counts from the end of that second.
       if (last.at !== null && Date.now() - (last.at + CLIENT_ACTIVITY_PRECISION_MS) < INPUT_QUIET_MS) {
         throw new DeliveryGuardError("draft_input_busy", "A writable client of this seat had recent activity. Automatic delivery is held; nothing was pasted.");

@@ -239,6 +239,10 @@ export interface QueueTransitionInput {
   identityPrincipal?: string | null;
   ownerNotificationKind?: string | null;
   ownerNotificationLevel?: OwnerNotificationLevel | null;
+  /** T-012748: the gate the row is blocked on, recorded only on a `blocked` transition and only where the column exists
+   *  (migration 174). Absent on a `blocked` transition, the row's current `queue_items.blocked_on` is recorded: every
+   *  writer appends after its queue_items update, so that is the gate this transition leaves the row on. */
+  blockedOn?: string | null;
 }
 
 export type RecentQueueTransitionTargetKind = "qitem" | "slice" | "mission";
@@ -375,6 +379,8 @@ export class QueueTransitionLog {
   private readonly hasIdentityProvenanceColumn: boolean;
   private readonly hasOwnerNotificationColumns: boolean;
   private readonly hasIdentityPrincipalColumn: boolean;
+  /** T-012748: migration 174's gate column; a schema without it records the transition as before. */
+  private readonly hasBlockedOnColumn: boolean;
   private readonly historySource: string;
   /** The history tables this schema has: the live table, and the archive where it exists. */
   private readonly historyTables: string[];
@@ -389,6 +395,7 @@ export class QueueTransitionLog {
     );
     this.hasOwnerNotificationColumns = columns.has("owner_notification_kind") && columns.has("owner_notification_level");
     this.hasIdentityPrincipalColumn = columns.has("identity_principal");
+    this.hasBlockedOnColumn = columns.has("blocked_on");
     // One explicit projection for all history readers, including old nullable schemas.
     // SELECT * cannot union the archive's extra archived_at column with the live table.
     const fields = ["transition_id", "qitem_id", "ts", "state", "transition_note", "actor_session",
@@ -434,6 +441,13 @@ export class QueueTransitionLog {
     if (this.hasOwnerNotificationColumns) {
       columns.push("owner_notification_kind", "owner_notification_level");
       values.push(input.ownerNotificationKind ?? null, input.ownerNotificationLevel ?? null);
+    }
+    if (this.hasBlockedOnColumn && input.state === "blocked") {
+      const gate = input.blockedOn !== undefined
+        ? input.blockedOn
+        : (this.db.prepare("SELECT blocked_on FROM queue_items WHERE qitem_id = ?").get(input.qitemId) as { blocked_on: string | null } | undefined)?.blocked_on ?? null;
+      columns.push("blocked_on");
+      values.push(gate);
     }
     const result = this.db
       .prepare(`INSERT INTO queue_transitions (${columns.join(", ")}) VALUES (${columns.map(() => "?").join(", ")})`)

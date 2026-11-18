@@ -9,11 +9,13 @@ import { quietHoldCustody } from "./quiet-hold-custody.js";
 import { latestHookMovedOn, latestHookPermissionPending, latestHookWaitsOnPerson } from "./agent-activity-store.js";
 import type { AgentActivity } from "./types.js";
 import type { OperatorDeliveryEngine } from "./gateway/operator-delivery-engine.js";
-import { openPromptRefusals, CLOSE_PREFIX, PARKED_OWNER_POLICY_NAME, REFUSED_PREFIX } from "./policies/parked-owner-consumer.js";
+import { openPromptRefusals, CLOSE_PREFIX, PARKED_OWNER_POLICY_NAME, QUEUE_ONLY_SKIP_RESULT_PREFIX } from "./policies/parked-owner-consumer.js";
 import { findQueueRecovery, recoveryTag } from "./queue-recovery.js";
 import { lastMeaningfulTransition, type WaitingView } from "./queue-waiting.js";
 import { readWakeOutcome } from "./connection-contract.js";
 import { runSyncSite } from "./sync-site-wrap.js";
+import { readOffLoop } from "./read-off-loop.js";
+import { PROMPT_REFUSAL_NOTE_PREDICATE } from "../db/migrations/171_queue_transitions_prompt_refusal_index.js";
 // S01 (OPR.0.5.5.1) — WAKE OR ESCALATE ON BATONS. A handoff whose wake fails must never
 // silently park: today one failed nudge is recorded and nothing follows (the measured
 // dominant 0.5.3 failure class — a perfect surviving packet, a recipient never woken).
@@ -388,6 +390,10 @@ function classifyWakeResult(lastNudgeResult: string | null): WakeMode | null {
   // A claimed row's unconfirmed result is presented as `claimed` (presentedNudgeResult): the claim is pickup, which
   // outranks any wake outcome.
   if (lastNudgeResult === "claimed") return null;
+  // A queue-only seat's wake stays in its queue by the seat's own level (T-006631): nothing was typed and nothing is
+  // owed; the row waits there for the seat to read. It never enters the ladder, as before 0.7.13 read an unrecognised
+  // result as unknown (#3011).
+  if (lastNudgeResult?.startsWith(QUEUE_ONLY_SKIP_RESULT_PREFIX)) return null;
   const outcome = readWakeOutcome(lastNudgeResult);
   if (!outcome) return null;
   switch (outcome.fact) {
@@ -584,13 +590,17 @@ function deliveryHeld(repo: QueueRepository, row: QueueItem): boolean {
 function appendMarker(repo: QueueRepository, row: QueueItem, note: string, admittedOutcome = false): void {
   // A new drain defers admission, not the durable outcome of an attempt already admitted.
   if (!admittedOutcome && deliveryHeld(repo, row)) return;
+  // N4 of the delta review of 7590bf00e: a marker repeats the row's state as it is NOW, not as read before an await
+  // (a wake attempt). A stale 'in-progress' on a row parked meanwhile would read as an exit from 'blocked' and end
+  // the current park's wake (current-park-arm.ts).
+  const state = repo.getById(row.qitemId)?.state ?? row.state;
   repo.transitionLog.append({
     qitemId: row.qitemId,
-    state: row.state,
+    state,
     actorSession: LADDER_ACTOR,
     transitionNote: note,
     // A scheduler receipt does not clear the claim's original gate. State writes do.
-    closureTarget: row.state === "in-progress" ? repo.retainedClaimBlocker(row.qitemId) : undefined,
+    closureTarget: state === "in-progress" ? repo.retainedClaimBlocker(row.qitemId) : undefined,
   });
 }
 
@@ -1105,11 +1115,13 @@ const PROMPT_ALERT_ROWS = `(tags LIKE '%"${PROMPT_ALERT_TAG}"%' OR tags LIKE '%\
  * (the state index) and then each candidate's own transitions (the qitem index), not by matching the note across the
  * whole transition log, which only grows. Ordered by each row's first refusal: the order the whole-log read returned
  * under its observed plan (it had no ORDER BY), now explicit. A recovered id is cut after the 13-byte ASCII prefix as
- * bytes, because text substr stops at a NUL, which a caller-supplied id can hold; the join then compares it exactly. */
+ * bytes, because text substr stops at a NUL, which a caller-supplied id can hold; the join then compares it exactly.
+ * T-010230: the refusal term is the 171 index's own predicate, so each row's first refusal is read from that partial
+ * index (refusal notes only), never from the note text of all its transitions. */
 export const PROMPT_REFUSAL_CANDIDATES_SQL = `WITH scored AS MATERIALIZED (
     SELECT q.qitem_id, q.destination_session,
       (SELECT min(t.transition_id) FROM queue_transitions t
-        WHERE t.qitem_id = q.qitem_id AND t.transition_note LIKE @refused) AS first_refusal
+        WHERE t.qitem_id = q.qitem_id AND t.${PROMPT_REFUSAL_NOTE_PREDICATE}) AS first_refusal
     FROM (
       SELECT qitem_id FROM queue_items WHERE state IN ('pending','in-progress','blocked')
       UNION
@@ -1124,7 +1136,7 @@ export const PROMPT_REFUSAL_CANDIDATES_SQL = `WITH scored AS MATERIALIZED (
 /** Named in the slow-operation log, so a stall during it is attributed to this read: one begin and one end record per tick. */
 export function readPromptRefusalCandidates(db: Database.Database): Array<{ qitem_id: string; destination_session: string }> {
   return runSyncSite("queue.wake_ladder.prompt_candidates", () => db.prepare(PROMPT_REFUSAL_CANDIDATES_SQL)
-    .all({ refused: `${REFUSED_PREFIX}%`, alertTag: PROMPT_ALERT_TAG }) as Array<{ qitem_id: string; destination_session: string }>);
+    .all({ alertTag: PROMPT_ALERT_TAG }) as Array<{ qitem_id: string; destination_session: string }>);
 }
 
 /** Active watchdog jobs whose latest attempt was refused at a target's prompt. A run of refusals starts
@@ -1229,6 +1241,13 @@ function recoversEscalationNotice(deps: WakeLadderDeps, row: QueueItem): boolean
     && deps.queueRepo.getById(tag.slice(prefix.length))?.tags?.includes(WAKE_ESCALATION_TAG)) ?? false;
 }
 
+/** readPromptRefusalCandidates on the read worker's connection, off the event loop (T-010231), under the same site
+ *  name; on the main handle where the worker cannot serve the read (a memory database, an open transaction). */
+export function readPromptRefusalCandidatesOffLoop(db: Database.Database): Promise<Array<{ qitem_id: string; destination_session: string }>> {
+  return readOffLoop(db, "promptRefusalCandidates", {}, () => readPromptRefusalCandidates(db),
+    { site: "queue.wake_ladder.prompt_candidates", record: "always" });
+}
+
 /** Positive refusals enter the existing rungs without ever retrying the blocked
  * seat. One aggregate carries the episode's obligations and notification key;
  * original work remains owned by its current recipient. */
@@ -1257,7 +1276,7 @@ async function advancePromptRefusals(
       return null;
     }
   };
-  const candidates = readPromptRefusalCandidates(deps.db);
+  const candidates = await readPromptRefusalCandidatesOffLoop(deps.db);
   // Every tag value of every final prompt disposition, read once per tick when the first episode needs it,
   // rather than one scan of all terminal rows per open episode. The row predicates are the per-episode lookup's;
   // membership is the same exact json_each value equality; and nothing below writes before the last episode is

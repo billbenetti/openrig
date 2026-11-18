@@ -19,11 +19,15 @@ import { SessionRegistry } from "../src/domain/session-registry.js";
 import { SessionTransport } from "../src/domain/session-transport.js";
 import { makeWatchdogDeliver } from "../src/domain/watchdog-delivery.js";
 import { EventBus } from "../src/domain/event-bus.js";
-import { QueueRepository } from "../src/domain/queue-repository.js";
+import { QueueRepository, defaultParkWakeMessage, isDefaultParkWakeMessage } from "../src/domain/queue-repository.js";
+import { withContinuationPreview } from "../src/domain/park-wake-text.js";
+import { refreshQueueWaits } from "../src/domain/queue-wait-backoff.js";
+import { NO_TIMED_BACKSTOP, readWaitingView } from "../src/domain/queue-waiting.js";
 import { WatchdogJobsRepository } from "../src/domain/watchdog-jobs-repository.js";
 import { WatchdogHistoryLog } from "../src/domain/watchdog-history-log.js";
 import { WatchdogPolicyEngine } from "../src/domain/watchdog-policy-engine.js";
 import { WatchdogScheduler } from "../src/domain/watchdog-scheduler.js";
+import { updateWatchdogJob } from "../src/domain/watchdog-job-update.js";
 import { WorkflowInstanceStore } from "../src/domain/workflow-instance-store.js";
 import { makeWorkflowKeepalivePolicy } from "../src/domain/policies/workflow-keepalive.js";
 import { makeIdleGateQitemPolicy } from "../src/domain/policies/idle-gate-qitem.js";
@@ -90,7 +94,7 @@ const seat = "worker@test";
 
 /** The queue, watchdog engine and scheduler on a fixture's store, wired as the daemon wires them. `withoutPreview`
  *  leaves out the park-entry lookup, so wakes go with their stored message, as a daemon before the preview sent them. */
-function scheduled(f: ReturnType<typeof fixture>, { withoutPreview = false } = {}) {
+function scheduled(f: ReturnType<typeof fixture>, { withoutPreview = false, parkedRows = false, queueWait = false } = {}) {
   const bus = new EventBus(f.db);
   const repo = new QueueRepository(f.db, bus, { transport: f.transport as never, loadHumanRegistry: () => ({ ok: true, entities: [], warnings: [] }) });
   repo.attachOutbox(f.outbox);
@@ -99,9 +103,15 @@ function scheduled(f: ReturnType<typeof fixture>, { withoutPreview = false } = {
   const history = new WatchdogHistoryLog(f.db);
   const engine = new WatchdogPolicyEngine({ jobsRepo: jobs, historyLog: history, eventBus: bus, deliver: f.deliver,
     resolvePreDeliveryTerminalReason: ({ jobId }) => repo.resolveWatchdogPreDeliveryTerminalReason(jobId),
-    onWakeAttempt: ({ jobId, deliveryStatus }) => repo.recordWatchdogWakeAttempt(jobId, deliveryStatus),
+    onWakeAttempt: ({ jobId, deliveryStatus, retryAt, queuedQitemId, message }: { jobId: string; deliveryStatus: string; retryAt?: string; queuedQitemId?: string; message?: string }) =>
+      (repo.recordWatchdogWakeAttempt as (...a: unknown[]) => void)(jobId, deliveryStatus, retryAt, queuedQitemId, message),
     ...(withoutPreview ? {} : { resolveDigestEntry: ({ jobId, message }: { jobId: string; message: string }) => repo.parkReminderDigestEntry(jobId, message) }),
-  });
+    // As startup wires them (T-007715). Optional chaining keeps the fixture loadable on a base without the method, so
+    // the tests that need it fail there by behaviour (a wd- row), not by a missing function.
+    ...(queueWait ? { resolveQueueWait: (input: { jobId: string }) => repo.evaluateWaitReminder(input) } : {}),
+    ...(parkedRows ? { resolveParkedRows: ({ jobId, targetSession }: { jobId: string; targetSession: string }) =>
+      (repo as unknown as { parkedRowsOwnedBy?: (j: string, o: string) => string[] }).parkedRowsOwnedBy?.(jobId, targetSession) ?? [] } : {}),
+  } as never);
   const scheduler = new WatchdogScheduler({ jobsRepo: jobs, policyEngine: engine });
   const park = async (summary: string, transitionNote = "parked") => {
     const row = await repo.create({ sourceSession: "orch@test", destinationSession: seat, body: summary, summary, nudge: false } as never) as unknown as { qitemId: string };
@@ -413,8 +423,505 @@ describe("watchdog positive no-input outcomes", () => {
     expect(deliberate.status).toBe("ok");
     expect(sends).toHaveBeenCalledTimes(1);
   });
+
+  it("T-006631: at a queue-only seat, a reminder with no parked row of origin is one cold queue row, never typed", async () => {
+    const sends = vi.fn().mockResolvedValue({ ok: true });
+    const rows: Array<{ qitemId: string; destinationSession: string; body: string; summary: string; tags: string[] }> = [];
+    const deliver = makeWatchdogDeliver({ sessionTransport: { send: sends }, isQueueOnlySeat: s => s === seat,
+      createQueueRow: async row => { if (!rows.some(r => r.qitemId === row.qitemId)) rows.push(row); } });
+    const wake = { jobId: "wake-1", policy: "periodic-reminder", occurrenceId: "occ-1" };
+    expect(await deliver({ targetSession: seat, message: "Check the deploy." }, wake)).toMatchObject({ status: "ok", code: "queued_as_row" });
+    expect(await deliver({ targetSession: seat, message: "Check the deploy." }, wake)).toMatchObject({ status: "ok", code: "queued_as_row" });
+    const digest = { jobId: "digest", policy: "periodic-reminder", members: [{ jobId: "a", occurrenceId: "o-a" }, { jobId: "b", occurrenceId: "o-b" }] };
+    expect(await deliver({ targetSession: seat, message: "Two reminders" }, digest)).toMatchObject({ status: "ok" });
+    expect(sends).not.toHaveBeenCalled();
+    expect(rows).toHaveLength(2);
+    expect(rows[0]).toMatchObject({ destinationSession: seat, tags: ["watchdog", "queue-only", "policy:periodic-reminder"] });
+    expect(rows[0]!.body).toContain("[OpenRig watchdog scheduler · policy: periodic-reminder · job: wake-1]");
+    expect(rows[0]!.body).toContain("Check the deploy.");
+    // Another seat is unchanged: typed as before.
+    expect(await deliver({ targetSession: "other@test", message: "Typed" }, { jobId: "x", policy: "periodic-reminder", occurrenceId: "o-x" })).toMatchObject({ status: "ok" });
+    expect(sends).toHaveBeenCalledTimes(1);
+    // A row that can't be created leaves the occurrence owed, with no input.
+    const failing = makeWatchdogDeliver({ sessionTransport: { send: sends }, isQueueOnlySeat: () => true, createQueueRow: async () => { throw new Error("queue down"); } });
+    expect(await failing({ targetSession: seat, message: "m" }, { jobId: "f", policy: "periodic-reminder", occurrenceId: "o-f" }))
+      .toMatchObject({ status: "failed", sent: false, inputPhase: "not_reached" });
+  });
+
+  it("T-006857: a queue-only seat's park timer is recorded on the parked row, with no second wd- row", async () => {
+    const f = fixture();
+    let repo!: QueueRepository;
+    const deliver = makeWatchdogDeliver({ sessionTransport: f.transport, outbox: f.outbox, isQueueOnlySeat: name => name === seat,
+      createQueueRow: row => repo.create({ qitemId: row.qitemId, sourceSession: "watchdog@system", destinationSession: row.destinationSession,
+        body: row.body, summary: row.summary, tags: row.tags, nudge: false } as never).then(() => {}) });
+    const s = scheduled({ ...f, deliver });
+    repo = s.repo;
+    const wdRows = () => (f.db.prepare("SELECT qitem_id FROM queue_items WHERE qitem_id LIKE 'wd-%'").all() as Array<{ qitem_id: string }>).map(r => r.qitem_id);
+    // One parked row alone, then two parked rows in one pass (the digest): each timer is its row's own reminder.
+    const a = await s.park("A's wait");
+    s.due(a.jobId);
+    await s.scheduler.runTickNow();
+    const b = await s.park("B's wait");
+    const c = await s.park("C's wait");
+    s.due(b.jobId);
+    s.due(c.jobId);
+    await s.scheduler.runTickNow();
+    expect(wdRows()).toEqual([]);
+    for (const { qitemId, jobId } of [a, b, c]) {
+      expect(s.repo.getById(qitemId)!.state).toBe("blocked");
+      const notes = s.repo.listTransitions(qitemId).map(t => t.transitionNote ?? "");
+      expect(notes.some(n => n.includes(`park wake noted on this row: watchdog ${jobId}; delivery=noted_on_parked_row; nothing typed`))).toBe(true);
+      expect(notes.some(n => n.includes("delivery=ok"))).toBe(false);
+      expect(s.repo.getParkWakeStatus(qitemId)).toMatchObject({ deliveryStatus: "noted_on_parked_row", unconsumed: true });
+      expect(s.history.listForJob(jobId, 1)[0]).toMatchObject({ outcome: "sent", deliveryStatus: "noted_on_parked_row" });
+      expect(s.jobs.getByIdOrThrow(jobId).state).toBe("terminal");
+    }
+    // The outbox closes custody for each occurrence (no retry, never indeterminate) and says it was noted on the row.
+    const receipts = f.db.prepare("SELECT delivery_state, guard_delivery FROM outbox_entries WHERE outbox_id LIKE 'watchdog-occurrence-%'").all() as Array<{ delivery_state: string; guard_delivery: string }>;
+    expect(receipts.length).toBeGreaterThan(0);
+    for (const r of receipts) {
+      expect(r.delivery_state).toBe("delivered");
+      expect(JSON.parse(r.guard_delivery).watchdog).toMatchObject({ notedOnParkedRow: true });
+    }
+    expect(f.pastes).toEqual([]);
+    expect(f.submissions).toEqual([]);
+  });
 });
 
+
+describe("T-007715 (SH-A of the REVISAO-openrig-5): a park timer outside the digest is noted on its own parked row", () => {
+  const other = "other@test";
+  function queueOnly() {
+    const f = fixture();
+    let repo!: QueueRepository;
+    const deliver = makeWatchdogDeliver({ sessionTransport: f.transport, outbox: f.outbox, isQueueOnlySeat: name => name === seat || name === other,
+      createQueueRow: row => repo.create({ qitemId: row.qitemId, sourceSession: "watchdog@system", destinationSession: row.destinationSession,
+        body: row.body, summary: row.summary, tags: row.tags, nudge: false } as never).then(() => {}) });
+    const s = scheduled({ ...f, deliver }, { parkedRows: true, queueWait: true });
+    repo = s.repo;
+    const wdRows = () => (f.db.prepare("SELECT qitem_id, destination_session FROM queue_items WHERE qitem_id LIKE 'wd-%'").all() as
+      Array<{ qitem_id: string; destination_session: string }>);
+    const parkWith = async (summary: string, wake: Record<string, unknown>) => {
+      const row = await repo.create({ sourceSession: "orch@test", destinationSession: seat, body: summary, summary, nudge: false } as never) as unknown as { qitemId: string };
+      repo.update({ qitemId: row.qitemId, actorSession: seat, state: "blocked", blockedOn: "external:wait", transitionNote: "parked", ...wake } as never);
+      return { qitemId: row.qitemId, jobId: repo.getParkWakeStatus(row.qitemId)!.ref };
+    };
+    const notas = (qitemId: string, jobId: string) => s.repo.listTransitions(qitemId).map(t => t.transitionNote ?? "")
+      .filter(n => n.includes(`park wake noted on this row: watchdog ${jobId}; delivery=noted_on_parked_row; nothing typed`));
+    const noted = (qitemId: string, jobId: string) => notas(qitemId, jobId).length > 0;
+    return { f, s, wdRows, parkWith, noted, notas };
+  }
+
+  it("a park timer with its own message (rig watchdog update --message)", async () => {
+    const { f, s, wdRows, notas } = queueOnly();
+    const a = await s.park("A's wait");
+    updateWatchdogJob(s.jobs, a.jobId, { message: "Check the release notes first." });
+    s.due(a.jobId);
+    await s.scheduler.runTickNow();
+    expect(wdRows()).toEqual([]);
+    // B1 of the REVISAO-openrig-9: the reminder's own text is on the note (the wd- row used to carry it)
+    expect(notas(a.qitemId, a.jobId).some(n => n.includes("Check the release notes first."))).toBe(true);
+    expect(s.history.listForJob(a.jobId, 1)[0]).toMatchObject({ outcome: "sent", deliveryStatus: "noted_on_parked_row" });
+    expect(s.repo.getById(a.qitemId)!.state).toBe("blocked");
+    expect(f.pastes).toEqual([]);
+    expect(f.submissions).toEqual([]);
+  });
+
+  it("a workflow's park (its re-presentation message, never the default one)", async () => {
+    const { f, s, wdRows, parkWith, notas } = queueOnly();
+    const w = await parkWith("work step", { wakeAfterSeconds: 60, wakeMessage:
+      "Workflow wait re-presentation (blocker progress or reminder): authored-wait@1 instance wf-x step work.\nYou still own the same frontier packet." });
+    s.due(w.jobId);
+    await s.scheduler.runTickNow();
+    expect(wdRows()).toEqual([]);
+    expect(notas(w.qitemId, w.jobId).some(n => n.includes("You still own the same frontier packet."))).toBe(true);
+    expect(s.history.listForJob(w.jobId, 1)[0]).toMatchObject({ outcome: "sent", deliveryStatus: "noted_on_parked_row" });
+    expect(f.submissions).toEqual([]);
+  });
+
+  it("a repeating wait (wakeMaxSeconds): noted on the row, and the wait keeps its cadence", async () => {
+    const { f, s, wdRows, parkWith, notas } = queueOnly();
+    const r = await parkWith("long wait", { wakeAfterSeconds: 600, wakeMaxSeconds: 2400 });
+    s.due(r.jobId);
+    await s.scheduler.runTickNow();
+    expect(wdRows()).toEqual([]);
+    // the wait's reason (backstop or source changed) is on the note too
+    expect(notas(r.qitemId, r.jobId).some(n => /Waiting (backstop|source changed)/.test(n))).toBe(true);
+    expect(s.history.listForJob(r.jobId, 1)[0]).toMatchObject({ outcome: "sent", deliveryStatus: "noted_on_parked_row" });
+    expect(s.jobs.getByIdOrThrow(r.jobId).state).toBe("active");
+    expect(f.submissions).toEqual([]);
+  });
+
+  it("a shared --wake-watchdog: both parked rows are noted, and no wd- row", async () => {
+    const { f, s, wdRows, parkWith, noted } = queueOnly();
+    const a = await s.park("A's wait");
+    const b = await parkWith("B attached", { wakeWatchdogId: a.jobId });
+    s.due(a.jobId);
+    await s.scheduler.runTickNow();
+    expect(wdRows()).toEqual([]);
+    expect(noted(a.qitemId, a.jobId)).toBe(true);
+    expect(noted(b.qitemId, a.jobId)).toBe(true);
+    expect(s.history.listForJob(a.jobId, 1)[0]).toMatchObject({ outcome: "sent", deliveryStatus: "noted_on_parked_row" });
+    expect(f.submissions).toEqual([]);
+  });
+
+  it("S1 of the REVISAO-openrig-9: an operator's periodic reminder attached by --wake-watchdog notes the parked row on every fire", async () => {
+    const { f, s, wdRows, parkWith, notas } = queueOnly();
+    const job = s.jobs.register({ policy: "periodic-reminder", targetSession: seat, intervalSeconds: 600, registeredBySession: "orch@test",
+      specYaml: `policy: periodic-reminder\ntarget:\n  session: ${JSON.stringify(seat)}\nmessage: "check your rows"\n` });
+    const b = await parkWith("bound to the operator's reminder", { wakeWatchdogId: job.jobId });
+    for (let i = 0; i < 2; i++) {
+      s.due(job.jobId);
+      await s.scheduler.runTickNow();
+    }
+    expect(wdRows()).toEqual([]);
+    expect(notas(b.qitemId, job.jobId).filter(n => n.includes("check your rows"))).toHaveLength(2);
+    expect(s.jobs.getByIdOrThrow(job.jobId).state).toBe("active");
+    expect(s.repo.getById(b.qitemId)!.state).toBe("blocked");
+    expect(f.submissions).toEqual([]);
+  });
+
+  it("B1 of the delta review: a row resumed and parked again with no wake of its own is no longer that reminder's row", async () => {
+    const { f, s, wdRows, parkWith, notas } = queueOnly();
+    const job = s.jobs.register({ policy: "periodic-reminder", targetSession: seat, intervalSeconds: 600, registeredBySession: "orch@test",
+      specYaml: `policy: periodic-reminder\ntarget:\n  session: ${JSON.stringify(seat)}\nmessage: "check your rows"\n` });
+    const b = await parkWith("bound to the operator's reminder", { wakeWatchdogId: job.jobId });
+    s.due(job.jobId);
+    await s.scheduler.runTickNow();
+    expect(notas(b.qitemId, job.jobId)).toHaveLength(1);
+    // the owner takes the row back, then parks it on a gate with no wake: the attachment belonged to the earlier park
+    s.repo.update({ qitemId: b.qitemId, actorSession: seat, state: "in-progress", transitionNote: "resumed" } as never);
+    s.repo.update({ qitemId: b.qitemId, actorSession: seat, state: "blocked", blockedOn: "external:gate", transitionNote: "gate" } as never);
+    s.due(job.jobId);
+    await s.scheduler.runTickNow();
+    expect(notas(b.qitemId, job.jobId)).toHaveLength(1);
+    expect(wdRows().map(r => r.destination_session)).toEqual([seat]);
+    expect(f.submissions).toEqual([]);
+  });
+
+  it("N2 of the delta review: a park's default wake adds no reminder line, nor the default of the row that armed a shared job", async () => {
+    const { s, parkWith, notas } = queueOnly();
+    const a = await s.park("A's wait");
+    const b = await parkWith("B attached", { wakeWatchdogId: a.jobId });
+    s.due(a.jobId);
+    await s.scheduler.runTickNow();
+    for (const q of [a.qitemId, b.qitemId]) {
+      expect(notas(q, a.jobId)).toHaveLength(1);
+      expect(notas(q, a.jobId).some(n => n.includes("\nreminder:"))).toBe(false);
+    }
+  });
+
+  it("N3 of the delta review: a long reminder is cut on the note, pointing at the job's full text", async () => {
+    const { s, notas } = queueOnly();
+    const a = await s.park("A's wait");
+    updateWatchdogJob(s.jobs, a.jobId, { message: `Check the notes. ${"x".repeat(3000)}` });
+    s.due(a.jobId);
+    await s.scheduler.runTickNow();
+    const [nota] = notas(a.qitemId, a.jobId);
+    expect(nota).toContain("Check the notes.");
+    expect(nota).toContain(`… (full text: rig watchdog show ${a.jobId})`);
+    expect(nota!.length).toBeLessThan(2400);
+  });
+
+  it("unchanged: a reminder whose target is another seat than the parked row's owner is still that seat's row", async () => {
+    const { s, wdRows, parkWith } = queueOnly();
+    const job = s.jobs.register({ policy: "periodic-reminder", targetSession: seat, intervalSeconds: 600, registeredBySession: "orch@test",
+      specYaml: `policy: periodic-reminder\ntarget:\n  session: ${JSON.stringify(seat)}\nmessage: "check your rows"\n` });
+    await parkWith("bound to a shared job", { wakeWatchdogId: job.jobId });
+    // the job's target moves to another seat after the park: its fire is not the parked row's own reminder
+    const moved = `policy: periodic-reminder\ntarget:\n  session: ${JSON.stringify(other)}\nmessage: "check your rows"\n`;
+    s.jobs.updateInPlace(job.jobId, moved, 600, s.jobs.getByIdOrThrow(job.jobId).lastEvaluationAt);
+    s.due(job.jobId);
+    await s.scheduler.runTickNow();
+    expect(wdRows().map(r => r.destination_session)).toEqual([other]);
+  });
+
+  // The redesign (volta 4): one rule for "the arm of the row's current park", read by every reader of the binding.
+  const resume = (s: ReturnType<typeof scheduled>, qitemId: string) =>
+    s.repo.update({ qitemId, actorSession: seat, state: "in-progress", transitionNote: "resumed" } as never);
+  const gate = (s: ReturnType<typeof scheduled>, qitemId: string, blockedOn = "external:gate") =>
+    s.repo.update({ qitemId, actorSession: seat, state: "blocked", blockedOn, transitionNote: "parked on a gate, no wake" } as never);
+
+  it("B1 of the delta review of 7590bf00e (queue-only seat): a shared park timer retires when its row leaves, though a row once attached was parked again with no wake", async () => {
+    const { f, s, wdRows, parkWith, notas } = queueOnly();
+    const a = await s.park("A's wait");
+    const b = await parkWith("B attached", { wakeWatchdogId: a.jobId });
+    resume(s, b.qitemId);
+    gate(s, b.qitemId);
+    // S2: B's current park has no wake of its own, so its park status is not A's live timer
+    expect(s.repo.getParkWakeStatus(b.qitemId)).toBeNull();
+    resume(s, a.qitemId);
+    expect(s.jobs.getByIdOrThrow(a.jobId).state).toBe("terminal");
+    for (let i = 0; i < 3; i++) {
+      s.due(a.jobId);
+      await s.scheduler.runTickNow();
+    }
+    expect(wdRows()).toEqual([]);
+    expect(notas(b.qitemId, a.jobId)).toEqual([]);
+    // the net for a timer an older daemon left active: it is retired before delivery, and nothing is sent
+    f.db.prepare("UPDATE watchdog_jobs SET state = 'active', terminal_reason = NULL WHERE job_id = ?").run(a.jobId);
+    s.due(a.jobId);
+    await s.scheduler.runTickNow();
+    expect(s.jobs.getByIdOrThrow(a.jobId).state).toBe("terminal");
+    expect(wdRows()).toEqual([]);
+    expect(f.submissions).toEqual([]);
+  });
+
+  it("B1 of the delta review of 7590bf00e (terminal seat): the same timer is never typed again at A's owner", async () => {
+    const f = fixture();
+    const s = scheduled(f, { parkedRows: true });
+    const a = await s.park("A's wait");
+    const row = await s.repo.create({ sourceSession: "orch@test", destinationSession: seat, body: "B", summary: "B", nudge: false } as never) as unknown as { qitemId: string };
+    s.repo.update({ qitemId: row.qitemId, actorSession: seat, state: "blocked", blockedOn: "external:wait", transitionNote: "attached", wakeWatchdogId: a.jobId } as never);
+    resume(s, row.qitemId);
+    gate(s, row.qitemId);
+    expect(s.repo.getParkWakeStatus(row.qitemId)).toBeNull();
+    resume(s, a.qitemId);
+    expect(s.jobs.getByIdOrThrow(a.jobId).state).toBe("terminal");
+    for (let i = 0; i < 3; i++) {
+      s.due(a.jobId);
+      await s.scheduler.runTickNow();
+    }
+    expect(f.submissions.filter(t => t.includes(`Wake timer fired for parked qitem ${a.qitemId}`))).toEqual([]);
+  });
+
+  it("N2 of the delta review of 7590bf00e: a re-park blocked → blocked with no wake keeps the attachment (the same park)", async () => {
+    const { s, wdRows, parkWith, notas } = queueOnly();
+    const job = s.jobs.register({ policy: "periodic-reminder", targetSession: seat, intervalSeconds: 600, registeredBySession: "orch@test",
+      specYaml: `policy: periodic-reminder\ntarget:\n  session: ${JSON.stringify(seat)}\nmessage: "check your rows"\n` });
+    const b = await parkWith("bound to the operator's reminder", { wakeWatchdogId: job.jobId });
+    gate(s, b.qitemId, "external:another-gate");
+    expect(s.repo.getParkWakeStatus(b.qitemId)).toMatchObject({ kind: "watchdog", ref: job.jobId });
+    s.due(job.jobId);
+    await s.scheduler.runTickNow();
+    expect(notas(b.qitemId, job.jobId).filter(n => n.includes("check your rows"))).toHaveLength(1);
+    expect(wdRows()).toEqual([]);
+  });
+
+  it("the repeating wait a row once attached to ends when no current park holds it (refreshQueueWaits)", async () => {
+    const { s, parkWith } = queueOnly();
+    const a = await parkWith("A waits on X", { wakeAfterSeconds: 600, wakeMaxSeconds: 2400 });
+    const b = await parkWith("B attached", { wakeWatchdogId: a.jobId });
+    resume(s, a.qitemId);
+    // B's current park still holds the wait
+    refreshQueueWaits(s.repo.db, s.jobs);
+    expect(s.jobs.getByIdOrThrow(a.jobId).state).toBe("active");
+    resume(s, b.qitemId);
+    gate(s, b.qitemId);
+    refreshQueueWaits(s.repo.db, s.jobs);
+    expect(s.jobs.getByIdOrThrow(a.jobId).state).toBe("terminal");
+  });
+
+  it("S1 of the delta review of 7590bf00e: the park's default wake is recognized only exact or with its continuation's preview", async () => {
+    const q = "qitem-20261114000000-aaaaaaaa";
+    const dflt = defaultParkWakeMessage(q);
+    expect(isDefaultParkWakeMessage(dflt)).toBe(true);
+    expect(isDefaultParkWakeMessage(withContinuationPreview(dflt, q, "hand the head to the planner"))).toBe(true);
+    expect(isDefaultParkWakeMessage(withContinuationPreview(dflt, q, `long ${"x".repeat(400)}\n  more`))).toBe(true);
+    expect(isDefaultParkWakeMessage(`${dflt}\nSTOP: inspect the failed migration before resuming.`)).toBe(false);
+    expect(isDefaultParkWakeMessage(`${dflt} and check the deploy`)).toBe(false);
+    expect(isDefaultParkWakeMessage(`${withContinuationPreview(dflt, q, "do X")}\nSTOP: and this too.`)).toBe(false);
+    expect(isDefaultParkWakeMessage("Check the release notes first.")).toBe(false);
+  });
+
+  it("S1 of the delta review of 7590bf00e: a reminder's own text after the default wake is on the note", async () => {
+    const { s, notas } = queueOnly();
+    const a = await s.park("A's wait");
+    updateWatchdogJob(s.jobs, a.jobId, { message: `${defaultParkWakeMessage(a.qitemId)}\nSTOP: inspect the failed migration before resuming.` });
+    s.due(a.jobId);
+    await s.scheduler.runTickNow();
+    const [nota] = notas(a.qitemId, a.jobId);
+    expect(nota).toContain("\nreminder: ");
+    expect(nota).toContain("STOP: inspect the failed migration before resuming.");
+  });
+
+  it("N2 of the delta review of 7590bf00e: the default wake with its continuation's preview adds no reminder line", async () => {
+    const { s, notas } = queueOnly();
+    const a = await s.park("A's wait", "continuation: hand the head to the planner");
+    s.due(a.jobId);
+    await s.scheduler.runTickNow();
+    const ns = notas(a.qitemId, a.jobId);
+    expect(ns).toHaveLength(1);
+    expect(ns[0]).not.toContain("\nreminder:");
+  });
+
+  it("the generating row parked again on a gate: the attached row is the shared timer's only target, and the timer then ends", async () => {
+    const { s, wdRows, parkWith, notas } = queueOnly();
+    const a = await s.park("A's wait");
+    const b = await parkWith("B attached", { wakeWatchdogId: a.jobId });
+    resume(s, a.qitemId);
+    gate(s, a.qitemId);
+    expect(s.jobs.getByIdOrThrow(a.jobId).state).toBe("active"); // B's current park still holds it
+    expect(s.repo.getParkWakeStatus(a.qitemId)).toBeNull();
+    s.due(a.jobId);
+    await s.scheduler.runTickNow();
+    expect(notas(a.qitemId, a.jobId)).toEqual([]);
+    expect(notas(b.qitemId, a.jobId)).toHaveLength(1);
+    expect(wdRows()).toEqual([]);
+    expect(s.jobs.getByIdOrThrow(a.jobId)).toMatchObject({ state: "terminal", terminalReason: "park_timer_target_terminal" });
+  });
+
+  it("the last attached row leaving: the shared timer no current park holds ends before delivery, with nothing sent", async () => {
+    const { f, s, wdRows, parkWith } = queueOnly();
+    const a = await s.park("A's wait");
+    const b = await parkWith("B attached", { wakeWatchdogId: a.jobId });
+    resume(s, a.qitemId);
+    gate(s, a.qitemId);
+    resume(s, b.qitemId);
+    s.due(a.jobId);
+    await s.scheduler.runTickNow();
+    expect(wdRows()).toEqual([]);
+    expect(f.submissions).toEqual([]);
+    expect(s.jobs.getByIdOrThrow(a.jobId)).toMatchObject({ state: "terminal", terminalReason: "park_timer_target_terminal" });
+  });
+
+  it("rerouteParked reads the current park: a past park's timer, still active, is not rearmed for a row now on a gate", async () => {
+    const { f, s, parkWith } = queueOnly();
+    const a = await s.park("A's wait");
+    const b = await parkWith("B attached", { wakeWatchdogId: a.jobId });
+    resume(s, a.qitemId);
+    gate(s, a.qitemId);
+    resume(s, b.qitemId);
+    // a timer an older daemon left active
+    f.db.prepare("UPDATE watchdog_jobs SET state = 'active', terminal_reason = NULL WHERE job_id = ?").run(a.jobId);
+    const routed = s.repo.rerouteParked(a.qitemId, "other@test", "owner gone");
+    expect(routed.park).toBe("unparked");
+    expect(s.repo.getById(a.qitemId)!.state).toBe("pending");
+  });
+
+  // A wait J whose own row A moved on (parked again on the same blocker, no wake) while B held it, and whose B
+  // attachment a fire then consumed: no current park holds J any more.
+  const waitLeftBehind = async () => {
+    const q = queueOnly();
+    const a = await q.parkWith("A waits on X", { wakeAfterSeconds: 600, wakeMaxSeconds: 2400 });
+    await q.parkWith("B attached", { wakeWatchdogId: a.jobId });
+    resume(q.s, a.qitemId);
+    gate(q.s, a.qitemId, "external:wait");
+    q.s.repo.recordWatchdogWakeAttempt(a.jobId, "noted_on_parked_row");
+    expect(q.s.jobs.getByIdOrThrow(a.jobId).state).toBe("active");
+    return { ...q, a };
+  };
+
+  it("a wait no current park holds ends at its refresh, though its row is parked again on the same blocker", async () => {
+    const { s, a } = await waitLeftBehind();
+    refreshQueueWaits(s.repo.db, s.jobs);
+    expect(s.jobs.getByIdOrThrow(a.jobId)).toMatchObject({ state: "terminal", terminalReason: "park_wait_ended" });
+  });
+
+  it("a row that parks again with a wait gets its own, never the wait of a park it left", async () => {
+    const { s, a } = await waitLeftBehind();
+    s.repo.update({ qitemId: a.qitemId, actorSession: seat, state: "blocked", blockedOn: "external:wait", transitionNote: "wait again",
+      wakeAfterSeconds: 600, wakeMaxSeconds: 2400 } as never);
+    expect(s.repo.getParkWakeStatus(a.qitemId)!.ref).not.toBe(a.jobId);
+  });
+
+  it("the readers of a parked row's wake see no wake when the current park has none (pool facts, waiting view)", async () => {
+    const { s, parkWith } = queueOnly();
+    const job = s.jobs.register({ policy: "periodic-reminder", targetSession: seat, intervalSeconds: 600, registeredBySession: "orch@test",
+      specYaml: `policy: periodic-reminder\ntarget:\n  session: ${JSON.stringify(seat)}\nmessage: "check your rows"\n` });
+    const b = await parkWith("B on the operator's reminder", { wakeWatchdogId: job.jobId });
+    resume(s, b.qitemId);
+    gate(s, b.qitemId);
+    expect(readWaitingView(s.repo.db, b.qitemId)!.nextBackstop.mechanism).toBe(NO_TIMED_BACKSTOP);
+    expect(s.repo.listPoolSeatRowFacts(seat).parked).toMatchObject({ qitemId: b.qitemId, blockedOn: "external:gate",
+      timerIntervalS: null, timerArmedLive: false, parkActor: null, parkedAt: null });
+  });
+
+  it("a seat swap keeps a park timer an attached row of the same owner still holds, after its own row moved on", async () => {
+    const { s, parkWith } = queueOnly();
+    const a = await s.park("A's wait");
+    await parkWith("B attached", { wakeWatchdogId: a.jobId });
+    resume(s, a.qitemId);
+    gate(s, a.qitemId);
+    expect(s.repo.currentParkTimerIds()).toContain(a.jobId);
+  });
+
+  it("an arm whose transition is no longer in the history (retention archived it, then a reopen) is not the current park's", async () => {
+    const { f, s } = queueOnly();
+    const a = await s.park("A's wait");
+    f.db.prepare("DELETE FROM queue_transitions WHERE qitem_id = ?").run(a.qitemId);
+    expect(s.repo.getParkWakeStatus(a.qitemId)).toBeNull();
+  });
+
+  it("N5 of the delta review of 7590bf00e: the cut of a long reminder never splits a surrogate pair", async () => {
+    const { s, notas } = queueOnly();
+    const a = await s.park("A's wait");
+    updateWatchdogJob(s.jobs, a.jobId, { message: `${"x".repeat(1999)}\u{1F600}${"y".repeat(100)}` });
+    s.due(a.jobId);
+    await s.scheduler.runTickNow();
+    const [nota] = notas(a.qitemId, a.jobId);
+    expect(nota).toContain(`\nreminder: ${"x".repeat(1999)}… (full text: rig watchdog show ${a.jobId})`);
+    expect(nota).not.toMatch(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])/);
+  });
+
+  it("N1 of the delta review of 7590bf00e (PROBE-S1): a recovered delivery notes the text that was sent, not the job's later message", async () => {
+    const queueOnlyDeliver = (ff: ReturnType<typeof fixture>, repoOf: () => QueueRepository) =>
+      makeWatchdogDeliver({ sessionTransport: ff.transport, outbox: ff.outbox, isQueueOnlySeat: name => name === seat,
+        createQueueRow: row => repoOf().create({ qitemId: row.qitemId, sourceSession: "watchdog@system", destinationSession: row.destinationSession,
+          body: row.body, summary: row.summary, tags: row.tags, nudge: false } as never).then(() => {}) });
+    const f = fixture();
+    let firstRepo!: QueueRepository;
+    const realFirst = queueOnlyDeliver(f, () => firstRepo);
+    let interrupted: Buffer | undefined;
+    // the first process delivers, then its accounting is lost: the store is kept as it was right after the delivery
+    const first = scheduled({ ...f, deliver: (async (...args: Parameters<typeof realFirst>) => {
+      const result = await realFirst(...args);
+      interrupted ??= f.db.serialize();
+      return result;
+    }) as typeof realFirst }, { parkedRows: true });
+    firstRepo = first.repo;
+    const a = await first.park("A's wait");
+    updateWatchdogJob(first.jobs, a.jobId, { message: "first text" });
+    first.due(a.jobId);
+    await first.scheduler.runTickNow();
+    expect(interrupted).toBeDefined();
+    const g = fixture(interrupted);
+    let nextRepo!: QueueRepository;
+    const next = scheduled({ ...g, deliver: queueOnlyDeliver(g, () => nextRepo) }, { parkedRows: true });
+    nextRepo = next.repo;
+    updateWatchdogJob(next.jobs, a.jobId, { message: "second text" });
+    next.due(a.jobId);
+    await next.scheduler.runTickNow();
+    const notes = next.repo.listTransitions(a.qitemId).map(t => t.transitionNote ?? "")
+      .filter(n => n.includes(`park wake noted on this row: watchdog ${a.jobId}`));
+    expect(notes).toHaveLength(1);
+    expect(notes[0]).toContain("reminder: first text");
+    expect(notes[0]).not.toContain("second text");
+  });
+});
+
+describe("T-006857 SH-2: a queue-only reminder is recorded as the row it became", () => {
+  it("records queued_as_row with the row id in the outbox receipt and the history, never ok", async () => {
+    const f = fixture();
+    let repo!: QueueRepository;
+    const deliver = makeWatchdogDeliver({ sessionTransport: f.transport, outbox: f.outbox, isQueueOnlySeat: s => s === seat,
+      createQueueRow: row => repo.create({ qitemId: row.qitemId, sourceSession: "watchdog@system", destinationSession: row.destinationSession,
+        body: row.body, summary: row.summary, tags: row.tags, nudge: false } as never).then(() => {}) });
+    const s = scheduled({ ...f, deliver });
+    repo = s.repo;
+    // A reminder with no parked row of origin: the one case that still becomes a wd- row after SH-1.
+    const job = s.jobs.register({ policy: "periodic-reminder", targetSession: seat, intervalSeconds: 600, registeredBySession: "orch@test",
+      specYaml: `policy: periodic-reminder\ntarget:\n  session: ${JSON.stringify(seat)}\nmessage: "Check the deploy"\n` });
+    s.due(job.jobId);
+    await s.scheduler.runTickNow();
+    expect(f.pastes).toEqual([]);
+    expect(f.submissions).toEqual([]);
+    const last = s.history.listForJob(job.jobId, 1)[0]!;
+    expect(last).toMatchObject({ outcome: "sent", deliveryStatus: "queued_as_row",
+      evaluationNotes: expect.objectContaining({ deliveryCode: "queued_as_row" }) });
+    const wd = (last.evaluationNotes as { queuedQitemId: string }).queuedQitemId;
+    expect(wd).toMatch(/^wd-/);
+    expect(s.repo.getById(wd)).toMatchObject({ destinationSession: seat, state: "pending" });
+    expect(s.repo.getById(wd)!.body).toContain("Check the deploy");
+    const receipt = f.db.prepare("SELECT delivery_state, guard_delivery FROM outbox_entries WHERE outbox_id LIKE 'watchdog-occurrence-%'").get() as { delivery_state: string; guard_delivery: string };
+    expect(receipt.delivery_state).toBe("delivered");
+    expect(JSON.parse(receipt.guard_delivery).watchdog).toMatchObject({ queuedAs: wd });
+    // The fired event names the row too.
+    const fired = (f.db.prepare("SELECT payload FROM events WHERE type = 'watchdog.evaluation_fired'").all() as Array<{ payload: string }>)
+      .map(e => JSON.parse(e.payload)).filter(e => e.jobId === job.jobId);
+    expect(fired.at(-1)).toMatchObject({ deliveryStatus: "queued_as_row", queuedQitemId: wd });
+  });
+});
 
 describe("blocked parked-owner no-input recovery on the real repository", () => {
   it.each(["quota", "terminal"].flatMap(kind => ["before", "after"].map(noteTiming => ({ kind, noteTiming }))))("keeps $kind recovery across another seat note $noteTiming creation", async ({ kind, noteTiming }) => {

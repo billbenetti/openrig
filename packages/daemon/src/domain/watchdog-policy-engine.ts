@@ -55,8 +55,11 @@ export interface DeliveryRequest {
 
 export interface DeliveryOutcome {
   status: "ok" | "failed" | "retained";
-  /** Typed admission refusal, kept independently of human-readable error text. */
-  code?: "retained_quota_full" | "terminal_seat";
+  /** Typed admission refusal, kept independently of human-readable error text. On an ok at a queue-only seat, nothing
+   *  was typed (T-006857): `queued_as_row`, the reminder became the cold row `queuedQitemId`; `noted_on_parked_row`, a
+   *  parked row's own wake timer was recorded on that row (SH-1). */
+  code?: "retained_quota_full" | "terminal_seat" | "queued_as_row" | "noted_on_parked_row";
+  queuedQitemId?: string;
   outboxIds?: string[];
   /** The existing transport's actual input boundary; failure never means no input by itself. */
   inputPhase?: "not_reached" | "attempted" | "written";
@@ -80,12 +83,22 @@ export interface DeliveryOutcome {
   memberOutcomes?: Record<string, DeliveryOutcome>;
 }
 
+/** The status a delivery is recorded under: at a queue-only seat, `queued_as_row` or `noted_on_parked_row`, never a
+ *  typed "ok". */
+export function deliveryStatusLabel(delivery: Pick<DeliveryOutcome, "status" | "code">): string {
+  return delivery.status === "ok" && (delivery.code === "queued_as_row" || delivery.code === "noted_on_parked_row")
+    ? delivery.code : delivery.status;
+}
+
 export interface WatchdogDeliverySource {
   occurrenceId?: string;
   jobId: string;
   policy: string;
   /** A digest's members, when one send carries several reminders: each job and the occurrence it was due for. */
   members?: Array<{ jobId: string; occurrenceId: string }>;
+  /** The parked rows this send reminds about: the digest entry's row, or every live parked row of the target this job
+   *  is the current wake of (T-007715). Absent when the reminder is no parked row's. */
+  parkedQitemIds?: string[];
 }
 
 export type DeliveryFn = ((
@@ -170,10 +183,15 @@ interface WatchdogPolicyEngineDeps {
   /** Queue-side observer for a wake attempt. It appends resume evidence to
    *  every HELD row armed to this job; delivery outcome is preserved. */
   resolveQueueWait?: (input: { jobId: string }) => PolicyEvaluation | null | undefined;
-  onWakeAttempt?: (attempt: { jobId: string; deliveryStatus: string; retryAt?: string }) => void;
+  onWakeAttempt?: (attempt: { jobId: string; deliveryStatus: string; retryAt?: string; queuedQitemId?: string; message?: string }) => void;
   /** The parked row a due reminder is about, when it may share one message with other reminders due for the same
    *  seat in the same scheduler pass. Null, or absent, keeps the reminder's own send. */
   resolveDigestEntry?: (input: { jobId: string; message: string }) => ParkReminderEntry | null;
+  /** The live parked rows of the reminder's own target this job is the current wake of, whatever its message, policy or
+   *  cadence (a custom message, a workflow's park, a repeating wait, a shared --wake-watchdog). A queue-only seat gets
+   *  the fire as a note on those rows, not a second row (T-007715, SH-A of the REVISAO-openrig-5). Empty, or absent,
+   *  keeps the reminder's own send. */
+  resolveParkedRows?: (input: { jobId: string; targetSession: string }) => string[];
 }
 
 /** The parked row an ordinary park reminder is about, with the current park's recorded continuation for its preview. */
@@ -248,6 +266,10 @@ const QUIET_SKIP_REASONS = new Set<string>([
   // scan writes no history (the loud, audited signals are the SENT wake,
   // episode-ended, and all-parked-owners-deferred).
   "no-parked-owner",
+  // A seat pool with nothing to change, or whose previous plan is still being applied: the executor records every
+  // effect it applies, and a plan with work is loud (seat_pool_planned).
+  "seat_pool_steady",
+  "seat_pool_busy",
   // OPR.0.4.3.16 rev1-r1 fixback (advisor ruling 2026-07-03): seat_needs_input
   // and activity_stale_unknown are the COMMON recurring states for this
   // policy's own target scenario — a gate qitem pending on a seat that has
@@ -286,8 +308,9 @@ export class WatchdogPolicyEngine {
   private readonly resolveContextUsage?: WatchdogPolicyEngineDeps["resolveContextUsage"];
   private readonly resolvePreDeliveryTerminalReason?: (input: { jobId: string }) => string | null;
   private readonly resolveQueueWait?: WatchdogPolicyEngineDeps["resolveQueueWait"];
-  private readonly onWakeAttempt?: (attempt: { jobId: string; deliveryStatus: string; retryAt?: string }) => void;
+  private readonly onWakeAttempt?: (attempt: { jobId: string; deliveryStatus: string; retryAt?: string; queuedQitemId?: string; message?: string }) => void;
   private readonly resolveDigestEntry?: WatchdogPolicyEngineDeps["resolveDigestEntry"];
+  private readonly resolveParkedRows?: WatchdogPolicyEngineDeps["resolveParkedRows"];
 
   constructor(deps: WatchdogPolicyEngineDeps) {
     this.jobsRepo = deps.jobsRepo;
@@ -301,6 +324,7 @@ export class WatchdogPolicyEngine {
     this.onWakeAttempt = deps.onWakeAttempt;
     this.resolveQueueWait = deps.resolveQueueWait;
     this.resolveDigestEntry = deps.resolveDigestEntry;
+    this.resolveParkedRows = deps.resolveParkedRows;
     this.parseSpec = deps.parseSpec ?? parseWatchdogSpec;
     this.now = deps.now ?? (() => new Date());
     this.deliveryDeferred = deps.deliveryDeferred;
@@ -653,7 +677,8 @@ export class WatchdogPolicyEngine {
         message,
         ...(continuityAction ? { continuityAction } : {}),
       },
-      { jobId: job.jobId, policy: job.policy, occurrenceId },
+      { jobId: job.jobId, policy: job.policy, occurrenceId,
+        ...this.parkedSource(job.jobId, outcome.target.session, digestEntry, continuityAction !== undefined) },
     );
     if (
       isContextUsageThreshold &&
@@ -664,6 +689,15 @@ export class WatchdogPolicyEngine {
       this.jobsRepo.recordThresholdFire(job.jobId, occupantGeneration, evaluatedAt);
     }
     return this.recordAttempt({ job, outcome, evaluatedAt, deliverySchedule, delivery, isContextUsageThreshold: thresholdFire, notice: outcome.notice === true, sentMessage: message });
+  }
+
+  /** The parked rows a send reminds about: the digest entry's row, or else every live parked row of the target this job
+   *  is the current wake of (T-007715). A continuity action is not a park reminder: it never carries parked rows. */
+  private parkedSource(jobId: string, targetSession: string, entry: ParkReminderEntry | null, continuity: boolean): { parkedQitemIds?: string[] } {
+    if (entry) return { parkedQitemIds: [entry.qitemId] };
+    if (continuity) return {};
+    const rows = this.resolveParkedRows?.({ jobId, targetSession }) ?? [];
+    return rows.length ? { parkedQitemIds: rows } : {};
   }
 
   /** The pre-transport guard: a job its owning domain can prove is no longer actionable is terminaled, not sent. */
@@ -765,7 +799,7 @@ export class WatchdogPolicyEngine {
     ].join("\n");
     const delivery = await this.deliver(
       { targetSession: seat, message },
-      { jobId: digestId, policy: "periodic-reminder", occurrenceId: digestId, members },
+      { jobId: digestId, policy: "periodic-reminder", occurrenceId: digestId, members, parkedQitemIds: digest.map(({ entry }) => entry.qitemId) },
     );
     digest.forEach((held, i) => this.recordAttempt({
       ...held, deliverySchedule: schedules[i]!, delivery: delivery.memberOutcomes?.[held.job.jobId] ?? delivery, isContextUsageThreshold: false,
@@ -781,7 +815,8 @@ export class WatchdogPolicyEngine {
     const message = entry ? withContinuationPreview(held.outcome.message, entry.qitemId, entry.continuation) : held.outcome.message;
     const delivery = await this.deliver(
       { targetSession: seat, message },
-      { jobId: held.job.jobId, policy: held.job.policy, occurrenceId: held.occurrenceId },
+      { jobId: held.job.jobId, policy: held.job.policy, occurrenceId: held.occurrenceId,
+        ...this.parkedSource(held.job.jobId, seat, entry, false) },
     );
     this.recordAttempt({ ...held, deliverySchedule: schedule, delivery, isContextUsageThreshold: false, sentMessage: message });
   }
@@ -811,7 +846,8 @@ export class WatchdogPolicyEngine {
       : outcome.notes;
     const deliveryNotes = delivery.inputPhase === undefined && delivery.code === undefined ? notes
       : { ...(notes ?? {}), ...(delivery.inputPhase === undefined ? {} : { deliveryInputPhase: delivery.inputPhase }),
-        ...(delivery.code === undefined ? {} : { deliveryCode: delivery.code }) };
+        ...(delivery.code === undefined ? {} : { deliveryCode: delivery.code }),
+        ...(delivery.queuedQitemId === undefined ? {} : { queuedQitemId: delivery.queuedQitemId }) };
     const receiptNotes = delivery.retryAt || delivery.nextAction || delivery.occurrenceTracked
       ? { ...(deliveryNotes ?? {}), ...(delivery.retryAt ? { retryAt: delivery.retryAt } : {}),
         ...(delivery.nextAction ? { nextAction: delivery.nextAction } : {}),
@@ -823,7 +859,7 @@ export class WatchdogPolicyEngine {
         : isRefusedInteractive(delivery.error) ? "refused" : "failed",
       skipReason: delivery.reconciled ? "delivery_receipt_reconciled" : delivery.status === "retained" ? "typing_guard_retained" : null,
       deliveryTargetSession: outcome.target.session,
-      deliveryStatus: delivery.status,
+      deliveryStatus: deliveryStatusLabel(delivery),
       deliveryMessage: digest?.line ?? delivery.sentMessage ?? sentMessage ?? outcome.message,
       // OPR.0.5.6.24 — the delivery error/reason string survives into the
       // durable record so a policy can distinguish an interactive-prompt
@@ -839,8 +875,15 @@ export class WatchdogPolicyEngine {
       if (current.state === "active" && this.jobsRepo.scheduleUnchanged(current, deliverySchedule)
         && (isContextUsageThreshold || current.lastEvaluationAt === evaluatedAt
           || (retryPending && current.lastEvaluationAt === deliverySchedule.lastEvaluationAt))) {
-        this.onWakeAttempt?.({ jobId: job.jobId, deliveryStatus: delivery.status,
-          ...(retryPending && delivery.retryAt ? { retryAt: delivery.retryAt } : {}) });
+        this.onWakeAttempt?.({ jobId: job.jobId, deliveryStatus: deliveryStatusLabel(delivery),
+          ...(retryPending && delivery.retryAt ? { retryAt: delivery.retryAt } : {}),
+          ...(delivery.queuedQitemId ? { queuedQitemId: delivery.queuedQitemId } : {}),
+          // T-007715 (B1 of the REVISAO-openrig-9): a reminder noted on a parked row carries its own text there (a
+          // custom message, a workflow's re-presentation, a wait's reason); a digest's members are default reminders.
+          // S1 of the delta review: the text that was sent, in the history's own precedence (a recovered delivery's
+          // receipt keeps the original even if the job's message changed before the recovery)
+          ...(delivery.code === "noted_on_parked_row" && !digest
+            ? { message: delivery.sentMessage ?? sentMessage ?? outcome.message } : {}) });
       }
       if (delivery.terminalReason) this.jobsRepo.markTerminal(job.jobId, delivery.terminalReason);
     };
@@ -870,7 +913,8 @@ export class WatchdogPolicyEngine {
       jobId: job.jobId,
       policy: job.policy,
       targetSession: outcome.target.session,
-      deliveryStatus: delivery.status,
+      deliveryStatus: deliveryStatusLabel(delivery),
+      ...(delivery.queuedQitemId ? { queuedQitemId: delivery.queuedQitemId } : {}),
     });
     if (!delivery.occurrenceTracked) accountWake();
     this.jobsRepo.deliveryAccounted(job.jobId);

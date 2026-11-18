@@ -26,7 +26,7 @@
 
 import { Hono } from "hono";
 import { parseDocument, isScalar } from "yaml";
-import { readMissionReadiness, readSliceReadiness } from "../domain/proof/judgments.js";
+import { createProofPolicyRead, readMissionReadiness, readSliceReadiness } from "../domain/proof/judgments.js";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import type {
@@ -74,13 +74,14 @@ export function missionsRoutes(): Hono {
       workflowSpec,
       c.get("workflowSpecCache" as never) as WorkflowSpecCache | undefined,
     );
-    const readiness = readMissionReadiness(missionPath);
+    const readPolicy = createProofPolicyRead();
+    const readiness = readMissionReadiness(missionPath, readPolicy);
     const status = readiness.historicalStatus ?? readMissionStatus(missionPath);
     return c.json({
       missionId,
       missionPath,
       readiness,
-      slices: slices.map(s => ({ ...s, readiness: readSliceReadiness(s.slicePath) })),
+      slices: slices.map(s => ({ ...s, readiness: readSliceReadiness(s.slicePath, undefined, readPolicy) })),
       workflow_spec: workflowSpec,
       topology,
       status,
@@ -98,12 +99,12 @@ export function missionsRoutes(): Hono {
       return c.json({ error: "slices_indexer_unavailable" }, 503);
     }
     const missionId = c.req.param("missionId");
-    const allSlices = indexer.list();
-    const slices = allSlices.filter((s) => s.missionId === missionId);
-    if (slices.length === 0) {
+    // Only the mission folder is needed here: a directory walk, never the cold
+    // listing rebuild, which reads every queue row and can block the loop for ~30 s.
+    const missionPath = indexer.missionPath(missionId);
+    if (!missionPath) {
       return c.json({ error: "mission_not_found", missionId }, 404);
     }
-    const missionPath = computeMissionPath(slices[0]!);
     try {
       writeMissionStatusComplete(missionPath);
     } catch (err) {

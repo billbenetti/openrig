@@ -186,6 +186,11 @@ export const SETTINGS_VALID_KEYS = [
   // and keep being maintained regardless of either key.
   "policies.idle_gate_qitem.auto_register",
   "policies.idle_gate_qitem.opt_in_sessions",
+  // Seat pools: the daemon's launch budget, shared by every pool (launch-budget.ts); read at each launch.
+  "policies.seat_pool.max_launches_in_flight",
+  "policies.seat_pool.max_launches_per_tick",
+  "policies.seat_pool.min_free_memory_mb",
+  "policies.seat_pool.max_load_per_cpu_percent",
   "snapshots.periodic.enabled",
   "snapshots.periodic.interval_seconds",
   "snapshots.periodic.retention_keep",
@@ -200,6 +205,9 @@ export const SETTINGS_VALID_KEYS = [
   "terminal.history_limit",
   "terminal.fixed_geometry",
   "terminal.inherit_tmux_environment",
+  // Each seat in a systemd user scope of its own with TasksMax (Linux, daemon as a user service); default off. Twin of the CLI key.
+  "terminal.seat_scope",
+  "terminal.seat_scope_tasks_max",
   // Slice 15 (OPR.0.7.0.15) — compact command-output defaults; CLI-read, twin of the CLI key.
   "output.compact",
   "output.whoami_peers",
@@ -341,6 +349,10 @@ const ENV_MAP: Record<SettingsValidKey, { primary: string; legacy?: string }> = 
   "policies.idle_gate_qitem.active_wake_interval_seconds": { primary: "OPENRIG_POLICIES_IDLE_GATE_QITEM_ACTIVE_WAKE_INTERVAL_SECONDS" },
   "policies.idle_gate_qitem.auto_register": { primary: "OPENRIG_POLICIES_IDLE_GATE_QITEM_AUTO_REGISTER" },
   "policies.idle_gate_qitem.opt_in_sessions": { primary: "OPENRIG_POLICIES_IDLE_GATE_QITEM_OPT_IN_SESSIONS" },
+  "policies.seat_pool.max_launches_in_flight": { primary: "OPENRIG_POLICIES_SEAT_POOL_MAX_LAUNCHES_IN_FLIGHT" },
+  "policies.seat_pool.max_launches_per_tick": { primary: "OPENRIG_POLICIES_SEAT_POOL_MAX_LAUNCHES_PER_TICK" },
+  "policies.seat_pool.min_free_memory_mb": { primary: "OPENRIG_POLICIES_SEAT_POOL_MIN_FREE_MEMORY_MB" },
+  "policies.seat_pool.max_load_per_cpu_percent": { primary: "OPENRIG_POLICIES_SEAT_POOL_MAX_LOAD_PER_CPU_PERCENT" },
   "snapshots.periodic.enabled": { primary: "OPENRIG_SNAPSHOTS_PERIODIC_ENABLED" },
   "snapshots.periodic.interval_seconds": { primary: "OPENRIG_SNAPSHOTS_PERIODIC_INTERVAL_SECONDS" },
   "snapshots.periodic.retention_keep": { primary: "OPENRIG_SNAPSHOTS_PERIODIC_RETENTION_KEEP" },
@@ -350,6 +362,8 @@ const ENV_MAP: Record<SettingsValidKey, { primary: string; legacy?: string }> = 
   "terminal.history_limit": { primary: "OPENRIG_TERMINAL_HISTORY_LIMIT" },
   "terminal.fixed_geometry": { primary: "OPENRIG_TERMINAL_FIXED_GEOMETRY" },
   "terminal.inherit_tmux_environment": { primary: "OPENRIG_TERMINAL_INHERIT_TMUX_ENVIRONMENT" },
+  "terminal.seat_scope": { primary: "OPENRIG_TERMINAL_SEAT_SCOPE" },
+  "terminal.seat_scope_tasks_max": { primary: "OPENRIG_TERMINAL_SEAT_SCOPE_TASKS_MAX" },
   "output.compact": { primary: "OPENRIG_OUTPUT_COMPACT" },
   "output.whoami_peers": { primary: "OPENRIG_OUTPUT_WHOAMI_PEERS" },
   "output.rebuild_recaps": { primary: "OPENRIG_OUTPUT_REBUILD_RECAPS" },
@@ -453,6 +467,10 @@ const KEY_TO_PATH: Record<SettingsValidKey, string[]> = {
   "policies.idle_gate_qitem.active_wake_interval_seconds": ["policies", "idleGateQitem", "activeWakeIntervalSeconds"],
   "policies.idle_gate_qitem.auto_register": ["policies", "idleGateQitem", "autoRegister"],
   "policies.idle_gate_qitem.opt_in_sessions": ["policies", "idleGateQitem", "optInSessions"],
+  "policies.seat_pool.max_launches_in_flight": ["policies", "seatPool", "maxLaunchesInFlight"],
+  "policies.seat_pool.max_launches_per_tick": ["policies", "seatPool", "maxLaunchesPerTick"],
+  "policies.seat_pool.min_free_memory_mb": ["policies", "seatPool", "minFreeMemoryMb"],
+  "policies.seat_pool.max_load_per_cpu_percent": ["policies", "seatPool", "maxLoadPerCpuPercent"],
   "snapshots.periodic.enabled": ["snapshots", "periodic", "enabled"],
   "snapshots.periodic.interval_seconds": ["snapshots", "periodic", "intervalSeconds"],
   "snapshots.periodic.retention_keep": ["snapshots", "periodic", "retentionKeep"],
@@ -461,6 +479,8 @@ const KEY_TO_PATH: Record<SettingsValidKey, string[]> = {
   "terminal.history_limit": ["terminal", "historyLimit"],
   "terminal.fixed_geometry": ["terminal", "fixedGeometry"],
   "terminal.inherit_tmux_environment": ["terminal", "inheritTmuxEnvironment"],
+  "terminal.seat_scope": ["terminal", "seatScope"],
+  "terminal.seat_scope_tasks_max": ["terminal", "seatScopeTasksMax"],
   "output.compact": ["output", "compact"],
   "output.whoami_peers": ["output", "whoamiPeers"],
   "output.rebuild_recaps": ["output", "rebuildRecaps"],
@@ -771,6 +791,10 @@ function getDefaultValue(key: SettingsValidKey, workspaceRoot: string): string |
     // B6 — NOT default-on by founder ruling; "all" is the explicit fleet opt-in.
     case "policies.idle_gate_qitem.auto_register": return "off";
     case "policies.idle_gate_qitem.opt_in_sessions": return "";
+    case "policies.seat_pool.max_launches_in_flight": return 1;
+    case "policies.seat_pool.max_launches_per_tick": return 1;
+    case "policies.seat_pool.min_free_memory_mb": return 1024;
+    case "policies.seat_pool.max_load_per_cpu_percent": return 100;
     case "snapshots.periodic.enabled": return true;
     case "snapshots.periodic.interval_seconds": return 300;
     case "snapshots.periodic.retention_keep": return 10;
@@ -782,6 +806,8 @@ function getDefaultValue(key: SettingsValidKey, workspaceRoot: string): string |
     case "terminal.history_limit": return 10000;
     case "terminal.fixed_geometry": return false;
     case "terminal.inherit_tmux_environment": return false;
+    case "terminal.seat_scope": return false;
+    case "terminal.seat_scope_tasks_max": return 2048;
     case "output.compact": return false;
     case "output.whoami_peers": return 8;
     case "output.rebuild_recaps": return 3;
@@ -915,6 +941,12 @@ const KEY_CONSTRAINTS: Partial<Record<SettingsValidKey, KeyConstraint>> = {
       throw new Error(`Invalid value for terminal.history_limit: must be an integer in [2000, 1000000], got "${raw}"`);
     }
   },
+  // terminal.seat_scope's TasksMax: a seat's own process ceiling. Below 64 a seat would not start its own runtime.
+  "terminal.seat_scope_tasks_max": (raw, coerced) => {
+    if (!/^\d+$/.test(raw.trim()) || typeof coerced !== "number" || !Number.isSafeInteger(coerced) || coerced < 64 || coerced > 4_194_304) {
+      throw new Error(`Invalid value for terminal.seat_scope_tasks_max: must be an integer in [64, 4194304], got "${raw}"`);
+    }
+  },
   // Constraint gap fix — lockstep with cli/src/config-store.ts KEY_CONSTRAINTS.
   // daemon.port had no entry, so `rig config set daemon.port 99999` stored
   // 99999 and the next daemon start died with a raw ERR_SOCKET_BAD_PORT
@@ -948,6 +980,20 @@ const KEY_CONSTRAINTS: Partial<Record<SettingsValidKey, KeyConstraint>> = {
   "policies.idle_gate_qitem.active_wake_interval_seconds": positiveIntegerConstraint("policies.idle_gate_qitem.active_wake_interval_seconds"),
   "policies.idle_gate_qitem.auto_register": choiceConstraint(["off", "all"],
     (raw) => `Invalid value for policies.idle_gate_qitem.auto_register: must be "off" or "all", got "${raw}"`, true),
+  "policies.seat_pool.max_launches_in_flight": positiveIntegerConstraint("policies.seat_pool.max_launches_in_flight"),
+  // 0 admits no launch: the pools start no seat.
+  "policies.seat_pool.max_launches_per_tick": (raw, coerced) => {
+    if (!/^\d+$/.test((raw ?? "").trim()) || typeof coerced !== "number" || !Number.isInteger(coerced) || coerced < 0) {
+      throw new Error(`Invalid value for policies.seat_pool.max_launches_per_tick: must be an integer >= 0 (0 starts no seat), got "${raw}"`);
+    }
+  },
+  // 0 sets no free-memory floor.
+  "policies.seat_pool.min_free_memory_mb": (raw, coerced) => {
+    if (!/^\d+$/.test((raw ?? "").trim()) || typeof coerced !== "number" || !Number.isInteger(coerced) || coerced < 0) {
+      throw new Error(`Invalid value for policies.seat_pool.min_free_memory_mb: must be an integer >= 0 (0 sets no floor), got "${raw}"`);
+    }
+  },
+  "policies.seat_pool.max_load_per_cpu_percent": positiveIntegerConstraint("policies.seat_pool.max_load_per_cpu_percent"),
   // Policy threshold: integer in [1, 100]. Documented contract from
   // slice 27 README. parseInt's permissive coercion ("80abc" → 80;
   // "80.5" → 80) is not safe for a key the daemon's compaction trigger

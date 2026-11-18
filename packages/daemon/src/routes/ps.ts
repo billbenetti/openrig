@@ -2,7 +2,7 @@ import { Hono } from "hono";
 import type { PsProjectionService } from "../domain/ps-projection.js";
 import { projectionLane } from "../domain/projection-lane.js";
 
-import { availableParallelism, loadavg, platform } from "node:os";
+import { availableParallelism, freemem, loadavg, platform, totalmem } from "node:os";
 import { getTranscriptCaptureStats } from "../domain/transcript-rotation.js";
 
 export const psRoutes = new Hono();
@@ -10,15 +10,20 @@ export const psRoutes = new Hono();
 // Separate opt-in payload: the ordinary /api/ps bare-array contract is unchanged.
 psRoutes.get("/resources", (c) => {
   const psService = c.get("psProjectionService" as never) as PsProjectionService;
-  return projectionLane.run(() => {
+  return projectionLane.run(async () => {
+    // The seats' database read runs on the read worker (off the event loop); the rest is in-memory.
+    const entries = await psService.getEntriesOffLoop({ includeArchived: true, archivedOnly: false });
     const cpuCount = availableParallelism();
     const load = platform() === "win32" ? null : loadavg();
     return c.json({
       sampledAt: new Date().toISOString(), cpuCount,
       loadAverage: load, loadPerCpu: load ? load.map((value) => value / cpuCount) : null,
+      // On Linux, libuv reports MemAvailable (reclaimable cache counts as free)
+      // and falls back to MemFree only on kernels without it.
+      memory: { totalBytes: totalmem(), freeBytes: freemem() },
       // Forced archival can hide a rig without stopping its seats. Host load
       // measurements must count those running processes as well.
-      runningSeats: psService.getEntries({ includeArchived: true, archivedOnly: false }).reduce((n, entry) => n + entry.runningCount, 0),
+      runningSeats: entries.reduce((n, entry) => n + entry.runningCount, 0),
       capture: getTranscriptCaptureStats(),
     });
   });
@@ -32,5 +37,7 @@ psRoutes.get("/", (c) => {
   // slice-04: the whole projection + JSON serialization runs as ONE cooperative
   // lane job (shared with /api/rigs/summary) so a concurrent burst yields the event
   // loop between jobs and /healthz stays responsive. Only query-flag parsing is here.
-  return projectionLane.run(() => c.json(psService.getEntries({ includeArchived, archivedOnly })));
+  // T-010231: the projection's database reads run on the read worker, so the job
+  // holds the loop only for the in-memory fold and the JSON.
+  return projectionLane.run(async () => c.json(await psService.getEntriesOffLoop({ includeArchived, archivedOnly })));
 });

@@ -129,6 +129,9 @@ Keys:
                          message_inline, message_file_path
   policies.idle_gate_qitem.scan_interval_seconds
   policies.idle_gate_qitem.active_wake_interval_seconds
+  policies.seat_pool.*   max_launches_in_flight, max_launches_per_tick, min_free_memory_mb,
+                         max_load_per_cpu_percent (the host's room for seat-pool launches;
+                         defaults 1, 1, 1024, 100)
   snapshots.periodic.*   enabled, interval_seconds, retention_keep
   queue.*                pickup_stall_threshold_minutes (S04 pickup-receipt stall threshold),
                          stuck_sweep_interval_seconds, stuck_sweep_unclaimed_age_minutes (S02 standing stuck sweep),
@@ -165,6 +168,29 @@ Keys:
                          POSIX launches otherwise start from daemon + seat environment, preserving shell startup.
                          Turn on for custom setups that intentionally rely on tmux globals. Running agents are unchanged.
                          If the scoped boundary is unavailable, launch continues with its previous environment and a diagnostic.
+  terminal.seat_scope     each seat in a systemd user scope of its own, with TasksMax (default off; Linux, daemon as a
+                         systemd user service). A seat that forks without end hits its own ceiling, not the others'.
+                         The scopes go in openrig-seats.slice, which systemd puts inside openrig.slice (the dash makes
+                         it a child), next to app.slice where the daemon runs: out of the seat terminal server's scope.
+                         Limits put on that scope for all seats together (MemoryMax, MemoryHigh, TasksMax) no longer
+                         reach them, and neither does its CPU share next to the daemon. Before turning this on, put the
+                         aggregate limits on ~/.config/systemd/user/openrig-seats.slice.d/*.conf and a CPUWeight that
+                         keeps the daemon ahead on openrig.slice (openrig.slice.d/*.conf; CPUWeight only weighs
+                         siblings, and openrig-seats.slice is openrig.slice's only child, so one there does nothing):
+                         a limit on openrig.slice also reaches the seats. OOMPolicy=continue (systemd 253+), as the
+                         server's scope: an OOM kill ends one process, not the seat. Applies at each seat's next launch,
+                         and it is daemon-wide: to try it on one rig first, turn it on, relaunch only that rig's seats
+                         (rig seat launch <seat>@<rig> --fresh --stop --reason "seat scope canary", which starts a blank
+                         conversation) and turn it off again. While it is on, any seat launched in any rig goes in a
+                         scope; after it is off, seats relaunched by the autoscale or by any relaunch go back out of the
+                         scope, which undoes the canary seat by seat. Where no user scope can be made (no user manager
+                         or bus, systemd-run missing or refusing, terminal.inherit_tmux_environment on), the seat
+                         launches as before, with a warning, and launches skip asking again for 60 s; a wave of
+                         launches (a boot) that hits that stays out of the scope until each seat's next launch. A
+                         restart in place keeps its own command and brings no seat environment: it runs out of the seat
+                         scope, with a warning, until the seat's next launch (with terminal.inherit_tmux_environment on,
+                         that launch stays out too). Never stop a seat's scope by hand: use rig seat stop.
+  terminal.seat_scope_tasks_max  TasksMax of each seat scope (default 2048, integer in [64, 4194304])
   terminal.fixed_geometry  use 90x27 web geometry while subscribed (default off; other viewers share the pinned size)
   terminal.status_bar    show the inner tmux status bar on launch (default off)
   terminal.tmux_server   inherit the launching server, or isolated per OpenRig home (restart required)
