@@ -116,7 +116,8 @@ import {
 import { WatchdogJobsRepository } from "./watchdog-jobs-repository.js";
 import { NOTED_ON_QUEUED_ROW, QUEUED_AS_ROW, isQueueOnlyDeliveryCode } from "./watchdog-history-log.js";
 import { parkedRowNotePrefix, queuedAsRowNote } from "./park-wake-text.js";
-import type { ParkFacts } from "./policies/seat-pool.js";
+import { seatPoolLongGateOf, type ParkFacts } from "./policies/seat-pool.js";
+import { nextDueAt } from "./watchdog-due.js";
 import { parse as parseYaml } from "yaml";
 import { armQueueWait, backOffQueueWait, refreshQueueWaits, evaluateQueueWait, retargetQueueWait, isQueueWait } from "./queue-wait-backoff.js";
 import { parseHumanQuestions, unansweredQuestions, describeTypedReplyPlacement, formatHumanAnswers, humanAnswerText, type HumanQuestion, type HumanAnswers, type TypedHumanReply, type RecordHumanAnswerResult } from "./human-questions.js";
@@ -1215,6 +1216,10 @@ export interface PoolSeatRowFacts {
    *  `rows`' order (T-007036, dispatch_to_parked.max_open_rows). Absent otherwise. */
   parkedRows?: ParkFacts[];
 }
+
+/** What a seat pool with `return_long_gates` asks of each park (listPoolSeatRowFacts, T-012673): its `to` (`returnTo`)
+ *  and its `gates` (`returnGates`, T-012748: the age counts only the time blocked on one of them). Both or neither. */
+export type PoolSeatReturnOpts = { returnTo?: undefined; returnGates?: undefined } | { returnTo: string; returnGates: readonly string[] };
 
 export class QueueRepository {
   readonly db: Database.Database;
@@ -4411,6 +4416,8 @@ export class QueueRepository {
       identityPrincipal: input.identityPrincipal ?? null,
       ownerNotificationKind: notification?.kind,
       ownerNotificationLevel: notification?.level,
+      // T-012748: the gate of this park, recorded on the transition (migration 174).
+      ...(input.state === "blocked" ? { blockedOn: nextBlockedOn ?? null } : {}),
     });
     if (parkWake) {
       // OPR.0.5.8.1 S1b addendum — A NEW PARK EPISODE SUPERSEDES THE OLD.
@@ -4552,7 +4559,7 @@ export class QueueRepository {
           .run(successor.qitemId, input.ts, r.qitem_id);
         const rebound = this.transitionLog.append({ qitemId: r.qitem_id, state: "blocked", actorSession: input.actorSession,
           transitionNote: `blocker custody moved from ${input.qitemId} to ${successor.qitemId}`,
-          identityProvenance: input.identityProvenance });
+          identityProvenance: input.identityProvenance, blockedOn: successor.qitemId });
         const jobs = this.watchdogJobsRepo ?? new WatchdogJobsRepository(this.db);
         const retainedTimer = oldWake?.kind === "timer" && retargetQueueWait(this.db, jobs, oldWake.ref, successor.qitemId);
         if (!retainedTimer) this.retireParkGeneratedTimer(r.qitem_id, "blocker_custody_moved");
@@ -5570,8 +5577,9 @@ export class QueueRepository {
    * gives the transition that armed it (its actor and time) and, for a timer, its job's interval in any state of the job;
    * getCurrentParkStatus says whether that wake is still armed and live. The row was taken at its claim, or else at its first move
    * to in-progress by one of its destination's addresses (a seat that takes a row by update, with no claim).
+   * `opts` (a seat pool with `return_long_gates`): its `to` and its `gates`, for poolSeatParkFacts.
    */
-  listPoolSeatRowFacts(sessionName: string, maxBlocked = 1, opts: { returnTo?: string } = {}): PoolSeatRowFacts {
+  listPoolSeatRowFacts(sessionName: string, maxBlocked = 1, opts: PoolSeatReturnOpts = {}): PoolSeatRowFacts {
     const rows = this.listOpenObligations(sessionName, 500).map((row) => ({ qitemId: row.qitemId, state: row.state }));
     if (rows.length === 0 || rows.length > Math.max(1, maxBlocked) || rows.some((row) => row.state !== "blocked")) return { rows, parked: null };
     if (rows.length === 1) return { rows, parked: this.poolSeatParkFacts(rows[0]!.qitemId, opts) };
@@ -5580,9 +5588,10 @@ export class QueueRepository {
   }
 
   /** The park facts of one blocked row (listPoolSeatRowFacts); null when the row is not there. With `returnTo` (a seat
-   *  pool with `return_long_gates`, T-012673) also `blockedSince`, `wakeFiredAt` and `returnRefusal` (whether the row
-   *  could be handed to that seat as it is), so the facts of any other read are the ones from before. */
-  private poolSeatParkFacts(qitemId: string, opts: { returnTo?: string } = {}): ParkFacts | null {
+   *  pool with `return_long_gates`, T-012673) also `blockedSince` (on `returnGates` only, T-012748), `wakeFiredAt` and
+   *  `returnRefusal` (whether the row could be handed to that seat as it is), so the facts of any other read are the
+   *  ones from before. */
+  private poolSeatParkFacts(qitemId: string, opts: PoolSeatReturnOpts = {}): ParkFacts | null {
     const item = this.db.prepare("SELECT blocked_on, claimed_at, destination_session FROM queue_items WHERE qitem_id = ?")
       .get(qitemId) as { blocked_on: string | null; claimed_at: string | null; destination_session: string } | undefined;
     if (!item) return null;
@@ -5617,7 +5626,7 @@ export class QueueRepository {
       takenAt: item.claimed_at ?? firstTake?.ts ?? null,
       ...(opts.returnTo !== undefined
         ? {
-          blockedSince: this.blockedSinceMs(qitemId),
+          blockedSince: this.blockedSinceMs(qitemId, opts.returnGates ?? []),
           wakeFiredAt: this.lastWakeFiredMs(qitemId),
           returnRefusal: this.parkedHandoffRefusal(qitemId, opts.returnTo)?.code ?? null,
         }
@@ -5626,20 +5635,52 @@ export class QueueRepository {
     return parked;
   }
 
-  /** T-012673: since when a blocked row has been blocked without leaving `blocked` (ms), on any gate: its first move to
-   *  blocked after its latest transition to another state (the unbroken park, as current-park-arm.ts reads it). A
-   *  re-park, a note and a change of gate keep it: the age counts the unbroken block on any gate, so a row that waited on
-   *  one gate and was parked again on a long one may be returned soon after (no new schema column for the gate of each
-   *  park, to keep the rebase on 0.7.18 clean). Null when the record has no such transition. */
-  private blockedSinceMs(qitemId: string): number | null {
-    const row = this.db.prepare(
-      `SELECT MIN(t.ts) AS ts FROM queue_transitions t
+  /**
+   * T-012673, T-012748: since when a blocked row has been blocked on a gate of `gates` (`return_long_gates.gates`, as
+   * seatPoolLongGateOf matches them) without leaving `blocked` (ms). The current blocked episode is the row's transitions
+   * after its latest transition to any other state; walking it from the newest back, each transition whose recorded
+   * gate (queue_transitions.blocked_on, migration 174) is listed moves the start back to it, and the first one on a gate
+   * out of the list ends the walk. A re-park on a listed gate, a note and a wake that fired keep the count (they record
+   * the gate the row is on); a re-park from a gate out of the list (2 h on suite-flock, then github-review) starts it at
+   * the move to the listed gate, so the row is never returned for time it spent on another wait.
+   *
+   * A transition recorded before the column (or in a schema without it: NULL) counts only when it is the row's newest,
+   * whose gate is the row's current blocked_on; an older NULL ends the walk, so the count can only start later than the
+   * truth, never earlier (the row goes back later, never sooner). Null when nothing counts.
+   */
+  private blockedSinceMs(qitemId: string, gates: readonly string[]): number | null {
+    const recorded = this.transitionsHaveBlockedOn();
+    const episode = this.db.prepare(
+      `SELECT t.ts, ${recorded ? "t.blocked_on" : "NULL"} AS blocked_on FROM queue_transitions t
         WHERE t.qitem_id = @qitem AND t.state = 'blocked' AND t.transition_id > COALESCE((SELECT MAX(o.transition_id)
-          FROM queue_transitions o WHERE o.qitem_id = @qitem AND o.state <> 'blocked'), 0)`,
-    ).get({ qitem: qitemId }) as { ts: string | null } | undefined;
-    const ms = row?.ts ? Date.parse(row.ts) : NaN;
+          FROM queue_transitions o WHERE o.qitem_id = @qitem AND o.state <> 'blocked'), 0)
+        ORDER BY t.transition_id DESC`,
+    ).all({ qitem: qitemId }) as Array<{ ts: string; blocked_on: string | null }>;
+    if (episode.length === 0 || gates.length === 0) return null;
+    const rule = { gates: [...gates] };
+    const listed = (gate: string | null) => gate !== null && seatPoolLongGateOf(rule, gate) !== null;
+    let since: string | null = null;
+    for (const [i, transition] of episode.entries()) {
+      let gate = transition.blocked_on;
+      if (gate === null) {
+        if (i !== 0) break;
+        gate = (this.db.prepare("SELECT blocked_on FROM queue_items WHERE qitem_id = ?").get(qitemId) as { blocked_on: string | null } | undefined)
+          ?.blocked_on ?? null;
+      }
+      if (!listed(gate)) break;
+      since = transition.ts;
+    }
+    const ms = since ? Date.parse(since) : NaN;
     return Number.isFinite(ms) ? ms : null;
   }
+
+  /** T-012748: whether queue_transitions records the gate of each park (migration 174), read once. */
+  private transitionsHaveBlockedOn(): boolean {
+    this.blockedOnRecorded ??= (this.db.prepare("PRAGMA table_info(queue_transitions)").all() as Array<{ name: string }>)
+      .some((column) => column.name === "blocked_on");
+    return this.blockedOnRecorded;
+  }
+  private blockedOnRecorded: boolean | undefined;
 
   /** T-012673: when a wake of the row last fired (ms; its fire receipt), null when none did or the records are absent. */
   private lastWakeFiredMs(qitemId: string): number | null {
@@ -5697,16 +5738,21 @@ export class QueueRepository {
    * Otherwise, for each row: it closes `handed-off` (its timer retired with it), with its `note` on that transition; the
    * successor at `toSession`, with no wake sent (`nudge: false`), carries the row's chain of record ending in the row,
    * so the work done so far is reached from it, and its tags but `dropTags`; it is parked at once on the same gate, with
-   * a timer of the same interval and message (a default message names the successor; a new interval counts from now)
-   * when the row had one, and with none when it had none. Rows of other seats that waited on the row wait on the
-   * successor (the handoff's propagateBlockerCompletion). The successor's park note is the row's recorded continuation
+   * a timer of the same interval and message (a default message names the successor) when the row had one, and with
+   * none when it had none. The successor's timer falls due when the row's would have (T-012748: its next due, read
+   * before the handoff retires the row's timer, is set on the new job as its last evaluation one interval earlier, so a
+   * wake due in 1 min is due in 1 min at the fixed seat, and one already due is due now); like every park timer it fires
+   * once. A timer with no next due of its own (one that fired, delivered or with its retry pending, or is no longer
+   * active) gets a full interval from now, as before. `moved[].wakeDueAt` says when the successor's wake falls due (ISO:
+   * the row's own due, past when it was overdue; the move's time when it carried the wake-now marker).
+   * Rows of other seats that waited on the row wait on the successor (the handoff's propagateBlockerCompletion). The successor's park note is the row's recorded continuation
    * when it had one (so the fixed seat's wake previews it), else the row's `note`.
    */
   handoffParkedRows(
     rows: ReadonlyArray<{ qitemId: string; blockedOn: string; note: string }>,
     toSession: string,
     opts: { expectDestination: string; dropTags?: readonly string[]; actorSession: string },
-  ): { ok: true; moved: Array<{ qitemId: string; newQitemId: string; wakeAfterSeconds: number | null }> }
+  ): { ok: true; moved: Array<{ qitemId: string; newQitemId: string; wakeAfterSeconds: number | null; wakeDueAt: string | null }> }
     | { ok: false; code: string; error: string; qitemId?: string } {
     const jobs = this.watchdogJobsRepo ?? new WatchdogJobsRepository(this.db);
     let current: string | undefined;
@@ -5719,7 +5765,7 @@ export class QueueRepository {
             `${opts.expectDestination} holds ${open.join(", ") || "no row"}, not ${expected.join(", ") || "no row"}; nothing was handed on`);
         }
         const drop = new Set(opts.dropTags ?? []);
-        const moved: Array<{ qitemId: string; newQitemId: string; wakeAfterSeconds: number | null }> = [];
+        const moved: Array<{ qitemId: string; newQitemId: string; wakeAfterSeconds: number | null; wakeDueAt: string | null }> = [];
         for (const row of rows) {
           current = row.qitemId;
           const { qitemId } = row;
@@ -5738,19 +5784,22 @@ export class QueueRepository {
           }
           const refusal = this.parkedHandoffRefusal(qitemId, toSession);
           if (refusal) throw new QueueRepositoryError(refusal.code, `${refusal.message}; nothing was handed on`);
-          // A park timer of its own is carried over by its interval and message (parkedHandoffRefusal admits only that
-          // or no wake).
+          // A park timer of its own is carried over by its interval, message and next due (parkedHandoffRefusal admits
+          // only that or no wake). The due is read here: the handoff retires the row's timer.
           const armed = this.wakeRepo.getCurrentParkStatus(qitemId);
-          let wake: { seconds: number; message: string | null } | null = null;
+          let wake: { seconds: number; message: string | null; dueMs: number | null | undefined } | null = null;
           if (armed) {
             const job = jobs.getById(armed.ref)!;
+            // undefined: no next due of its own (it fired, delivered or with a retry pending, or is no longer active): a full
+            // interval from now.
+            const dueMs = job.state === "active" && armed.live ? nextDueAt(job) : undefined;
             let message: string | null = null;
             try {
               const spec = parseYaml(job.specYaml) as { message?: unknown; context?: { message?: unknown } } | null;
               const written = spec?.message ?? spec?.context?.message;
               if (typeof written === "string" && written.trim() && !isDefaultParkWakeMessage(written)) message = written;
             } catch { /* the default message, for the successor */ }
-            wake = { seconds: job.intervalSeconds, message };
+            wake = { seconds: job.intervalSeconds, message, dueMs };
           }
           const continuation = this.currentParkContinuation(qitemId);
           const { created } = this.handoffWithin({
@@ -5763,7 +5812,20 @@ export class QueueRepository {
             ...(wake ? { wakeAfterSeconds: wake.seconds, ...(wake.message !== null ? { wakeMessage: wake.message } : {}) } : {}),
           });
           for (const event of parked.persistedEvents) register(event);
-          moved.push({ qitemId, newQitemId: created.qitemId, wakeAfterSeconds: wake?.seconds ?? null });
+          let wakeDueAt: string | null = null;
+          if (wake) {
+            const ref = this.wakeRepo.getCurrentParkStatus(created.qitemId)?.ref;
+            const timer = ref !== undefined ? jobs.getById(ref) : null;
+            if (!timer) throw new QueueRepositoryError("handoff_parked_failed", `qitem ${created.qitemId} was parked with no timer; nothing was handed on`);
+            if (wake.dueMs !== undefined) {
+              // The epoch is #860's wake-now marker (nextDueAt reads it as due now); otherwise the row's own due.
+              const last = wake.dueMs === null ? new Date(0).toISOString() : new Date(wake.dueMs - wake.seconds * 1000).toISOString();
+              jobs.recordEvaluation(timer.jobId, last, false);
+            }
+            const due = nextDueAt(jobs.getById(timer.jobId)!);
+            wakeDueAt = new Date(due ?? Date.now()).toISOString();
+          }
+          moved.push({ qitemId, newQitemId: created.qitemId, wakeAfterSeconds: wake?.seconds ?? null, wakeDueAt });
         }
         current = undefined;
         return { ok: true as const, moved };

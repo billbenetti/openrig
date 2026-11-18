@@ -191,6 +191,7 @@ import { nodeAdvisorSchema } from "./migrations/125_node_advisor.js";
 import { operationCorrelationSchema } from "./migrations/127_operation_correlation.js";
 import { queueListReceiptAndStateIndexesSchema } from "./migrations/170_queue_list_receipt_and_state_indexes.js";
 import { queueTransitionsPromptRefusalIndexSchema } from "./migrations/171_queue_transitions_prompt_refusal_index.js";
+import { queueTransitionsBlockedOnSchema } from "./migrations/174_queue_transitions_blocked_on.js";
 
 /** Ordered migrations; numbers may be reserved by independent changes. */
 
@@ -381,4 +382,5 @@ export const ALL_MIGRATIONS: Migration[] = [
   seatPoolSlotsLiveAtSchema,
   queueListReceiptAndStateIndexesSchema,
   queueTransitionsPromptRefusalIndexSchema,
+  queueTransitionsBlockedOnSchema,
 ];
