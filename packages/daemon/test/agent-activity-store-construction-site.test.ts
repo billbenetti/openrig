@@ -25,7 +25,7 @@ describe("AgentActivityStore — single production construction site (W2a-1)", (
     });
   }
 
-  it("has exactly one production construction site, and it injects the generation resolvers and the adoption rule", () => {
+  it("has the startup site and the read worker's, and each injects the generation resolvers and the adoption rule", () => {
     const sites: Array<{ file: string; injectsResolver: boolean; injectsMembership: boolean; injectsAdoption: boolean }> = [];
     for (const file of walkTs(srcDir)) {
       const text = fs.readFileSync(file, "utf8");
@@ -43,24 +43,28 @@ describe("AgentActivityStore — single production construction site (W2a-1)", (
       }
     }
 
+    // The fork reads the hook rows of `rig ps` on the read worker's own connection (read-off-loop-jobs.ts), with a store
+    // wired as startup wires it: two production sites, each with the whole gate. Any other site, or a naked one, fails.
     expect(
-      sites,
-      `expected exactly ONE production construction site of AgentActivityStore; got ${JSON.stringify(sites)}`,
-    ).toHaveLength(1);
-    expect(
-      sites[0]?.injectsResolver,
-      `the sole construction site (${sites[0]?.file}) must inject resolveOccupantGeneration — a naked site ` +
-        `silently disables the generation gate (legacy clock-only path)`,
-    ).toBe(true);
-    expect(
-      sites[0]?.injectsMembership,
-      `the sole construction site (${sites[0]?.file}) must inject isRegisteredOccupantGeneration — ` +
-        `otherwise an uncommitted reservation can be misreported as a dead tenure`,
-    ).toBe(true);
-    expect(
-      sites[0]?.injectsAdoption,
-      `the sole construction site (${sites[0]?.file}) must inject isOccupantContinuedByAdoption — ` +
-        `otherwise an adopted, still-running seat's hooks read as a dead tenure`,
-    ).toBe(true);
+      sites.map((site) => site.file).sort(),
+      `expected the production construction sites of AgentActivityStore to be startup.ts and the read worker's; got ${JSON.stringify(sites)}`,
+    ).toEqual(["domain/read-off-loop-jobs.ts", "startup.ts"]);
+    for (const site of sites) {
+      expect(
+        site.injectsResolver,
+        `the construction site ${site.file} must inject resolveOccupantGeneration — a naked site ` +
+          `silently disables the generation gate (legacy clock-only path)`,
+      ).toBe(true);
+      expect(
+        site.injectsMembership,
+        `the construction site ${site.file} must inject isRegisteredOccupantGeneration — ` +
+          `otherwise an uncommitted reservation can be misreported as a dead tenure`,
+      ).toBe(true);
+      expect(
+        site.injectsAdoption,
+        `the construction site ${site.file} must inject isOccupantContinuedByAdoption — ` +
+          `otherwise an adopted, still-running seat's hooks read as a dead tenure`,
+      ).toBe(true);
+    }
   });
 });
