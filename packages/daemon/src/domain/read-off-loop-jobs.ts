@@ -29,8 +29,8 @@ export type ReadJobResult<J extends ReadJobName> = Jobs[J]["result"];
 // The hook reads publish nothing; a store needs a bus only to write.
 const NO_EVENTS = { emit: () => undefined } as unknown as EventBus;
 
-/** The daemon's hook store, wired as startup wires it (the occupant-generation gate from the session registry), on
- *  the worker's connection. */
+/** The daemon's hook store, wired as startup wires it (the occupant-generation gate and, since the v0.7.18, the
+ *  adoption rule from the session registry, #3365), on the worker's connection. */
 function hookStore(db: Database.Database, freshnessMs: number): AgentActivityStore {
   const sessions = new SessionRegistry(db);
   return new AgentActivityStore({
@@ -39,6 +39,7 @@ function hookStore(db: Database.Database, freshnessMs: number): AgentActivitySto
     freshnessMs,
     resolveOccupantGeneration: (nodeId) => sessions.currentOccupantTenure(nodeId)?.generationUuid ?? null,
     isRegisteredOccupantGeneration: (nodeId, generation) => sessions.isOccupantGenerationRegistered(nodeId, generation),
+    isOccupantContinuedByAdoption: (nodeId, generation) => sessions.isOccupantContinuedByAdoption(nodeId, generation),
   });
 }
 
