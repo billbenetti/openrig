@@ -22,6 +22,7 @@ import { configureShadowCapture } from "./domain/shadow-capture.js";
 import { SeatDeliveryGuard, resolveExternalCliOccupant, resolveGuardTarget } from "./domain/seat-delivery-guard.js";
 import { seatCodexCorePluginDir, vendoredCorePluginDir } from "./domain/claude-core-plugin-env.js";
 import { queueRecoveryOwnsWake } from "./domain/queue-wake-ladder.js";
+import { withRecoveryIndex } from "./domain/queue-recovery.js";
 import { HealthPolicyStore } from "./domain/health-policy.js";
 import { HealthCheckpointSource } from "./domain/health-checkpoints.js";
 import { PassiveCeremonySource } from "./domain/health-passive-ceremony.js";
@@ -2889,7 +2890,12 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
           },
           // Best-effort attempt reporting; actual prompt and failure recovery still use the existing ladder.
           rows: {
-            recoveryOwnsWake: (qitemId) => queueRecoveryOwnsWake(db, queueRepoInstance.getById(qitemId)),
+            // T-013820: the recheck asks this for every open row of a parked seat (hundreds, for a seat holding many) in
+            // one synchronous pass, so one recovery index serves all of them, and the custody read takes the row without
+            // its waiting view (it reads only the row's own state, claim, handoff and wake fields). Per row, outside the
+            // index, the pass held the loop 5-6 s for a seat with 233 open rows.
+            recoveryOwnedAmong: (qitemIds) => withRecoveryIndex(db, () => new Set(qitemIds.filter((qitemId) =>
+              queueRecoveryOwnsWake(db, queueRepoInstance.getById(qitemId, { waiting: false }))))),
             listTransitions: (qitemId: string) =>
               queueRepoInstance
                 .listTransitions(qitemId)
