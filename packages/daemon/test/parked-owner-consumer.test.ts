@@ -33,6 +33,8 @@ import { WatchdogHistoryLog } from "../src/domain/watchdog-history-log.js";
 import { WatchdogJobsRepository } from "../src/domain/watchdog-jobs-repository.js";
 import { RigRepository } from "../src/domain/rig-repository.js";
 import { pruneWatchdogHistory } from "../src/domain/queue-retention.js";
+import { queueRecoveryOwnsWake } from "../src/domain/queue-wake-ladder.js";
+import { withRecoveryIndex } from "../src/domain/queue-recovery.js";
 
 const RIG = "test-rig";
 const SEAT = `dev-planner@${RIG}`;
@@ -944,6 +946,7 @@ describe("a wake escalation about the seat's own prompt is not that seat's work"
       appendNote: (q, note) => { repo.update({ qitemId: q, actorSession: "watchdog@system", transitionNote: note }); return { ok: true }; },
       recordNudgeResult: (q, result) => repo.recordNudgeAttempt(q, result),
       listOpenIds: (dest) => repo.listOpenObligations(dest, 500).map((r) => r.qitemId),
+      recoveryOwnedAmong: (ids) => withRecoveryIndex(db, () => new Set(ids.filter((id) => queueRecoveryOwnsWake(db, repo.getById(id, { waiting: false }))))),
     };
     const policy = makeParkedOwnerConsumerPolicy({ diagnoseRig: () => diagnosis as never, history: { listForJob: () => [], countForJob: () => 0 },
       rows, occupantGeneration: () => "gen-1", now: () => NOW });
