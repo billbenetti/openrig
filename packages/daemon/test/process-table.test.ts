@@ -3,7 +3,8 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { readProcessTable, readProcTable, readProcessTableCensus, readProcCensus } from "../src/domain/process-table.js";
+import { procTablePartsForTest, readProcessTable, readProcTable, readProcessTableCensus, readProcCensus, restartProcReaderForTest } from "../src/domain/process-table.js";
+import { configureSyncSiteRecorder } from "../src/domain/sync-site-wrap.js";
 import { claudeCommandSessionToken, listNativeProcesses, processArgv, verifyCodexPaneProcess, verifyPaneIdleShell } from "../src/domain/native-process-lineage.js";
 import { defaultListProcessesStrict } from "../src/domain/resume-metadata-refresher.js";
 import { restoreProc, serveProcRoot, writeFakeProc, readPermissionHiddenProc } from "./helpers/fake-proc.js";
@@ -175,6 +176,50 @@ describe("readProcTable", () => {
     const ps = (columns: string) => execFileSync("ps", ["-o", columns, "-p", String(process.pid)], { encoding: "utf8", env: { ...process.env, LC_ALL: "C" } }).trim();
     expect(self).toMatchObject({ ppid: Number(ps("ppid=")), pgid: Number(ps("pgid=")), tpgid: Number(ps("tpgid=")), executableName: ps("ucomm="), command: ps("args=") });
     expect(self.startedAt).toBe(ps("lstart="));
+  });
+});
+
+describe("the reader's rows module (T-011108)", () => {
+  afterEach(async () => {
+    configureSyncSiteRecorder(undefined);
+    await restartProcReaderForTest();
+  });
+
+  const twoProcesses = () => fakeProc(0, {
+    7: { stat: stat(7, "node", "S", 1, 7, 7, 0), cmdline: "node\0a.js\0" },
+    8: { stat: stat(8, "sh", "S", 1, 8, 8, 0), cmdline: "sh\0" },
+  });
+
+  it("parses on the reader's thread: the parts come with rows, and nothing is parsed on the loop", async () => {
+    const offered: Record<string, unknown>[] = [];
+    configureSyncSiteRecorder({ recordDiagnostic: (record) => { offered.push(record); return true; } });
+    await restartProcReaderForTest();
+    const rows = await readProcTable(twoProcesses());
+    expect(rows.map((row) => row.command).sort()).toEqual(["node a.js", "sh"]);
+    expect(procTablePartsForTest()).toEqual({ rows: 1, files: 0 });
+    expect(offered).toEqual([]);
+  });
+
+  it("names the parse on the loop when the reader cannot load the rows module, once a minute, and still gives the rows", async () => {
+    const offered: Record<string, unknown>[] = [];
+    configureSyncSiteRecorder({ recordDiagnostic: (record) => { offered.push(record); return true; } });
+    await restartProcReaderForTest({ rowsUrl: "file:///nowhere/process-table-rows.js" });
+    const root = twoProcesses();
+    expect((await readProcTable(root)).map((row) => row.command).sort()).toEqual(["node a.js", "sh"]);
+    expect((await readProcTable(root)).map((row) => row.command).sort()).toEqual(["node a.js", "sh"]);
+    expect(procTablePartsForTest()).toEqual({ rows: 0, files: 2 });
+    expect(offered).toEqual([{ site: "process-table.parse-on-loop", error: expect.stringContaining("nowhere") }]);
+  });
+
+  it("never throws synchronously when the tsx loader cannot be resolved: the loop parses, and the read resolves", async () => {
+    const offered: Record<string, unknown>[] = [];
+    configureSyncSiteRecorder({ recordDiagnostic: (record) => { offered.push(record); return true; } });
+    await restartProcReaderForTest({ resolveLoader: () => { throw new Error("Cannot find package 'tsx'"); } });
+    let read: Promise<unknown> | undefined;
+    expect(() => { read = readProcTable(twoProcesses()); }).not.toThrow();
+    expect(((await read) as { command: string }[]).map((row) => row.command).sort()).toEqual(["node a.js", "sh"]);
+    expect(procTablePartsForTest()).toEqual({ rows: 0, files: 1 });
+    expect(offered).toEqual([{ site: "process-table.parse-on-loop", error: expect.stringContaining("Cannot find package 'tsx'") }]);
   });
 });
 

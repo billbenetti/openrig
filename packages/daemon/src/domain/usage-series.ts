@@ -17,6 +17,7 @@ import { hasClientCostColumns } from "./usage-samples-store.js";
 import { hasPiUsageChargesTable, hasPiUsageEntriesTable } from "./pi-usage-entries-store.js";
 import { openRouterChargeTarget } from "./openrouter-charge.js";
 import { sameReset } from "./provider/usage-windows.js";
+import { runSyncSiteWhenSlow } from "./sync-site-wrap.js";
 
 export interface UsageSeriesQuery {
   seatSession?: string;
@@ -67,7 +68,9 @@ function capturedAtBound(value: string): string {
 /** Serve the RAW stored rows, oldest first. Bounds are absolute on captured_at
  *  (since inclusive-of-later, i.e. `>=`; until exclusive `<`). */
 export function queryUsageSeries(db: Database, q: UsageSeriesQuery): UsageSeriesRow[] {
-  return readUsageSeries(db, q, false);
+  // T-010230: named in the slow-operation log when slow. Two callers read through it, GET /api/telemetry/usage/series
+  // (it held the loop 2-3 s on 16/11) and the health detectors (one read per live node), so the site names the read.
+  return runSyncSiteWhenSlow("usage_series.query", () => readUsageSeries(db, q, false));
 }
 
 /** Complete internal projections must not inherit the public raw-row page cap. */

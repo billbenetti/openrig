@@ -123,7 +123,7 @@ export class ContextUsageStore {
    * no zone marker), so it is parsed as UTC; a bare Date.parse would read it as local time.
    * #3044 C3: a reading recorded with the live occupant's generation is its own, so the time doesn't apply.
    */
-  private isPriorGenerationReading(nodeId: string, row: ContextUsageRow): boolean {
+  private isPriorGenerationReading(nodeId: string, row: Pick<ContextUsageRow, "occupant_generation" | "sampled_at">): boolean {
     if (row.occupant_generation && row.occupant_generation === this.resolveOccupantGeneration?.(nodeId)) return false;
     const sampledAt = row.sampled_at;
     if (!sampledAt) return false;
@@ -191,6 +191,25 @@ export class ContextUsageStore {
     const result = this.readSidecar(sessionName);
     if (!result.ok) return this.unknownUsage(result.reason);
     return this.normalizeSample(result.data);
+  }
+
+  /**
+   * The disk sidecar of a node's live occupant, normalized: readAndNormalize with the generation guard of getForNode, so
+   * a sample another occupant left under the same name (one recording a generation other than the live one's, or with no
+   * generation and sampled before the current one booted) reads as unknown ("stale_generation"). The seat pool reads this to keep a seat past its context limit from
+   * a row (T-012383); the freshness of the sample is the caller's to judge.
+   */
+  readSidecarForNode(nodeId: string, sessionName: string): ContextUsage {
+    const usage = this.readAndNormalize(sessionName);
+    if (usage.availability !== "known") return usage;
+    // A sample that records a generation other than the live occupant's is another occupant's, whatever its time (a
+    // retained predecessor still writing under the name); one with no generation falls back on the boot-time guard.
+    const live = this.resolveOccupantGeneration?.(nodeId) ?? null;
+    if (live && usage.occupantGeneration && usage.occupantGeneration !== live) return this.unknownUsage("stale_generation");
+    if (this.isPriorGenerationReading(nodeId, { occupant_generation: usage.occupantGeneration ?? null, sampled_at: usage.sampledAt })) {
+      return this.unknownUsage("stale_generation");
+    }
+    return usage;
   }
 
   /** Read the latest Codex token_count event for a thread and normalize it. */

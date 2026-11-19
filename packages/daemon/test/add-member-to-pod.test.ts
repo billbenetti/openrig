@@ -72,6 +72,40 @@ describe("PodRigInstantiator.addMemberToPod", () => {
     expect(newNode!.podId).toBe(result.result.podId);
   });
 
+  it("with launch: false creates the node without a session, and an ordinary launch starts it later", async () => {
+    const rig = await seedRigWithPod();
+    setup.tmuxAdapter.probeSession = vi.fn(async () => ({ state: "absent" as const }));
+    vi.mocked(setup.tmuxAdapter.createSession).mockClear();
+
+    const result = await setup.podInstantiator.addMemberToPod(rig.id, "infra", terminalMember("server2"), ".", { launch: false });
+
+    expect(result).toMatchObject({ ok: true, result: { node: { logicalId: "infra.server2", status: "materialized" } } });
+    if (!result.ok) return;
+    expect(result.result.node.sessionName).toBeUndefined();
+    const node = setup.rigRepo.getRig(rig.id)!.nodes.find((n) => n.logicalId === "infra.server2")!;
+    expect(node.id).toBe(result.result.node.nodeId);
+    expect(setup.sessionRegistry.getSessionsForRig(rig.id).filter((s) => s.nodeId === node.id)).toEqual([]);
+    expect(setup.sessionRegistry.getBindingForNode(node.id)).toBeNull();
+    expect(setup.tmuxAdapter.createSession).not.toHaveBeenCalled();
+
+    const launched = await setup.app.request(`/api/rigs/${rig.id}/nodes/infra.server2/launch`, {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: "{}",
+    });
+    expect({ status: launched.status, body: await launched.json() }).toMatchObject({
+      status: 201, body: { ok: true, nodeId: node.id, sessionName: "infra-server2@test-rig" },
+    });
+    expect(setup.sessionRegistry.getSessionsForRig(rig.id).filter((s) => s.nodeId === node.id)).toHaveLength(1);
+  });
+
+  it("refuses launch: false with a fork's launch additions before creating anything", async () => {
+    const rig = await seedRigWithPod();
+    const result = await setup.podInstantiator.addMemberToPod(rig.id, "infra", terminalMember("server2"), ".", {
+      launch: false, launchAdditionsFrom: seatSkillPaths({ rigId: rig.id, logicalId: "infra.server", runtime: "claude-code" }),
+    });
+    expect(result).toMatchObject({ ok: false, code: "validation_failed" });
+    expect(setup.rigRepo.getRig(rig.id)!.nodes.some((n) => n.logicalId === "infra.server2")).toBe(false);
+  });
+
   function podRowsForRig(rigId: string) {
     return db.prepare("SELECT id, namespace FROM pods WHERE rig_id = ?").all(rigId) as Array<{ id: string; namespace: string }>;
   }

@@ -8,6 +8,7 @@ import { queryUsageSeries, computeTopBurn, computeCostView } from "../domain/usa
 import { readTelemetryPage, TelemetryInputError, type TelemetrySource, type TelemetryStream } from "../domain/finite-telemetry.js";
 import { timeBoundAdvisory } from "../domain/time-bound-advisory.js";
 import { SQL_LIMIT_BOUND } from "./query-limit.js";
+import { readOffLoop } from "../domain/read-off-loop.js";
 
 export interface TelemetryRouteDeps {
   db: () => Database;
@@ -34,7 +35,7 @@ export function telemetryRoutes(deps: TelemetryRouteDeps): Hono {
     });
   }
 
-  app.get("/usage/series", (c) => {
+  app.get("/usage/series", async (c) => {
     const seat = c.req.query("seat") || undefined;
     const lane = c.req.query("lane");
     const sinceIso = c.req.query("since") || undefined;
@@ -50,17 +51,23 @@ export function telemetryRoutes(deps: TelemetryRouteDeps): Hono {
         return c.json({ error: `invalid limit "${limitRaw}" — must be a positive number` }, 400);
       }
     }
-    const rows = queryUsageSeries(deps.db(), {
+    const query = {
       seatSession: seat,
       lane: lane as "context" | "provider_window" | undefined,
       sinceIso,
       untilIso,
       limit,
-    });
+    };
+    // T-010231: the read and the rows' serialization run on the read worker, off the event loop (synchronous on a
+    // memory database); the body is the bytes c.json({ rows, advisories? }) would send.
+    const db = deps.db();
+    const rowsJson = await readOffLoop(db, "usageSeriesJson", query, () => JSON.stringify(queryUsageSeries(db, query)),
+      { site: "telemetry.usage_series.read", record: "whenSlow" });
     // An unrecognised bound is compared as text against captured_at, as before; say so.
     const advisories = [timeBoundAdvisory("since", sinceIso, "captured_at"), timeBoundAdvisory("until", untilIso, "captured_at")]
       .filter((a): a is string => a !== undefined);
-    return c.json({ rows, ...(advisories.length > 0 ? { advisories } : {}) });
+    const body = `{"rows":${rowsJson}${advisories.length > 0 ? `,"advisories":${JSON.stringify(advisories)}` : ""}}`;
+    return c.body(body, 200, { "Content-Type": "application/json" });
   });
 
   // OPR.0.7.0.2: what each seat's harness reports about cost, labelled; absent and stale stay visible.
