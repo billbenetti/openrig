@@ -20,6 +20,7 @@ import { createHash, randomUUID } from "node:crypto";
 import type { Policy, PolicyJob, PolicyEvaluation } from "./types.js";
 import { BACKGROUND_SHELL_GRACE_MINUTES } from "../queue-pickup.js";
 import { deliveryReachedSeat, type WatchdogHistoryEntry } from "../watchdog-history-log.js";
+import { runSyncSiteWhenSlow } from "../sync-site-wrap.js";
 
 /** The nudge result the parked-owner records when a queue-only seat's wake stays in its queue (T-006631). The wake
  *  ladder reads it as the seat's own choice, not as an unknown outcome, so the row never enters the ladder. */
@@ -71,6 +72,9 @@ export interface ParkedOwnerConsumerDeps {
     listOpenIds: (destinationSession: string) => string[];
     /** Existing delivery/recovery ownership; does not change the parked diagnosis. */
     recoveryOwnsWake?: (qitemId: string) => boolean;
+    /** The same answer as recoveryOwnsWake for all of a seat's rows at once, the ids it owns (T-013820): one read pass
+     *  for the whole set instead of one per row. Preferred when present. */
+    recoveryOwnedAmong?: (qitemIds: string[]) => ReadonlySet<string>;
   };
   /** Optional attempt provenance; the transport still binds the actual recipient. */
   occupantGeneration?: (sessionName: string) => string | null;
@@ -89,6 +93,8 @@ export interface ParkedOwnerConsumerDeps {
 }
 
 export const PARKED_OWNER_POLICY_NAME = "parked-owner-consumer";
+/** The slow-operations site of one evaluation (T-013820). */
+export const PARKED_OWNER_EVALUATE_SITE = "parked_owner.evaluate";
 /** A seat that just handed work off or asked a person has only started waiting (#1933): its first reminder waits
  *  until its arbitrated waiting state has been unchanged this long. A seat at a prompt gets no grace. */
 export const PARKED_OWNER_IDLE_GRACE_MS = 5 * 60_000;
@@ -206,247 +212,254 @@ export function openPromptRefusals(transitions: RowTransitionView[]): Array<{ ke
 export function makeParkedOwnerConsumerPolicy(deps: ParkedOwnerConsumerDeps): Policy {
   return {
     name: PARKED_OWNER_POLICY_NAME,
+    // T-013820: the evaluation is one synchronous block (no await): the diagnosis, the delivery-boundary recheck and the
+    // reserve all run before the loop turns. Named, so a pass that holds the loop shows up as a site, not a bare gap.
     async evaluate(job: PolicyJob): Promise<PolicyEvaluation> {
-      const rigName = rigFromAnchor(job.target.session);
-      const d = deps.diagnoseRig(rigName);
-      if (!d) {
-        return { action: "skip", reason: "indeterminate-not-parked", notes: { rig: rigName } };
-      }
-
-      // Missing telemetry or note writes cannot prevent a current input attempt.
-      let recent: WatchdogHistoryEntry[] = [];
-      try { recent = deps.history.listForJob(job.jobId, 25); } catch { /* telemetry is not admission */ }
-      const latestRows = new Set<string>();
-      for (const e of recent) {
-        if (e.outcome === "skipped" || e.outcome === "terminal" || !e.deliveryStatus) continue;
-        const n = e.evaluationNotes ?? {};
-        const key = typeof n["episodeKey"] === "string" ? n["episodeKey"] : null;
-        const primary = typeof n["primaryRow"] === "string" ? n["primaryRow"] : null;
-        if (!key || !primary || latestRows.has(primary)) continue;
-        latestRows.add(primary);
-        if (deliveryReachedSeat(e.deliveryStatus)) {
-          try {
-            if (!deps.rows.listTransitions(primary).some(t => t.transitionNote === `${DELIVERED_PREFIX} ${key}`))
-              deps.rows.appendNote(primary, `${DELIVERED_PREFIX} ${key}`);
-          } catch { /* absent bookkeeping cannot prove a delivered reminder */ }
-          continue;
+      return runSyncSiteWhenSlow(PARKED_OWNER_EVALUATE_SITE, (): PolicyEvaluation => {
+        const rigName = rigFromAnchor(job.target.session);
+        const d = deps.diagnoseRig(rigName);
+        if (!d) {
+          return { action: "skip", reason: "indeterminate-not-parked", notes: { rig: rigName } };
         }
-        const reason = String(n["deliveryReason"] ?? e.deliveryStatus);
-        // The parked policy retries after its own stage clears; the generic wake ladder must not interrupt restore.
-        if (reason.includes(PARKED_OWNER_COMPACTION_PENDING)) continue;
-        try {
-          const recorded = deps.rows.listTransitions(primary).some(t =>
-            (t.transitionNote?.startsWith(REFUSED_PREFIX) || t.transitionNote?.startsWith(FAILED_PREFIX)) && keyOfNote(t.transitionNote!) === key);
-          if (recorded) continue;
-          if (isRefusedInteractive(reason)) {
-            deps.rows.appendNote(primary, `${REFUSED_PREFIX} ${key}; ${reason}`);
-          } else {
-            const typedNoInput = n["deliveryInputPhase"] === "not_reached" && n["deliveryCode"] === "retained_quota_full";
-            const terminal = n["deliveryInputPhase"] === "not_reached" && n["deliveryCode"] === "terminal_seat";
-            const admission = typedNoInput ? QUOTA_NO_INPUT : terminal ? TERMINAL_NO_INPUT : "; detail:";
-            deps.rows.appendNote(primary, `${FAILED_PREFIX} ${key}${admission} ${reason}`);
-            const uncertain = n["deliveryInputPhase"] === "attempted" || n["deliveryInputPhase"] === "written";
-            deps.rows.recordNudgeResult(primary, `${uncertain ? "indeterminate: parked-owner wake delivery" : NUDGE_FAIL_PREFIX}${typedNoInput ? QUOTA_NO_INPUT : terminal ? TERMINAL_NO_INPUT : ""} — ${reason}`);
-          }
-        } catch { /* reporting failure is not permission to lose the next message */ }
-      }
 
-      const closures: string[] = [];
-      const skipped: Array<{ seat: string; why: string; primaryRow?: string; obligations?: string[]; episodeKey?: string; refusalReason?: string }> = [];
-      // Rotate after the latest physical delivery selection, including retained input. A single
-      // cursor from history cannot lose an owner's turn just because a bounded window filled.
-      const lastTarget = recent.find(e => e.deliveryStatus && e.deliveryTargetSession)?.deliveryTargetSession;
-      const ordered = [...d.seats].sort((a, b) => a.sessionName.localeCompare(b.sessionName));
-      const next = ordered.findIndex(seat => seat.sessionName === lastTarget) + 1;
-      const seats = [...ordered.slice(next), ...ordered.slice(0, next)];
-
-      for (const seat of seats) {
-        if (seat.parked === "indeterminate") {
-          skipped.push({ seat: seat.sessionName, why: "indeterminate-not-parked" });
-          continue;
-        }
-        const knownRows = [
-          ...seat.obligations.items.map((r) => r.qitemId),
-          ...seat.obligations.held.map((h) => h.qitemId),
-        ].filter((v, i, a) => a.indexOf(v) === i);
-
-        if (seat.parked === false) {
-          // The episode ends when the seat reads not-parked: close every open
-          // reserve key on the seat's rows, durably, on this pass (bounded —
-          // one close note per open key, never a write per clean scan).
-          for (const qitemId of knownRows) {
+        // Missing telemetry or note writes cannot prevent a current input attempt.
+        let recent: WatchdogHistoryEntry[] = [];
+        try { recent = deps.history.listForJob(job.jobId, 25); } catch { /* telemetry is not admission */ }
+        const latestRows = new Set<string>();
+        for (const e of recent) {
+          if (e.outcome === "skipped" || e.outcome === "terminal" || !e.deliveryStatus) continue;
+          const n = e.evaluationNotes ?? {};
+          const key = typeof n["episodeKey"] === "string" ? n["episodeKey"] : null;
+          const primary = typeof n["primaryRow"] === "string" ? n["primaryRow"] : null;
+          if (!key || !primary || latestRows.has(primary)) continue;
+          latestRows.add(primary);
+          if (deliveryReachedSeat(e.deliveryStatus)) {
             try {
-              for (const key of openKeysOnRow(deps.rows.listTransitions(qitemId))) {
-                if (deps.rows.appendNote(qitemId, `${CLOSE_PREFIX} ${key} (no longer observed parked)`).ok && !closures.includes(key)) closures.push(key);
-              }
-            } catch { /* best-effort closure of old prompt-refusal records */ }
+              if (!deps.rows.listTransitions(primary).some(t => t.transitionNote === `${DELIVERED_PREFIX} ${key}`))
+                deps.rows.appendNote(primary, `${DELIVERED_PREFIX} ${key}`);
+            } catch { /* absent bookkeeping cannot prove a delivered reminder */ }
+            continue;
           }
-          continue;
+          const reason = String(n["deliveryReason"] ?? e.deliveryStatus);
+          // The parked policy retries after its own stage clears; the generic wake ladder must not interrupt restore.
+          if (reason.includes(PARKED_OWNER_COMPACTION_PENDING)) continue;
+          try {
+            const recorded = deps.rows.listTransitions(primary).some(t =>
+              (t.transitionNote?.startsWith(REFUSED_PREFIX) || t.transitionNote?.startsWith(FAILED_PREFIX)) && keyOfNote(t.transitionNote!) === key);
+            if (recorded) continue;
+            if (isRefusedInteractive(reason)) {
+              deps.rows.appendNote(primary, `${REFUSED_PREFIX} ${key}; ${reason}`);
+            } else {
+              const typedNoInput = n["deliveryInputPhase"] === "not_reached" && n["deliveryCode"] === "retained_quota_full";
+              const terminal = n["deliveryInputPhase"] === "not_reached" && n["deliveryCode"] === "terminal_seat";
+              const admission = typedNoInput ? QUOTA_NO_INPUT : terminal ? TERMINAL_NO_INPUT : "; detail:";
+              deps.rows.appendNote(primary, `${FAILED_PREFIX} ${key}${admission} ${reason}`);
+              const uncertain = n["deliveryInputPhase"] === "attempted" || n["deliveryInputPhase"] === "written";
+              deps.rows.recordNudgeResult(primary, `${uncertain ? "indeterminate: parked-owner wake delivery" : NUDGE_FAIL_PREFIX}${typedNoInput ? QUOTA_NO_INPUT : terminal ? TERMINAL_NO_INPUT : ""} — ${reason}`);
+            }
+          } catch { /* reporting failure is not permission to lose the next message */ }
         }
 
-        // Whole diagnosis inherited: open items PLUS unhealthy HELD rows.
-        const ids = [
-          ...seat.obligations.items.map((r) => r.qitemId),
-          ...seat.obligations.held.filter((h) => h.healthy === false).map((h) => h.qitemId),
-        ]
-          .filter((v, i, a) => a.indexOf(v) === i)
-          .sort();
-        if (ids.length === 0) {
-          skipped.push({ seat: seat.sessionName, why: "no-park-driving-obligation" });
-          continue;
+        const closures: string[] = [];
+        const skipped: Array<{ seat: string; why: string; primaryRow?: string; obligations?: string[]; episodeKey?: string; refusalReason?: string }> = [];
+        // Rotate after the latest physical delivery selection, including retained input. A single
+        // cursor from history cannot lose an owner's turn just because a bounded window filled.
+        const lastTarget = recent.find(e => e.deliveryStatus && e.deliveryTargetSession)?.deliveryTargetSession;
+        const ordered = [...d.seats].sort((a, b) => a.sessionName.localeCompare(b.sessionName));
+        const next = ordered.findIndex(seat => seat.sessionName === lastTarget) + 1;
+        const seats = [...ordered.slice(next), ...ordered.slice(0, next)];
+
+        for (const seat of seats) {
+          if (seat.parked === "indeterminate") {
+            skipped.push({ seat: seat.sessionName, why: "indeterminate-not-parked" });
+            continue;
+          }
+          const knownRows = [
+            ...seat.obligations.items.map((r) => r.qitemId),
+            ...seat.obligations.held.map((h) => h.qitemId),
+          ].filter((v, i, a) => a.indexOf(v) === i);
+
+          if (seat.parked === false) {
+            // The episode ends when the seat reads not-parked: close every open
+            // reserve key on the seat's rows, durably, on this pass (bounded —
+            // one close note per open key, never a write per clean scan).
+            for (const qitemId of knownRows) {
+              try {
+                for (const key of openKeysOnRow(deps.rows.listTransitions(qitemId))) {
+                  if (deps.rows.appendNote(qitemId, `${CLOSE_PREFIX} ${key} (no longer observed parked)`).ok && !closures.includes(key)) closures.push(key);
+                }
+              } catch { /* best-effort closure of old prompt-refusal records */ }
+            }
+            continue;
+          }
+
+          // Whole diagnosis inherited: open items PLUS unhealthy HELD rows.
+          const ids = [
+            ...seat.obligations.items.map((r) => r.qitemId),
+            ...seat.obligations.held.filter((h) => h.healthy === false).map((h) => h.qitemId),
+          ]
+            .filter((v, i, a) => a.indexOf(v) === i)
+            .sort();
+          if (ids.length === 0) {
+            skipped.push({ seat: seat.sessionName, why: "no-park-driving-obligation" });
+            continue;
+          }
+
+          // S16 composition: usage-limit parks belong to S16's timed wake.
+          const niReason = seat.activity.needsInput.reason ?? "";
+          if (/usage.?limit/i.test(niReason)) {
+            skipped.push({ seat: seat.sessionName, why: "usage-limit-defer-s16" });
+            continue;
+          }
+
+          // Leave this wake unreserved: the existing next pass can remind the owner after restore/audit.
+          if (deps.hasPendingPostCompactStage?.(seat.sessionName)) {
+            skipped.push({ seat: seat.sessionName, why: "managed-compaction-pending" });
+            continue;
+          }
+
+          // #2661 (b): the turn is over but a shell the owner started still runs (a CI watch, a test suite). It is working
+          // in the background, up to a ceiling, so a forgotten shell still gets its reminder. Unreserved, as above.
+          const shell = seat.activity.backgroundWork?.observedAt ? Date.parse(seat.activity.backgroundWork.observedAt) : Number.NaN;
+          const shellGraceMs = deps.backgroundShellGraceMs ?? BACKGROUND_SHELL_GRACE_MINUTES * 60_000;
+          if (seat.activity.needsInput.count === 0 && Number.isFinite(shell) && (deps.now?.() ?? Date.now()) - shell < shellGraceMs) {
+            skipped.push({ seat: seat.sessionName, why: "background-shell" });
+            continue;
+          }
+
+          // A seat idle for moments has just handed off or asked someone, not got stuck holding work. The diagnosis says
+          // how long its waiting state has been unchanged; with no start known, the reminder goes as before. A seat at a
+          // prompt gets no grace: this attempt's refusal is what alerts whoever can clear the prompt.
+          const waitingSince = seat.activity.since ? Date.parse(seat.activity.since) : Number.NaN;
+          if (seat.activity.needsInput.count === 0 && Number.isFinite(waitingSince)
+            && (deps.now?.() ?? Date.now()) - waitingSince < PARKED_OWNER_IDLE_GRACE_MS) {
+            skipped.push({ seat: seat.sessionName, why: "waiting-grace" });
+            continue;
+          }
+
+          // B1 — the delivery-boundary recheck: re-read the seat's open rows NOW;
+          // an obligation closed after diagnosis must not be named or woken.
+          const fresh = new Set(deps.rows.listOpenIds(seat.sessionName));
+          const stillOpen = ids.filter((id) => fresh.has(id));
+          const owned = deps.rows.recoveryOwnedAmong?.(stillOpen)
+            ?? new Set(stillOpen.filter((id) => deps.rows.recoveryOwnsWake?.(id)));
+          const namedIds = stillOpen.filter((id) => !owned.has(id));
+          if (namedIds.length === 0) {
+            skipped.push({ seat: seat.sessionName, why: ids.some(id => fresh.has(id)) ? "recovery-already-owns-wake" : "obligation-closed-between-derive-and-wake" });
+            continue;
+          }
+
+          const idsHash = idsHashOf(namedIds);
+          const primaryRow = namedIds[0]!;
+          const generation = deps.occupantGeneration?.(seat.sessionName) ?? null;
+          let transitions: RowTransitionView[] = [];
+          try { transitions = deps.rows.listTransitions(primaryRow); } catch { /* missing history cannot prove success or refusal */ }
+          const matches = (key: string) => key.startsWith(`${seat.sessionName}|${idsHash}#`);
+          const generationOf = (t: RowTransitionView | undefined) => t?.transitionNote?.match(/; generation ([^;\s]+);/)?.[1] ?? null;
+          const reserve = [...transitions].reverse().find(t => t.transitionNote?.startsWith(RESERVE_PREFIX) && matches(keyOfNote(t.transitionNote) ?? ""));
+          const refused = openPromptRefusals(transitions).find(({ key }) => {
+            const prior = generationOf(transitions.find(t => t.transitionNote?.startsWith(RESERVE_PREFIX) && keyOfNote(t.transitionNote) === key));
+            return matches(key) && (generation === null || prior === null || prior === generation);
+          });
+          if (refused) {
+            skipped.push({ seat: seat.sessionName, why: "destination-refused-interactive-prompt", primaryRow,
+              obligations: namedIds, episodeKey: refused.key, refusalReason: refused.note });
+            continue;
+          }
+          const lastKey = reserve && keyOfNote(reserve.transitionNote!);
+          const delivered = reserve && generation !== null && generationOf(reserve) === generation
+            && transitions.some(t => t.transitionNote === `${DELIVERED_PREFIX} ${lastKey}`)
+            && !transitions.some(t => (t.transitionNote?.startsWith(FAILED_PREFIX) || t.transitionNote?.startsWith(REFUSED_PREFIX)) && keyOfNote(t.transitionNote!) === lastKey);
+          if (delivered && !changedSince(deps.rows.listTransitions, namedIds, seat.sessionName, reserve)) {
+            skipped.push({ seat: seat.sessionName, why: "unchanged-since-last-wake" });
+            continue;
+          }
+          let retentionState: string | null = null;
+          try { retentionState = deps.retentionState?.(seat.sessionName) ?? null; } catch { /* unknown is not evidence that admission recovered */ }
+          const encodedRetentionState = Buffer.from(retentionState ?? "unknown").toString("base64url");
+          const open = lastKey != null && openKeysOnRow(transitions).includes(lastKey);
+          const sameGeneration = generation === null || generationOf(reserve) === null || generationOf(reserve) === generation;
+          const quotaFailed = open && sameGeneration && transitions.some(t => t.transitionNote?.startsWith(FAILED_PREFIX)
+            && keyOfNote(t.transitionNote) === lastKey && t.transitionNote.startsWith(`${FAILED_PREFIX} ${lastKey}${QUOTA_NO_INPUT}`));
+          const priorRetentionState = reserve?.transitionNote?.match(/; retention-state ([^;\s]+);/)?.[1];
+          if (quotaFailed && reserve && (retentionState === null || priorRetentionState === encodedRetentionState)
+            && !changedSince(deps.rows.listTransitions, namedIds, seat.sessionName, reserve)) {
+            // The existing row failure/recovery keeps custody. Do not recreate attempts or row notes every tick.
+            skipped.push({ seat: seat.sessionName, why: "retention-quota-unchanged" });
+            continue;
+          }
+          const terminal = deps.isTerminalSeat?.(seat.sessionName) === true;
+          if (terminal && open && sameGeneration && transitions.some(t => t.transitionNote?.startsWith(FAILED_PREFIX)
+            && keyOfNote(t.transitionNote) === lastKey && t.transitionNote.startsWith(`${FAILED_PREFIX} ${lastKey}${TERMINAL_NO_INPUT}`))) {
+            skipped.push({ seat: seat.sessionName, why: "terminal-seat" });
+            continue;
+          }
+          const queueOnly = !terminal && deps.isQueueOnlySeat?.(seat.sessionName) === true;
+          if (queueOnly && open && sameGeneration && transitions.some(t => t.transitionNote?.startsWith(`${FAILED_PREFIX} ${lastKey}${QUEUE_ONLY_NO_INPUT}`))) {
+            skipped.push({ seat: seat.sessionName, why: "queue-only-seat" });
+            continue;
+          }
+          const episodeKey = `${seat.sessionName}|${idsHash}#${randomUUID()}`;
+          let noted = false;
+          try {
+            noted = deps.rows.appendNote(primaryRow,
+              `${RESERVE_PREFIX} ${episodeKey}; ${generation === null ? "" : `generation ${generation}; `}retention-state ${encodedRetentionState}; obligations ${namedIds.join(",")}`).ok;
+          } catch { /* the current row, not the receipt write, governs the wake */ }
+          if (!noted && !deps.rows.listOpenIds(seat.sessionName).includes(primaryRow)) {
+            skipped.push({ seat: seat.sessionName, why: "obligation-closed-between-derive-and-wake" });
+            continue;
+          }
+
+          if (queueOnly) {
+            // The rows are in the seat's queue already; a person reads that terminal, so nothing is typed into it.
+            const reason = "The seat takes OpenRig's reminders only in its queue (typing guard queue-only); its open rows are the reminder. No input was written.";
+            try { deps.rows.appendNote(primaryRow, `${FAILED_PREFIX} ${episodeKey}${QUEUE_ONLY_NO_INPUT} ${reason}`); } catch { /* the row stays open and listed */ }
+            try { deps.rows.recordNudgeResult(primaryRow, `${QUEUE_ONLY_SKIP_RESULT_PREFIX}: ${reason}`); } catch { /* no reporting failure permits input */ }
+            skipped.push({ seat: seat.sessionName, why: "queue-only-seat" });
+            continue;
+          }
+
+          if (terminal) {
+            const reason = "Automated reminders cannot be consumed by a terminal seat; route it to an agent seat. No input was written.";
+            try { deps.rows.appendNote(primaryRow, `${FAILED_PREFIX} ${episodeKey}${TERMINAL_NO_INPUT} ${reason}`); } catch { /* keep the obligation visible if reporting is unavailable */ }
+            try { deps.rows.recordNudgeResult(primaryRow, `failed:terminal-seat: ${reason}`); } catch { /* no reporting failure permits terminal input */ }
+            skipped.push({ seat: seat.sessionName, why: "terminal-seat" });
+            continue;
+          }
+
+          const message =
+            `You are parked (arbitrated: idle at prompt) while holding ${namedIds.length} open ` +
+            `obligation${namedIds.length === 1 ? "" : "s"}: ${namedIds.join(", ")}. ` +
+            `Resume the work or update each row honestly (close, park-with-wake, or hand off). ` +
+            `If you're waiting on a person's answer, don't ask again; hold the row with rig queue block <id> --on <who> --wake-after <duration> ` +
+            `(a hold on a person also needs --summary and --evidence-ref unless the row has them). ` +
+            `After a recorded delivery to this occupant, this check waits for your rows to change. An interrupted or unconfirmed attempt may repeat; interactive-prompt recovery stays with the wake-or-escalate ladder. ` +
+            `Held rows stay listed in rig view show held; for a claimed in-progress row, the wake-or-escalate ladder also retries a failed wake.`;
+          return {
+            action: "send",
+            target: { session: seat.sessionName },
+            message,
+            notes: {
+              episodeKey,
+              episodeSeat: seat.sessionName,
+              idsHash,
+              primaryRow,
+              obligations: namedIds,
+              evidence: Number.isFinite(shell) && seat.activity.needsInput.count === 0 ? "arbitrated-idle-at-prompt; background-shell-past-ceiling" : "arbitrated-idle-at-prompt",
+              episodeClosures: closures,
+              skippedSeats: skipped,
+            },
+          };
         }
 
-        // S16 composition: usage-limit parks belong to S16's timed wake.
-        const niReason = seat.activity.needsInput.reason ?? "";
-        if (/usage.?limit/i.test(niReason)) {
-          skipped.push({ seat: seat.sessionName, why: "usage-limit-defer-s16" });
-          continue;
+        if (closures.length > 0) {
+          return { action: "skip", reason: "episode-ended", notes: { episodeClosures: closures, skippedSeats: skipped } };
         }
-
-        // Leave this wake unreserved: the existing next pass can remind the owner after restore/audit.
-        if (deps.hasPendingPostCompactStage?.(seat.sessionName)) {
-          skipped.push({ seat: seat.sessionName, why: "managed-compaction-pending" });
-          continue;
+        if (skipped.length > 0) {
+          return { action: "skip", reason: "all-parked-owners-deferred", notes: { skippedSeats: skipped } };
         }
-
-        // #2661 (b): the turn is over but a shell the owner started still runs (a CI watch, a test suite). It is working
-        // in the background, up to a ceiling, so a forgotten shell still gets its reminder. Unreserved, as above.
-        const shell = seat.activity.backgroundWork?.observedAt ? Date.parse(seat.activity.backgroundWork.observedAt) : Number.NaN;
-        const shellGraceMs = deps.backgroundShellGraceMs ?? BACKGROUND_SHELL_GRACE_MINUTES * 60_000;
-        if (seat.activity.needsInput.count === 0 && Number.isFinite(shell) && (deps.now?.() ?? Date.now()) - shell < shellGraceMs) {
-          skipped.push({ seat: seat.sessionName, why: "background-shell" });
-          continue;
-        }
-
-        // A seat idle for moments has just handed off or asked someone, not got stuck holding work. The diagnosis says
-        // how long its waiting state has been unchanged; with no start known, the reminder goes as before. A seat at a
-        // prompt gets no grace: this attempt's refusal is what alerts whoever can clear the prompt.
-        const waitingSince = seat.activity.since ? Date.parse(seat.activity.since) : Number.NaN;
-        if (seat.activity.needsInput.count === 0 && Number.isFinite(waitingSince)
-          && (deps.now?.() ?? Date.now()) - waitingSince < PARKED_OWNER_IDLE_GRACE_MS) {
-          skipped.push({ seat: seat.sessionName, why: "waiting-grace" });
-          continue;
-        }
-
-        // B1 — the delivery-boundary recheck: re-read the seat's open rows NOW;
-        // an obligation closed after diagnosis must not be named or woken.
-        const fresh = new Set(deps.rows.listOpenIds(seat.sessionName));
-        const namedIds = ids.filter((id) => fresh.has(id) && !deps.rows.recoveryOwnsWake?.(id));
-        if (namedIds.length === 0) {
-          skipped.push({ seat: seat.sessionName, why: ids.some(id => fresh.has(id)) ? "recovery-already-owns-wake" : "obligation-closed-between-derive-and-wake" });
-          continue;
-        }
-
-        const idsHash = idsHashOf(namedIds);
-        const primaryRow = namedIds[0]!;
-        const generation = deps.occupantGeneration?.(seat.sessionName) ?? null;
-        let transitions: RowTransitionView[] = [];
-        try { transitions = deps.rows.listTransitions(primaryRow); } catch { /* missing history cannot prove success or refusal */ }
-        const matches = (key: string) => key.startsWith(`${seat.sessionName}|${idsHash}#`);
-        const generationOf = (t: RowTransitionView | undefined) => t?.transitionNote?.match(/; generation ([^;\s]+);/)?.[1] ?? null;
-        const reserve = [...transitions].reverse().find(t => t.transitionNote?.startsWith(RESERVE_PREFIX) && matches(keyOfNote(t.transitionNote) ?? ""));
-        const refused = openPromptRefusals(transitions).find(({ key }) => {
-          const prior = generationOf(transitions.find(t => t.transitionNote?.startsWith(RESERVE_PREFIX) && keyOfNote(t.transitionNote) === key));
-          return matches(key) && (generation === null || prior === null || prior === generation);
-        });
-        if (refused) {
-          skipped.push({ seat: seat.sessionName, why: "destination-refused-interactive-prompt", primaryRow,
-            obligations: namedIds, episodeKey: refused.key, refusalReason: refused.note });
-          continue;
-        }
-        const lastKey = reserve && keyOfNote(reserve.transitionNote!);
-        const delivered = reserve && generation !== null && generationOf(reserve) === generation
-          && transitions.some(t => t.transitionNote === `${DELIVERED_PREFIX} ${lastKey}`)
-          && !transitions.some(t => (t.transitionNote?.startsWith(FAILED_PREFIX) || t.transitionNote?.startsWith(REFUSED_PREFIX)) && keyOfNote(t.transitionNote!) === lastKey);
-        if (delivered && !changedSince(deps.rows.listTransitions, namedIds, seat.sessionName, reserve)) {
-          skipped.push({ seat: seat.sessionName, why: "unchanged-since-last-wake" });
-          continue;
-        }
-        let retentionState: string | null = null;
-        try { retentionState = deps.retentionState?.(seat.sessionName) ?? null; } catch { /* unknown is not evidence that admission recovered */ }
-        const encodedRetentionState = Buffer.from(retentionState ?? "unknown").toString("base64url");
-        const open = lastKey != null && openKeysOnRow(transitions).includes(lastKey);
-        const sameGeneration = generation === null || generationOf(reserve) === null || generationOf(reserve) === generation;
-        const quotaFailed = open && sameGeneration && transitions.some(t => t.transitionNote?.startsWith(FAILED_PREFIX)
-          && keyOfNote(t.transitionNote) === lastKey && t.transitionNote.startsWith(`${FAILED_PREFIX} ${lastKey}${QUOTA_NO_INPUT}`));
-        const priorRetentionState = reserve?.transitionNote?.match(/; retention-state ([^;\s]+);/)?.[1];
-        if (quotaFailed && reserve && (retentionState === null || priorRetentionState === encodedRetentionState)
-          && !changedSince(deps.rows.listTransitions, namedIds, seat.sessionName, reserve)) {
-          // The existing row failure/recovery keeps custody. Do not recreate attempts or row notes every tick.
-          skipped.push({ seat: seat.sessionName, why: "retention-quota-unchanged" });
-          continue;
-        }
-        const terminal = deps.isTerminalSeat?.(seat.sessionName) === true;
-        if (terminal && open && sameGeneration && transitions.some(t => t.transitionNote?.startsWith(FAILED_PREFIX)
-          && keyOfNote(t.transitionNote) === lastKey && t.transitionNote.startsWith(`${FAILED_PREFIX} ${lastKey}${TERMINAL_NO_INPUT}`))) {
-          skipped.push({ seat: seat.sessionName, why: "terminal-seat" });
-          continue;
-        }
-        const queueOnly = !terminal && deps.isQueueOnlySeat?.(seat.sessionName) === true;
-        if (queueOnly && open && sameGeneration && transitions.some(t => t.transitionNote?.startsWith(`${FAILED_PREFIX} ${lastKey}${QUEUE_ONLY_NO_INPUT}`))) {
-          skipped.push({ seat: seat.sessionName, why: "queue-only-seat" });
-          continue;
-        }
-        const episodeKey = `${seat.sessionName}|${idsHash}#${randomUUID()}`;
-        let noted = false;
-        try {
-          noted = deps.rows.appendNote(primaryRow,
-            `${RESERVE_PREFIX} ${episodeKey}; ${generation === null ? "" : `generation ${generation}; `}retention-state ${encodedRetentionState}; obligations ${namedIds.join(",")}`).ok;
-        } catch { /* the current row, not the receipt write, governs the wake */ }
-        if (!noted && !deps.rows.listOpenIds(seat.sessionName).includes(primaryRow)) {
-          skipped.push({ seat: seat.sessionName, why: "obligation-closed-between-derive-and-wake" });
-          continue;
-        }
-
-        if (queueOnly) {
-          // The rows are in the seat's queue already; a person reads that terminal, so nothing is typed into it.
-          const reason = "The seat takes OpenRig's reminders only in its queue (typing guard queue-only); its open rows are the reminder. No input was written.";
-          try { deps.rows.appendNote(primaryRow, `${FAILED_PREFIX} ${episodeKey}${QUEUE_ONLY_NO_INPUT} ${reason}`); } catch { /* the row stays open and listed */ }
-          try { deps.rows.recordNudgeResult(primaryRow, `${QUEUE_ONLY_SKIP_RESULT_PREFIX}: ${reason}`); } catch { /* no reporting failure permits input */ }
-          skipped.push({ seat: seat.sessionName, why: "queue-only-seat" });
-          continue;
-        }
-
-        if (terminal) {
-          const reason = "Automated reminders cannot be consumed by a terminal seat; route it to an agent seat. No input was written.";
-          try { deps.rows.appendNote(primaryRow, `${FAILED_PREFIX} ${episodeKey}${TERMINAL_NO_INPUT} ${reason}`); } catch { /* keep the obligation visible if reporting is unavailable */ }
-          try { deps.rows.recordNudgeResult(primaryRow, `failed:terminal-seat: ${reason}`); } catch { /* no reporting failure permits terminal input */ }
-          skipped.push({ seat: seat.sessionName, why: "terminal-seat" });
-          continue;
-        }
-
-        const message =
-          `You are parked (arbitrated: idle at prompt) while holding ${namedIds.length} open ` +
-          `obligation${namedIds.length === 1 ? "" : "s"}: ${namedIds.join(", ")}. ` +
-          `Resume the work or update each row honestly (close, park-with-wake, or hand off). ` +
-          `If you're waiting on a person's answer, don't ask again; hold the row with rig queue block <id> --on <who> --wake-after <duration> ` +
-          `(a hold on a person also needs --summary and --evidence-ref unless the row has them). ` +
-          `After a recorded delivery to this occupant, this check waits for your rows to change. An interrupted or unconfirmed attempt may repeat; interactive-prompt recovery stays with the wake-or-escalate ladder. ` +
-          `Held rows stay listed in rig view show held; for a claimed in-progress row, the wake-or-escalate ladder also retries a failed wake.`;
-        return {
-          action: "send",
-          target: { session: seat.sessionName },
-          message,
-          notes: {
-            episodeKey,
-            episodeSeat: seat.sessionName,
-            idsHash,
-            primaryRow,
-            obligations: namedIds,
-            evidence: Number.isFinite(shell) && seat.activity.needsInput.count === 0 ? "arbitrated-idle-at-prompt; background-shell-past-ceiling" : "arbitrated-idle-at-prompt",
-            episodeClosures: closures,
-            skippedSeats: skipped,
-          },
-        };
-      }
-
-      if (closures.length > 0) {
-        return { action: "skip", reason: "episode-ended", notes: { episodeClosures: closures, skippedSeats: skipped } };
-      }
-      if (skipped.length > 0) {
-        return { action: "skip", reason: "all-parked-owners-deferred", notes: { skippedSeats: skipped } };
-      }
-      return { action: "skip", reason: "no-parked-owner", notes: { rig: rigName } };
+        return { action: "skip", reason: "no-parked-owner", notes: { rig: rigName } };
+      });
     },
   };
 }
