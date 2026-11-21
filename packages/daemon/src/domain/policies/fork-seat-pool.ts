@@ -798,11 +798,12 @@ function seatPoolHeldBusy(spec: SeatPoolSpec, slot: SeatPoolSlotView): boolean {
  * the row to the next full seat. No reading, an unreadable or stale one, an adopted seat and a limit of 0 hold nothing
  * back, as before the field.
  *
- * A quiet seat (no open row, no held message, idle since a known time) keeps its reading while it stays quiet
- * (T-017384): it runs no turn, so its context does not move, and the sample of the turn it ended (taken no more than
- * SEAT_POOL_CONTEXT_MAX_AGE_SECONDS before it went idle, or after) still reads it. Without this, the sample went stale
- * 10 min after the seat's last turn, which is when idle_grace_s (600 s in the pools that run it) lets a seat be drained:
- * the full seat read as free again, took a row, woke, read its fresh sample and gave the row back.
+ * A quiet seat (no open row, no held message, idle since a known time) keeps its reading, however old (T-017384): it
+ * runs no turn, so its context does not move and nothing rewrites the sample, which is its live occupant's (the reader
+ * refuses a previous occupant's, and /clear writes none). Its idle time says nothing about the sample: it restarts with
+ * the daemon and with a change of activity that ran no turn. Without this, the sample went stale 10 min after the
+ * seat's last turn, which is when idle_grace_s (600 s in the pools that run it) lets a seat be drained, or at once after
+ * a restart: the full seat read as free again, took a row, woke, read its fresh sample and gave the row back.
  */
 export function seatPoolContextOver(spec: Pick<SeatPoolSpec, "contextLimitPercent">, slot: SeatPoolSlotView, nowMs: number): boolean {
   const limit = seatPoolContextLimit(spec);
@@ -813,8 +814,9 @@ export function seatPoolContextOver(spec: Pick<SeatPoolSpec, "contextLimitPercen
   // Written so that an unreadable time (NaN) holds nothing back.
   if (!Number.isFinite(sampledMs)) return false;
   if (Math.max(0, nowMs - sampledMs) < SEAT_POOL_CONTEXT_MAX_AGE_SECONDS * 1000) return true;
-  const idleMs = slot.openRows === 0 && slot.heldMessages === 0 && slot.idleSince !== null ? Date.parse(slot.idleSince) : NaN;
-  return Number.isFinite(idleMs) && sampledMs >= idleMs - SEAT_POOL_CONTEXT_MAX_AGE_SECONDS * 1000;
+  // A quiet seat keeps its reading, however old (REVISAO-seat-pool S5): it runs no turn, so nothing rewrote the sample,
+  // and the reading is its live occupant's (the reader refuses another occupant's, and /clear writes none).
+  return slot.openRows === 0 && slot.heldMessages === 0 && slot.idleSince !== null;
 }
 
 /**
@@ -1227,12 +1229,16 @@ export function planSeatPool(spec: SeatPoolSpec, state: SeatPoolState, nowMs: nu
     else if (!usageLimited) intents.push({ kind: "launch", slotId: slot.slotId });
   }
   if (usageLimited && starting.length > removeStarting.length) reason = "usage_limit";
-  // The full seats are on their way out (above), so the rows that no seat takes and no starting seat will (rowsLeft) are
-  // asked for as if they weren't there: up to `target - current + full`, the seats that would serve the target. Only for
-  // those rows: a full seat the target counts anyway (the demand command counted it, e.g. a seat its tarefa in the
-  // ledger still holds, whose release the release command refuses) is never replaced while no row waits for a seat,
-  // so no add and drain go round it (lens review of the volta 1).
-  const wanted = Math.max(target - current, Math.min(target - current + full.length, Math.max(0, rowsLeft)));
+  // Without demand_cmd, the full seats are on their way out (above), so the rows that no seat takes and no starting
+  // seat will (rowsLeft) are asked for as if they weren't there: up to `target - current + full`, the seats that would
+  // serve the target. Only for those rows: a full seat the target counts anyway is never replaced while no row waits for
+  // a seat, so no add and drain go round it (lens review of the volta 1).
+  // With demand_cmd the demand command is the target's authority (REVISAO-seat-pool B4): it sizes the rows it wants
+  // seats for (a row it leaves out on purpose, as under a downstream brake, gets none), and the full seats it does not
+  // count are out of the target already, so they go by the surplus and the next plan adds for them.
+  const wanted = spec.demandCmd
+    ? target - current
+    : Math.max(target - current, Math.min(target - current + full.length, Math.max(0, rowsLeft)));
   if (wanted > 0 && !cooling) {
     // The same room the executor checks before each seat: an add it would refuse is never asked for. A seat the same
     // plan forgets (its node is gone) or reaps is out of the count: the executor applies those intents before the add,
