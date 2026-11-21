@@ -522,6 +522,32 @@ describe("Daemon Lifecycle", () => {
     expect(deps.writeFile).not.toHaveBeenCalledWith(STATE_FILE, expect.anything());
   });
 
+  it("start: the child's own EADDRINUSE line, with its host and port, comes before the older EADDRINUSE match", async () => {
+    vi.useFakeTimers();
+    let log = "Earlier daemon log\n";
+    const child = Object.assign(new EventEmitter(), { pid: 12345, exitCode: null as number | null, signalCode: null, unref: vi.fn() });
+    const line = "OPENRIG_LISTEN_FAILED EADDRINUSE 100.64.0.9:7433 Address already in use (EADDRINUSE) on port 7433. Inspect the listener before stopping it, or run 'rig daemon start --port <unused-port>'.";
+    const deps = mockDeps({
+      fetch: vi.fn().mockRejectedValue(new Error("refused")),
+      readFile: vi.fn((p: string) => p === LOG_FILE ? log : null),
+      spawn: vi.fn(() => {
+        setTimeout(() => {
+          log += `${line}\n`;
+          child.exitCode = 69;
+          child.emit("exit", 69, null);
+        }, 1);
+        return child as unknown as ChildProcess;
+      }),
+    });
+    const pending = startDaemon({ port: 7433 }, deps).catch((error) => error as Error);
+    await vi.runAllTimersAsync();
+    const error = await pending;
+
+    // The line names the listener that failed (here the Tailscale address), which the older match would drop.
+    expect(error.message).toContain(`(code 69, signal none). ${line}`);
+    expect(error.message.match(/Address already in use/g)).toHaveLength(1);
+  });
+
   it("start reports the current child's database-conflict stop and one-start remedy", async () => {
     await import("@openrig/daemon/instance-initialization");
     vi.useFakeTimers();
