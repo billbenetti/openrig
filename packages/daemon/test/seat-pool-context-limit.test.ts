@@ -216,6 +216,17 @@ describe("T-017384: a free slot past the limit is drained, not held for ever as 
     const stuck = planSeatPool(vm({ max: 13 }), state([1, 2, 3, 4, 5, 6, 7, 8, 9].map(working).concat([10, 11].map(fullVm)), rows(2)), NOW, 120_000);
     expect(stuck.intents.filter((i) => i.kind === "add")).toEqual([{ kind: "add", count: 2 }]);
     expect(drains(stuck.intents)).toEqual([]);
+    // with demand_cmd its target alone decides the add (REVISAO B4): 5 working and 1 full slot the demand counts, 3 rows
+    // it leaves out (a downstream brake): desired 6 = current, no add; the next plan, desired 7 = current, none either
+    const braked = { ...state([1, 2, 3, 4, 5].map(working).concat([fullVm(6)]), rows(3)), demand: { desired: 6, sampledAt: ago(10) } };
+    expect(planSeatPool(withDemand, braked, NOW, 120_000).intents.filter((i) => i.kind === "add")).toEqual([]);
+    const braked2 = { ...state([1, 2, 3, 4, 5, 7].map(working).concat([fullVm(6)]), rows(3)), demand: { desired: 7, sampledAt: ago(10) } };
+    expect(planSeatPool(withDemand, braked2, NOW, 120_000).intents.filter((i) => i.kind === "add")).toEqual([]);
+    // without demand_cmd and no row waiting, the full slots fill min until a row waits for a seat (no add and drain
+    // round them): min 5, 2 full, 3 added, none drained
+    const warm = planSeatPool(vm({ max: 13, min: 5 }), state([fullVm(1), fullVm(2)], []), NOW, 120_000);
+    expect(warm.intents.filter((i) => i.kind === "add")).toEqual([{ kind: "add", count: 3 }]);
+    expect(drains(warm.intents)).toEqual([]);
     // no row waiting, min 2, max 2: a slot draining and 2 full ones: only the draining one, the pool stays at min
     const draining = slot(1, { phase: "draining" });
     expect(drains(planSeatPool(vm({ min: 2, max: 2 }), state([draining, fullVm(2), fullVm(3)], []), NOW, 120_000).intents)).toEqual([1]);
@@ -237,6 +248,9 @@ describe("T-017384: a free slot past the limit is drained, not held for ever as 
     expect(at(busy, [slot(1, full(50)), slot(2, full(50)), slot(3, full(50))], { modelCause: "usage_limit" })).toEqual([]);
     // context_limit_percent 0: no slot is full, the rows go to the free slots, and the surplus slot is the free one left
     expect(at(spec({ max: 2, context_limit_percent: 0 }), [slot(1, full(50)), slot(2, full(50)), slot(3, full(50))])).toEqual([3]);
+    // after a daemon restart (quiet for 30 s, the sample 1 h old): the full slot takes no row (REVISAO S5)
+    const restarted = slot(7, { ...full(47, 3600), idleSince: ago(30) });
+    expect(dispatches(planSeatPool(spec({ max: 2 }), state([restarted], rows(1)), NOW, 120_000).intents)).toEqual([]);
     // a slot that is not quiet keeps the 10 min of its sample: the stale one of a working slot reads as no reading
     expect(seatPoolContextOver(busy, slot(5, { ...full(80, 3605), openRows: 1, idleSince: null, cause: "working" }), NOW)).toBe(false);
   });
@@ -248,7 +262,7 @@ describe("T-012383: seatPoolContextOver and seatPoolCanReceive (the reading)", (
     ["40% exactly", true, full(40)],
     ["39.9%", false, full(39.9)],
     ["sampled 599 s ago", true, full(80, 599)],
-    ["sampled 1201 s ago, 601 s before the slot went quiet (stale)", false, full(80, 1201)],
+    ["sampled 1 h ago, quiet for 30 s (the daemon restarted, or a change of activity with no turn): a quiet slot keeps it", true, { ...full(80, 3600), idleSince: ago(30) }],
     ["sampled 3605 s ago, 5 s before the slot went quiet (its last turn): a quiet slot keeps it", true, { ...full(80, 3605), idleSince: ago(3600) }],
     ["sampled ahead of the clock (as just taken)", true, { context: { usedPercentage: 80, sampledAt: new Date(NOW + 5_000).toISOString() } }],
     ["an unreadable time", false, { context: { usedPercentage: 80, sampledAt: "not a time" } }],
