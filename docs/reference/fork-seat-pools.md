@@ -73,8 +73,8 @@ environment plus:
 | `OPENRIG_SEAT_POOL_MODEL` | every command | the model's session name |
 | `OPENRIG_SEAT_POOL_SLOT` | `prepare_cmd`, `release_cmd`, `reap_cmd`, `remove_cmd` | the seat's session name |
 | `OPENRIG_SEAT_POOL_SLOT_CWD` | `prepare_cmd` | the seat's working directory |
-| `OPENRIG_SEAT_POOL_RELEASE_REASON` | `release_cmd` | why it is asked: `idle` (a free seat drained, by `drain` or by `idle_grace_s`), `drain-deadline` (the forced pass at a drain's deadline) or `reap` (a seat whose session is gone) |
-| `OPENRIG_SEAT_POOL_SLOTS` | `demand_cmd` | JSON list of `{session, phase, receives, held?}` for the pool's seats; `receives` is how the seat may take a waiting row now: `"free"`, `"parked"` (see [A seat parked on its own wait](#a-seat-parked-on-its-own-wait)) or `null`: a seat out of provider usage, a parked seat while the load is above `parked_max_load_per_cpu_percent` and a free or parked seat with a `busy_processes` program running say `null`, as the plan reads it; one more `null` is the demand command's alone: a parked seat that a waiting row was refused by (the plan still gives it other rows, never that one), so the refused row is demand ([A seat parked on its own wait](#a-seat-parked-on-its-own-wait)); `held` is `"busy"` only for a free seat (no open row, no held message) whose `busy_processes` read found a program under its pane, the seat the plan counts as occupied for it, `"context"` for a quiet seat (no open row, no held message, idle at its prompt) past `context_limit_percent` (see [A seat past its context limit](#a-seat-past-its-context-limit)), also occupied in the plan (a seat held both ways says `"busy"`), and is absent for every other seat (out of usage, a held message, to be reaped, a failed process read) |
+| `OPENRIG_SEAT_POOL_RELEASE_REASON` | `release_cmd` | why it is asked: `idle` (a free seat drained, by `drain` or by `idle_grace_s`, or a seat past its context limit the pool replaces), `drain-deadline` (the forced pass at a drain's deadline) or `reap` (a seat whose session is gone) |
+| `OPENRIG_SEAT_POOL_SLOTS` | `demand_cmd` | JSON list of `{session, phase, receives, held?}` for the pool's seats; `receives` is how the seat may take a waiting row now: `"free"`, `"parked"` (see [A seat parked on its own wait](#a-seat-parked-on-its-own-wait)) or `null`: a seat out of provider usage, a parked seat while the load is above `parked_max_load_per_cpu_percent` and a free or parked seat with a `busy_processes` program running say `null`, as the plan reads it; one more `null` is the demand command's alone: a parked seat that a waiting row was refused by (the plan still gives it other rows, never that one), so the refused row is demand ([A seat parked on its own wait](#a-seat-parked-on-its-own-wait)); `held` is `"busy"` only for a free seat (no open row, no held message) whose `busy_processes` read found a program under its pane, the seat the plan counts as occupied for it, `"context"` for a quiet seat (no open row, no held message, idle at its prompt) past `context_limit_percent` that the plan does not drain yet (inside `idle_grace_s`, or with a `busy_processes` program running; see [A seat past its context limit](#a-seat-past-its-context-limit)), also occupied in the plan (a seat held both ways says `"busy"`), and is absent for a full seat the plan drains, which is on its way out (`receives` `null`), and for every other seat (out of usage, a held message, to be reaped, a failed process read) |
 
 A command that runs past `timeout_s` is killed and counts as failed. Each command has its own `timeout_s` (default 60),
 so a slow `release_cmd` can be given longer than `demand_cmd`; `release_cmd` runs under the seat's lifecycle lease,
@@ -139,13 +139,20 @@ isn't taking it:
 
 A seat the pool added whose context usage is at `context_limit_percent` or above (default 40; 0 turns the rule off)
 takes no row, free or parked. The usage is the `used_percentage` of the status-line sidecar its current occupant writes
-(`$OPENRIG_HOME/state/context-usage/<session>.json`), read only while its `sampled_at` is less than 10 minutes old. No
-sidecar, an unreadable one, one with no percentage, a stale one, or one a previous occupant left under the same name
-(sampled before the live occupant booted, with no generation of its own) holds nothing back, as before the field. An
-adopted seat is never held back by its context: the pool never replaces it.
+(`$OPENRIG_HOME/state/context-usage/<session>.json`), read while its `sampled_at` is less than 10 minutes old, and for
+as long as the seat stays quiet (no open row, no held message, idle at its prompt): a quiet seat runs no turn, so its
+context does not move and nothing rewrites the sample. No sidecar, an unreadable one, one with no percentage, a stale
+one of a seat that is not quiet, or one a previous occupant left under the same name (sampled before the live occupant
+booted, with no generation of its own) holds nothing back, as before the field. An adopted seat is never held back by
+its context: the pool never replaces it.
 
-Such a seat counts as occupied, so the pool adds a seat for the row it can't take rather than leave the row at the
-model, and it is never drained as free: it leaves the pool by its own release, or a relaunch gives it a fresh context.
+Such a seat counts as occupied while it is inside `idle_grace_s` or a `busy_processes` program runs in it (the pool adds
+a seat for the row it can't take rather than leave the row at the model), and the demand command is told so
+(`held: "context"`). Past that, its context only grows, so the pool replaces it: it counts as neither occupied nor free
+and holds the target up no more, the demand command is not told it is held, and it is drained (its `release_cmd`
+runs with reason `idle`), the newest first, after the free seats, for the surplus over the target and, for each waiting
+row no seat takes and no starting seat will, beyond the room `max` leaves. Without `demand_cmd`, the pool adds a seat
+for such a row as if the full seats weren't there; with it, the demand command's target alone decides the add.
 The executor reads the sidecar again just before the move: a seat that passed the limit since the plan keeps the row at
 its seat and records `seat_pool_dispatch_skipped` with `code: free_context` (or `parked_context`), the reading and the
 limit. Without the rule, a seat that stops taking new work past a context threshold of its own takes the row, gives it
