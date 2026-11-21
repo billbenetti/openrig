@@ -54,6 +54,7 @@ context:
     min_blocked_s: 1800             # how long each row must have been blocked, unbroken, on these gates (0..604800, default 1800)
     to: dev-review@my-rig           # required: the fixed seat the rows go to (<session>@<rig>)
     max_rows: 4                     # the most open rows a seat may hold and still hand them all (1..32, default 4)
+    ignore_busy_processes: [release-holder]  # absent (the default): every busy program keeps the rows; see below
 ```
 
 Registration and `rig watchdog update --spec` refuse a spec with an unknown field, `max` below `min`, a relative
@@ -62,7 +63,8 @@ address (`<session>@<rig>`), or a `dispatch_to_parked` that isn't an object, has
 range (`dispatch_to_parked: {}` turns it on with every default; `refuse_gates` and `busy_processes` are lists of at most
 32 strings of 1 to 128 characters with no whitespace, and a `busy_processes` entry has no `/`; `busy_orphan_max_age_s` is
 refused without `busy_processes`), or a `return_long_gates` that isn't an object, has an unknown field, a gate that
-isn't `external:<name>`, a `to` that isn't a seat address or a number out of its range. Commands run without a shell, with the daemon's
+isn't `external:<name>`, a `to` that isn't a seat address, a number out of its range or an `ignore_busy_processes` entry
+that `dispatch_to_parked.busy_processes` does not list. Commands run without a shell, with the daemon's
 environment plus:
 
 | Variable | Set for | Value |
@@ -173,6 +175,12 @@ seat state: a seat a wake was just typed into may still read as idle. A row can'
 attached watchdog, a repeating wait or a blocker row, not a park timer of its own or nothing, or when a row of `to`
 waits on it (the move would release that row as if its blocker were done); the plan never asks for such a seat, so it
 keeps its turn as a parked receiver.
+
+`ignore_busy_processes` names programs of `busy_processes` that do not keep the rows from going: a holder that only waits
+for the seat's own release, which no row of the seat feeds. The busy read then names such a program only when nothing
+else holds the seat (another `busy_processes` program under the pane or left from it, an unread shell, a failed read),
+so a seat held by it alone hands its long-gate rows on, and one that also runs a suite keeps them. The program still keeps
+the seat from a row, free or parked, and counts it as occupied, as before.
 
 The plan asks for the move (`return_long_gate`) and gives that seat nothing else in the same plan, also as a parked seat;
 it still counts as occupied there. The executor checks the seat again just before, with the same rule, and hands all its

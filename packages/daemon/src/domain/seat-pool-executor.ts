@@ -618,6 +618,8 @@ export function readSeatPoolBusyCandidates(
     || seatPoolLongGateRows(spec, { ...slot, busyProcess: null }, nowMs) !== null).map((slot) => slot.sessionName);
   return readSeatPoolBusySessions(candidates, programs, deps, {
     ...(timeoutMs !== undefined ? { timeoutMs } : {}),
+    // T-016495: a reason that names an ignored program then says nothing else holds the seat (seatPoolLongGateBusy)
+    ...(spec.returnLongGates?.ignoreBusyProcesses ? { lastPrograms: spec.returnLongGates.ignoreBusyProcesses } : {}),
     ...(spec.dispatchToParked?.busyOrphanMaxAgeSeconds !== undefined ? { orphanMaxAgeSeconds: spec.dispatchToParked.busyOrphanMaxAgeSeconds } : {}),
   });
 }

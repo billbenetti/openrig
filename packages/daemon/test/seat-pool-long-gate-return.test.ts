@@ -242,6 +242,44 @@ describe("T-012673: the predicate and the planner", () => {
   });
 });
 
+describe("T-016495: return_long_gates.ignore_busy_processes", () => {
+  const SEGURADOR = "sair-do-pool.py";
+  const BUSY = { busy_processes: ["suite-flock", SEGURADOR] };
+  const on = spec({ dispatch_to_parked: BUSY, return_long_gates: { ...RULE, ignore_busy_processes: [SEGURADOR] } });
+
+  it("parses only with programs that busy_processes lists; without the key the rule reads as before", () => {
+    expect(on.returnLongGates).toEqual({ gates: [GATE], minBlockedSeconds: 1800, to: FIXED, maxRows: 4, ignoreBusyProcesses: [SEGURADOR] });
+    expect(spec({ dispatch_to_parked: BUSY, return_long_gates: RULE }).returnLongGates).not.toHaveProperty("ignoreBusyProcesses");
+    for (const [value, extra] of [
+      [[SEGURADOR], {}],
+      [["congelar-eval"], { dispatch_to_parked: BUSY }],
+      [[], { dispatch_to_parked: BUSY }],
+      [["/x/sair-do-pool.py"], { dispatch_to_parked: BUSY }],
+      [["bash"], { dispatch_to_parked: BUSY }],
+      [SEGURADOR, { dispatch_to_parked: BUSY }],
+    ] as const) {
+      const parsed = parse({ ...extra, return_long_gates: { ...RULE, ignore_busy_processes: value } });
+      expect("problem" in parsed && parsed.problem.field).toBe("return_long_gates.ignore_busy_processes");
+    }
+  });
+
+  it("a seat held only by an ignored program hands its rows back; another program, a failed read or no ignore list keeps them", () => {
+    const held = (busyProcess: string) => slot(1, { busyProcess });
+    expect(seatPoolLongGateRows(on, held(`${SEGURADOR} (pid 3181405, TMUX_PANE %1718)`), NOW)).toEqual([park("qitem-s1")]);
+    expect(seatPoolLongGateRows(on, held(`${SEGURADOR} (pid 9)`), NOW)).not.toBeNull();
+    expect(seatPoolLongGateRows(on, held("suite-flock (pid 4242, TMUX_PANE %1718)"), NOW)).toBeNull();
+    expect(seatPoolLongGateRows(on, held("pane not found"), NOW)).toBeNull();
+    expect(seatPoolLongGateRows(on, held(`environment of pid 7 not read: ${SEGURADOR}`), NOW)).toBeNull();
+    const off = spec({ dispatch_to_parked: BUSY, return_long_gates: RULE });
+    expect(seatPoolLongGateRows(off, held(`${SEGURADOR} (pid 9)`), NOW)).toBeNull();
+    // The plan hands the rows back, and the seat still takes no row while the holder runs.
+    const intents = plan(on, state([held(`${SEGURADOR} (pid 9)`)], [row("qitem-b")]));
+    expect(returns(intents)).toEqual([{ kind: "return_long_gate", slotId: 1, qitemIds: ["qitem-s1"], to: FIXED }]);
+    expect(dispatches(intents)).toEqual([]);
+  });
+});
+
+
 // ---------------------------------------------------------------------------------------------------------------
 // The executor: the real queue, the reader and the history
 // ---------------------------------------------------------------------------------------------------------------
@@ -951,3 +989,38 @@ describe("T-012673: the executor (real queue, reader and history)", () => {
     expect(h.notes("seat_pool_long_gate_returned").map((r) => r["qitemId"])).toEqual([a]);
   });
 });
+
+describe("T-016495: the executor with ignore_busy_processes", () => {
+  let h: Harness;
+  beforeEach(() => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    h = new Harness();
+  });
+  afterEach(async () => {
+    await h.executor.stop();
+    h.db.close();
+    vi.useRealTimers();
+  });
+
+  it("a seat held only by sair-do-pool.py hands its row back at the recheck; with suite-flock too it keeps it (skipped, busy)", async () => {
+    h.register({
+      ...BASE, dispatch_to_parked: { busy_processes: ["suite-flock", "sair-do-pool.py"] },
+      return_long_gates: { gates: [GATE], to: FIXED, min_blocked_s: 1800, ignore_busy_processes: ["sair-do-pool.py"] },
+    });
+    const s1 = h.poolSeat("qualidade.revisor-s1");
+    const a = await h.park(s1);
+    h.busy.set(s1.session, "suite-flock (pid 4242)");
+
+    await h.tickAt(61);
+    expect(h.notes("seat_pool_long_gate_returned")).toEqual([]);
+    expect(h.notes("seat_pool_long_gate_skipped")).toEqual([
+      expect.objectContaining({ slot: s1.session, qitemIds: [a], code: "busy", busyProcess: "suite-flock (pid 4242)" }),
+    ]);
+
+    h.busy.set(s1.session, "sair-do-pool.py (pid 3181405, TMUX_PANE %1718)");
+    await h.tickAt(200);
+    expect(h.notes("seat_pool_long_gate_returned")).toEqual([expect.objectContaining({ slot: s1.session, qitemId: a, to: FIXED })]);
+    expect(h.get(a).state).toBe("handed-off");
+  });
+});
+
