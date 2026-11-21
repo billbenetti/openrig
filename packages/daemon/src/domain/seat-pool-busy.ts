@@ -225,7 +225,14 @@ const pendingReads = new WeakMap<object, { count: number; waiters: Array<() => v
  */
 export function seatPoolBusyFromProcess(reason: string | null | undefined): boolean {
   // The program is one word (a busy_processes entry has no whitespace, parentheses allowed): `run(1) (pid 9)` is a process.
-  return !!reason && /^\S+ \(pid \d+(, TMUX_PANE \S+)?\)$/.test(reason);
+  return seatPoolBusyProgram(reason) !== null;
+}
+
+/** The program a busy reason names when it names a process the read found (seatPoolBusyFromProcess); null for a failed
+ *  read or no reason. */
+export function seatPoolBusyProgram(reason: string | null | undefined): string | null {
+  const match = reason ? /^(\S+) \(pid \d+(, TMUX_PANE \S+)?\)$/.exec(reason) : null;
+  return match ? match[1]! : null;
 }
 
 /** Runs `tasks` with at most `limit` at once, keeping their order. */
@@ -290,6 +297,10 @@ export interface SeatPoolBusyReadOptions {
   timeoutMs?: number;
   /** dispatch_to_parked.busy_orphan_max_age_s. Default SEAT_POOL_BUSY_ORPHAN_MAX_AGE_S. */
   orphanMaxAgeSeconds?: number;
+  /** T-016495: programs of `programs` a reason names only when nothing else holds the seat (return_long_gates
+   *  .ignore_busy_processes): any other matching process, an unread shell or a failed read is said first, so a reason
+   *  that names one of these says that nothing but them was found. Whether the seat is busy does not change. */
+  lastPrograms?: readonly string[];
 }
 
 /**
@@ -308,8 +319,11 @@ export async function readSeatPoolBusySessions(
   sessions: readonly string[], programs: readonly string[], deps: SeatPoolBusyReadDeps,
   options: SeatPoolBusyReadOptions | number = {},
 ): Promise<Map<string, string | null>> {
-  const { timeoutMs = SEAT_POOL_BUSY_READ_TIMEOUT_MS, orphanMaxAgeSeconds = SEAT_POOL_BUSY_ORPHAN_MAX_AGE_S } =
+  const { timeoutMs = SEAT_POOL_BUSY_READ_TIMEOUT_MS, orphanMaxAgeSeconds = SEAT_POOL_BUSY_ORPHAN_MAX_AGE_S, lastPrograms = [] } =
     typeof options === "number" ? { timeoutMs: options } : options;
+  // T-016495: the programs said first; with no lastPrograms, all of them, and the read is the one from before
+  const last = new Set(lastPrograms.filter((program) => programs.includes(program)));
+  const first = programs.filter((program) => !last.has(program));
   const busy = new Map<string, string | null>();
   if (sessions.length === 0 || programs.length === 0) return busy;
   const holdAll = (why: string) => { for (const session of sessions) busy.set(session, why); return busy; };
@@ -434,11 +448,12 @@ export async function readSeatPoolBusySessions(
       busy.set(session, "pane not found");
       continue;
     }
-    const under = seatPoolBusyProcess(rows, pane.panePid, programs);
+    const under = first.length > 0 ? seatPoolBusyProcess(rows, pane.panePid, first) : null;
     if (under) {
       busy.set(session, under);
       continue;
     }
+    const lastUnder = last.size > 0 ? seatPoolBusyProcess(rows, pane.panePid, programs) : null;
     const { byPane: found, unread, unreadShells } = await matchingByPane();
     const occupantMs = seatPoolPaneOccupantMs(rows, pane.panePid);
     const holds = (pid: number) => {
@@ -446,7 +461,8 @@ export async function readSeatPoolBusySessions(
       if (started === null) return true;
       return nowMs - started <= orphanMaxAgeSeconds * 1000 && (occupantMs === null || started >= occupantMs);
     };
-    const left = (found.get(pane.paneId) ?? []).find(holds);
+    const orphans = (found.get(pane.paneId) ?? []).filter(holds);
+    const left = orphans.find((pid) => !last.has(seatPoolBusyCommand(byPid.get(pid)!.command, programs)!));
     if (left !== undefined) {
       busy.set(session, `${seatPoolBusyCommand(byPid.get(left)!.command, programs)} (pid ${left}, TMUX_PANE ${pane.paneId})`);
       continue;
@@ -456,7 +472,10 @@ export async function readSeatPoolBusySessions(
       busy.set(session, `command line of pid ${shell} not read (${byPid.get(shell)!.command.trim()}, TMUX_PANE ${pane.paneId})`);
       continue;
     }
-    busy.set(session, unread ?? seatPoolUnreadInTree(rows, pane.panePid, programs));
+    const failed = unread ?? seatPoolUnreadInTree(rows, pane.panePid, programs);
+    const lastLeft = orphans[0];
+    busy.set(session, failed ?? lastUnder
+      ?? (lastLeft !== undefined ? `${seatPoolBusyCommand(byPid.get(lastLeft)!.command, programs)} (pid ${lastLeft}, TMUX_PANE ${pane.paneId})` : null));
   }
   return busy;
 }

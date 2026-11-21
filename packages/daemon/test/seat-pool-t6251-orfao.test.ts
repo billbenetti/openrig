@@ -797,3 +797,38 @@ describe("T-007477: S16 (an orphan [bash]/[sh] whose command line could not be r
     expect(seen).toEqual([]);
   });
 });
+
+describe("T-016495: lastPrograms (return_long_gates.ignore_busy_processes)", () => {
+  const WITH = [...PROGRAMS, "sair-do-pool.py"];
+  /** The scene above plus the setup's holder (pid 400, reparented to 1, TMUX_PANE %24), optionally under the pane. */
+  function withHolder(opts: { suiteFlock: boolean; holderUnderPane?: boolean; unreadEnv?: boolean }) {
+    const { rows, deps } = scene({ occupantAgoS: 7200, orphanAgoS: 3600 });
+    const holder: BusyProcessRow = {
+      pid: 400, ppid: opts.holderUnderPane ? 101 : 1, command: "python3 -I /home/bruno/dev/setup/ops/autoscale/sair-do-pool.py --segurar",
+      startedAt: agoS(1800),
+    };
+    const all = [...rows.filter((row) => opts.suiteFlock || row.pid !== 500), holder];
+    return {
+      ...deps, processes: async () => all,
+      processPane: async (pid: number) => {
+        if (opts.unreadEnv && pid === 500) throw new Error("EACCES");
+        return pid === 500 || pid === 400 ? "%24" : null;
+      },
+    };
+  }
+  const read = async (deps: SeatPoolBusyReadDeps, last?: string[]) =>
+    (await readSeatPoolBusySessions(["qa-s7@r"], WITH, deps, last ? { lastPrograms: last } : {})).get("qa-s7@r");
+
+  it("a seat held only by the holder names it, orphaned or under the pane", async () => {
+    expect(await read(withHolder({ suiteFlock: false }), ["sair-do-pool.py"])).toBe("sair-do-pool.py (pid 400, TMUX_PANE %24)");
+    expect(await read(withHolder({ suiteFlock: false, holderUnderPane: true }), ["sair-do-pool.py"])).toBe("sair-do-pool.py (pid 400)");
+  });
+
+  it("with another busy program or a failed read too, the reason names that, though the holder has the lower pid", async () => {
+    expect(await read(withHolder({ suiteFlock: true }), ["sair-do-pool.py"])).toBe("suite-flock (pid 500, TMUX_PANE %24)");
+    expect(await read(withHolder({ suiteFlock: true, holderUnderPane: true }), ["sair-do-pool.py"])).toBe("suite-flock (pid 500, TMUX_PANE %24)");
+    expect(await read(withHolder({ suiteFlock: true, unreadEnv: true }), ["sair-do-pool.py"])).toMatch(/^environment of pid 500 not read/);
+    // Without lastPrograms the read is the one from before: the lowest pid
+    expect(await read(withHolder({ suiteFlock: true }))).toBe("sair-do-pool.py (pid 400, TMUX_PANE %24)");
+  });
+});

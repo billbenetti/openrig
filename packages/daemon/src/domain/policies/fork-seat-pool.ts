@@ -8,7 +8,7 @@
 // policy itself never creates, launches, stops, removes, moves or sends anything, so one slow launch can't hold every
 // other job's evaluation.
 
-import { SEAT_POOL_BUSY_ORPHAN_MAX_AGE_S, seatPoolBusyFromProcess, seatPoolBusyWrapper } from "../seat-pool-busy.js";
+import { SEAT_POOL_BUSY_ORPHAN_MAX_AGE_S, seatPoolBusyFromProcess, seatPoolBusyProgram, seatPoolBusyWrapper } from "../seat-pool-busy.js";
 import type { Policy, PolicyEvaluation, PolicyJob } from "./types.js";
 
 export const SEAT_POOL_POLICY_NAME = "seat-pool";
@@ -85,6 +85,10 @@ export interface SeatPoolReturnLongGates {
   to: string;
   /** `max_rows` (default 4): the most open rows a seat may hold and still hand them all back. */
   maxRows: number;
+  /** `ignore_busy_processes` (T-016495): programs of `dispatch_to_parked.busy_processes` that do not keep a seat's rows
+   *  from going back when nothing else holds it (a holder that only waits for the seat's own release, as the setup's
+   *  `sair-do-pool.py --segurar`). They still keep the seat from a row. Absent when not given: every busy program holds. */
+  ignoreBusyProcesses?: string[];
 }
 
 /** `dispatch_to_parked` in the job's context: when a seat parked on its own wait counts as a receiver of one more row. */
@@ -316,7 +320,7 @@ const RETURN_LONG_GATES_NUMBERS = {
   min_blocked_s: { min: 0, max: 604_800, fallback: 1800 },
   max_rows: { min: 1, max: 32, fallback: 4 },
 } as const;
-const RETURN_LONG_GATES_KEYS = new Set([...Object.keys(RETURN_LONG_GATES_NUMBERS), "gates", "to"]);
+const RETURN_LONG_GATES_KEYS = new Set([...Object.keys(RETURN_LONG_GATES_NUMBERS), "gates", "to", "ignore_busy_processes"]);
 /** The most gates `return_long_gates.gates` may list, and the longest one. */
 const RETURN_LONG_GATES_LIST_MAX = 32;
 const RETURN_LONG_GATES_ENTRY_MAX = 128;
@@ -357,7 +361,21 @@ function returnLongGates(value: unknown): SeatPoolReturnLongGates | SpecProblem 
     }
     numbers[key] = field as number;
   }
-  return { gates: [...new Set(gates as string[])], minBlockedSeconds: numbers["min_blocked_s"]!, to, maxRows: numbers["max_rows"]! };
+  // T-016495: program names, as busy_processes (each must also be one of them: parseSeatPoolSpec checks it)
+  const ignore = record["ignore_busy_processes"];
+  const ignoreField = `${RETURN_LONG_GATES}.ignore_busy_processes`;
+  if (ignore !== undefined && (!Array.isArray(ignore) || ignore.length === 0 || ignore.length > DISPATCH_TO_PARKED_LIST_MAX
+    || ignore.some((entry) => typeof entry !== "string" || entry.length === 0 || entry.length > DISPATCH_TO_PARKED_ENTRY_MAX
+      || /\s/.test(entry) || entry.includes("/") || seatPoolBusyWrapper(entry)))) {
+    return {
+      field: ignoreField,
+      message: `seat-pool: ${ignoreField} must be a list of 1 to ${DISPATCH_TO_PARKED_LIST_MAX} program names of ${DISPATCH_TO_PARKED}.busy_processes`,
+    };
+  }
+  return {
+    gates: [...new Set(gates as string[])], minBlockedSeconds: numbers["min_blocked_s"]!, to, maxRows: numbers["max_rows"]!,
+    ...(ignore !== undefined ? { ignoreBusyProcesses: [...new Set(ignore as string[])] } : {}),
+  };
 }
 
 const isProblem = (value: unknown): value is SpecProblem =>
@@ -432,6 +450,12 @@ export function parseSeatPoolSpec(context: Record<string, unknown>): { spec: Sea
     const parsed = returnLongGates(context[RETURN_LONG_GATES]);
     if (isProblem(parsed)) return { problem: parsed };
     longGates = parsed;
+  }
+  // T-016495: an ignored program that busy_processes does not list would ignore nothing, so it is a mistake in the spec
+  const notBusy = longGates?.ignoreBusyProcesses?.filter((program) => !parkedRule?.busyProcesses?.includes(program)) ?? [];
+  if (notBusy.length > 0) {
+    const field = `${RETURN_LONG_GATES}.ignore_busy_processes`;
+    return { problem: { field, message: `seat-pool: ${field} lists ${notBusy.join(", ")}, not in ${DISPATCH_TO_PARKED}.busy_processes` } };
   }
   return {
     spec: {
@@ -904,7 +928,8 @@ export function seatPoolLongGateOf(rule: Pick<SeatPoolReturnLongGates, "gates">,
 export function seatPoolLongGateRows(spec: SeatPoolSpec, slot: SeatPoolSlotView, nowMs: number): ParkFacts[] | null {
   const rule = spec.returnLongGates;
   if (!rule || spec.drain || slot.adopted || !seatPoolLive(slot) || slot.nodeId === null || !slot.nodeExists) return null;
-  if (slot.heldMessages !== 0 || slot.cause !== "idle" || slot.atPrompt !== true || slot.backgroundWork === true || slot.busyProcess) return null;
+  if (slot.heldMessages !== 0 || slot.cause !== "idle" || slot.atPrompt !== true || slot.backgroundWork === true
+    || seatPoolLongGateBusy(rule, slot.busyProcess)) return null;
   // The seat's state is observed, so it lags: a seat a wake was just typed into (its own row's timer firing) can still
   // read as idle since hours. A quiet seat has been idle a while and no wake of its rows fired a moment ago, so the
   // move never lands under a turn the seat just began on one of them. Written so that an unknown time refuses.
@@ -920,6 +945,18 @@ export function seatPoolLongGateRows(spec: SeatPoolSpec, slot: SeatPoolSlotView,
   // is never planned: the plan would be refused on every pass, and the seat would lose its turn as a parked receiver.
   return parks.every((park) => seatPoolLongGateOf(rule, park.blockedOn) !== null && old(park) && unwoken(park) && park.returnRefusal === null)
     ? parks : null;
+}
+
+/** Whether the seat's busy read keeps its rows from going back (seatPoolLongGateRows): any reason does, except one that
+ *  names a program of `ignore_busy_processes` (T-016495). The read says such a program only when nothing else holds the
+ *  seat (readSeatPoolBusySessions, lastPrograms), so a failed read or another busy program still keeps the rows. The case
+ *  (21/11 02:03Z): 14 of the 28 seats of the dev pool were held by their `sair-do-pool.py --segurar` (it waits for the
+ *  seat's own execution in the ledger to end), and one of them kept its row parked on a listed gate for over
+ *  `min_blocked_s` instead of handing it to the fixed seat, while 22 rows waited at the model. */
+export function seatPoolLongGateBusy(rule: Pick<SeatPoolReturnLongGates, "ignoreBusyProcesses">, busy: string | null | undefined): boolean {
+  if (!busy) return false;
+  const program = seatPoolBusyProgram(busy);
+  return !(program !== null && (rule.ignoreBusyProcesses ?? []).includes(program));
 }
 
 /** How long a seat must have been idle, and since a wake of its rows last fired, before return_long_gates moves its rows
