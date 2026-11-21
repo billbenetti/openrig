@@ -797,6 +797,13 @@ function seatPoolHeldBusy(spec: SeatPoolSpec, slot: SeatPoolSlotView): boolean {
  * seat would take the row and give it straight back (its own rule: no new work past the limit), and the pool would hand
  * the row to the next full seat. No reading, an unreadable or stale one, an adopted seat and a limit of 0 hold nothing
  * back, as before the field.
+ *
+ * A quiet seat (no open row, no held message, idle since a known time) keeps its reading, however old (T-017384): it
+ * runs no turn, so its context does not move and nothing rewrites the sample, which is its live occupant's (the reader
+ * refuses a previous occupant's, and /clear writes none). Its idle time says nothing about the sample: it restarts with
+ * the daemon and with a change of activity that ran no turn. Without this, the sample went stale 10 min after the
+ * seat's last turn, which is when idle_grace_s (600 s in the pools that run it) lets a seat be drained, or at once after
+ * a restart: the full seat read as free again, took a row, woke, read its fresh sample and gave the row back.
  */
 export function seatPoolContextOver(spec: Pick<SeatPoolSpec, "contextLimitPercent">, slot: SeatPoolSlotView, nowMs: number): boolean {
   const limit = seatPoolContextLimit(spec);
@@ -805,18 +812,37 @@ export function seatPoolContextOver(spec: Pick<SeatPoolSpec, "contextLimitPercen
   if (typeof reading.usedPercentage !== "number" || !Number.isFinite(reading.usedPercentage) || reading.usedPercentage < limit) return false;
   const sampledMs = Date.parse(reading.sampledAt);
   // Written so that an unreadable time (NaN) holds nothing back.
-  return Number.isFinite(sampledMs) && Math.max(0, nowMs - sampledMs) < SEAT_POOL_CONTEXT_MAX_AGE_SECONDS * 1000;
+  if (!Number.isFinite(sampledMs)) return false;
+  if (Math.max(0, nowMs - sampledMs) < SEAT_POOL_CONTEXT_MAX_AGE_SECONDS * 1000) return true;
+  // A quiet seat keeps its reading, however old (REVISAO-seat-pool S5): it runs no turn, so nothing rewrote the sample,
+  // and the reading is its live occupant's (the reader refuses another occupant's, and /clear writes none).
+  return slot.openRows === 0 && slot.heldMessages === 0 && slot.idleSince !== null;
 }
 
 /**
  * Whether a quiet seat is held only by its context (seatPoolContextOver): live, in usage, no open row, no held message,
- * idle since a known time, and past the limit. The plan counts these as occupied (the pool grows for the row they can't
- * take, and never drains them as free), and the demand command is told so as `held: "context"`. A seat with an open row
+ * idle since a known time, and past the limit. The plan counts these as occupied while they are inside idle_grace_s or
+ * busy with a process, and the demand command is told so as `held: "context"`; past that (seatPoolContextDrainable,
+ * T-017384) they are neither occupied nor free: they don't hold the target up, the demand command is not told they are
+ * held, they are drained after the free seats and for the rows `max` leaves no room for, and the rows they can't take
+ * get seats of their own. A seat with an open row
  * is occupied already; one out of provider usage says nothing, as for `held: "busy"` (seatPoolHeldByProcess).
  */
 export function seatPoolHeldByContext(spec: SeatPoolSpec, slot: SeatPoolSlotView, nowMs: number, facts: { usageLimited?: boolean } = {}): boolean {
   if (facts.usageLimited || slot.cause === "usage_limit") return false;
   return seatPoolLive(slot) && seatPoolQuiet(slot) && seatPoolContextOver(spec, slot, nowMs);
+}
+
+
+/**
+ * Whether the plan drains a seat held only by its context (T-017384): seatPoolHeldByContext, not adopted, no busy
+ * program in it (seatPoolHeldBusy), idle for `idle_grace_s`. Such a seat is neither occupied nor free in the plan, and
+ * the demand command is not told it is held (`held: "context"`): it is on its way out, and counted as held it would hold
+ * the target up for ever (REVISAO-seat-pool B1).
+ */
+export function seatPoolContextDrainable(spec: SeatPoolSpec, slot: SeatPoolSlotView, nowMs: number, facts: { usageLimited?: boolean } = {}): boolean {
+  return !slot.adopted && !seatPoolHeldBusy(spec, slot) && seatPoolHeldByContext(spec, slot, nowMs, facts)
+    && nowMs - Date.parse(slot.idleSince!) >= spec.idleGraceSeconds * 1000;
 }
 
 /**
@@ -1019,8 +1045,10 @@ export function seatPoolOutOfUsage(state: Pick<SeatPoolState, "modelCause" | "sl
  * seat on record counts, adopted or added, running, stopped or draining, but not one the same plan forgets or reaps);
  * with no room it is not asked for at all, and a plan left with nothing to do says so (`max_reached`, held). A demand answer older than `sampleMaxAgeMs` holds the pool's size as it is.
  * While a seat of the pool is out of usage, the pool adds no seat and launches none: neither a stopped seat nor one it
- * added and has not started, which waits as it is (and may still be removed). Only a free seat the pool added, idle
- * for `idle_grace_s`, is drained, the newest first; an adopted seat is never drained, and under `drain` it is unlinked.
+ * added and has not started, which waits as it is (and may still be removed). Only a seat the pool added, idle for
+ * `idle_grace_s`, is drained, the newest first: a free one for the surplus, then one held only by its context (T-017384)
+ * for the rest of the surplus and for each waiting row no seat takes beyond the room `max` leaves; an adopted seat is
+ * never drained, and under `drain` it is unlinked.
  * Adds and new drains wait for `cooldown_s` after the last add or removal, except under `drain`. A seat that never
  * becomes free under `drain` is the executor's: once `drain_deadline_s` passes it takes the seat out (the forced pass).
  */
@@ -1062,9 +1090,9 @@ export function planSeatPool(spec: SeatPoolSpec, state: SeatPoolState, nowMs: nu
   // seat) and is never drained as free while its suite runs (REVISAO lente de lógica, wf_fff3f5f2).
   const heldBusy = (slot: SeatPoolSlotView) => seatPoolHeldBusy(spec, slot);
   const quiet = seatPoolQuiet;
-  // A quiet seat past its context limit (seatPoolContextOver, T-012383) takes no row either: it is occupied, as a busy
-  // one, so the pool grows for the row it can't take instead of leaving the row at the model, and it is not drained as
-  // free (it leaves the pool by its own release, or a relaunch gives it a fresh context).
+  // A quiet seat past its context limit (seatPoolContextOver, T-012383) takes no row either, so it is not idle: the pool
+  // grows for the row it can't take instead of leaving the row at the model. Past idle_grace_s and with no busy process
+  // it leaves the pool (`full`, T-017384): its context only grows, so a seat in its place is what takes the row.
   const heldContext = (slot: SeatPoolSlotView) => seatPoolContextOver(spec, slot, nowMs);
   const idle = (slot: SeatPoolSlotView) => quiet(slot) && !heldBusy(slot) && !heldContext(slot);
   // T-006251 S6: a quiet seat held only because its processes could not be read (a timeout under load, an unreadable
@@ -1137,7 +1165,13 @@ export function planSeatPool(spec: SeatPoolSpec, state: SeatPoolState, nowMs: nu
     }
   }
 
-  const occupied = live.filter((slot) => (!idle(slot) && !heldUnread(slot)) || receiving.has(slot));
+  // T-017384: the seats held only by their context (seatPoolHeldByContext: live, in usage, no open row, no held message,
+  // idle since a known time), not busy with a process, idle for idle_grace_s, and not adopted, the newest first. They
+  // take no row and never will (their context only grows), so they are neither occupied nor free: they don't hold the
+  // target up, and they leave the pool after the free seats.
+  const full = live.filter((slot) => seatPoolContextDrainable(spec, slot, nowMs, { usageLimited })).sort((a, b) => b.slotId - a.slotId);
+  const fullSet = new Set(full);
+  const occupied = live.filter((slot) => ((!idle(slot) && !heldUnread(slot)) || receiving.has(slot)) && !fullSet.has(slot));
   const unread = live.filter((slot) => heldUnread(slot) && !receiving.has(slot));
   const free = live.filter((slot) => idle(slot) && !receiving.has(slot) && nowMs - Date.parse(slot.idleSince!) >= spec.idleGraceSeconds * 1000);
   const current = live.length + starting.length;
@@ -1173,23 +1207,53 @@ export function planSeatPool(spec: SeatPoolSpec, state: SeatPoolState, nowMs: nu
   const surplus = Math.max(0, current - target);
   // An adopted seat was someone else's before the pool: the pool never stops or removes it.
   const drainOrder = free.filter((slot) => !slot.adopted).sort((a, b) => b.slotId - a.slotId);
-  if (!cooling) for (const slot of drainOrder.slice(0, surplus)) intents.push({ kind: "drain", slotId: slot.slotId, idleSince: slot.idleSince });
-  // A seat that never started holds no work. It goes only for the surplus free seats can't cover (a lowered max, or drain).
-  const removeStarting = [...starting].sort((a, b) => b.slotId - a.slotId).slice(0, Math.max(0, surplus - drainOrder.length));
+  // T-017384: the full seats (above) leave after the free ones: for the surplus the free seats don't cover (they don't
+  // hold the target up, so with no row waiting they all go, down to `min`), and one for each waiting row that no seat
+  // takes and no starting seat will, beyond the room `max` leaves. That room is the add's (seatPoolRoom) before its clamp
+  // at 0: a pool over `max` must first drain back to it before a drain makes room for a seat that takes a row. The free
+  // seats still go first for the surplus, as before: a full seat whose release command refuses (the executor puts it
+  // back, and the next plan picks it again) holds back only the full seats behind it, never a free seat that would go.
+  const leavingNow = new Set([...state.slots.filter((slot) => !present.includes(slot)), ...present.filter(seatPoolReapable)]);
+  const keptNow = state.slots.filter((slot) => !leavingNow.has(slot));
+  const roomNow = seatPoolRoom(spec, keptNow, state.adoptable.length);
+  const rowsLeft = movable.length - dispatched.size - starting.length;
+  // With demand_cmd every full seat goes while such a row waits, also below `max` (REVISAO-seat-pool B5): the add is the
+  // demand's target alone, and a demand that does not count the full seat asks for no more than `current`, so the row
+  // would wait with the full seat kept for ever. Drained, the next plan adds up to the target. A full seat the demand
+  // counts (its tarefa in the ledger) is held by the release command, and nothing is added for it; all of them go, not
+  // one per row, so a held one (the plan does not remember the refusal) never stands in front of one that would go
+  // (lens review of the volta 3).
+  const renew = spec.drain || rowsLeft <= 0 ? 0
+    : spec.demandCmd ? full.length : Math.max(0, rowsLeft - (spec.max - keptNow.length - state.adoptable.length));
+  const freeOut = drainOrder.slice(0, surplus);
+  const fullOut = full.slice(0, Math.max(0, Math.max(surplus, renew) - freeOut.length));
+  if (!cooling) for (const slot of [...freeOut, ...fullOut]) intents.push({ kind: "drain", slotId: slot.slotId, idleSince: slot.idleSince });
+  // A seat that never started holds no work. It goes only for the surplus free and full seats can't cover (a lowered
+  // max, or drain).
+  const removeStarting = [...starting].sort((a, b) => b.slotId - a.slotId).slice(0, Math.max(0, surplus - full.length - drainOrder.length));
   for (const slot of starting) {
     if (removeStarting.includes(slot)) intents.push({ kind: "remove", slotId: slot.slotId });
     else if (!usageLimited) intents.push({ kind: "launch", slotId: slot.slotId });
   }
   if (usageLimited && starting.length > removeStarting.length) reason = "usage_limit";
-  if (target > current && !cooling) {
+  // Without demand_cmd, the full seats are on their way out (above), so the rows that no seat takes and no starting
+  // seat will (rowsLeft) are asked for as if they weren't there: up to `target - current + full`, the seats that would
+  // serve the target. Only for those rows: a full seat the target counts anyway is never replaced while no row waits for
+  // a seat, so no add and drain go round it (lens review of the volta 1).
+  // With demand_cmd the demand command is the target's authority (REVISAO-seat-pool B4): it sizes the rows it wants
+  // seats for (a row it leaves out on purpose, as under a downstream brake, gets none), and the full seats it does not
+  // count are out of the target already, so they go by the surplus and the next plan adds for them.
+  const wanted = spec.demandCmd
+    ? target - current
+    : Math.max(target - current, Math.min(target - current + full.length, Math.max(0, rowsLeft)));
+  if (wanted > 0 && !cooling) {
     // The same room the executor checks before each seat: an add it would refuse is never asked for. A seat the same
     // plan forgets (its node is gone) or reaps is out of the count: the executor applies those intents before the add,
     // and checks the room again before each seat, so a reap that ends up launching its seat instead never takes the pool
     // past `max` (below it, the add may still start one seat more than the target, idle until idle_grace_s).
-    const leaving = new Set([...state.slots.filter((slot) => !present.includes(slot)), ...present.filter(seatPoolReapable)]);
-    const count = Math.min(target - current, seatPoolRoom(spec, state.slots.filter((slot) => !leaving.has(slot)), state.adoptable.length));
+    const count = Math.min(wanted, roomNow);
     if (count > 0) intents.push({ kind: "add", count });
-    else reason = "max_reached";
+    else if (target > current) reason = "max_reached";
   }
   if (cooling && target !== current) reason = "cooldown";
   return { intents, reason, target, current };
