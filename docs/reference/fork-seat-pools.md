@@ -151,8 +151,11 @@ a seat for the row it can't take rather than leave the row at the model), and th
 (`held: "context"`). Past that, its context only grows, so the pool replaces it: it counts as neither occupied nor free
 and holds the target up no more, the demand command is not told it is held, and it is drained (its `release_cmd`
 runs with reason `idle`), the newest first, after the free seats, for the surplus over the target and, for each waiting
-row no seat takes and no starting seat will, beyond the room `max` leaves. Without `demand_cmd`, the pool adds a seat
-for such a row as if the full seats weren't there; with it, the demand command's target alone decides the add.
+row no seat takes and no starting seat will: without `demand_cmd`, beyond the room `max` leaves, and the pool adds a seat
+for such a row as if the full seats weren't there; with it, every full seat goes while such a row waits, whatever the
+room (a demand that does not count the full seat asks for no more seats than are there), and the demand command's
+target alone decides the add, in the next plan. A full seat the demand command counts (its tarefa in the ledger) is held
+by the `release_cmd`, and its drain is asked again at each plan while the row waits.
 The executor reads the sidecar again just before the move: a seat that passed the limit since the plan keeps the row at
 its seat and records `seat_pool_dispatch_skipped` with `code: free_context` (or `parked_context`), the reading and the
 limit. Without the rule, a seat that stops taking new work past a context threshold of its own takes the row, gives it

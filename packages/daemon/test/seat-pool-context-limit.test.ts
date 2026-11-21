@@ -211,7 +211,8 @@ describe("T-017384: a free slot past the limit is drained, not held for ever as 
     const countedRows = { ...state([fullVm(1)], rows(2)), demand: { desired: 3, sampledAt: ago(10) } };
     const twoRows = planSeatPool(withDemand, countedRows, NOW, 120_000);
     expect(twoRows.intents.filter((i) => i.kind === "add")).toEqual([{ kind: "add", count: 2 }]);
-    expect(drains(twoRows.intents)).toEqual([]);
+    // with demand_cmd the full slot also goes for the rows (B5); its release command holds it while the ledger does
+    expect(drains(twoRows.intents)).toEqual([1]);
     // the room is there but the target already counts the full slots (9 working, 2 full, 2 rows, max 13): 2 added
     const stuck = planSeatPool(vm({ max: 13 }), state([1, 2, 3, 4, 5, 6, 7, 8, 9].map(working).concat([10, 11].map(fullVm)), rows(2)), NOW, 120_000);
     expect(stuck.intents.filter((i) => i.kind === "add")).toEqual([{ kind: "add", count: 2 }]);
@@ -227,6 +228,26 @@ describe("T-017384: a free slot past the limit is drained, not held for ever as 
     const warm = planSeatPool(vm({ max: 13, min: 5 }), state([fullVm(1), fullVm(2)], []), NOW, 120_000);
     expect(warm.intents.filter((i) => i.kind === "add")).toEqual([{ kind: "add", count: 3 }]);
     expect(drains(warm.intents)).toEqual([]);
+    // with demand_cmd, below max, the demand not counting the full slots (REVISAO B5), in 2 plans: first the full slots go,
+    // one per row no slot takes (the add is the demand's alone: desired = current, none), then the add for the rows
+    const notCounted = (slots: SeatPoolSlotView[], desired: number) => ({ ...state(slots, rows(2)), demand: { desired, sampledAt: ago(10) } });
+    const nine = [1, 2, 3, 4, 5, 6, 7, 8, 9].map(working);
+    const p12 = planSeatPool(withDemand, notCounted([...nine, fullVm(10), fullVm(11)], 11), NOW, 120_000);
+    expect(drains(p12.intents)).toEqual([11, 10]);
+    expect(p12.intents.filter((i) => i.kind === "add")).toEqual([]);
+    const p12next = planSeatPool(withDemand, notCounted(nine, 11), NOW, 120_000);
+    expect(p12next.intents.filter((i) => i.kind === "add")).toEqual([{ kind: "add", count: 2 }]);
+    expect(drains(p12next.intents)).toEqual([]);
+    // the qa pool at the VM's max 8: 6 working, 1 full, 1 row, desired 7: the full slot goes, then 1 is added
+    const qa8 = vm({ max: 8, demand_cmd: { argv: ["d"] } });
+    const six = [1, 2, 3, 4, 5, 6].map(working);
+    const one = (slots: SeatPoolSlotView[]) => ({ ...state(slots, rows(1)), demand: { desired: 7, sampledAt: ago(10) } });
+    expect(drains(planSeatPool(qa8, one([...six, fullVm(7)]), NOW, 120_000).intents)).toEqual([7]);
+    expect(planSeatPool(qa8, one(six), NOW, 120_000).intents.filter((i) => i.kind === "add")).toEqual([{ kind: "add", count: 1 }]);
+    // every full slot goes while a row waits, not one per row: a newer one the release command holds (its tarefa in the
+    // ledger, counted by the demand: desired 7 = 5 working + s12 + 1 row) never stands in front of an older one, s9
+    const mixed = { ...state([1, 2, 3, 4, 5].map(working).concat([fullVm(9), fullVm(12)]), rows(1)), demand: { desired: 7, sampledAt: ago(10) } };
+    expect(drains(planSeatPool(withDemand, mixed, NOW, 120_000).intents)).toEqual([12, 9]);
     // no row waiting, min 2, max 2: a slot draining and 2 full ones: only the draining one, the pool stays at min
     const draining = slot(1, { phase: "draining" });
     expect(drains(planSeatPool(vm({ min: 2, max: 2 }), state([draining, fullVm(2), fullVm(3)], []), NOW, 120_000).intents)).toEqual([1]);
