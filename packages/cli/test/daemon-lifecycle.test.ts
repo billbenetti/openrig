@@ -567,6 +567,27 @@ describe("Daemon Lifecycle", () => {
     expect(deps.writeFile).not.toHaveBeenCalledWith(STATE_FILE, expect.anything());
   });
 
+  it("start: a database-conflict stop comes before a listen-failure line in the same log", async () => {
+    await import("@openrig/daemon/instance-initialization");
+    vi.useFakeTimers();
+    const child = Object.assign(new EventEmitter(), { pid: 12345, exitCode: null as number | null, signalCode: null, unref: vi.fn() });
+    const reason = "OPENRIG_DB_CONFLICT: Another live daemon holds /fixture/shared.sqlite. To proceed once, run rig daemon start --allow-db-conflict.";
+    const listen = "OPENRIG_LISTEN_FAILED EADDRINUSE 127.0.0.1:7433 Address already in use (EADDRINUSE) on port 7433.";
+    const deps = mockDeps({
+      fetch: vi.fn().mockRejectedValue(new Error("refused")),
+      readFileFrom: vi.fn(() => `${listen}\nError: ${reason}\n`),
+      spawn: vi.fn(() => {
+        setTimeout(() => { child.exitCode = 1; child.emit("exit", 1, null); }, 1);
+        return child as unknown as ChildProcess;
+      }),
+    });
+    const pending = startDaemon({}, deps).catch(error => error as Error);
+    await vi.runAllTimersAsync();
+    const message = (await pending).message;
+    expect(message).toContain(reason);
+    expect(message).not.toContain("OPENRIG_LISTEN_FAILED");
+  });
+
   it("start: an old bind error is not attributed to a new child's unrelated exit", async () => {
     vi.useFakeTimers();
     const child = Object.assign(new EventEmitter(), { pid: 12345, exitCode: null as number | null, signalCode: null, unref: vi.fn() });
