@@ -26,6 +26,7 @@ import { WatchdogHistoryLog } from "../src/domain/watchdog-history-log.js";
 import { parseWatchdogSpec, watchdogJobTarget } from "../src/domain/watchdog-policy-engine.js";
 import { ContextUsageStore } from "../src/domain/context-usage-store.js";
 import {
+  readSeatPoolBusyCandidates,
   readSeatPoolState,
   SeatPoolExecutor,
   seatPoolQueueEffects,
@@ -116,14 +117,21 @@ describe("T-012383: the ping-pong of T-011798 and T-012070 (planner)", () => {
     expect(dispatches(plan.intents).map((i) => [i.qitemId, i.slotId])).toEqual([["qitem-T-011798", 24], ["qitem-T-012070", 28]]);
   });
 
-  it("with the default limit no row goes to a full slot; the full slots count as occupied and the pool grows for the rows", () => {
-    const plan = planSeatPool(spec(), state(fullSlots(), pending()), NOW, 120_000);
+  it("with the default limit no row goes to a full slot; inside idle_grace_s the full slots count as occupied and the pool grows for the rows", () => {
+    const recent = () => [slot(24, { ...full(52), idleSince: ago(60) }), slot(28, { ...full(47), idleSince: ago(60) }), slot(31, { ...full(61), idleSince: ago(60) })];
+    const plan = planSeatPool(spec(), state(recent(), pending()), NOW, 120_000);
     expect(dispatches(plan.intents)).toEqual([]);
     // 3 full slots occupied + 2 rows no slot takes: 5 seats wanted, 3 there, 2 added.
     expect(plan).toMatchObject({ target: 5, current: 3, reason: "scale_up" });
     expect(plan.intents).toContainEqual({ kind: "add", count: 2 });
-    // A full slot idle past idle_grace_s is not drained as free.
     expect(plan.intents.filter((i) => i.kind === "drain")).toEqual([]);
+    // Past idle_grace_s (T-017384) they are replaced: they don't hold the target up (2, for the rows), one goes for the
+    // surplus, and 2 seats are added for the rows.
+    const past = planSeatPool(spec(), state(fullSlots(), pending()), NOW, 120_000);
+    expect(dispatches(past.intents)).toEqual([]);
+    expect(past).toMatchObject({ target: 2, current: 3, reason: "scale_down" });
+    expect(past.intents).toContainEqual({ kind: "add", count: 2 });
+    expect(past.intents.filter((i) => i.kind === "drain").map((i) => (i as { slotId: number }).slotId)).toEqual([31]);
   });
 
   it("a slot under the limit takes the row; the full one beside it does not", () => {
@@ -131,10 +139,13 @@ describe("T-012383: the ping-pong of T-011798 and T-012070 (planner)", () => {
     expect(dispatches(plan.intents)).toEqual([{ kind: "dispatch", qitemId: "qitem-T-011798", from: MODEL_SESSION, slotId: 30 }]);
   });
 
-  it("with no row waiting, a full slot is still occupied: the pool does not drain it below what it holds", () => {
-    const plan = planSeatPool(spec({ min: 0 }), state([slot(24, full(52))], []), NOW, 120_000);
+  it("with no row waiting, a full slot inside idle_grace_s is still occupied; past it, it goes (T-017384)", () => {
+    const plan = planSeatPool(spec({ min: 0 }), state([slot(24, { ...full(52), idleSince: ago(60) })], []), NOW, 120_000);
     expect(plan).toMatchObject({ target: 1, current: 1 });
     expect(plan.intents).toEqual([]);
+    const past = planSeatPool(spec({ min: 0 }), state([slot(24, full(52))], []), NOW, 120_000);
+    expect(past).toMatchObject({ target: 0, current: 1, reason: "scale_down" });
+    expect(past.intents).toEqual([{ kind: "drain", slotId: 24, idleSince: ago(600) }]);
   });
 });
 
@@ -142,36 +153,72 @@ describe("T-017384: a free slot past the limit is drained, not held for ever as 
   const drains = (intents: SeatPoolIntent[]) => intents.filter((i) => i.kind === "drain").map((i) => (i as { slotId: number }).slotId);
   const working = (n: number) => slot(n, { openRows: 1, idleSince: null, cause: "working" });
   const rows = (count: number) => Array.from({ length: count }, (_, k) => row(`qitem-qa-${k + 1}`));
+  // The VM's times (ops/autoscale/pools/*.json: idle_grace_s 600): the slot went quiet 700 s ago, and its last sample is
+  // from the turn it ended, 5 s before that, so older than the 10 min a sample is read for.
+  const vm = (overrides: Record<string, unknown> = {}) => spec({ idle_grace_s: 600, ...overrides });
+  const fullVm = (n: number) => slot(n, { ...full(47, 705), idleSince: ago(700) });
 
   // The qa pool at 14:21Z of 21/11: 16 live with max 13, 10 of them free past 40%, 6 with a row in progress, 5 rows
   // waiting. Before, the full slots counted as occupied and were never drained (only an idle slot is), so the plan read
   // scale_down with nothing to drain and nothing to add: the rows waited with no slot able to take them.
-  it("the qa pool of 21/11: 16 live, max 13, 10 free past the limit, rows waiting: the full free slots go, newest first", () => {
-    const slots = [1, 2, 3, 4, 5, 6].map(working).concat([7, 8, 9, 10, 11, 12, 13, 14, 15, 16].map((n) => slot(n, full(47))));
-    const plan = planSeatPool(spec({ max: 13 }), state(slots, rows(5)), NOW, 120_000);
-    expect(plan).toMatchObject({ current: 16, target: 13, reason: "scale_down" });
+  it("the qa pool of 21/11 with the VM's times: no row goes to a full slot, and the full slots go, newest first", () => {
+    const slots = [1, 2, 3, 4, 5, 6].map(working).concat([7, 8, 9, 10, 11, 12, 13, 14, 15, 16].map(fullVm));
+    const plan = planSeatPool(vm({ max: 13 }), state(slots, rows(5)), NOW, 120_000);
+    // 6 slots working + 5 rows: 11 wanted; the full slots hold nothing up
+    expect(plan).toMatchObject({ current: 16, target: 11, reason: "scale_down" });
     expect(dispatches(plan.intents)).toEqual([]);
-    // The 3 over max, then one full slot per row no slot takes (5): 8 go, so the next plan has room to add 5 slots that
-    // take the rows. The slots with a row in progress stay.
+    // The 3 over max, then one per row no slot takes: 8 go, so the next plan has room to add 5 slots that take the rows.
     expect(drains(plan.intents)).toEqual([16, 15, 14, 13, 12, 11, 10, 9]);
-    // With no row waiting only the surplus goes, full slots when no free one is left.
-    expect(drains(planSeatPool(spec({ max: 13 }), state(slots, []), NOW, 120_000).intents)).toEqual([16, 15, 14]);
-    // A free slot still goes first for the surplus, as before (surplus 4: s17, then 3 full slots), so a full slot whose
-    // release command refuses never holds back a free one.
-    expect(drains(planSeatPool(spec({ max: 13 }), state([...slots, slot(17, full(10))], []), NOW, 120_000).intents)).toEqual([17, 16, 15, 14]);
-    // Room for some of the rows (3 full slots, max 4, 3 rows): 1 slot is added and 2 full slots go for the other 2.
-    const partial = planSeatPool(spec({ max: 4 }), state([slot(1, full(50)), slot(2, full(50)), slot(3, full(50))], rows(3)), NOW, 120_000);
-    expect(drains(partial.intents)).toEqual([3, 2]);
-    expect(partial.intents).toContainEqual({ kind: "add", count: 1 });
-    // A seat still starting is launched, not removed, while full slots cover the surplus (3 full + 1 starting, max 2).
-    const starting = slot(4, { phase: "added", nodeId: null, idleSince: null, cause: "stopped" });
-    const withStarting = planSeatPool(spec({ max: 2 }), state([slot(1, full(50)), slot(2, full(50)), slot(3, full(50)), starting], []), NOW, 120_000);
-    expect(drains(withStarting.intents)).toEqual([3, 2]);
-    expect(withStarting.intents).toContainEqual({ kind: "launch", slotId: 4 });
-    expect(withStarting.intents).not.toContainEqual({ kind: "remove", slotId: 4 });
+    // The next plan: 6 working and 2 full, room 5: the 5 seats for the rows are added (the full ones go when over).
+    const next = planSeatPool(vm({ max: 13 }), state([1, 2, 3, 4, 5, 6].map(working).concat([7, 8].map(fullVm)), rows(5)), NOW, 120_000);
+    expect(next.intents).toContainEqual({ kind: "add", count: 5 });
+    expect(drains(next.intents)).toEqual([]);
+    // With no row waiting all the full slots go (scale_down), down to min.
+    expect(drains(planSeatPool(vm({ max: 13 }), state(slots, []), NOW, 120_000).intents)).toEqual([16, 15, 14, 13, 12, 11, 10, 9, 8, 7]);
+    expect(drains(planSeatPool(vm({ max: 13, min: 8 }), state(slots, []), NOW, 120_000).intents)).toEqual([16, 15, 14, 13, 12, 11, 10, 9]);
+    // The same with demand_cmd and a fresh desired 0.
+    const asked = { ...state(slots, []), demand: { desired: 0, sampledAt: ago(10) } };
+    expect(drains(planSeatPool(vm({ max: 13, demand_cmd: { argv: ["d"] } }), asked, NOW, 120_000).intents)).toEqual([16, 15, 14, 13, 12, 11, 10, 9, 8, 7]);
+    // A free slot under the limit still goes first for the surplus, as before.
+    expect(drains(planSeatPool(vm({ max: 13 }), state([...slots, slot(17, { ...full(10), idleSince: ago(700) })], []), NOW, 120_000).intents))
+      .toEqual([17, 16, 15, 14, 13, 12, 11, 10, 9, 8, 7]);
     // Inside the cooldown nothing is drained.
     const cooling = { ...state(slots, rows(5)), lastScaleAt: ago(10) };
-    expect(drains(planSeatPool(spec({ max: 13, cooldown_s: 60 }), cooling, NOW, 120_000).intents)).toEqual([]);
+    expect(drains(planSeatPool(vm({ max: 13, cooldown_s: 60 }), cooling, NOW, 120_000).intents)).toEqual([]);
+  });
+
+  it("the rows a full slot is drained for: only beyond the room max leaves and what a starting seat will take, never below min", () => {
+    // room for some of the rows (3 full, max 4, 3 rows): 1 added, and 2 full slots go for the other 2
+    const partial = planSeatPool(vm({ max: 4 }), state([fullVm(1), fullVm(2), fullVm(3)], rows(3)), NOW, 120_000);
+    expect(drains(partial.intents)).toEqual([3, 2]);
+    expect(partial.intents).toContainEqual({ kind: "add", count: 1 });
+    // a seat still starting is launched, not removed, while full slots cover the surplus (3 full + 1 starting, max 2)
+    const starting = slot(4, { phase: "added", nodeId: null, idleSince: null, cause: "stopped" });
+    const withStarting = planSeatPool(vm({ max: 2 }), state([fullVm(1), fullVm(2), fullVm(3), starting], []), NOW, 120_000);
+    expect(drains(withStarting.intents)).toEqual([3, 2, 1]);
+    expect(withStarting.intents).toContainEqual({ kind: "launch", slotId: 4 });
+    expect(withStarting.intents).not.toContainEqual({ kind: "remove", slotId: 4 });
+    // 5 seats starting for the 5 rows (min 13 holds the pool at its size): no full slot goes for the rows, none is added
+    const added = [9, 10, 11, 12, 13].map((n) => slot(n, { phase: "added", nodeId: null, idleSince: null, cause: "stopped" }));
+    const up = planSeatPool(vm({ max: 13, min: 13 }), state([1, 2, 3, 4, 5, 6, 7, 8].map(fullVm).concat(added), rows(5)), NOW, 120_000);
+    expect(drains(up.intents)).toEqual([]);
+    expect(up.intents.filter((i) => i.kind === "add")).toEqual([]);
+    // a full slot the demand counts (desired 1: e.g. its tarefa in the ledger), no row waiting: no add and no drain, so
+    // nothing goes round it (the release command would refuse its drain); with 2 rows, 2 seats for them, no more
+    const counted = { ...state([fullVm(1)], []), demand: { desired: 1, sampledAt: ago(10) } };
+    const withDemand = vm({ max: 13, demand_cmd: { argv: ["d"] } });
+    expect(planSeatPool(withDemand, counted, NOW, 120_000).intents).toEqual([]);
+    const countedRows = { ...state([fullVm(1)], rows(2)), demand: { desired: 3, sampledAt: ago(10) } };
+    const twoRows = planSeatPool(withDemand, countedRows, NOW, 120_000);
+    expect(twoRows.intents.filter((i) => i.kind === "add")).toEqual([{ kind: "add", count: 2 }]);
+    expect(drains(twoRows.intents)).toEqual([]);
+    // the room is there but the target already counts the full slots (9 working, 2 full, 2 rows, max 13): 2 added
+    const stuck = planSeatPool(vm({ max: 13 }), state([1, 2, 3, 4, 5, 6, 7, 8, 9].map(working).concat([10, 11].map(fullVm)), rows(2)), NOW, 120_000);
+    expect(stuck.intents.filter((i) => i.kind === "add")).toEqual([{ kind: "add", count: 2 }]);
+    expect(drains(stuck.intents)).toEqual([]);
+    // no row waiting, min 2, max 2: a slot draining and 2 full ones: only the draining one, the pool stays at min
+    const draining = slot(1, { phase: "draining" });
+    expect(drains(planSeatPool(vm({ min: 2, max: 2 }), state([draining, fullVm(2), fullVm(3)], []), NOW, 120_000).intents)).toEqual([1]);
   });
 
   it("a full slot that is not free stays: a busy process, inside idle_grace_s, adopted, out of usage or the limit off", () => {
@@ -180,7 +227,7 @@ describe("T-017384: a free slot past the limit is drained, not held for ever as 
       drains(planSeatPool(s, { ...state(slots, rows(2)), ...st }, NOW, 120_000).intents);
     // the case: 3 full free slots, max 2, 2 rows waiting: all 3 go (1 over max, then 1 per row)
     expect(at(busy, [slot(1, full(50)), slot(2, full(50)), slot(3, full(50))])).toEqual([3, 2, 1]);
-    // a suite still runs under s3: it is left, as an idle slot with one would be
+    // a suite still runs under s3 (the busy read: T-017384/the real reader below): it is left
     expect(at(busy, [slot(1, full(50)), slot(2, full(50)), slot(3, { ...full(50), busyProcess: "suite-flock" })])).toEqual([2, 1]);
     // idle for less than idle_grace_s (300 s): left
     expect(at(busy, [slot(1, full(50)), slot(2, full(50)), slot(3, { ...full(50), idleSince: ago(60) })])).toEqual([2, 1]);
@@ -190,6 +237,8 @@ describe("T-017384: a free slot past the limit is drained, not held for ever as 
     expect(at(busy, [slot(1, full(50)), slot(2, full(50)), slot(3, full(50))], { modelCause: "usage_limit" })).toEqual([]);
     // context_limit_percent 0: no slot is full, the rows go to the free slots, and the surplus slot is the free one left
     expect(at(spec({ max: 2, context_limit_percent: 0 }), [slot(1, full(50)), slot(2, full(50)), slot(3, full(50))])).toEqual([3]);
+    // a slot that is not quiet keeps the 10 min of its sample: the stale one of a working slot reads as no reading
+    expect(seatPoolContextOver(busy, slot(5, { ...full(80, 3605), openRows: 1, idleSince: null, cause: "working" }), NOW)).toBe(false);
   });
 });
 
@@ -199,7 +248,8 @@ describe("T-012383: seatPoolContextOver and seatPoolCanReceive (the reading)", (
     ["40% exactly", true, full(40)],
     ["39.9%", false, full(39.9)],
     ["sampled 599 s ago", true, full(80, 599)],
-    ["sampled 600 s ago (stale)", false, full(80, 600)],
+    ["sampled 1201 s ago, 601 s before the slot went quiet (stale)", false, full(80, 1201)],
+    ["sampled 3605 s ago, 5 s before the slot went quiet (its last turn): a quiet slot keeps it", true, { ...full(80, 3605), idleSince: ago(3600) }],
     ["sampled ahead of the clock (as just taken)", true, { context: { usedPercentage: 80, sampledAt: new Date(NOW + 5_000).toISOString() } }],
     ["an unreadable time", false, { context: { usedPercentage: 80, sampledAt: "not a time" } }],
     ["a percentage that is NaN", false, { context: { usedPercentage: Number.NaN, sampledAt: ago(10) } }],
@@ -333,7 +383,7 @@ class Harness {
   spec(): SeatPoolSpec { return this.readJob(this.jobId)!.spec!; }
 
   /** The reader as startup.ts builds it: the plan's and the executor's own read the context the same way. */
-  readState(job: { jobId: string; targetSession: string; spec: SeatPoolSpec }): SeatPoolState {
+  readState(job: { jobId: string; targetSession: string; spec: SeatPoolSpec }, busy?: ReadonlyMap<string, string | null>): SeatPoolState {
     return readSeatPoolState({
       db: this.db,
       slots: this.slots,
@@ -345,6 +395,8 @@ class Harness {
       seatState: () => ({ activity: "idle-at-prompt", needsInput: { count: 0 }, backgroundWork: null, changedAt: IDLE_SINCE }) as never,
       restoring: () => false,
       demand: (jobId) => this.executor.demandSample(jobId),
+      // as startup.ts: the busy read's answer, when the test gives one (T-017384)
+      busyProcess: busy ? (sessionName) => busy.get(sessionName) : undefined,
       contextUsage: (_nodeId, sessionName) => {
         this.contextReads.push(sessionName);
         return this.context.get(sessionName) ?? null;
@@ -436,6 +488,27 @@ describe("T-012383: the executor (real queue, reader and history)", () => {
     vi.useRealTimers();
   });
 
+  it("T-017384: the real reader, with the VM's times, drains a full quiet slot, asks the busy read for it, and leaves it while a suite runs", async () => {
+    h.register({ ...BASE, max: 2, idle_grace_s: 600, dispatch_to_parked: { busy_processes: ["suite-flock"] } });
+    const s1 = h.poolSeat("build.dev-1-s1");
+    // the sample of its last turn, 5 s before it went quiet 2 h ago: past the 10 min a sample is read for
+    h.context.set(s1.session, { usedPercentage: 47, sampledAt: iso(Date.parse(IDLE_SINCE) - 5_000) });
+    const spec = h.spec();
+    const view = h.state().slots.find((s) => s.sessionName === s1.session)!;
+    expect(seatPoolHeldByContext(spec, view, h.nowMs)).toBe(true);
+    // the daemon's busy read (startup.ts) asks this slot's processes, though it can't take a row
+    const asked: string[] = [];
+    await readSeatPoolBusyCandidates(spec, h.state().slots, h.nowMs, {
+      processes: async () => [], panes: async () => [], processPane: async () => null,
+      paneOf: (session) => { asked.push(session); return { paneId: "%1", tmuxSession: session }; },
+    });
+    expect(asked).toEqual([s1.session]);
+    const job = { jobId: h.jobId, targetSession: MODEL, spec };
+    const drainsOf = (st: SeatPoolState) => planSeatPool(spec, st, h.nowMs, 120_000).intents.filter((i) => i.kind === "drain");
+    expect(drainsOf(h.readState(job, new Map([[s1.session, null]])))).toEqual([{ kind: "drain", slotId: s1.slotId, idleSince: view.idleSince }]);
+    expect(drainsOf(h.readState(job, new Map([[s1.session, "suite-flock (pid 4242)"]])))).toEqual([]);
+  });
+
   it("the ping-pong: the rows of T-011798 and T-012070 stay at the model while s24 and s28 are past 40%, and go once s24 is relaunched", async () => {
     h.register({ ...BASE, max: 2 });
     const s24 = h.poolSeat("build.dev-1-s24");
@@ -521,6 +594,16 @@ describe("T-012383: the executor (real queue, reader and history)", () => {
     const freshEntry = last.find((x) => x.session === fresh.session)!;
     expect(freshEntry.receives).toBe("free");
     expect(freshEntry).not.toHaveProperty("held");
+  });
+
+  it("T-017384: a full slot the plan drains (past idle_grace_s) is not told held: the demand would hold the target up for it", async () => {
+    h.register({ ...BASE, max: 2, idle_grace_s: 600, demand_cmd: { argv: ["demand"] } });
+    const fullSlot = h.poolSeat("build.dev-1-s24");
+    h.context.set(fullSlot.session, { usedPercentage: 52, sampledAt: iso(Date.parse(IDLE_SINCE) - 5_000) });
+    await h.tickAt(1);
+    const entry = h.demandSlots.at(-1)!.find((x) => x.session === fullSlot.session)!;
+    expect(entry.receives).toBeNull();
+    expect(entry).not.toHaveProperty("held");
   });
 });
 
