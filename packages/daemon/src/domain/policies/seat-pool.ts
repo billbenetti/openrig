@@ -1217,7 +1217,14 @@ export function planSeatPool(spec: SeatPoolSpec, state: SeatPoolState, nowMs: nu
   const keptNow = state.slots.filter((slot) => !leavingNow.has(slot));
   const roomNow = seatPoolRoom(spec, keptNow, state.adoptable.length);
   const rowsLeft = movable.length - dispatched.size - starting.length;
-  const renew = spec.drain || rowsLeft <= 0 ? 0 : Math.max(0, rowsLeft - (spec.max - keptNow.length - state.adoptable.length));
+  // With demand_cmd every full seat goes while such a row waits, also below `max` (REVISAO-seat-pool B5): the add is the
+  // demand's target alone, and a demand that does not count the full seat asks for no more than `current`, so the row
+  // would wait with the full seat kept for ever. Drained, the next plan adds up to the target. A full seat the demand
+  // counts (its tarefa in the ledger) is held by the release command, and nothing is added for it; all of them go, not
+  // one per row, so a held one (the plan does not remember the refusal) never stands in front of one that would go
+  // (lens review of the volta 3).
+  const renew = spec.drain || rowsLeft <= 0 ? 0
+    : spec.demandCmd ? full.length : Math.max(0, rowsLeft - (spec.max - keptNow.length - state.adoptable.length));
   const freeOut = drainOrder.slice(0, surplus);
   const fullOut = full.slice(0, Math.max(0, Math.max(surplus, renew) - freeOut.length));
   if (!cooling) for (const slot of [...freeOut, ...fullOut]) intents.push({ kind: "drain", slotId: slot.slotId, idleSince: slot.idleSince });
