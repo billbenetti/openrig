@@ -1,11 +1,16 @@
 # Seat pools
 
 A seat pool keeps extra seats beside one model seat and adds or removes them as work comes and goes. It is a watchdog
-job with the `seat-pool` policy, so it is registered, changed and inspected with `rig watchdog`, and it survives a
-daemon restart.
+job with the `fork-seat-pool` policy, so it is registered, changed and inspected with `rig watchdog`, and it survives
+a daemon restart.
+
+The policy was named `seat-pool` until the upstream's own seat pool ([Seat pools](seat-pools.md), #3495) took that id.
+The daemon's migration `183_fork_seat_pool_policy_id` moves every job registered under the old id to `fork-seat-pool`,
+in its `policy` column and in its spec's `policy`, and leaves the upstream's jobs alone: the ones the daemon registered
+(`daemon@kernel`) and the ones whose spec carries a `pool` block in `context` (T-018881).
 
 ```bash
-rig watchdog register --policy seat-pool --target-session dev-impl@my-rig \
+rig watchdog register --policy fork-seat-pool --target-session dev-impl@my-rig \
   --spec pool.yaml --interval-seconds 60 --registered-by <your session>
 ```
 
@@ -19,7 +24,7 @@ instead (see [Reaping a seat](#reaping-a-seat)).
 ## The spec
 
 ```yaml
-policy: seat-pool
+policy: fork-seat-pool
 context:
   max: 4                    # required: the most extra seats
   min: 0                    # the fewest extra seats (default 0)
@@ -563,8 +568,9 @@ with `drain` (`startedAt`, `deadlineAt`, `expired`) and `slots` (`logicalId`, `p
 refused is still listed. The pool is empty when `seatPool.slots` is `[]`, or once the stop is accepted with its
 `leftRunning`.
 
-A pool can still end with seats in it: a daemon that doesn't know the `seat-pool` policy, such as an earlier version
-started on the same `OPENRIG_HOME`, marks the job terminal (`unknown_policy:seat-pool`), and the job can't be updated
+A pool can still end with seats in it: a daemon that doesn't know the `fork-seat-pool` policy, such as an earlier
+version started on the same `OPENRIG_HOME` (one from before the 183 knows the pool only as `seat-pool`), marks the job
+terminal (`unknown_policy:fork-seat-pool`), and the job can't be updated
 or restarted. Its seats keep running and holding their rows, and no pool holds them any more. Register a new pool with
 those seats in `adopt` to take them over: a seat the ended pool added stays a seat a pool added, which the new pool
 drains and reaps, and only a seat that was there before any pool is treated as adopted. Drain the pool before going

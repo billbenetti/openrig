@@ -39,7 +39,7 @@ import {
   type ParkFacts,
   type SeatPoolSlotView,
   type SeatPoolSpec,
-} from "../src/domain/policies/seat-pool.js";
+} from "../src/domain/policies/fork-seat-pool.js";
 import {
   CAPTURE_NOW_MS,
   armedTransition,

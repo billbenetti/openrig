@@ -11,7 +11,9 @@
 import { SEAT_POOL_BUSY_ORPHAN_MAX_AGE_S, seatPoolBusyFromProcess, seatPoolBusyProgram, seatPoolBusyWrapper } from "../seat-pool-busy.js";
 import type { Policy, PolicyEvaluation, PolicyJob } from "./types.js";
 
-export const SEAT_POOL_POLICY_NAME = "seat-pool";
+/** The fork's pool runs under its own id: the upstream's pool (policies/seat-pool.ts, #3495) owns `seat-pool`, and the
+ *  183 migration moves the fork's jobs registered under the old id to this one (T-018881). */
+export const FORK_SEAT_POOL_POLICY_NAME = "fork-seat-pool";
 
 /** A command the executor runs: an argv (never a shell string) and how long it may take. */
 export interface SeatPoolCommand {
@@ -1310,7 +1312,7 @@ export interface SeatPoolPolicyDeps {
 
 export function makeSeatPoolPolicy(deps: SeatPoolPolicyDeps): Policy {
   return {
-    name: SEAT_POOL_POLICY_NAME,
+    name: FORK_SEAT_POOL_POLICY_NAME,
     async evaluate(job: PolicyJob): Promise<PolicyEvaluation> {
       const parsed = parseSeatPoolSpec(job.context);
       // Registration and update refuse an invalid spec; one that is invalid here holds the pool rather than act on it.

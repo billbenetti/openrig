@@ -35,7 +35,7 @@ import {
 } from "../src/domain/seat-pool-busy.js";
 import {
   parseSeatPoolSpec, planSeatPool, seatPoolSpecProblem, type SeatPoolSlotView, type SeatPoolSpec, type SeatPoolState,
-} from "../src/domain/policies/seat-pool.js";
+} from "../src/domain/policies/fork-seat-pool.js";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const REAL = join(HERE, "fixtures", "t6090", "real");

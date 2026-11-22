@@ -59,7 +59,7 @@ import {
   seatSessionName,
   type SeatPoolEffects,
 } from "../src/domain/seat-pool-executor.js";
-import { makeSeatPoolPolicy, parseSeatPoolSpec, type SeatPoolSpec } from "../src/domain/policies/seat-pool.js";
+import { makeSeatPoolPolicy, parseSeatPoolSpec, type SeatPoolSpec } from "../src/domain/policies/fork-seat-pool.js";
 import type { Policy, PolicyJob } from "../src/domain/policies/types.js";
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -386,12 +386,12 @@ class Harness {
 
   // ---- the job ---------------------------------------------------------------------------------------------------
   specYaml(context: Record<string, unknown>): string {
-    return JSON.stringify({ policy: "seat-pool", target: { session: MODEL }, context });
+    return JSON.stringify({ policy: "fork-seat-pool", target: { session: MODEL }, context });
   }
 
   register(context: Record<string, unknown>): void {
     this.jobId = this.jobs.register({
-      policy: "seat-pool", specYaml: this.specYaml(context), targetSession: MODEL, intervalSeconds: 30, registeredBySession: LEAD,
+      policy: "fork-seat-pool", specYaml: this.specYaml(context), targetSession: MODEL, intervalSeconds: 30, registeredBySession: LEAD,
     } as never).jobId;
   }
 

@@ -40,7 +40,7 @@ import {
   type SeatPoolIntent,
   type SeatPoolSpec,
   type SeatPoolState,
-} from "../src/domain/policies/seat-pool.js";
+} from "../src/domain/policies/fork-seat-pool.js";
 import type { Policy, PolicyJob } from "../src/domain/policies/types.js";
 import { readSeatPoolBusySessions, seatPoolBusyCommand, seatPoolBusyProcess, type BusyProcessRow } from "../src/domain/seat-pool-busy.js";
 import {
@@ -50,7 +50,7 @@ import {
   type ParkFacts,
   type SeatPoolPendingRow,
   type SeatPoolSlotView,
-} from "../src/domain/policies/seat-pool.js";
+} from "../src/domain/policies/fork-seat-pool.js";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const REAL = join(HERE, "fixtures", "t6090", "real");
@@ -188,7 +188,7 @@ class Harness {
   // ---- the job ---------------------------------------------------------------------------------------------------
   register(context: Record<string, unknown>): void {
     this.jobId = this.jobs.register({
-      policy: "seat-pool", specYaml: JSON.stringify({ policy: "seat-pool", target: { session: MODEL }, context }), targetSession: MODEL,
+      policy: "fork-seat-pool", specYaml: JSON.stringify({ policy: "fork-seat-pool", target: { session: MODEL }, context }), targetSession: MODEL,
       intervalSeconds: 30, registeredBySession: LEAD,
     } as never).jobId;
   }

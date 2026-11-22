@@ -16,7 +16,7 @@ import {
   type ParkFacts,
   type SeatPoolSlotView,
   type SeatPoolSpec,
-} from "../src/domain/policies/seat-pool.js";
+} from "../src/domain/policies/fork-seat-pool.js";
 
 const NOW = Date.parse("2026-11-13T02:00:00.000Z");
 const ago = (seconds: number) => new Date(NOW - seconds * 1000).toISOString();

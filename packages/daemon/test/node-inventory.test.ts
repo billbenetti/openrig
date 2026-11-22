@@ -1363,7 +1363,7 @@ describe("Node inventory seatPoolModel projection", () => {
   let rigId: string;
   let poolJobId: string;
   const at = "2026-11-09T12:00:00.000Z";
-  const specYaml = "policy: seat-pool\ncontext:\n  max: 2\n  cwd_template: /work/{slot}\n";
+  const specYaml = "policy: fork-seat-pool\ncontext:\n  max: 2\n  cwd_template: /work/{slot}\n";
   const entry = (logicalId: string) => getNodeInventory(db, rigId).find((e) => e.logicalId === logicalId)!;
 
   beforeEach(() => {
@@ -1374,7 +1374,7 @@ describe("Node inventory seatPoolModel projection", () => {
     const model = repo.addNode(rigId, "dev.impl", { runtime: "claude-code", cwd: "/project" });
     seedSession(db, model.id, "dev-impl@pool-rig");
     poolJobId = new WatchdogJobsRepository(db).register({
-      policy: "seat-pool", specYaml, targetSession: "dev-impl@pool-rig", intervalSeconds: 60, registeredBySession: "ops@kernel",
+      policy: "fork-seat-pool", specYaml, targetSession: "dev-impl@pool-rig", intervalSeconds: 60, registeredBySession: "ops@kernel",
     }).jobId;
   });
   afterEach(() => { db.close(); });
@@ -1409,7 +1409,7 @@ describe("Node inventory seatPoolModel projection", () => {
     const elsewhere = repo.addNode(otherRig, "dev.impl-s1", { runtime: "claude-code", cwd: "/work/impl-s1" });
     slots.insert({ poolJobId, logicalId: "dev.impl-s1", nodeId: elsewhere.id, phase: "live", intent: null, opId: "op-1", at });
     const orphanJob = new WatchdogJobsRepository(db).register({
-      policy: "seat-pool", specYaml, targetSession: "dev-gone@pool-rig", intervalSeconds: 60, registeredBySession: "ops@kernel",
+      policy: "fork-seat-pool", specYaml, targetSession: "dev-gone@pool-rig", intervalSeconds: 60, registeredBySession: "ops@kernel",
     }).jobId;
     const orphan = repo.addNode(rigId, "dev.gone-s1", { runtime: "claude-code", cwd: "/work/gone-s1" });
     slots.insert({ poolJobId: orphanJob, logicalId: "dev.gone-s1", nodeId: orphan.id, phase: "live", intent: null, opId: "op-2", at });

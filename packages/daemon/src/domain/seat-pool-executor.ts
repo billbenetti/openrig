@@ -54,7 +54,7 @@ import {
   type SeatPoolSlotView,
   type SeatPoolSpec,
   type SeatPoolState,
-} from "./policies/seat-pool.js";
+} from "./policies/fork-seat-pool.js";
 
 /**
  * The seat-pool executor: applies a pool's plan outside the scheduler tick.

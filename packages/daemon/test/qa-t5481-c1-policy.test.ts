@@ -43,7 +43,7 @@ import {
   type SeatPoolSlotView,
   type SeatPoolSpec,
   type SeatPoolState,
-} from "../src/domain/policies/seat-pool.js";
+} from "../src/domain/policies/fork-seat-pool.js";
 import {
   CAPTURE_NOW_MS,
   SLOT_DIRS,

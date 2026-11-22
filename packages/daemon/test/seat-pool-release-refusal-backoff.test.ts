@@ -45,7 +45,7 @@ import {
   type SeatPoolSlotView,
   type SeatPoolSpec,
   type SeatPoolState,
-} from "../src/domain/policies/seat-pool.js";
+} from "../src/domain/policies/fork-seat-pool.js";
 import type { Policy, PolicyJob } from "../src/domain/policies/types.js";
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -213,7 +213,7 @@ class Harness {
 
   register(context: Record<string, unknown>): void {
     this.jobId = this.jobs.register({
-      policy: "seat-pool", specYaml: JSON.stringify({ policy: "seat-pool", target: { session: MODEL }, context: { ...BASE, ...context } }), targetSession: MODEL,
+      policy: "fork-seat-pool", specYaml: JSON.stringify({ policy: "fork-seat-pool", target: { session: MODEL }, context: { ...BASE, ...context } }), targetSession: MODEL,
       intervalSeconds: 30, registeredBySession: LEAD,
     } as never).jobId;
   }

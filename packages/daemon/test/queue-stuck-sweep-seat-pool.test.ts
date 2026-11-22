@@ -58,7 +58,7 @@ describe("stuck sweep: rows waiting in an active seat pool's queue (T-007029, #2
     const lines = Object.entries({ max: 4, cwd_template: "/w/{slot}", dispatch_tag: TAG, ...context })
       .map(([k, v]) => `  ${k}: ${JSON.stringify(v)}`).join("\n");
     db.prepare(`INSERT INTO watchdog_jobs (job_id, policy, spec_yaml, target_session, interval_seconds, state, registered_by_session, registered_at)
-                VALUES (?, 'seat-pool', ?, ?, 60, ?, 'lead@dev', ?)`).run(jobId, `context:\n${lines}\n`, target, state, minutesAgo(600));
+                VALUES (?, 'fork-seat-pool', ?, ?, 60, ?, 'lead@dev', ?)`).run(jobId, `context:\n${lines}\n`, target, state, minutesAgo(600));
     return jobId;
   }
   /** A seat of the pool: `live` with its node present and its latest session `session` (default "running"), or retired
@@ -446,7 +446,7 @@ describe("stuck sweep: rows waiting in an active seat pool's queue (T-007029, #2
   });
 
   it("refuses no_seat_grace_s out of range in the spec", async () => {
-    const { parseSeatPoolSpec } = await import("../src/domain/policies/seat-pool.js");
+    const { parseSeatPoolSpec } = await import("../src/domain/policies/fork-seat-pool.js");
     const bad = parseSeatPoolSpec({ max: 2, cwd_template: "/w/{slot}", no_seat_grace_s: 30 });
     expect("problem" in bad && bad.problem.field).toBe("no_seat_grace_s");
     const ok = parseSeatPoolSpec({ max: 2, cwd_template: "/w/{slot}", no_seat_grace_s: 3600 });

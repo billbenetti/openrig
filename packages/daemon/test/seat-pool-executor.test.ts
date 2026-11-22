@@ -43,7 +43,7 @@ import {
   type SeatPoolSeatCause,
   type SeatPoolSpec,
   type SeatPoolState,
-} from "../src/domain/policies/seat-pool.js";
+} from "../src/domain/policies/fork-seat-pool.js";
 import type { Node } from "../src/domain/types.js";
 import { LaunchBudget } from "../src/domain/launch-budget.js";
 
@@ -1129,7 +1129,7 @@ describe("seat-pool executor", () => {
         now: () => new Date(clock),
       });
       db.prepare(`INSERT INTO watchdog_jobs (job_id, policy, spec_yaml, target_session, interval_seconds, state, registered_by_session, registered_at)
-                  VALUES (?, 'seat-pool', ?, ?, 60, 'active', 'lead@r', ?)`)
+                  VALUES (?, 'fork-seat-pool', ?, ?, 60, 'active', 'lead@r', ?)`)
         .run(JOB, 'context:\n  max: 4\n  cwd_template: "/w/{slot}"\n  dispatch_tag: "pool-work"\n', MODEL.sessionName,
           new Date(T0 - 10 * 3_600_000).toISOString());
       for (let turn = 0; turn < 3; turn++) {
@@ -2448,15 +2448,15 @@ describe("readSeatPoolState", () => {
     const left = add("dev.impl-s1");
     const held = add("dev.impl-s2");
     const jobs = new WatchdogJobsRepository(db);
-    const register = () => jobs.register({ policy: "seat-pool", specYaml: "policy: seat-pool", targetSession: "dev-impl@r", intervalSeconds: 60, registeredBySession: "test@r" }).jobId;
+    const register = () => jobs.register({ policy: "fork-seat-pool", specYaml: "policy: fork-seat-pool", targetSession: "dev-impl@r", intervalSeconds: 60, registeredBySession: "test@r" }).jobId;
     const ended = register();
     const other = register();
     const slots = new SeatPoolSlots(db);
     const at = "2026-11-09T11:00:00.000Z";
     const old = slots.insert({ poolJobId: ended, logicalId: "dev.impl-s1", nodeId: left.id, phase: "live", intent: null, opId: "op-1", at });
     slots.insert({ poolJobId: other, logicalId: "dev.impl-s2", nodeId: held.id, phase: "live", intent: null, opId: "op-2", at });
-    // A daemon without the seat-pool policy ends the job and leaves its seat running.
-    jobs.markTerminal(ended, "unknown_policy:seat-pool");
+    // A daemon without the fork-seat-pool policy ends the job and leaves its seat running.
+    jobs.markTerminal(ended, "unknown_policy:fork-seat-pool");
     const state = readSeatPoolState({
       db, slots,
       openRows: () => [], sessionAddresses: (session) => [session], heldMessages: () => 0, seatStopped: () => false,

@@ -24,14 +24,14 @@ import {
   SEAT_POOL_DRAIN_EXPIRED,
   SEAT_POOL_DRAIN_RETRYING,
   SEAT_POOL_DRAIN_STARTED,
-  SEAT_POOL_POLICY_NAME,
+  FORK_SEAT_POOL_POLICY_NAME,
   seatPoolDrainEpisode,
   type SeatPoolIntent,
   type SeatPoolPendingRow,
   type SeatPoolSlotView,
   type SeatPoolSpec,
   type SeatPoolState,
-} from "../src/domain/policies/seat-pool.js";
+} from "../src/domain/policies/fork-seat-pool.js";
 
 const NOW = Date.parse("2026-11-09T12:00:00.000Z");
 const ago = (seconds: number) => new Date(NOW - seconds * 1000).toISOString();
@@ -351,7 +351,7 @@ describe("planSeatPool: dispatch and wake", () => {
     ]);
     expect(result.reason).toBe("usage_limit");
     const evaluated = await makeSeatPoolPolicy({ readState: async () => state({ modelCause: "usage_limit", pending: waiting }), submit: () => true, now: () => NOW })
-      .evaluate({ jobId: "pool-1", policy: SEAT_POOL_POLICY_NAME, target: { session: "dev-impl@r" }, intervalSeconds: 60, context: { max: 2, cwd_template: "/w/{slot}" } } as PolicyJob);
+      .evaluate({ jobId: "pool-1", policy: FORK_SEAT_POOL_POLICY_NAME, target: { session: "dev-impl@r" }, intervalSeconds: 60, context: { max: 2, cwd_template: "/w/{slot}" } } as PolicyJob);
     expect(evaluated).toMatchObject({ reason: "seat_pool_held", notes: { reason: "usage_limit" } });
   });
 
@@ -397,7 +397,7 @@ describe("planSeatPool: dispatch and wake", () => {
 
 describe("seat-pool policy evaluation", () => {
   const job = (context: Record<string, unknown>): PolicyJob => ({
-    jobId: "pool-1", policy: SEAT_POOL_POLICY_NAME, target: { session: "dev-impl@r" }, intervalSeconds: 60, context,
+    jobId: "pool-1", policy: FORK_SEAT_POOL_POLICY_NAME, target: { session: "dev-impl@r" }, intervalSeconds: 60, context,
   } as PolicyJob);
 
   it("hands the plan to the executor and reports it, quietly when nothing changes", async () => {
@@ -438,10 +438,10 @@ describe("seat-pool registration, update and stop", () => {
   let db: Database.Database;
   let jobsRepo: WatchdogJobsRepository;
   let app: Hono;
-  const specYaml = "policy: seat-pool\ncontext:\n  max: 2\n  cwd_template: /work/{slot}\n";
+  const specYaml = "policy: fork-seat-pool\ncontext:\n  max: 2\n  cwd_template: /work/{slot}\n";
   const register = (yaml: string) => app.request("/api/watchdog/register", {
     method: "POST", headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ policy: "seat-pool", specYaml: yaml, targetSession: "dev-impl@r", intervalSeconds: 60, registeredBySession: "ops@kernel" }),
+    body: JSON.stringify({ policy: "fork-seat-pool", specYaml: yaml, targetSession: "dev-impl@r", intervalSeconds: 60, registeredBySession: "ops@kernel" }),
   });
 
   beforeEach(() => {
@@ -462,7 +462,7 @@ describe("seat-pool registration, update and stop", () => {
   afterEach(() => db.close());
 
   it("refuses an invalid spec at registration and update, before anything is stored", async () => {
-    const refused = await register("policy: seat-pool\ncontext:\n  max: 2\n  cwd_template: /work/shared\n");
+    const refused = await register("policy: fork-seat-pool\ncontext:\n  max: 2\n  cwd_template: /work/shared\n");
     expect(refused.status).toBe(400);
     expect(await refused.json()).toMatchObject({ error: "spec_invalid", message: expect.stringContaining("{slot}") });
     expect(jobsRepo.listAll()).toEqual([]);
@@ -470,14 +470,14 @@ describe("seat-pool registration, update and stop", () => {
     const created = await register(specYaml);
     expect(created.status).toBe(201);
     const { jobId } = await created.json() as { jobId: string };
-    expect(() => updateWatchdogJob(jobsRepo, jobId, { specYaml: "policy: seat-pool\ncontext:\n  max: 2\n  cwd_template: /w/{slot}\n  release_cmd: release-now\n" }))
+    expect(() => updateWatchdogJob(jobsRepo, jobId, { specYaml: "policy: fork-seat-pool\ncontext:\n  max: 2\n  cwd_template: /w/{slot}\n  release_cmd: release-now\n" }))
       .toThrow(/release_cmd/);
     const drained = updateWatchdogJob(jobsRepo, jobId, { specYaml: `${specYaml}  drain: true\n` });
     expect(drained.changed).toEqual(["specYaml"]);
   });
 
   it("refuses to stop a pool that still holds seats, and stops it once they are retired", async () => {
-    const job = jobsRepo.register({ policy: "seat-pool", specYaml, targetSession: "dev-impl@r", intervalSeconds: 60, registeredBySession: "ops@kernel" });
+    const job = jobsRepo.register({ policy: "fork-seat-pool", specYaml, targetSession: "dev-impl@r", intervalSeconds: 60, registeredBySession: "ops@kernel" });
     const slots = new SeatPoolSlots(db);
     const held = slots.insert({ poolJobId: job.jobId, logicalId: "dev.impl-s1", nodeId: "n1", phase: "live", intent: null, opId: "op-1", at: ago(0) });
     const stop = () => app.request(`/api/watchdog/${job.jobId}/stop`, { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
@@ -492,7 +492,7 @@ describe("seat-pool registration, update and stop", () => {
 
   // T-004870 F3, r1 rule 3: the stop needs the forced pass's proof in the history; once it is pruned, the stop refuses.
   it("refuses to stop a drained pool again once the forced pass's entry is pruned, and says when the deadline passes", async () => {
-    const job = jobsRepo.register({ policy: "seat-pool", specYaml: `${specYaml}  drain: true
+    const job = jobsRepo.register({ policy: "fork-seat-pool", specYaml: `${specYaml}  drain: true
 `, targetSession: "dev-impl@r", intervalSeconds: 60, registeredBySession: "ops@kernel" });
     const slots = new SeatPoolSlots(db);
     slots.insert({ poolJobId: job.jobId, logicalId: "dev.impl-s1", nodeId: "n1", phase: "live", intent: null, opId: "op-1", at: ago(0) });
@@ -518,7 +518,7 @@ describe("seat-pool registration, update and stop", () => {
 
   // The 409 tells the current drain, not the spec: drain_deadline_s changed during a drain applies to the next one.
   it("says the current drain has no deadline when it started with 0, even after the spec changed to a deadline", async () => {
-    const job = jobsRepo.register({ policy: "seat-pool", specYaml: `${specYaml}  drain: true\n  drain_deadline_s: 600\n`, targetSession: "dev-impl@r", intervalSeconds: 60, registeredBySession: "ops@kernel" });
+    const job = jobsRepo.register({ policy: "fork-seat-pool", specYaml: `${specYaml}  drain: true\n  drain_deadline_s: 600\n`, targetSession: "dev-impl@r", intervalSeconds: 60, registeredBySession: "ops@kernel" });
     new SeatPoolSlots(db).insert({ poolJobId: job.jobId, logicalId: "dev.impl-s1", nodeId: "n1", phase: "live", intent: null, opId: "op-1", at: ago(0) });
     new WatchdogHistoryLog(db).record({ jobId: job.jobId, evaluatedAt: ago(0), outcome: "skipped", skipReason: SEAT_POOL_DRAIN_STARTED, evaluationNotes: { startedAt: ago(0), deadlineAt: null } });
     const refused = await app.request(`/api/watchdog/${job.jobId}/stop`, { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
@@ -532,7 +532,7 @@ describe("F3s: the stop says which seats were left stopped, and the show and the
   let db: Database.Database;
   let jobsRepo: WatchdogJobsRepository;
   let app: Hono;
-  const SPEC = "policy: seat-pool\ncontext:\n  max: 3\n  cwd_template: /w/{slot}\n  drain: true\n";
+  const SPEC = "policy: fork-seat-pool\ncontext:\n  max: 3\n  cwd_template: /w/{slot}\n  drain: true\n";
   beforeEach(() => {
     db = createDb();
     migrate(db, [coreSchema, eventsSchema, watchdogJobsSchema, watchdogHistorySchema, seatPoolSlotsSchema, forkSeatPoolSlotsRenameSchema]);
@@ -552,7 +552,7 @@ describe("F3s: the stop says which seats were left stopped, and the show and the
   const startedAt = "2026-11-09T12:00:00.000Z";
   const deadlineAt = "2026-11-09T12:15:00.000Z";
   const pool = (seats: string[]) => {
-    const job = jobsRepo.register({ policy: "seat-pool", specYaml: SPEC, targetSession: "dev-impl@r", intervalSeconds: 60, registeredBySession: "ops@kernel" });
+    const job = jobsRepo.register({ policy: "fork-seat-pool", specYaml: SPEC, targetSession: "dev-impl@r", intervalSeconds: 60, registeredBySession: "ops@kernel" });
     const slots = new SeatPoolSlots(db);
     seats.forEach((logicalId, i) => slots.insert({ poolJobId: job.jobId, logicalId, nodeId: `n${i}`, phase: "draining", intent: null, opId: `op-${i}`, at: ago(0) }));
     const log = new WatchdogHistoryLog(db);
@@ -610,7 +610,7 @@ describe("F6a: escalation_owner, max_reached in the history, the room a plan fre
     // The REVISAO-f1 S2 shape: a stopped adopted seat takes room under max but isn't one of the seats taking work.
     const full = [slot({ cause: "working", idleSince: null, openRows: 1 }), slot({ adopted: true, cause: "stopped", idleSince: null })];
     const evaluated = await makeSeatPoolPolicy({ readState: () => state({ slots: full, pending: rows(3) }), submit: () => true, now: () => NOW })
-      .evaluate({ jobId: "pool-1", policy: SEAT_POOL_POLICY_NAME, target: { session: "dev-impl@r" }, intervalSeconds: 60,
+      .evaluate({ jobId: "pool-1", policy: FORK_SEAT_POOL_POLICY_NAME, target: { session: "dev-impl@r" }, intervalSeconds: 60,
         context: { max: 2, cwd_template: "/w/{slot}" } } as PolicyJob);
     expect(evaluated).toMatchObject({ action: "skip", reason: "seat_pool_held", notes: { reason: "max_reached", intents: [] } });
   });

@@ -24,7 +24,7 @@ import {
   type SeatPoolModel,
   type SeatPoolSpec,
   type SeatPoolState,
-} from "../src/domain/policies/seat-pool.js";
+} from "../src/domain/policies/fork-seat-pool.js";
 import { LaunchBudget } from "../src/domain/launch-budget.js";
 
 interface PsNode {

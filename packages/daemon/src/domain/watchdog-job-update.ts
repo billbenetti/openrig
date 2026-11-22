@@ -2,7 +2,7 @@ import { parse as parseYaml, parseDocument } from "yaml";
 import { artifactPoolListProblem, type ArtifactPoolSpec } from "./policies/artifact-pool-helpers.js";
 import { edgeArtifactRequiredSpecProblem } from "./policies/edge-artifact-required.js";
 import { periodicReminderSpecProblem } from "./policies/periodic-reminder.js";
-import { SEAT_POOL_POLICY_NAME, seatPoolSpecProblem } from "./policies/seat-pool.js";
+import { FORK_SEAT_POOL_POLICY_NAME, seatPoolSpecProblem } from "./policies/fork-seat-pool.js";
 import { workflowKeepaliveSpecProblem } from "./policies/workflow-keepalive.js";
 import { isQueueWait, retuneQueueWait } from "./queue-wait-backoff.js";
 import { nextDueAt } from "./watchdog-due.js";
@@ -22,7 +22,7 @@ const UPDATABLE_POLICIES = new Set([
   "workflow-keepalive",
   "idle-gate-qitem",
   "context-usage-threshold",
-  SEAT_POOL_POLICY_NAME,
+  FORK_SEAT_POOL_POLICY_NAME,
 ]);
 
 /** The session the daemon registers its own jobs as (continuity and auto idle-gate watchdogs). */
@@ -49,7 +49,7 @@ const SPEC_PROBLEMS: Record<string, (spec: ReturnType<typeof parseWatchdogSpec>)
   "edge-artifact-required": (spec) => edgeArtifactRequiredSpecProblem(spec)?.message,
   "artifact-pool-ready": (spec) => artifactPoolListProblem(spec.context["pools"] as ArtifactPoolSpec | ArtifactPoolSpec[] | undefined),
   "workflow-keepalive": (spec) => workflowKeepaliveSpecProblem(spec)?.message,
-  [SEAT_POOL_POLICY_NAME]: (spec) => seatPoolSpecProblem(spec)?.message,
+  [FORK_SEAT_POOL_POLICY_NAME]: (spec) => seatPoolSpecProblem(spec)?.message,
 };
 /** What is wrong with a spec for its policy, or null. Registration checks a seat-pool spec with this too. */
 export function specProblem(policy: string, parsed: ReturnType<typeof parseWatchdogSpec>): string | null {

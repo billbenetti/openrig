@@ -175,7 +175,12 @@ import { resolveWorkflowHumanDestination } from "./domain/workflow-human-destina
 import { makeWorkflowKeepalivePolicy } from "./domain/policies/workflow-keepalive.js";
 import { makeIdleGateQitemPolicy } from "./domain/policies/idle-gate-qitem.js";
 import { makeParkedOwnerConsumerPolicy, makeRigAnchor, PARKED_OWNER_POLICY_NAME } from "./domain/policies/parked-owner-consumer.js";
-import { makeSeatPoolPolicy, parseSeatPoolSpec, seatPoolOutOfUsage, type SeatPoolSpec } from "./domain/policies/seat-pool.js";
+import { makeSeatPoolPolicy } from "./domain/policies/seat-pool.js";
+// Fork (T-018881): the fork's pool, which the engine runs as `fork-seat-pool`; the import above is the upstream's,
+// composed unarmed below.
+import {
+  makeSeatPoolPolicy as makeForkSeatPoolPolicy, parseSeatPoolSpec, seatPoolOutOfUsage, type SeatPoolSpec,
+} from "./domain/policies/fork-seat-pool.js";
 import { SeatPoolSlotsRepository } from "./domain/seat-pool-slots.js";
 import { escalateUnclaimedReminder } from "./domain/parked-owner-escalation.js";
 import { readProcTmuxPane } from "./domain/seat-pool-busy.js";
@@ -2601,7 +2606,7 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
       readSlots: (modelNodeId) => seatPoolSlotsRepository.forModel(modelNodeId),
     });
     void seatPoolPolicy;
-    // Seat pools: the seat-pool policy plans, and this executor adds, launches, drains, reaps and removes the seats,
+    // Seat pools: the fork-seat-pool policy plans, and this executor adds, launches, drains, reaps and removes the seats,
     // moves waiting rows and wakes the seats holding them outside the scheduler tick, through the same services the
     // member, launch, stop, clean, node and queue routes use.
     const seatPoolSlots = new SeatPoolSlots(db);
@@ -2852,7 +2857,7 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
           reconcileStuckExceptions: (id) => workflowRuntime?.reconcileStuckExceptions(id) ?? 0,
         }),
         makeIdleGateQitemPolicy({ db, seatActivity: seatActivityService, isQueueOnlySeat: isQueueOnlyGuardSeat }),
-        makeSeatPoolPolicy({
+        makeForkSeatPoolPolicy({
           readState: async (job) => {
             const usageLimited = await usageLimitedSessions();
             return readPoolState(job, usageLimited, await busyPoolSessions(job, usageLimited));

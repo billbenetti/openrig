@@ -11,7 +11,7 @@ import {
 import { parseWatchdogSpec, type WatchdogPolicyEngine } from "../domain/watchdog-policy-engine.js";
 import { specProblem, updateWatchdogJob } from "../domain/watchdog-job-update.js";
 import { requireSenderIdentity } from "./require-sender-identity.js";
-import { SEAT_POOL_POLICY_NAME } from "../domain/policies/seat-pool.js";
+import { FORK_SEAT_POOL_POLICY_NAME } from "../domain/policies/fork-seat-pool.js";
 import type { QueueRepository } from "../domain/queue-repository.js";
 
 /**
@@ -114,7 +114,7 @@ export function watchdogRoutes(): Hono {
       const parsedSpec = parseWatchdogSpec(body.specYaml);
       const context = parsedSpec.context;
       // A pool acts on seats, so its spec is checked before it can run, as an update checks it.
-      const poolProblem = body.policy === SEAT_POOL_POLICY_NAME ? specProblem(body.policy, parsedSpec) : null;
+      const poolProblem = body.policy === FORK_SEAT_POOL_POLICY_NAME ? specProblem(body.policy, parsedSpec) : null;
       if (poolProblem) {
         throw new WatchdogJobsError("spec_invalid", `watchdog spec is not valid for ${body.policy}: ${poolProblem}`, { policy: body.policy });
       }
@@ -291,7 +291,7 @@ export function watchdogRoutes(): Hono {
     const jobsRepo = getJobsRepo(c);
     const job = jobsRepo.getById(jobId);
     if (!job) return c.json({ error: "job_not_found", jobId }, 404);
-    if (job.policy !== SEAT_POOL_POLICY_NAME) return c.json(job);
+    if (job.policy !== FORK_SEAT_POOL_POLICY_NAME) return c.json(job);
     const queueRepo = c.get("queueRepo" as never) as QueueRepository | undefined;
     const seatPool = jobsRepo.seatPoolView(jobId, queueRepo ? (session) => queueRepo.listOpenObligations(session, 500).length : undefined);
     return c.json(seatPool ? { ...job, seatPool } : job);

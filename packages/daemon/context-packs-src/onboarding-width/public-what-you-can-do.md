@@ -831,7 +831,7 @@ not have to tear one down to change it, and you rarely have to start from nothin
   `rig_snapshot_create`, `rig_snapshot_list`, `rig_restore`, `rig_rig_nodes`, `rig_add` and
   `rig_bind`. A name two rigs share returns `rig_ambiguous` with the candidates. Don't look the id
   up first.
-- **`rig watchdog register --policy seat-pool`** — keep extra seats cloned from one model seat
+- **`rig watchdog register --policy fork-seat-pool`** — keep extra seats cloned from one model seat
   (`<member>-s<n>`) and add or drain them with demand, within the spec's `min` and `max`. A pending row
   left waiting at the model moves to a free seat, and a seat that isn't taking its rows is launched
   when it stopped and escalated when it needs input. A seat the pool added whose session is gone is reaped

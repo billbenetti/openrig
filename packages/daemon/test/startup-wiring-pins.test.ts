@@ -27,6 +27,8 @@ import type { TmuxAdapter } from "../src/adapters/tmux.js";
 import { getActiveRotationCount, startTranscriptRotation, stopTranscriptRotation } from "../src/domain/transcript-rotation.js";
 import type { makeWatchdogDeliver } from "../src/domain/watchdog-delivery.js";
 import type { makeSeatPoolPolicy } from "../src/domain/policies/seat-pool.js";
+// Fork (T-018881): the fork's pool, which the engine runs under its own id; the mock below records only the upstream's.
+import { FORK_SEAT_POOL_POLICY_NAME } from "../src/domain/policies/fork-seat-pool.js";
 import { RigRepository } from "../src/domain/rig-repository.js";
 import { PodRepository } from "../src/domain/pod-repository.js";
 import { SeatPoolSlotsRepository } from "../src/domain/seat-pool-slots.js";
@@ -284,6 +286,14 @@ describe("the seat-pool job stays unarmed until the activation change (#3395)", 
     const result = await engine.evaluate(job);
     expect(result.outcome).toEqual({ action: "terminal", reason: "unknown_policy:seat-pool" });
     expect(jobs.getById(job.jobId)).toMatchObject({ state: "terminal", terminalReason: "unknown_policy:seat-pool" });
+  });
+});
+
+describe("fork (T-018881): the fork's pool runs as `fork-seat-pool` beside the upstream's unarmed `seat-pool`", () => {
+  it("the watchdog engine resolves `fork-seat-pool` to the fork's pool and still resolves no `seat-pool`", () => {
+    const engine = deps.watchdogPolicyEngine!;
+    expect(engine.resolvePolicy(FORK_SEAT_POOL_POLICY_NAME)?.name).toBe("fork-seat-pool");
+    expect(engine.resolvePolicy("seat-pool")).toBeUndefined();
   });
 });
 

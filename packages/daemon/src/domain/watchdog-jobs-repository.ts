@@ -2,6 +2,7 @@ import type Database from "better-sqlite3";
 import { ulid } from "ulid";
 import { parse as parseYaml } from "yaml";
 import {
+  FORK_SEAT_POOL_POLICY_NAME,
   parseSeatPoolSpec,
   SEAT_POOL_DRAIN_EVENTS,
   SEAT_POOL_LEFT,
@@ -9,7 +10,7 @@ import {
   seatPoolLeftStopped,
   type SeatPoolDrainEpisode,
   type SeatPoolDrainEvent,
-} from "./policies/seat-pool.js";
+} from "./policies/fork-seat-pool.js";
 import { deriveCanonicalSessionName } from "./session-name.js";
 
 /**
@@ -58,8 +59,10 @@ export const PHASE_D_POLICIES = [
   "mode-scheduled-end",
   // Seat pool (#3395): one job per model member with a `pool` block, ensured by the daemon. Accepted here so the
   // ensure can register it; the watchdog engine does not run it until the activation change arms it.
-  // Fork: elastic seats cloned from one model member; its executor adds and removes them outside the tick.
   "seat-pool",
+  // Fork (T-018881): elastic seats cloned from one model member, under its own id so it never collides with the
+  // upstream's `seat-pool`; its executor adds and removes them outside the tick (policies/fork-seat-pool.ts).
+  "fork-seat-pool",
 ] as const;
 
 /**
@@ -972,7 +975,7 @@ export class WatchdogJobsRepository {
       );
     }
     if (existing.state === "stopped") return existing;
-    if (existing.policy === "seat-pool" && this.hasSeatPoolSlotsTable) return this.stopSeatPool(existing, reason);
+    if (existing.policy === FORK_SEAT_POOL_POLICY_NAME && this.hasSeatPoolSlotsTable) return this.stopSeatPool(existing, reason);
     this.db
       .prepare(`UPDATE watchdog_jobs SET state = 'stopped', terminal_reason = ? WHERE job_id = ?`)
       .run(reason, jobId);
@@ -1076,7 +1079,7 @@ export class WatchdogJobsRepository {
    */
   seatPoolView(jobId: string, openRows?: (sessionName: string) => number): SeatPoolJobView | null {
     const job = this.getById(jobId);
-    if (!job || job.policy !== "seat-pool" || !this.hasSeatPoolSlotsTable) return null;
+    if (!job || job.policy !== FORK_SEAT_POOL_POLICY_NAME || !this.hasSeatPoolSlotsTable) return null;
     const episode = seatPoolDrainEpisode(this.seatPoolDrainEvents(jobId));
     const hasQueue = !!this.db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'queue_items'").get();
     const count = openRows ?? ((sessionName: string) => (hasQueue ? (this.db.prepare(

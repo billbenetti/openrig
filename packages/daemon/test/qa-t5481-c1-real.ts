@@ -25,7 +25,7 @@
 
 import { readFileSync, readdirSync } from "node:fs";
 import { fileURLToPath } from "node:url";
-import type { ParkFacts, SeatPoolSlotView } from "../src/domain/policies/seat-pool.js";
+import type { ParkFacts, SeatPoolSlotView } from "../src/domain/policies/fork-seat-pool.js";
 
 export const CAPTURE_AT = "2026-11-11T05:02:55Z";
 export const CAPTURE_NOW_MS = Date.parse(CAPTURE_AT);

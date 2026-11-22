@@ -1,6 +1,6 @@
 import type Database from "better-sqlite3";
 import { parse as parseYaml } from "yaml";
-import { parseSeatPoolSpec, SEAT_POOL_NO_SEAT_GRACE_DEFAULT_SECONDS } from "./policies/seat-pool.js";
+import { FORK_SEAT_POOL_POLICY_NAME, parseSeatPoolSpec, SEAT_POOL_NO_SEAT_GRACE_DEFAULT_SECONDS } from "./policies/fork-seat-pool.js";
 import { nodeExecutorConfirmedStopped } from "./node-inventory.js";
 import { SeatPoolSlots } from "./seat-pool-executor.js";
 
@@ -45,8 +45,8 @@ export function seatPoolQueueCustody(
     const tables = new Set((db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('watchdog_jobs', 'fork_seat_pool_slots', 'nodes')")
       .all() as Array<{ name: string }>).map((t) => t.name));
     if (tables.size === 3) {
-      const jobs = db.prepare("SELECT job_id, spec_yaml, target_session, registered_at FROM watchdog_jobs WHERE policy = 'seat-pool' AND state = 'active'")
-        .all() as Array<{ job_id: string; spec_yaml: string; target_session: string; registered_at: string }>;
+      const jobs = db.prepare("SELECT job_id, spec_yaml, target_session, registered_at FROM watchdog_jobs WHERE policy = ? AND state = 'active'")
+        .all(FORK_SEAT_POOL_POLICY_NAME) as Array<{ job_id: string; spec_yaml: string; target_session: string; registered_at: string }>;
       const liveSlots = db.prepare(
         `SELECT s.id, s.node_id, s.op_id, s.live_at, s.created_at FROM fork_seat_pool_slots s JOIN nodes n ON n.id = s.node_id
           WHERE s.pool_job_id = ? AND s.retired_at IS NULL AND s.phase = 'live'`,
