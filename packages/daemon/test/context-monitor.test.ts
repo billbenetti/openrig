@@ -17,6 +17,7 @@ import type { SessionTransport } from "../src/domain/session-transport.js";
 import type { ReadinessResult } from "../src/domain/runtime-adapter.js";
 import { EventBus } from "../src/domain/event-bus.js";
 import { ALL_MIGRATIONS } from "../src/db/all-migrations.js";
+import { currentProcessCaller, withProcessCaller, type ProcessCaller } from "../src/domain/process-caller.js";
 
 
 describe("ContextMonitor", () => {
@@ -654,5 +655,33 @@ describe("ContextMonitor", () => {
     await Promise.all([timerTick, refreshRequest]);
 
     expect(maybeAutoCompact).toHaveBeenCalledTimes(1);
+  });
+
+  it("the timer poll attributes only the readiness check to the reconciler, so a compaction delivery keeps its own caller", async () => {
+    const rig = rigRepo.createRig("test-rig-caller");
+    const node = rigRepo.addNode(rig.id, "dev.caller", { runtime: "claude-code", cwd: "/project" });
+    const session = sessionRegistry.registerSession(node.id, "dev-caller@test");
+    db.prepare("UPDATE sessions SET status = 'running', startup_status = 'failed' WHERE id = ?").run(session.id);
+    writeSidecar("dev-caller@test", { ...VALID_SIDECAR, session_name: "dev-caller@test" });
+    const callers: Record<string, ProcessCaller | undefined> = {};
+    checkReadySpy.mockImplementation(async () => {
+      callers.readiness = currentProcessCaller();
+      return { ready: true };
+    });
+    // The enforcer's send enters the transport, which names its reads claude_delivery unless an outer caller is set.
+    const maybeAutoCompact = vi.fn(async () => {
+      callers.delivery = await withProcessCaller("claude_delivery", async () => currentProcessCaller());
+    });
+    monitor = new ContextMonitor(
+      db,
+      store,
+      { ensureContextCollector: ensureContextCollectorSpy, checkReady: checkReadySpy },
+      { maybeAutoCompact } as never,
+    );
+
+    monitor.start(5);
+    await vi.waitFor(() => expect(maybeAutoCompact).toHaveBeenCalled());
+
+    expect(callers).toEqual({ readiness: "reconciler", delivery: "claude_delivery" });
   });
 });
