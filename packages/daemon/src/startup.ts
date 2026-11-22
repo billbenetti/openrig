@@ -78,6 +78,7 @@ import { resolveCodexGitAddDirs } from "./domain/codex-git-add-dirs.js";
 import { PiResumeAdapter } from "./adapters/pi-resume.js";
 import { OmpResumeAdapter } from "./adapters/omp-resume.js";
 import { OMP_PROVIDER_ENV_VARS, OMP_PROVIDER_EXTRA_ENV_VARS } from "./adapters/pi-runner-protocol.js";
+import { withProcessCaller } from "./domain/process-caller.js";
 import { RigSpecExporter } from "./domain/rigspec-exporter.js";
 import { PodRepository } from "./domain/pod-repository.js";
 import { RigSpecPreflight } from "./domain/rigspec-preflight.js";
@@ -1593,12 +1594,13 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
     },
   });
   restoredSeatActivity = (sessionName, state) => {
-    void seatAttentionReconciler.onSeatActivity(sessionName, state)
+    // T-018092: telemetry attribution of the reconciler's process reads.
+    void withProcessCaller("reconciler", () => seatAttentionReconciler.onSeatActivity(sessionName, state))
       .catch(error => console.warn(`Restored-seat reconcile: ${error instanceof Error ? error.name : typeof error}`));
   };
   eventBus.subscribe(event => {
     if (event.type !== "restore.completed" && event.type !== "restore.subset_completed") return;
-    void seatAttentionReconciler.onRestoreCompleted(event.rigId)
+    void withProcessCaller("reconciler", () => seatAttentionReconciler.onRestoreCompleted(event.rigId))
       .catch(error => console.warn(`Restored-seat reconcile: ${error instanceof Error ? error.name : typeof error}`));
   });
 
