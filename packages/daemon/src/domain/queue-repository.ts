@@ -115,7 +115,7 @@ import {
 } from "./queue-wake-repository.js";
 import { WatchdogJobsRepository } from "./watchdog-jobs-repository.js";
 import { NOTED_ON_QUEUED_ROW, QUEUED_AS_ROW, isQueueOnlyDeliveryCode } from "./watchdog-history-log.js";
-import { parkedRowNotePrefix, queuedAsRowNote } from "./park-wake-text.js";
+import { isDefaultParkWakeMessage, parkedRowNotePrefix, queuedAsRowNote } from "./park-wake-text.js";
 import { seatPoolLongGateOf, type ParkFacts } from "./policies/fork-seat-pool.js";
 import { nextDueAt } from "./watchdog-due.js";
 import { parse as parseYaml } from "yaml";
