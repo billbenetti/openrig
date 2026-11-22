@@ -147,7 +147,8 @@ export class ContextMonitor {
         }
       }
 
-      await this.normalizeStartupStatus(session, pass);
+      // T-018092: only the readiness check is a reconciler read; the compaction delivery below names its own caller.
+      await withProcessCaller("reconciler", () => this.normalizeStartupStatus(session, pass));
       await this.maybeAutoCompact(session, observed);
     }
     this.drainProviderWindowSamples();
@@ -232,8 +233,7 @@ export class ContextMonitor {
   start(intervalMs: number = DEFAULT_POLL_INTERVAL_MS): void {
     if (this.timer) return; // Already running
     this.timer = setInterval(() => {
-      // T-018092: the periodic readiness poll's process reads are attributed to the reconciler in telemetry.
-      void withProcessCaller("reconciler", () => this.pollOnce());
+      void this.pollOnce();
     }, intervalMs);
     // Unref so the timer doesn't keep the process alive
     if (this.timer && typeof this.timer === "object" && "unref" in this.timer) {
