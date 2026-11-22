@@ -19,6 +19,12 @@ export interface AutoRehydratePruneOptions {
   keep?: number;
   batchSize?: number;
   nowMs?: number;
+  /** The caller knows a row of the rig newer than every prune candidate resolves with a resume token (the capture
+   *  that was just written, younger than 24 h): no candidate can be the newest usable one, so no data is read. */
+  newerUsable?: boolean;
+  /** Read no row newer than the usable candidate (the capture's bound): the candidate stays held back this call, and
+   *  the drain's scan reads on later. */
+  skipResumeScan?: boolean;
 }
 
 /** SQLite pre-filter for "some session carries a non-empty string resume token": a superset of the occupant rule
@@ -268,7 +274,8 @@ export class SnapshotRepository {
    *  Never deletes: a capture younger than 24 h (`created_at >= now - 24 h`, UTC), the `keep` newest older
    *  `auto-rehydrate` ones, another kind, the rig's newest snapshot whose occupant resolves with a resume token
    *  (`findLatestUsableSnapshot`'s rule), the one `findLatestRestoreUsable` returns (what `selectRestoreUsable` picks
-   *  without an id), or one an in-flight restore or launch holds (`holdForRestore`). */
+   *  without an id), or one an in-flight restore or launch holds (`holdForRestore`). The capture bounds the data it
+   *  reads (`newerUsable`, `skipResumeScan`); the drain reads on. */
   pruneAutoRehydrate(rigId: string, opts?: AutoRehydratePruneOptions): number {
     if (!autoRehydrateRetentionEnabled()) return 0;
     const keep = Math.max(1, Math.floor(opts?.keep ?? AUTO_REHYDRATE_RETENTION_DEFAULTS.keep));
@@ -287,7 +294,8 @@ export class SnapshotRepository {
       .filter(({ id }) => !held?.has(id) && id !== restoreUsable)
       .slice(0, batchSize + 1);
     if (window.length === 0) return 0;
-    const resumeUsable = this.newestResumeUsableIn(rigId, window);
+    const resumeUsable = opts?.newerUsable ? null
+      : this.newestResumeUsableIn(rigId, window, opts?.skipResumeScan ? 0 : RESUME_SCAN_ROWS_PER_PRUNE);
     const victims = window.map(({ id }) => id).filter((id) => id !== resumeUsable).slice(0, batchSize);
     if (victims.length === 0) return 0;
     return this.db.prepare(`DELETE FROM snapshots WHERE id IN (${victims.map(() => "?").join(",")})`).run(...victims).changes;
@@ -304,14 +312,15 @@ export class SnapshotRepository {
   /** Which of the candidates is the rig's newest snapshot (any kind, in `findLatestUsableSnapshot`'s order) whose
    *  occupant resolves with a resume token, as far as the rows read so far tell, or null when none of the candidates
    *  is usable or a newer usable row was found. The candidates are read newest first until the first usable one, U;
-   *  then, oldest first, at most RESUME_SCAN_ROWS_PER_PRUNE of the rig's rows newer than U that no earlier prune read
-   *  (`resumeScanByDb`). U stays held back until one of them is usable: an unfinished scan never lets it go. A row's
+   *  then, oldest first, at most `scanRows` of the rig's rows newer than U that no earlier prune read
+   *  (`resumeScanByDb`; with 0, none, and the scan state stays as it was). U stays held back until one of them is usable: an unfinished scan never lets it go. A row's
    *  data is parsed in JS only when SQLite sees a token in it (`MAY_CARRY_RESUME_TOKEN`). */
-  private newestResumeUsableIn(rigId: string, candidates: Array<{ id: string; created_at: string }>): string | null {
+  private newestResumeUsableIn(rigId: string, candidates: Array<{ id: string; created_at: string }>, scanRows: number): string | null {
     const newestFirst = [...candidates].sort((a, b) =>
       a.created_at === b.created_at ? (a.id < b.id ? 1 : a.id > b.id ? -1 : 0) : (a.created_at < b.created_at ? 1 : -1));
     const usable = newestFirst.find(({ id }) => this.rowHasResumeToken(id));
     if (!usable) return null;
+    if (scanRows === 0) return usable.id;
     let scans = resumeScanByDb.get(this.db);
     if (!scans) {
       scans = new Map();
@@ -323,7 +332,7 @@ export class SnapshotRepository {
     // data: better-sqlite3 refuses other statements while an iterator is open.
     const next = this.db.prepare(
       "SELECT id, created_at FROM snapshots WHERE rig_id = ? AND (created_at > ? OR (created_at = ? AND id > ?)) ORDER BY created_at ASC, id ASC LIMIT ?"
-    ).all(rigId, through.at, through.at, through.id, RESUME_SCAN_ROWS_PER_PRUNE) as Array<{ id: string; created_at: string }>;
+    ).all(rigId, through.at, through.at, through.id, scanRows) as Array<{ id: string; created_at: string }>;
     for (const row of next) {
       if (this.rowHasResumeToken(row.id)) {
         scans.delete(rigId);

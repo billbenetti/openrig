@@ -9,7 +9,7 @@ import {
 import type { RigRepository } from "./rig-repository.js";
 import type { SessionRegistry } from "./session-registry.js";
 import type { EventBus } from "./event-bus.js";
-import type { SnapshotRepository } from "./snapshot-repository.js";
+import { hasResolvedOccupantResumeToken, type SnapshotRepository } from "./snapshot-repository.js";
 import type { PersistedEvent } from "./types.js";
 import type { CheckpointStore } from "./checkpoint-store.js";
 import type { Snapshot, SnapshotData } from "./types.js";
@@ -224,8 +224,13 @@ export class SnapshotCapture {
 
     // 7. Retention of auto-rehydrate captures, the same for every capture origin: one bounded batch of this rig's
     // old captures (the backlog drains in AutoRehydrateRetentionScheduler, after boot). It never fails the capture.
+    // It runs on the request (and before the bind at boot), so it reads as little capture data as it can: none when
+    // this capture resolves with a resume token (no older row can be the newest usable one), and never the scan of
+    // the rows newer than a usable candidate, which the drain does.
     if (kind === "auto-rehydrate") {
-      try { this.snapshotRepo.pruneAutoRehydrate(rigId); }
+      try {
+        this.snapshotRepo.pruneAutoRehydrate(rigId, { newerUsable: hasResolvedOccupantResumeToken(snapshot.data), skipResumeScan: true });
+      }
       catch (error) { console.warn(`Snapshot retention: auto-rehydrate prune failed for ${rigId}: ${String(error)}`); }
     }
 
