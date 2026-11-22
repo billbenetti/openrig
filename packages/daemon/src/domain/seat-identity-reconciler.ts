@@ -14,6 +14,7 @@ import { RESERVED_HOST_IDS, validateHostRegistry } from "./hosts/hosts-registry-
 import { communityHarnessOf } from "./built-in-runtimes.js";
 import { sessionCommunityHarnessSelect, sessionCommunityRunnerSelect, recordedRunner } from "./session-registry.js";
 import { runSyncSiteWhenSlow } from "./sync-site-wrap.js";
+import { withProcessCaller } from "./process-caller.js";
 
 /** Default identity-reconcile cadence: 5s. Process identity changes rarely
  *  (a seat's pane/process is stable for its whole life), and the check is
@@ -494,7 +495,8 @@ export class SeatIdentityReconciler {
   start(intervalMs: number = DEFAULT_IDENTITY_POLL_INTERVAL_MS): void {
     if (this.timer) return;
     this.timer = setInterval(() => {
-      void this.reconcileAll();
+      // T-018092: telemetry attribution of the sweep's process reads.
+      void withProcessCaller("reconciler", () => this.reconcileAll());
     }, intervalMs);
     if (this.timer && typeof this.timer === "object" && "unref" in this.timer) {
       (this.timer as NodeJS.Timeout).unref();

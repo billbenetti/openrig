@@ -3,6 +3,7 @@ import { performance } from "node:perf_hooks";
 import { Worker } from "node:worker_threads";
 import type { Context, MiddlewareHandler } from "hono";
 import { transportSenderSession } from "../routes/require-sender-identity.js";
+import type { ProcessCaller } from "./process-caller.js";
 
 export const SLOW_OPERATION_THRESHOLD_MS = 250;
 // 16 MiB x (1 live + 6 rotated) keeps a day or more at the ~2 MB/h a busy daemon writes; 1 MiB x 3 kept ~2.5 h.
@@ -52,6 +53,7 @@ export interface SlowOperationInstrumentation {
     site: string,
     fn: () => Promise<T>,
     classify?: (value: T) => "ok" | "failed",
+    fields?: StageFields,
   ): Promise<T>;
   recordRequest?(site: string, durationMs: number, detail?: RequestDetail): void;
   /** A synchronous site's duration, recorded only at or above the slow threshold (runSyncSiteWhenSlow). */
@@ -64,6 +66,12 @@ export interface SlowOperationInstrumentation {
   // cannot prove durability rejects (never a silent success); see index.ts.
   flush?(): Promise<void>;
   close?(): Promise<void>;
+}
+
+/** Extra fields a stage record may carry besides its site (T-018092): `caller` names the entry point that asked,
+ *  for a site shared by several (the process-table read). Additive: readers that group by `site` see the same series. */
+export interface StageFields {
+  caller?: ProcessCaller;
 }
 
 /** What a slow request's record says about the request besides its route: the filters it asked for and who asked. */
@@ -310,19 +318,20 @@ export class SlowOpRecorder implements SlowOperationInstrumentation {
     site: string,
     fn: () => Promise<T>,
     classify?: (value: T) => "ok" | "failed",
+    fields?: StageFields,
   ): Promise<T> {
     const startedAt = performance.now();
     try {
       const value = await fn();
-      this.recordMeasurement(site, performance.now() - startedAt, classify?.(value) ?? "ok");
+      this.recordMeasurement(site, performance.now() - startedAt, classify?.(value) ?? "ok", fields);
       return value;
     } catch (error) {
-      this.recordMeasurement(site, performance.now() - startedAt, "failed");
+      this.recordMeasurement(site, performance.now() - startedAt, "failed", fields);
       throw error;
     }
   }
 
-  recordMeasurement(site: string, durationMs: number, outcome: "ok" | "failed" = "ok"): void {
+  recordMeasurement(site: string, durationMs: number, outcome: "ok" | "failed" = "ok", fields?: StageFields): void {
     this.appendAsync({
       v: 1,
       ts: new Date().toISOString(),
@@ -331,6 +340,7 @@ export class SlowOpRecorder implements SlowOperationInstrumentation {
       site,
       durationMs: Math.max(0, durationMs),
       outcome,
+      ...(fields?.caller ? { caller: fields.caller } : {}),
     });
   }
 

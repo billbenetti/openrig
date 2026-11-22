@@ -12,6 +12,7 @@ import type { ContextUsage } from "./types.js";
 import { getLatestStartupFailedEvent, hasClaudeResumeIdentityWork, readPendingStartupContext } from "./startup-orchestrator.js";
 import { claudeResumeRotation, SessionRegistry } from "./session-registry.js";
 import { ObservationPass } from "./process-observation-pass.js";
+import { withProcessCaller } from "./process-caller.js";
 
 /** Default polling interval: 30 seconds. */
 export const DEFAULT_POLL_INTERVAL_MS = 30_000;
@@ -146,7 +147,8 @@ export class ContextMonitor {
         }
       }
 
-      await this.normalizeStartupStatus(session, pass);
+      // T-018092: only the readiness check is a reconciler read; the compaction delivery below names its own caller.
+      await withProcessCaller("reconciler", () => this.normalizeStartupStatus(session, pass));
       await this.maybeAutoCompact(session, observed);
     }
     this.drainProviderWindowSamples();
