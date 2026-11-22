@@ -647,6 +647,16 @@ export interface SeatPoolSlotView {
    *  usage as the status-line sidecar of its current occupant reads it (a sample of a previous occupant, or one with no
    *  percentage, is none). Absent: no reading, which holds nothing back (seatPoolContextOver). */
   context?: SeatPoolContextReading;
+  /** Only for a seat the pool added whose release command refused it lately (SeatPoolExecutor.releaseRefusedUntilMs,
+   *  T-018090): until when (epoch ms) the plan leaves it out of the drain order, so the next seat down goes instead of
+   *  the refused one again (the head-of-line block). It is no different for any count: removeStarting, the share of
+   *  the surplus the free seats cover and fullOut still take every free seat the pool added. Absent: not held. */
+  releaseRefusedUntilMs?: number;
+}
+
+/** Whether the seat's refused release still holds it out of the drain order at `nowMs` (releaseRefusedUntilMs). */
+export function seatPoolReleaseRefused(slot: SeatPoolSlotView, nowMs: number): boolean {
+  return typeof slot.releaseRefusedUntilMs === "number" && slot.releaseRefusedUntilMs > nowMs;
 }
 
 /** A seat's context usage as its status-line sample reads it: `used_percentage` and `sampled_at` (T-012383). */
@@ -1225,8 +1235,13 @@ export function planSeatPool(spec: SeatPoolSpec, state: SeatPoolState, nowMs: nu
   // (lens review of the volta 3).
   const renew = spec.drain || rowsLeft <= 0 ? 0
     : spec.demandCmd ? full.length : Math.max(0, rowsLeft - (spec.max - keptNow.length - state.adoptable.length));
-  const freeOut = drainOrder.slice(0, surplus);
-  const fullOut = full.slice(0, Math.max(0, Math.max(surplus, renew) - freeOut.length));
+  // T-018090 (the head-of-line block): a seat whose release command refused it lately is skipped, still slotId
+  // descending, so the next seat goes instead of the same one again each tick. Only who goes changes, never how many:
+  // the free seats cover their share of the surplus (`freeCover`) and count for removeStarting whether held or not, so
+  // a held free seat sends the drain neither to a full seat nor to the removal of a starting one in its place.
+  const freeCover = Math.min(surplus, drainOrder.length);
+  const freeOut = drainOrder.filter((slot) => !seatPoolReleaseRefused(slot, nowMs)).slice(0, surplus);
+  const fullOut = full.filter((slot) => !seatPoolReleaseRefused(slot, nowMs)).slice(0, Math.max(0, Math.max(surplus, renew) - freeCover));
   if (!cooling) for (const slot of [...freeOut, ...fullOut]) intents.push({ kind: "drain", slotId: slot.slotId, idleSince: slot.idleSince });
   // A seat that never started holds no work. It goes only for the surplus free and full seats can't cover (a lowered
   // max, or drain).
