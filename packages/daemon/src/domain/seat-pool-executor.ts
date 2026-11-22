@@ -24,6 +24,7 @@ import {
   seatPoolHeldByProcess,
   seatPoolContextLimit,
   seatPoolContextOver,
+  seatPoolContextDrainable,
   seatPoolHeldByContext,
   type SeatPoolContextReading,
   seatPoolReceives,
@@ -603,7 +604,8 @@ function busyOf(busy: string | null | undefined): { busyProcess?: string | null 
 
 /**
  * For a spec whose `dispatch_to_parked` sets `busy_processes`: the seats that could take a row now (seatPoolCanReceive
- * read without the processes: free, since T-006251 B1, or parked), and why each is busy with heavy local work, or null
+ * read without the processes: free, since T-006251 B1, or parked) or that the plan may drain as held by their context
+ * (seatPoolHeldByContext, T-017384), and why each is busy with heavy local work, or null
  * (readSeatPoolBusySessions, with the spec's `busy_orphan_max_age_s`). Undefined for any other spec: nothing is read.
  * The daemon's busy read for the plan, the recheck before a move and the demand command (startup.ts).
  */
@@ -614,8 +616,10 @@ export function readSeatPoolBusyCandidates(
   if (!programs?.length) return undefined;
   // A seat the plan may empty by return_long_gates is read too (T-012673, S1 of the cross review): its rows must not move
   // while it runs a busy program, so the return's recheck asks this read like a move does.
+  // A seat held only by its context is read too (T-017384): the plan drains it only while no busy program runs in it.
   const candidates = slots.filter((slot) => seatPoolCanReceive(spec, slot, nowMs) !== null
-    || seatPoolLongGateRows(spec, { ...slot, busyProcess: null }, nowMs) !== null).map((slot) => slot.sessionName);
+    || seatPoolLongGateRows(spec, { ...slot, busyProcess: null }, nowMs) !== null
+    || seatPoolHeldByContext(spec, slot, nowMs)).map((slot) => slot.sessionName);
   return readSeatPoolBusySessions(candidates, programs, deps, {
     ...(timeoutMs !== undefined ? { timeoutMs } : {}),
     // T-016495: a reason that names an ignored program then says nothing else holds the seat (seatPoolLongGateBusy)
@@ -2252,7 +2256,8 @@ export class SeatPoolExecutor {
     // `held: "busy"` (T-007527): the free seat in usage held only by a busy_processes program the read found, the one
     // the plan counts as occupied for it; absent for every other seat (a null `receives` says no more than "no row now").
     // `held: "context"` (T-012383): a quiet seat in usage past `context_limit_percent`, also occupied in the plan (a
-    // seat held both ways says "busy").
+    // seat held both ways says "busy"); not one the plan drains (seatPoolContextDrainable, T-017384), which is on its
+    // way out and, counted as held, would hold the demand's target up for ever.
     // T-008466 SH-B: a row a parked seat refused never goes to it while it is parked (refusedBy), so while such a row
     // waits that seat is given to the demand command as receiving nothing: counted as a receiver, the row it refused
     // would wait for it with no seat added, up to max_claim_age_s. A seat that is free takes the row, and stays one.
@@ -2266,7 +2271,8 @@ export class SeatPoolExecutor {
         receives: receives === "parked" && refusing.has(slot.sessionName) ? null : receives,
         ...(seatPoolHeldByProcess(ctx.spec, read, { usageLimited: limited })
           ? { held: "busy" as const }
-          : seatPoolHeldByContext(ctx.spec, read, nowMs, { usageLimited: limited }) ? { held: "context" as const } : {}),
+          : seatPoolHeldByContext(ctx.spec, read, nowMs, { usageLimited: limited })
+            && !seatPoolContextDrainable(ctx.spec, read, nowMs, { usageLimited: limited }) ? { held: "context" as const } : {}),
       };
     });
     const result = await this.deps.effects.runCommand(ctx.spec.demandCmd, this.commandEnv(ctx, { OPENRIG_SEAT_POOL_SLOTS: JSON.stringify(slots) }), run.controller.signal);
