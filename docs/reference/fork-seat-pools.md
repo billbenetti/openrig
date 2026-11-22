@@ -39,6 +39,7 @@ context:
   remove_cmd:  { argv: [/usr/local/bin/pool-remove], timeout_s: 60 }
   escalation_owner: lead@my-rig     # where the pool's escalations go (default: the model's escalation owner)
   context_limit_percent: 40         # a seat the pool added at this context usage or above takes no row (0..100, default 40; 0: off)
+  release_refused_backoff_s: 300    # the first hold of a seat whose release_cmd refused it, doubled per refusal up to 1800 (1..1800, default 300)
   dispatch_to_parked:               # absent (the default): only a free seat receives a row; see "A seat parked on its own wait"
     max_wake_s: 3600                # the longest park timer that still counts (60..86400, default 3600)
     max_claim_age_s: 21600          # how long ago the seat may have taken the parked row (600..172800, default 21600)
@@ -82,13 +83,16 @@ which holds deliveries to that seat back for as long as it runs.
 
 A seat whose `release_cmd` refuses (a non-zero exit other than the unanswered 3 and 5 of the forced pass) stays, and the
 plan leaves it out of the drain order for a while, so the next seat down goes instead of the same one again each tick:
-300 s, doubled by each refusal in a row of the same occupant, at most 1800 s, and 60 s for a seat past its context
-limit. Who goes changes, never how many: the held seat still counts as free for the surplus, so its share is drained
-neither from a full seat nor by removing a starting one. An open row on the seat, another occupant (its relaunch, or a
-launch by hand) and its retirement forget the hold, and a restart of the daemon forgets them all. Each refusal is one
+`release_refused_backoff_s` (default 300 s), doubled by each refusal in a row of the same occupant, at most 1800 s, and
+60 s for a seat past its context limit. Who goes changes, never how many: the held seat still counts as free for the
+surplus, so its share is drained neither from a full seat nor by removing a starting one. A new row on the seat (one it
+did not hold when it refused: the rows of a working seat the forced pass asked, or of a dead one the reap asked, keep the
+hold), a row the pool moves to it, a `release_cmd` that agrees, another occupant (its relaunch, or a launch by hand) and
+its retirement forget the hold, and a restart of the daemon forgets them all. The reap honours the hold its own refusal
+set: inside it, the release command is not asked again and the seat goes straight to its relaunch. Each refusal is one
 line in the daemon's log, `[seat-pool] release_refused job=<id> {...}`, with the slot, the reason it was asked, the exit
-code, the first line of the command's stderr (control characters out, secrets redacted, at most 200 characters), the
-refusals in a row and `nextEligibleAt`.
+code, the first line of the command's stderr (control characters out, secrets redacted, at most 200 characters; with an
+empty stderr, `command failed (no stderr)`, never the command's argv), the refusals in a row and `nextEligibleAt`.
 
 ## How many seats
 
