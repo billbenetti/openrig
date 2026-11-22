@@ -1,0 +1,75 @@
+{
+  "capturado_em": "2026-11-22T03:07:57+00:00",
+  "janela_desde": "2026-11-15T03:07:57",
+  "fonte": "~/.openrig/openrig.sqlite (mode=ro), watchdog_history, skip_reason seat_pool_returned, why release_refused",
+  "total_recusas": 2550,
+  "jobs": {
+    "01M7370FNT20116YKCYXXBXTGR": 2241,
+    "01M71XNDSMNNYZ7CKNFJ7Z1GY2": 166,
+    "01M736SGNH0QD884K4EP5V75FD": 143
+  },
+  "slots_top10": [
+    {
+      "slot": "qualidade.qa-s24",
+      "recusas": 680
+    },
+    {
+      "slot": "qualidade.qa-s28",
+      "recusas": 680
+    },
+    {
+      "slot": "qualidade.qa-s7",
+      "recusas": 273
+    },
+    {
+      "slot": "qualidade.qa-s124",
+      "recusas": 225
+    },
+    {
+      "slot": "qualidade.qa-s6",
+      "recusas": 111
+    },
+    {
+      "slot": "qualidade.qa-s111",
+      "recusas": 97
+    },
+    {
+      "slot": "build.dev-1-s67",
+      "recusas": 74
+    },
+    {
+      "slot": "qualidade.qa-s27",
+      "recusas": 72
+    },
+    {
+      "slot": "qualidade.revisor-s159",
+      "recusas": 46
+    },
+    {
+      "slot": "qualidade.revisor-s243",
+      "recusas": 37
+    }
+  ],
+  "intervalo_mediano_s_top3": {
+    "qualidade.qa-s24": 61,
+    "qualidade.qa-s28": 61,
+    "qualidade.qa-s7": 61
+  },
+  "exemplo_slot_topo": {
+    "slot": "qualidade.qa-s24",
+    "primeiras_12": [
+      "2026-11-16T10:58:47.978Z",
+      "2026-11-16T10:59:50.631Z",
+      "2026-11-16T11:00:50.089Z",
+      "2026-11-16T11:01:49.823Z",
+      "2026-11-16T11:02:53.139Z",
+      "2026-11-16T11:03:51.603Z",
+      "2026-11-16T11:04:52.849Z",
+      "2026-11-16T11:05:54.952Z",
+      "2026-11-16T11:06:55.452Z",
+      "2026-11-16T11:07:55.173Z",
+      "2026-11-16T11:08:55.540Z",
+      "2026-11-16T11:09:55.970Z"
+    ]
+  }
+}
