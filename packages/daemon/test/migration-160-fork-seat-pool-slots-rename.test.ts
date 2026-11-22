@@ -58,6 +58,16 @@ describe("160_fork_seat_pool_slots_rename (T-013304)", () => {
   });
   afterEach(() => db.close());
 
+  // With the upstream's 178 in ALL_MIGRATIONS (rebase on 952ec4fe1, T-018881), seat_pool_slots exists again after
+  // a full migrate: it is the upstream's own empty table, never the fork's, whose rows live in fork_seat_pool_slots.
+  function expectUpstreamSeatPoolSlots(target: Database.Database): void {
+    expect(tableExists(target, "seat_pool_slots")).toBe(true);
+    const columns = (target.prepare("PRAGMA table_info(seat_pool_slots)").all() as Array<{ name: string }>).map((c) => c.name);
+    expect(columns).toEqual(expect.arrayContaining(["slot_id", "model_node_id", "slot_number"]));
+    expect(columns).not.toContain("pool_job_id");
+    expect(target.prepare("SELECT count(*) AS n FROM seat_pool_slots").get()).toEqual({ n: 0 });
+  }
+
   it("sorts after the 159s that add the table's columns and before the upstream's 178", () => {
     const names = ALL_MIGRATIONS.map((m) => m.name).sort((a, b) => a.localeCompare(b));
     const at = names.indexOf(forkSeatPoolSlotsRenameSchema.name);
@@ -70,7 +80,7 @@ describe("160_fork_seat_pool_slots_rename (T-013304)", () => {
     const rows = slotRows(db, "seat_pool_slots");
     const seq = db.prepare("SELECT seq FROM sqlite_sequence WHERE name = 'seat_pool_slots'").get() as { seq: number };
     migrate(db, ALL_MIGRATIONS);
-    expect(tableExists(db, "seat_pool_slots")).toBe(false);
+    expectUpstreamSeatPoolSlots(db);
     expect(slotRows(db, "fork_seat_pool_slots")).toEqual(rows);
     expect(db.prepare("SELECT seq FROM sqlite_sequence WHERE name = 'fork_seat_pool_slots'").get()).toEqual(seq);
     expect(indexNames(db, "fork_seat_pool_slots")).toEqual(["idx_fork_seat_pool_slots_linked_node", "idx_fork_seat_pool_slots_pool"]);
@@ -102,7 +112,7 @@ describe("160_fork_seat_pool_slots_rename (T-013304)", () => {
     const fresh = new Database(":memory:");
     try {
       migrate(fresh, ALL_MIGRATIONS);
-      expect(tableExists(fresh, "seat_pool_slots")).toBe(false);
+      expectUpstreamSeatPoolSlots(fresh);
       const columns = (fresh.prepare("PRAGMA table_info(fork_seat_pool_slots)").all() as Array<{ name: string }>).map((c) => c.name);
       expect(columns).toEqual(expect.arrayContaining(["id", "pool_job_id", "node_id", "logical_id", "phase", "live_at", "stopped_since"]));
       expect(indexNames(fresh, "fork_seat_pool_slots")).toEqual(["idx_fork_seat_pool_slots_linked_node", "idx_fork_seat_pool_slots_pool"]);
