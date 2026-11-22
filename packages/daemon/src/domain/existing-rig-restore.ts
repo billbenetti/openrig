@@ -122,6 +122,9 @@ type AutomaticRestore = {
   snapshotId: string | null;
   launched: Map<string, string>;
   hasSession?: (sessionName: string) => Promise<boolean>;
+  /** Releases the retention hold on `snapshotId` (P04-v2 PR-B): the entry outlives the restore, and the requests that
+   *  meet it read that snapshot by id, so the auto-rehydrate retention keeps it while the entry is the rig's latest. */
+  releaseSnapshot?: () => void;
 };
 const automaticRestores = new WeakMap<object, Map<string, AutomaticRestore>>();
 
@@ -295,7 +298,11 @@ export function restoreExistingRigUnattended(
     if (!choice.ok) return { ok: false, choice };
     const run = runExistingRigRestore(deps, choice, {
       exists, automatic: true,
-      onSnapshot: (id) => { entry.snapshotId = id; },
+      onSnapshot: (id) => {
+        entry.releaseSnapshot?.();
+        entry.snapshotId = id;
+        entry.releaseSnapshot = deps.snapshotRepo.holdForRestore(id);
+      },
       onSessionLaunched: (nodeId, sessionId) => { entry.launched.set(nodeId, sessionId); },
     });
     return { ok: true, staleSnapshot: choice.staleSnapshot, ...await run };
@@ -304,8 +311,12 @@ export function restoreExistingRigUnattended(
   const db = deps.snapshotRepo.db;
   const attempts = automaticRestores.get(db) ?? new Map<string, AutomaticRestore>();
   automaticRestores.set(db, attempts);
+  attempts.get(rigId)?.releaseSnapshot?.();
   attempts.set(rigId, entry);
-  outcome.then((done) => { entry.settled = done; }, () => { attempts.delete(rigId); });
+  outcome.then((done) => { entry.settled = done; }, () => {
+    entry.releaseSnapshot?.();
+    attempts.delete(rigId);
+  });
   return outcome.then((done) => {
     if (!done.ok) return { errors: [done.choice.body.error] };
     const { result } = done;

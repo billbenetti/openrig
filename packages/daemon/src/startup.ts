@@ -3152,6 +3152,11 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
   });
   deps.periodicSnapshotScheduler = periodicSnapshotScheduler;
 
+  // P04-v2 PR-B — the auto-rehydrate backlog drains in bounded batches after the daemon listens (index.ts starts it in
+  // the serve callback); nothing is pruned here, during boot.
+  const { AutoRehydrateRetentionScheduler } = await import("./domain/auto-rehydrate-retention.js");
+  deps.autoRehydrateRetentionScheduler = new AutoRehydrateRetentionScheduler({ db, snapshotRepo });
+
   // OPR.0.4.3.21 — daemon event-loop health instrumentation. Constructed once
   // per daemon and wired into deps so `/healthz` can surface wedge evidence
   // (loop lag / last-tick age) and the expensive topology routes are timed.
