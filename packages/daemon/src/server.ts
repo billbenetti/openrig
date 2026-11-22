@@ -275,6 +275,8 @@ export interface AppDeps {
   /** Concrete local relay inbound handler (`POST /api/gateway/relay/inbound`). */
   relayInboundHandler?: import("./domain/gateway/relay-inbound.js").RelayInboundHandler;
   periodicSnapshotScheduler?: import("./domain/periodic-snapshot-scheduler.js").PeriodicSnapshotScheduler;
+  /** P04-v2 PR-B — drains old `auto-rehydrate` captures in bounded batches, started only after the daemon listens. */
+  autoRehydrateRetentionScheduler?: import("./domain/auto-rehydrate-retention.js").AutoRehydrateRetentionScheduler;
   workflowRuntime?: WorkflowRuntime;
   /**
    * Absolute path to the daemon's bundled built-in workflow-specs
