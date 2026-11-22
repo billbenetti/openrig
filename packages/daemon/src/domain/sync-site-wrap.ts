@@ -1,5 +1,5 @@
 import { PerformanceObserver, constants as perfConstants } from "node:perf_hooks";
-import { SLOW_OPERATION_THRESHOLD_MS, type SlowOperationInstrumentation } from "./slow-op-recorder.js";
+import { SLOW_OPERATION_THRESHOLD_MS, type SlowOperationInstrumentation, type StageFields } from "./slow-op-recorder.js";
 
 let recorder: SlowOperationInstrumentation | undefined;
 
@@ -81,8 +81,8 @@ export function runSyncSiteWhenSlow<T>(site: string, fn: () => T): T {
  * wrapping an `execFileSync` freezes the loop for the whole spawn, which is the
  * daemon-degradation defect this replaces.
  */
-export async function runAsyncSite<T>(site: string, fn: () => Promise<T>): Promise<T> {
-  return recorder?.runStage ? recorder.runStage(site, fn) : fn();
+export async function runAsyncSite<T>(site: string, fn: () => Promise<T>, fields?: StageFields): Promise<T> {
+  return recorder?.runStage ? recorder.runStage(site, fn, undefined, fields) : fn();
 }
 
 /**

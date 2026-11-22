@@ -12,6 +12,7 @@ import type { ContextUsage } from "./types.js";
 import { getLatestStartupFailedEvent, hasClaudeResumeIdentityWork, readPendingStartupContext } from "./startup-orchestrator.js";
 import { claudeResumeRotation, SessionRegistry } from "./session-registry.js";
 import { ObservationPass } from "./process-observation-pass.js";
+import { withProcessCaller } from "./process-caller.js";
 
 /** Default polling interval: 30 seconds. */
 export const DEFAULT_POLL_INTERVAL_MS = 30_000;
@@ -231,7 +232,8 @@ export class ContextMonitor {
   start(intervalMs: number = DEFAULT_POLL_INTERVAL_MS): void {
     if (this.timer) return; // Already running
     this.timer = setInterval(() => {
-      void this.pollOnce();
+      // T-018092: the periodic readiness poll's process reads are attributed to the reconciler in telemetry.
+      void withProcessCaller("reconciler", () => this.pollOnce());
     }, intervalMs);
     // Unref so the timer doesn't keep the process alive
     if (this.timer && typeof this.timer === "object" && "unref" in this.timer) {

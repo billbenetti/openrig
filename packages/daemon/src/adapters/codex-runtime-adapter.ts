@@ -74,6 +74,7 @@ import { listNativeProcesses, listNativeProcessesOrThrow, observeCodexPaneProces
 import { recordUnchangedSeatSkillFollowing, recordSeatSkillFollowing, recordSeatSkillWrite, seatPluginSkillsLossNote, seatProjectionComplete, seatSkillWriteRefusal, SEAT_SKILLS_BOOTSTRAP_BLOCK_ID } from "../domain/seat-skill-storage.js";
 import { codexPluginContentHash, planOwnedCodexContentApproval, recordOwnedCodexApproval } from "../domain/codex-owned-plugin-trust.js";
 import { findTomlTable, opensTomlTable, parseTomlRoot, tomlArrayTableHeaderPath, tomlDefines, tomlTableHeaderPath } from "../domain/toml-tables.js";
+import { withProcessCaller } from "../domain/process-caller.js";
 
 // Shared by all probes of ONE launch, never reset by a delayed screen or an
 // ambiguous transport result. A separately requested launch gets a new attempt.
@@ -3075,13 +3076,14 @@ async function defaultProfilePreflight(profile: string, selected?: { cwd: string
 // this default directly (every other suite injects sync stubs) and asserts the non-blocking
 // property that the pre-B12 sync implementation violated.
 export async function defaultListProcesses(): Promise<CodexProcess[]> {
-  return listNativeProcesses();
+  // T-018092: telemetry attribution; an outer entry point (a reconciler, delivery) keeps its own caller.
+  return withProcessCaller("codex_runtime", () => listNativeProcesses());
 }
 
 /** The default listing for a shared observation pass: a failed enumeration rejects, so the pass can retry each agent
  *  on its own instead of caching an empty table as a success. */
 export async function defaultListProcessesOrThrow(): Promise<CodexProcess[]> {
-  return listNativeProcessesOrThrow();
+  return withProcessCaller("codex_runtime", () => listNativeProcessesOrThrow());
 }
 
 function findCodexDescendantPids(

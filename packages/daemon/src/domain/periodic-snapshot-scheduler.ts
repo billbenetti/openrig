@@ -8,6 +8,7 @@ import type { SnapshotRepository } from "./snapshot-repository.js";
 import type { SessionRegistry } from "./session-registry.js";
 import type { ResumeMetadataRefresher } from "./resume-metadata-refresher.js";
 import type { ProcessCensus } from "./process-census.js";
+import { withProcessCaller } from "./process-caller.js";
 
 export interface PeriodicSnapshotSchedulerDeps {
   db: Database.Database;
@@ -96,10 +97,11 @@ export class PeriodicSnapshotScheduler {
             try {
               // fillNullOnly: a routine snapshot refresh fills null tokens but NEVER
               // clears a present one (rev1-r2 fix — keep stale-present for FR-6).
-              await this.deps.resumeMetadataRefresher.refresh(
+              // T-018092: telemetry attribution of the periodic refresh's process reads.
+              await withProcessCaller("reconciler", () => this.deps.resumeMetadataRefresher!.refresh(
                 sessions,
                 { fillNullOnly: true, ...(tickListProcesses ? { listProcesses: tickListProcesses } : {}) },
-              );
+              ));
             } catch { /* best-effort — the snapshot still writes below */ }
             const runningIds = new Set(this.deps.sessionRegistry.getLatestLiveSessions(rigId)
               .filter((session) => session.status === "running").map((session) => session.sessionId));

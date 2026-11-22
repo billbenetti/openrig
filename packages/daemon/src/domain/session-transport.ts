@@ -56,6 +56,7 @@ import { hashSentText, type CaptureObserverSink, type CaptureSlot, type Observat
 import { isAttentionRequiredReadinessCode, type NodeBinding, type ReadinessOptions, type ReadinessResult } from "./runtime-adapter.js";
 import { getLatestStartupFailedEvent, hasClaudeResumeIdentityWork, isRecoverableStartupFailure } from "./startup-orchestrator.js";
 import { resolveSeatKind, seatInboundTransport } from "./seat-kinds.js";
+import { withProcessCaller } from "./process-caller.js";
 
 // OPR.0.4.1.10 — send-readiness freshness. The runtime-hook store keeps a 5min freshness for activity
 // DISPLAY, but "safe to send NOW" needs a tight window: a stale "idle" read must not authorize a send
@@ -4235,7 +4236,8 @@ export class SessionTransport {
         // process identity that can be compared safely.
         panePid = await this.tmuxAdapter.getPanePid(pane);
       }
-      const observation = await observeClaudeDelivery({ target: pane, tmux: this.tmuxAdapter, listProcesses: this.listProcesses, expectedToken: resumeToken, rotation });
+      // T-018092: telemetry attribution of the delivery observation's process reads.
+      const observation = await withProcessCaller("claude_delivery", () => observeClaudeDelivery({ target: pane, tmux: this.tmuxAdapter, listProcesses: this.listProcesses, expectedToken: resumeToken, rotation }));
       // Refusal already has positive evidence; a later failed read cannot erase it.
       if (observation.state === "conflict" || observation.state === "idle_shell") return observation;
       const after = await this.tmuxAdapter.listPanes(sessionName);
@@ -4261,8 +4263,8 @@ export class SessionTransport {
       // Reuse stable, foreground, pane-descendant Codex proof. A resumed process
       // must name this session's token. Stale UI, a Node
       // launcher alone, missing observations or a native process elsewhere cannot clear it.
-      const native = await verifyCodexPaneProcess({ target: readTarget, tmux: this.tmuxAdapter,
-        listProcesses: this.listProcesses, expectedToken: resumeToken });
+      const native = await withProcessCaller("codex_runtime", () => verifyCodexPaneProcess({ target: readTarget, tmux: this.tmuxAdapter,
+        listProcesses: this.listProcesses, expectedToken: resumeToken }));
       if (native && await this.tmuxAdapter.getPanePid(pane).catch(() => null) === native.panePid) return null;
     }
     return paneCommand.replace(/^-/, "");
