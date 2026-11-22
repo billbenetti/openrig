@@ -138,7 +138,7 @@ describe("SlowOpRecorder locked instrumentation contract", () => {
 
   it("adds a stage's caller to its record without changing the site or the other fields", async () => {
     const mod = await loadRecorderModule();
-    if (!mod) return;
+    if (!mod) throw new Error("recorder module missing");
     const logPath = path.join(tempDir(), "slow-operations.jsonl");
     const recorder = new mod.SlowOpRecorder({ logPath });
     try {
