@@ -403,4 +403,29 @@ describe("SnapshotCapture", () => {
     const events = db.prepare("SELECT * FROM events").all();
     expect(events).toHaveLength(0);
   });
+
+  it("an auto-rehydrate capture keeps the rig's older copy with a resume token, until a capture resolves with one itself", () => {
+    const rig = rigRepo.createRig("r-usable");
+    const node = rigRepo.addNode(rig.id, "worker", { role: "worker", runtime: "claude-code" });
+    const session = sessionRegistry.registerSession(node.id, "worker@r-usable");
+    sessionRegistry.updateStatus(session.id, "running");
+    const base = capture.captureSnapshot(rig.id, "manual");
+    const tokenless = (db.prepare("SELECT data FROM snapshots WHERE id = ?").get(base.id) as { data: string }).data;
+    const withToken = JSON.parse(tokenless);
+    for (const row of withToken.sessions) { row.resumeType = "claude_id"; row.resumeToken = "tok-old"; }
+    const stamp = (hours: number) => new Date(Date.now() - hours * 3_600_000).toISOString().replace("T", " ").slice(0, 19);
+    const insert = db.prepare("INSERT INTO snapshots (id, rig_id, kind, data, created_at) VALUES (?, ?, 'auto-rehydrate', ?, ?)");
+    insert.run("valid-old", rig.id, JSON.stringify(withToken), stamp(100));
+    for (let i = 0; i < 30; i++) insert.run(`tokenless-${i}`, rig.id, tokenless, stamp(30 + i));
+    const left = () => (db.prepare("SELECT id FROM snapshots WHERE rig_id = ? AND (id = 'valid-old' OR id LIKE 'tokenless-%')").all(rig.id) as Array<{ id: string }>).map((row) => row.id);
+
+    capture.captureSnapshot(rig.id, "auto-rehydrate");
+    expect(left()).toContain("valid-old");
+    expect(left()).toHaveLength(6);
+
+    db.prepare("UPDATE sessions SET resume_type = 'claude_id', resume_token = 'tok-live' WHERE id = ?").run(session.id);
+    capture.captureSnapshot(rig.id, "auto-rehydrate");
+    expect(left()).not.toContain("valid-old");
+    expect(left()).toHaveLength(5);
+  });
 });
