@@ -10,7 +10,11 @@ export const psRoutes = new Hono();
 // Separate opt-in payload: the ordinary /api/ps bare-array contract is unchanged.
 psRoutes.get("/resources", (c) => {
   const psService = c.get("psProjectionService" as never) as PsProjectionService;
-  return projectionLane.run(() => {
+  return projectionLane.run(async () => {
+    // T-010231: the seats' database read runs on the read worker (off the event loop); the rest is in-memory. Same sum
+    // as the upstream's countRunningSeats (#3636, pinned equal in ps-projection.test.ts), without the inventory fold on
+    // the loop: on this setup nearly every rig has a running seat, so skipping idle rigs saves almost nothing.
+    const entries = await psService.getEntriesOffLoop({ includeArchived: true, archivedOnly: false });
     const cpuCount = availableParallelism();
     const load = platform() === "win32" ? null : loadavg();
     return c.json({
@@ -21,7 +25,7 @@ psRoutes.get("/resources", (c) => {
       memory: { totalBytes: totalmem(), freeBytes: freemem() },
       // Forced archival can hide a rig without stopping its seats. Host load
       // measurements must count those running processes as well.
-      runningSeats: psService.countRunningSeats(),
+      runningSeats: entries.reduce((n, entry) => n + entry.runningCount, 0),
       capture: getTranscriptCaptureStats(),
     });
   });
