@@ -26,6 +26,8 @@ import {
   seatPoolContextLimit,
   seatPoolContextOver,
   seatPoolContextDrainable,
+  seatPoolReleaseRefusalBaseSeconds,
+  SEAT_POOL_RELEASE_REFUSAL_MAX_SECONDS,
   seatPoolHeldByContext,
   type SeatPoolContextReading,
   seatPoolReceives,
@@ -751,6 +753,9 @@ export interface SeatPoolCommandResult {
   exitCode: number | null;
   stdout: string;
   error?: string;
+  /** A failed command's stderr, apart from `error` (runSeatPoolCommand, T-018178): execFile's `Command failed: <argv>`
+   *  can span lines (an argv with a newline), so the log reads the cause from here. Absent: only `error` is known. */
+  stderr?: string;
 }
 
 /** The daemon operations a run uses, injected so the executor holds no service of its own. */
@@ -923,7 +928,7 @@ export function runSeatPoolCommand(command: SeatPoolCommand, env: Record<string,
     execFile(file!, args, {
       env: { ...process.env, ...env }, signal, timeout: command.timeoutSeconds * 1000, killSignal: "SIGKILL",
       maxBuffer: 1024 * 1024, encoding: "utf8",
-    }, (error, stdout) => {
+    }, (error, stdout, stderr) => {
       if (!error) return resolve({ exitCode: 0, stdout });
       const failure = error as NodeJS.ErrnoException & { code?: number | string; killed?: boolean; signal?: string };
       const timedOut = failure.killed === true && failure.signal === "SIGKILL" && !signal.aborted;
@@ -931,6 +936,7 @@ export function runSeatPoolCommand(command: SeatPoolCommand, env: Record<string,
         exitCode: typeof failure.code === "number" ? failure.code : null,
         stdout: stdout ?? "",
         error: timedOut ? `timed out after ${command.timeoutSeconds}s` : failure.message,
+        stderr: stderr ?? "",
       });
     });
   });
@@ -1002,8 +1008,9 @@ interface DrainOutcome {
   /** The history entry's reason; null writes none. */
   reason: string | null;
   notes?: Record<string, unknown>;
-  /** A reap the release command refused: its result. */
-  refused?: { exitCode: number | null; error: string | null };
+  /** A reap the release command refused: its result; or, inside the hold the reap's own refusal set (T-018178), when
+   *  that hold ends (the command was not asked). */
+  refused?: { exitCode: number | null; error: string | null } | { heldUntil: string };
   /** The seat's node was removed: the seat is forgotten next (forget). */
   removed?: true;
 }
@@ -1083,10 +1090,9 @@ const releaseUnanswered = (result: SeatPoolCommandResult) => result.exitCode ===
 export const SEAT_POOL_RELAUNCH_BACKOFF_FIRST_MS = 60_000;
 export const SEAT_POOL_RELAUNCH_BACKOFF_MAX_MS = 30 * 60_000;
 /** T-018090 (the head-of-line block): a seat whose release command refused it is held out of the drain order for
- *  300 s, doubled by each refusal in a row of the same occupant, at most 30 min; a full seat (the context drain,
- *  T-017384), whose context only grows, for a minute only. */
-export const SEAT_POOL_RELEASE_REFUSAL_FIRST_MS = 300_000;
-export const SEAT_POOL_RELEASE_REFUSAL_MAX_MS = 30 * 60_000;
+ *  `release_refused_backoff_s` (default 300 s, T-018178), doubled by each refusal in a row of the same occupant, at most
+ *  30 min (SEAT_POOL_RELEASE_REFUSAL_MAX_SECONDS); a full seat (the context drain, T-017384), whose context only grows,
+ *  for a minute only. */
 export const SEAT_POOL_RELEASE_REFUSAL_CONTEXT_MS = 60_000;
 /** A refusal of the release command as releaseRefusedLog is told it: where it was asked (`reason`, the variable the
  *  command got), its exit code and the first line of its error (control characters out, secrets redacted, at most
@@ -1102,16 +1108,31 @@ export interface SeatPoolReleaseRefusal {
   streak: number;
   nextEligibleAt: string;
 }
-/** The refusals in a row of one occupant of a seat (`sessionId`, its latest session) and when the hold ends. */
-interface ReleaseRefusalBackoff { sessionId: string | null; streak: number; untilMs: number }
-/** The first line of a command's error, fit for a log line (SeatPoolReleaseRefusal.error). A failed command's error is
- *  execFile's message, `Command failed: <argv>` and then the command's stderr: the first line of the stderr is the
- *  cause, so the `Command failed:` line counts only when nothing follows it. */
-const errorLine = (error: string | undefined): string | null => {
-  const lines = (error ?? "").split(/\r?\n/).filter((l) => l.trim() !== "");
-  const line = (lines[0]?.startsWith("Command failed:") && lines.length > 1 ? lines[1] : lines[0])
-    ?.replace(/[\u0000-\u001f\u007f]/g, " ").trim() ?? "";
+/** The refusals in a row of one occupant of a seat (`sessionId`, its latest session) and when the hold ends; with where
+ *  the latest was asked (the reap honours only its own, T-018178), the seat's session and the ids of the rows it held
+ *  then (not new work: they keep the hold). */
+interface ReleaseRefusalBackoff {
+  sessionId: string | null; streak: number; untilMs: number; reason: SeatPoolReleaseReason; sessionName: string; rows: string[];
+}
+/** What the log line says of a failed command with an empty stderr: never its `Command failed: <argv>` (T-018178). */
+export const SEAT_POOL_RELEASE_REFUSAL_NO_STDERR = "command failed (no stderr)";
+/** A text's first non-blank line fit for a log line: control characters out, secrets redacted, at most 200 characters. */
+const logLine = (text: string): string | null => {
+  const line = text.split(/\r?\n/).map((l) => l.replace(/[\u0000-\u001f\u007f]/g, " ").trim()).find((l) => l !== "") ?? "";
   return line === "" ? null : redactTranscriptContent(line).slice(0, 200);
+};
+/** The cause of a refusal, fit for a log line (SeatPoolReleaseRefusal.error). A failed command's error is execFile's
+ *  message, `Command failed: <argv>` and then the command's stderr, and an argv may span lines; so the cause is the
+ *  first line of the stderr apart (SeatPoolCommandResult.stderr), a fixed text when it is empty, and the error itself
+ *  only when it is not execFile's message (a timeout). An effect that gives no stderr apart: the line after
+ *  `Command failed:`, or the fixed text when there is none. The argv never reaches the log (T-018178). */
+const errorLine = (result: SeatPoolCommandResult): string | null => {
+  const error = result.error ?? "";
+  const execFailed = error.startsWith("Command failed:");
+  if (error.trim() !== "" && !execFailed) return logLine(error);
+  if (result.stderr !== undefined) return logLine(result.stderr) ?? SEAT_POOL_RELEASE_REFUSAL_NO_STDERR;
+  const lines = error.split(/\r?\n/).filter((l) => l.replace(/[\u0000-\u001f\u007f]/g, " ").trim() !== "");
+  return lines.length > 1 ? logLine(lines[1]!) : execFailed ? SEAT_POOL_RELEASE_REFUSAL_NO_STDERR : null;
 };
 /** A seat whose relaunch failed: how many in a row, when it may be tried again, whether the hold was recorded, and
  *  whether the latest try launched it (its next stop then counts as a failure). */
@@ -1132,8 +1153,9 @@ export class SeatPoolExecutor {
   private readonly relaunchBackoff = new Map<string, RelaunchBackoff>();
   /**
    * T-018090: the release command's refusals, by `<job>|<slot>`, in memory (a restart forgets them, and each seat is
-   * asked once more). An open row on the seat, another occupant, its relaunch by the pool and its retirement forget the
-   * seat's entry (releaseRefusedUntilMs, relaunch, pruneReleaseRefusals).
+   * asked once more). A new row on the seat (one it did not hold at the refusal), another occupant, its relaunch by the
+   * pool, its retirement, a row the pool moves to it and a release command that agrees forget the seat's entry
+   * (releaseRefusedUntilMs, relaunch, pruneReleaseRefusals, dispatch, forgetReleaseRefusal; T-018178).
    */
   private readonly releaseRefusalBackoff = new Map<string, ReleaseRefusalBackoff>();
   /** The `return_long_gates.to` said refused, by job (longGateTarget): said once while the queue refuses it. */
@@ -1543,9 +1565,10 @@ export class SeatPoolExecutor {
         // Its work may not be saved: the seat keeps running, and its rows stay with it, held out of the drain order for
         // a while once the drain is turned off (T-018090).
         if (released.exitCode !== 0) {
-          this.releaseRefused(jobId, slot, sessionName, "drain-deadline", seatPoolContextDrainable(inLease.spec, view, this.now().getTime()), released);
+          this.releaseRefused(jobId, inLease.spec, slot, sessionName, "drain-deadline", seatPoolContextDrainable(inLease.spec, view, this.now().getTime()), released, [...rowsBefore.keys()]);
           return leftAs("release_refused");
         }
+        this.forgetReleaseRefusal(jobId, slot.slotId);
         // The drain may have been turned off while the command ran: read it again, as the drain of a free seat does.
         const afterRelease = this.fresh(jobId, run);
         if (!afterRelease) return { stop: true, moved: [] };
@@ -1811,6 +1834,8 @@ export class SeatPoolExecutor {
       if (tookWork(inLease)) return returned();
       const expected = this.deps.effects.stopPrecondition(nodeId);
       if (inLease.spec.releaseCmd) {
+        // T-018178: the rows as the command is asked (none, for a free seat): one that arrives while it runs is new work.
+        const rowsAsked = this.deps.effects.openRows(sessionName).map((row) => row.qitemId);
         this.setIntent(slotId, "release");
         const released = await this.deps.effects.runCommand(inLease.spec.releaseCmd, this.releaseEnv(inLease, sessionName, "idle"), run.controller.signal);
         if (run.controller.signal.aborted) return { stop: true, reason: null };
@@ -1818,9 +1843,10 @@ export class SeatPoolExecutor {
           this.setIntent(slotId, null, "live");
           // T-018090: held out of the drain order, so the next plan drains the next seat down; a full seat (as the plan
           // read it, before the drain) for a minute only.
-          this.releaseRefused(jobId, slot, sessionName, "idle", seatPoolContextDrainable(inLease.spec, view, this.now().getTime()), released);
+          this.releaseRefused(jobId, inLease.spec, slot, sessionName, "idle", seatPoolContextDrainable(inLease.spec, view, this.now().getTime()), released, rowsAsked);
           return { stop: false, reason: "seat_pool_returned", notes: { why: "release_refused", exitCode: released.exitCode, error: released.error ?? null } };
         }
+        this.forgetReleaseRefusal(jobId, slotId);
         // The lease holds deliveries back, not queue writes: a row may have arrived while the command ran.
         const afterRelease = this.fresh(jobId, run);
         if (!afterRelease) return { stop: true, reason: null };
@@ -1947,15 +1973,21 @@ export class SeatPoolExecutor {
       };
 
       if (!released && inLease.spec.releaseCmd) {
+        // T-018178: inside the hold its own refusal set, the reap asks the release command nothing (the same occupant
+        // would refuse again) and goes straight to what a refusal leads to, the relaunch; no new refusal is counted.
+        const held = this.reapHeldUntilMs(jobId, slot);
+        if (held !== null) return { stop: false, reason: null, refused: { heldUntil: new Date(held).toISOString() } };
+        const rowsAsked = this.deps.effects.openRows(sessionName).map((row) => row.qitemId);
         this.setIntent(slotId, "release");
         const release = await this.deps.effects.runCommand(inLease.spec.releaseCmd, this.releaseEnv(inLease, sessionName, "reap"), run.controller.signal);
         if (run.controller.signal.aborted) return { stop: true, reason: null };
         if (release.exitCode !== 0) {
           this.setIntent(slotId, null);
           // T-018090: recorded for the occupant that refused; its relaunch below (another occupant) forgets it.
-          this.releaseRefused(jobId, slot, sessionName, "reap", false, release);
+          this.releaseRefused(jobId, inLease.spec, slot, sessionName, "reap", false, release, rowsAsked);
           return { stop: false, reason: null, refused: { exitCode: release.exitCode, error: release.error ?? null } };
         }
+        this.forgetReleaseRefusal(jobId, slotId);
       }
       this.setIntent(slotId, "reap");
       // T-007545 (B1 of its review): when it stopped running, before the clean writes its sessions exited now (a seat
@@ -2185,7 +2217,11 @@ export class SeatPoolExecutor {
         ? { parkedRows: slot.parkedRows!.length, parkedQitemIds: slot.parkedRows!.map((p) => p.qitemId) } : {}),
     };
     const moved = this.deps.effects.moveRow({ ...base, reason: seatPoolMoveReason(jobId, intent.from, slot.sessionName, park ? park.blockedOn : null) });
-    if (moved.ok) this.record(jobId, false, "seat_pool_dispatched", notes);
+    if (moved.ok) {
+      // T-018178: work for the seat, so it is asked afresh once that work is done (the row may close before any read).
+      this.forgetReleaseRefusal(jobId, intent.slotId);
+      this.record(jobId, false, "seat_pool_dispatched", notes);
+    }
     else if (ROW_MOVED_ON.has(moved.code)) this.record(jobId, false, "seat_pool_dispatch_skipped", { ...notes, code: moved.code });
     else this.record(jobId, true, "seat_pool_dispatch_failed", { ...notes, code: moved.code, error: moved.error });
     return true;
@@ -2266,8 +2302,8 @@ export class SeatPoolExecutor {
    * most 30 min, or for a minute when it is a full seat (`contextDrain`). Another occupant starts the count over.
    */
   private releaseRefused(
-    jobId: string, slot: SeatPoolSlot, sessionName: string, reason: SeatPoolReleaseReason, contextDrain: boolean,
-    result: SeatPoolCommandResult,
+    jobId: string, spec: SeatPoolSpec, slot: SeatPoolSlot, sessionName: string, reason: SeatPoolReleaseReason, contextDrain: boolean,
+    result: SeatPoolCommandResult, rowsAsked: string[],
   ): void {
     if (!slot.nodeId) return;
     const key = `${jobId}|${slot.slotId}`;
@@ -2275,19 +2311,22 @@ export class SeatPoolExecutor {
     const before = this.releaseRefusalBackoff.get(key);
     const streak = (before && before.sessionId === sessionId ? before.streak : 0) + 1;
     const holdMs = contextDrain ? SEAT_POOL_RELEASE_REFUSAL_CONTEXT_MS
-      : Math.min(SEAT_POOL_RELEASE_REFUSAL_MAX_MS, SEAT_POOL_RELEASE_REFUSAL_FIRST_MS * 2 ** Math.min(streak - 1, 16));
+      : Math.min(SEAT_POOL_RELEASE_REFUSAL_MAX_SECONDS, seatPoolReleaseRefusalBaseSeconds(spec) * 2 ** Math.min(streak - 1, 16)) * 1000;
     const untilMs = this.now().getTime() + holdMs;
-    this.releaseRefusalBackoff.set(key, { sessionId, streak, untilMs });
+    // The rows the seat held as the command was asked (the forced pass and the reap ask a seat with rows): not new work.
+    // A row that arrived while the command ran is.
+    this.releaseRefusalBackoff.set(key, { sessionId, streak, untilMs, reason, sessionName, rows: rowsAsked });
     this.deps.releaseRefusedLog?.(jobId, {
-      slot: slot.logicalId, sessionName, sessionId, reason, contextDrain, exitCode: result.exitCode, error: errorLine(result.error),
+      slot: slot.logicalId, sessionName, sessionId, reason, contextDrain, exitCode: result.exitCode, error: errorLine(result),
       streak, nextEligibleAt: new Date(untilMs).toISOString(),
     });
   }
 
   /**
-   * T-018090: until when the seat's refused release holds it out of the drain order, or null. An open row on the seat
-   * (work for it), another occupant (a relaunch, or a launch by hand outside the pool) and its retirement forget it.
-   * A hold that is over is still returned (the plan reads it as past), so the next refusal of the same occupant doubles.
+   * T-018090: until when the seat's refused release holds it out of the drain order, or null. A new open row on the seat
+   * (work for it: one it did not hold when it refused, T-018178), another occupant (a relaunch, or a launch by hand
+   * outside the pool) and its retirement forget it. A hold that is over is still returned (the plan reads it as past),
+   * so the next refusal of the same occupant doubles.
    */
   releaseRefusedUntilMs(jobId: string, slot: { slotId: number; nodeId: string | null; openRows: number }): number | null {
     const key = `${jobId}|${slot.slotId}`;
@@ -2295,11 +2334,25 @@ export class SeatPoolExecutor {
     if (!entry) return null;
     const record = this.deps.slots.get(slot.slotId);
     const sessionId = slot.nodeId ? this.deps.effects.stopPrecondition(slot.nodeId).sessionId ?? null : null;
-    if (slot.openRows > 0 || !record || record.retiredAt || !slot.nodeId || sessionId !== entry.sessionId) {
+    const newWork = slot.openRows > 0
+      && this.deps.effects.openRows(entry.sessionName).some((row) => !entry.rows.includes(row.qitemId));
+    if (newWork || !record || record.retiredAt || !slot.nodeId || sessionId !== entry.sessionId) {
       this.releaseRefusalBackoff.delete(key);
       return null;
     }
     return entry.untilMs;
+  }
+
+  /** T-018178: the end of the hold a refusal of the reap set for the seat's current occupant, while it lasts; else null. */
+  private reapHeldUntilMs(jobId: string, slot: SeatPoolSlot): number | null {
+    const entry = this.releaseRefusalBackoff.get(`${jobId}|${slot.slotId}`);
+    if (!entry || entry.reason !== "reap" || !slot.nodeId || entry.untilMs <= this.now().getTime()) return null;
+    return this.deps.effects.stopPrecondition(slot.nodeId).sessionId === entry.sessionId ? entry.untilMs : null;
+  }
+
+  /** T-018178: a release command that agreed, or a row the pool moved to the seat: its refusals are over. */
+  private forgetReleaseRefusal(jobId: string, slotId: number): void {
+    this.releaseRefusalBackoff.delete(`${jobId}|${slotId}`);
   }
 
   /** T-018090: drops the refusals of the job's seats that are retired or gone, which no plan reads again. */
