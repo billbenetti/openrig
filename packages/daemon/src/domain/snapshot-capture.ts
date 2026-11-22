@@ -222,6 +222,13 @@ export class SnapshotCapture {
     if (opts?.deferNotify) opts.deferNotify(persistedEvent);
     else this.eventBus.notifySubscribers(persistedEvent);
 
+    // 7. Retention of auto-rehydrate captures, the same for every capture origin: one bounded batch of this rig's
+    // old captures (the backlog drains in AutoRehydrateRetentionScheduler, after boot). It never fails the capture.
+    if (kind === "auto-rehydrate") {
+      try { this.snapshotRepo.pruneAutoRehydrate(rigId); }
+      catch (error) { console.warn(`Snapshot retention: auto-rehydrate prune failed for ${rigId}: ${String(error)}`); }
+    }
+
     return snapshot;
   }
 
