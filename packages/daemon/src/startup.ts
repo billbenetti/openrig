@@ -2634,6 +2634,8 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
         const usage = contextUsageStore.readSidecarForNode(nodeId, sessionName);
         return usage.availability === "known" ? { usedPercentage: usage.usedPercentage, sampledAt: usage.sampledAt } : null;
       },
+      // T-018090 (the head-of-line block): a seat whose release command refused it lately is out of the drain order.
+      releaseRefusedUntilMs: (jobId, slot) => seatPoolExecutor.releaseRefusedUntilMs(jobId, slot),
     }, job);
     // A seat's bound pane (`%12`), or null.
     const poolPaneId = (sessionName: string): string | null => (db.prepare(
@@ -2710,6 +2712,9 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
       usageLimited: usageLimitedSessions,
       // The busy seats read again just before a parked row moves and before the demand command (T-006090).
       busySessions: async (job) => (await busyPoolSessions(job)) ?? new Map(),
+      // T-018090 (the spec's 1.2.6): each refusal of the release command, its cause and the backoff it starts, one
+      // structured line in the daemon's log (the history entries stay as they were).
+      releaseRefusedLog: (jobId, event) => console.warn(`[seat-pool] release_refused job=${jobId} ${JSON.stringify(event)}`),
       record: (jobId, entry) => {
         watchdogHistoryLogInstance.record({
           jobId, evaluatedAt: new Date().toISOString(), outcome: entry.failed ? "failed" : "skipped",

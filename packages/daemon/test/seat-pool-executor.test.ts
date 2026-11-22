@@ -479,6 +479,39 @@ describe("seat-pool executor", () => {
     ]);
   });
 
+  // T-018090 (the spec's 1.2.6): the backoff is the mitigation, not the cause, so each refusal tells the daemon's log why.
+  it("tells releaseRefusedLog each refusal of the release command: its cause, the refusals in a row and when the seat may go", async () => {
+    jobSpec = spec({ release_cmd: { argv: ["release"] } });
+    const told: Array<Record<string, unknown>> = [];
+    const effects = world.effects();
+    const executor: SeatPoolExecutor = new SeatPoolExecutor({
+      slots,
+      readJob: () => ({ active, targetSession: MODEL.sessionName, spec: jobSpec }),
+      readState: () => world.state(slots, executor, jobSpec),
+      effects: {
+        ...effects,
+        runCommand: async (command, env, signal) => command.argv[0] === "release"
+          // execFile's message for a failed command: the argv, then the command's stderr.
+          ? { exitCode: 1, stdout: "", error: `Command failed: release --pool build-dev\n\n  refused: ghp_${"a".repeat(36)} holds\u0007it\nsecond line` }
+          : effects.runCommand(command, env, signal),
+      },
+      record: (_jobId, entry) => { history.push(entry); },
+      releaseRefusedLog: (jobId, event) => { told.push({ jobId, ...event }); },
+      now: () => new Date(T0),
+    });
+    await run(executor, [{ kind: "add", count: 1 }]);
+    const [seat] = slots.listOpen(JOB);
+    await run(executor, [drainOf(seat!.slotId)]);
+    await run(executor, [drainOf(seat!.slotId)]);
+    const sessionId = world.nodes.get(seat!.nodeId!)!.sessionId;
+    expect(told).toEqual([1, 2].map((streak) => ({
+      jobId: JOB, slot: "dev.impl-s1", sessionName: "dev-impl-s1@r", sessionId, reason: "idle", contextDrain: false, exitCode: 1,
+      error: "refused: [REDACTED] holds it", streak, nextEligibleAt: new Date(T0 + streak * 300_000).toISOString(),
+    })));
+    // The history keeps the entry it had (the first line of the error is the log's, not the history's to change).
+    expect(history.at(-1)).toMatchObject({ reason: "seat_pool_returned", notes: { why: "release_refused", exitCode: 1 } });
+  });
+
   // T-004870 F3, r1 rule 2: the drain's clock is the job's history. Once the retention prunes a drain's entries, the
   // drain is over for the executor too (as for the job's stop): the next run starts a new one, from what it recorded
   // in memory neither.
