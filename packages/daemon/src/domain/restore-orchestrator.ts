@@ -423,6 +423,17 @@ export class RestoreOrchestrator {
     /** Told each session this restore launches, as soon as its row is committed. */
     onSessionLaunched?: (nodeId: string, sessionId: string) => void;
   }): Promise<RestoreOutcome> {
+    // The snapshot this attempt names is held from its first read until the attempt returns: the auto-rehydrate
+    // retention never deletes it meanwhile (P04-v2 PR-B).
+    const release = this.snapshotRepo.holdForRestore(snapshotId);
+    try {
+      return await this.restoreHeld(snapshotId, opts);
+    } finally {
+      release();
+    }
+  }
+
+  private async restoreHeld(snapshotId: string, opts?: Parameters<RestoreOrchestrator["restore"]>[1]): Promise<RestoreOutcome> {
     // 1. Load snapshot
     const snapshot = this.snapshotRepo.getSnapshot(snapshotId);
     if (!snapshot) {
@@ -753,12 +764,25 @@ export class RestoreOrchestrator {
     namedAgent?: boolean;
     nonTargetMode: "unchanged" | "detach_and_hold";
   }): Promise<NarrowLaunchResult> {
+    // A launch holds the snapshot it names from the first read, and the one it selected, until it returns, as a
+    // restore does: the auto-rehydrate retention never deletes them meanwhile (P04-v2 PR-B).
+    const releases = opts.snapshotId ? [this.snapshotRepo.holdForRestore(opts.snapshotId)] : [];
+    try {
+      return await this.launchNodeTargetsHeld(rigId, logicalIds, opts, releases);
+    } finally {
+      for (const release of releases) release();
+    }
+  }
+
+  private async launchNodeTargetsHeld(rigId: string, logicalIds: string[],
+    opts: Parameters<RestoreOrchestrator["launchNodeTargets"]>[2], releases: Array<() => void>): Promise<NarrowLaunchResult> {
     const rig = this.rigRepo.getRig(rigId);
     if (!rig) return { ok: false, code: "rig_not_found", message: `Rig ${rigId} not found` };
 
     const selected = this.snapshotRepo.selectRestoreUsable(rigId, opts.snapshotId);
     if (!selected.ok) return selected;
     const { snapshot, selection: snapshotSelection } = selected;
+    if (snapshot.id !== opts.snapshotId) releases.push(this.snapshotRepo.holdForRestore(snapshot.id));
     const resumePeriodicCarry = opts.namedAgent === true && snapshot.kind === "auto-periodic"
       && snapshotSelection.mode === "automatic";
     if (opts.selectedHistory && (opts.snapshotId !== snapshot.id || !opts.selectedHistory.beforeEffect())) {

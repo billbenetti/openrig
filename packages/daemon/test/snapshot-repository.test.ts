@@ -498,3 +498,37 @@ describe("snapshot pruning above SQLite's parameter limit", () => {
     } finally { db.close(); }
   });
 });
+
+describe("SnapshotRepository.pruneAutoRehydrate: the newest resume-usable copy", () => {
+  const HOUR = 3_600_000;
+  const stamp = (ms: number) => new Date(ms).toISOString().replace("T", " ").slice(0, 19);
+  const body = (token: string | null) => JSON.stringify({
+    rig: { id: "rig-r", name: "rig-r", createdAt: "2026-11-01 00:00:00", updatedAt: "2026-11-01 00:00:00" },
+    nodes: [{ id: "n1", rigId: "rig-r", logicalId: "dev.impl" }], edges: [],
+    sessions: [{ id: "s1", nodeId: "n1", sessionName: "dev-impl@rig-r", status: "running", resumeType: token ? "claude_id" : null,
+      resumeToken: token, restorePolicy: "resume_if_possible", lastSeenAt: null, createdAt: "2026-11-01 00:00:00", origin: "launched" }],
+    activeSessionIdByNode: { n1: "s1" }, checkpoints: {},
+  });
+
+  it("an old copy held back as the newest usable one is let go once a newer usable copy arrives", () => {
+    const db = setupDb();
+    try {
+      const repo = new SnapshotRepository(db);
+      const now = Date.now();
+      const insert = (id: string, ageH: number, token: string | null) =>
+        db.prepare("INSERT INTO snapshots (id, rig_id, kind, data, created_at) VALUES (?, 'rig-r', 'auto-rehydrate', ?, ?)")
+          .run(id, body(token), stamp(now - ageH * HOUR));
+      insert("usable-old", 100, "tok-old");
+      insert("tokenless-40h", 40, null);
+      insert("tokenless-30h", 30, null);
+      insert("recent", 1, null);
+      expect(repo.pruneAutoRehydrate("rig-r", { keep: 1 })).toBe(1);
+      expect(repo.getSnapshot("usable-old")).not.toBeNull();
+      expect(repo.pruneAutoRehydrate("rig-r", { keep: 1 })).toBe(0);
+      insert("usable-new", 0.5, "tok-new");
+      expect(repo.pruneAutoRehydrate("rig-r", { keep: 1 })).toBe(1);
+      expect(repo.getSnapshot("usable-old")).toBeNull();
+      expect(repo.getSnapshot("usable-new")).not.toBeNull();
+    } finally { db.close(); }
+  });
+});
