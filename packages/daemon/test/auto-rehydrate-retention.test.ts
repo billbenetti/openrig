@@ -80,3 +80,31 @@ describe("auto-rehydrate drain: a rig with nothing to delete", () => {
     } finally { db.close(); }
   });
 });
+
+describe("auto-rehydrate drain: stop", () => {
+  it("stops the tick in flight before its next rig, and resolves only after that tick returns", async () => {
+    const db = createFullTestDb();
+    try {
+      const repo = new SnapshotRepository(db);
+      const now = Date.now();
+      for (const rig of ["rig-1", "rig-2"]) {
+        for (let i = 0; i < 6; i++) {
+          db.prepare("INSERT INTO snapshots (id, rig_id, kind, data, created_at) VALUES (?, ?, 'auto-rehydrate', '{}', ?)")
+            .run(`${rig}-old-${i}`, rig, sqliteUtc(now - (30 + i) * HOUR));
+        }
+      }
+      const count = (rig: string) => (db.prepare("SELECT COUNT(*) AS n FROM snapshots WHERE rig_id = ?").get(rig) as { n: number }).n;
+      const drain = new AutoRehydrateRetentionScheduler({ db, snapshotRepo: repo, keep: 1, batchSize: 50 });
+      let tickReturned = false;
+      const tick = drain.tick().then((n) => { tickReturned = true; return n; });
+      // The first rig's batch ran synchronously; the tick now waits to yield before the second rig.
+      expect(count("rig-1")).toBe(1);
+      await drain.stop();
+      expect(tickReturned).toBe(true);
+      expect(await tick).toBe(5);
+      expect(count("rig-2")).toBe(6);
+      expect(await drain.tick()).toBe(0);
+      expect(count("rig-2")).toBe(6);
+    } finally { db.close(); }
+  });
+});

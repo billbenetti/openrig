@@ -413,7 +413,9 @@ async function applySelectedHistory(c: Context, original = false) {
   if (!refs) return c.json({ ok: false, code: "invalid_request", message: "Apply requires action resume, snapshotId, historySessionId and the selected review revision." }, 400);
   const rigId = c.req.param("rigId")!, nodeId = c.req.param("nodeId")!;
   if (original) refs.retained = true;
-  return exclusive(c, nodeId, async () => {
+  // The selected snapshot stays held against retention for the whole exclusive apply, from the operation's reservation
+  // to the response: the launch holds it only while it runs, and the result re-reads it by id after the launch.
+  return exclusive(c, nodeId, () => holdingSnapshot(c, refs.snapshotId, async () => {
     let identityIssue: { code: string; detail: string } | null = null;
     const partial = (code: string, message: string) => c.json({ ok: false, partial: true, code, message,
       ...(identityIssue ? { identityEvidence: identityIssue } : {}),
@@ -586,8 +588,13 @@ async function applySelectedHistory(c: Context, original = false) {
       ...(attempted ? { runtimeHome: { attempted, sessionRegistered: !!outcome?.resultSessionId,
         ...(appliedHome ? { putBack: putBack ? { home: putBack.home, revision: putBack.revision } : null, ...(notPutBack ? { notPutBack } : {}) } : {}) } } : {}) };
     return c.json(response, ok ? 200 : 409);
-  });
+  }));
  }
+
+async function holdingSnapshot<T>(c: Context, snapshotId: string, run: () => Promise<T>): Promise<T> {
+  const release = dep<SnapshotRepository>(c, "snapshotRepo").holdForRestore(snapshotId);
+  try { return await run(); } finally { release(); }
+}
 startupRoutes.post("/:rigId/nodes/:nodeId", c => applySelectedHistory(c));
 startupRoutes.post("/:rigId/nodes/:nodeId/original", c => applySelectedHistory(c, true));
 

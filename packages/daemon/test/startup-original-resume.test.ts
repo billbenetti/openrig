@@ -232,6 +232,31 @@ describe("opt-in original conversation resume", () => {
     expect(db.prepare("SELECT account_home FROM nodes WHERE id=?").get(f.node.id)).toEqual({ account_home: "/changed-after-identity" });
   });
 
+  it("holds an old retained auto-rehydrate source until the response: a prune after the launch does not unconfirm the resume", async () => {
+    const f = fixture();
+    const stamp = (hours: number) => new Date(Date.now() - hours * 3_600_000).toISOString().replace("T", " ").slice(0, 19);
+    const saved = (db.prepare("SELECT data FROM snapshots WHERE id=?").get(f.snapshot.id) as { data: string }).data;
+    // The selected source becomes an ordinary old auto-rehydrate capture: past 24 h, behind newer usable copies.
+    db.prepare("UPDATE snapshots SET kind='auto-rehydrate', created_at=? WHERE id=?").run(stamp(100), f.snapshot.id);
+    for (const [id, hours] of [["newer-50h", 50], ["newer-40h", 40]] as const) {
+      db.prepare("INSERT INTO snapshots (id, rig_id, kind, data, created_at) VALUES (?,?,'auto-rehydrate',?,?)").run(id, f.rig.id, saved, stamp(hours));
+    }
+    const b = await review(f);
+    let pruned = 0;
+    vi.spyOn(ClaudeResumeAdapter.prototype, "resume").mockImplementation(async () => {
+      live.original = true;
+      live.afterResolve = () => { pruned += setup.snapshotRepo.pruneAutoRehydrate(f.rig.id, { keep: 1, batchSize: 50 }); };
+      return { ok: true };
+    });
+    const r = await request(f.path, apply(f, b.revision));
+    expect(await r.json()).toMatchObject({ ok: true, code: "resumed" });
+    expect(r.status).toBe(200);
+    expect(pruned).toBe(1);
+    // Answered: the source is an ordinary old capture again.
+    expect(setup.snapshotRepo.pruneAutoRehydrate(f.rig.id, { keep: 1, batchSize: 50 })).toBe(1);
+    expect(db.prepare("SELECT id FROM snapshots WHERE id=?").get(f.snapshot.id)).toBeUndefined();
+  });
+
   it("names the missing fresh native evidence after a reported successful resume", async () => {
     const f = fixture(); const b = await review(f);
     vi.spyOn(ClaudeResumeAdapter.prototype, "resume").mockImplementation(async () => {
