@@ -72,6 +72,11 @@ export interface SeatPoolSpec {
    *  PR waiting for a person's review) for at least `min_blocked_s` hands them to a fixed seat and is free again
    *  (seatPoolLongGateRows). Absent (no such property) when the key is not in the context: the rule is off. */
   returnLongGates?: SeatPoolReturnLongGates;
+  /** `release_refused_backoff_s` (T-018178, the spec's 1.2.4): how long a seat whose release command refused it is first
+   *  held out of the drain order; each refusal in a row of the same occupant doubles it, up to
+   *  SEAT_POOL_RELEASE_REFUSAL_MAX_SECONDS. Absent (no property) when not given: read as
+   *  SEAT_POOL_RELEASE_REFUSAL_DEFAULT_SECONDS (300) by seatPoolReleaseRefusalBaseSeconds. */
+  releaseRefusedBackoffSeconds?: number;
 }
 
 /** `return_long_gates` in the job's context (T-012673): where a seat's rows parked on a long wait go. */
@@ -131,7 +136,7 @@ export interface SeatPoolDispatchToParked {
 const SPEC_KEYS = new Set([
   "min", "max", "cooldown_s", "idle_grace_s", "dispatch_after_s", "dispatch_tag", "drain", "drain_deadline_s", "no_seat_grace_s", "adopt", "cwd_template",
   "demand_cmd", "release_cmd", "prepare_cmd", "reap_cmd", "remove_cmd", "escalation_owner", "dispatch_to_parked",
-  "priority_aging_s", "context_limit_percent", "return_long_gates",
+  "priority_aging_s", "context_limit_percent", "return_long_gates", "release_refused_backoff_s",
 ]);
 const DEFAULT_COOLDOWN_SECONDS = 60;
 const DEFAULT_IDLE_GRACE_SECONDS = 300;
@@ -183,6 +188,17 @@ export const SEAT_POOL_PRIORITY_AGING_DEFAULT_SECONDS = 7200;
 /** `context_limit_percent`: its bounds (0 turns it off) and the value when it is not given (T-012383). */
 const CONTEXT_LIMIT = { min: 0, max: 100 } as const;
 export const SEAT_POOL_CONTEXT_LIMIT_DEFAULT_PERCENT = 40;
+/** `release_refused_backoff_s` (T-018178): the first hold of a seat whose release command refused it, 1 s up to the
+ *  ceiling of the doubling (30 min), and its value when not given. */
+export const SEAT_POOL_RELEASE_REFUSAL_DEFAULT_SECONDS = 300;
+export const SEAT_POOL_RELEASE_REFUSAL_MAX_SECONDS = 1800;
+const RELEASE_REFUSED_BACKOFF = { min: 1, max: SEAT_POOL_RELEASE_REFUSAL_MAX_SECONDS } as const;
+
+/** The first hold, in seconds, of a seat whose release command refused it (release_refused_backoff_s, T-018178). */
+export function seatPoolReleaseRefusalBaseSeconds(spec: Pick<SeatPoolSpec, "releaseRefusedBackoffSeconds">): number {
+  return spec.releaseRefusedBackoffSeconds ?? SEAT_POOL_RELEASE_REFUSAL_DEFAULT_SECONDS;
+}
+
 /** A context sample at least this old says nothing about the seat (the freshness of the status-line sidecar, 10 min). */
 export const SEAT_POOL_CONTEXT_MAX_AGE_SECONDS = 600;
 
@@ -419,6 +435,11 @@ export function parseSeatPoolSpec(context: Record<string, unknown>): { spec: Sea
     && (!Number.isInteger(contextLimit) || (contextLimit as number) < CONTEXT_LIMIT.min || (contextLimit as number) > CONTEXT_LIMIT.max)) {
     return { problem: { field: "context_limit_percent", message: `seat-pool: context_limit_percent must be a whole number from ${CONTEXT_LIMIT.min} (off) to ${CONTEXT_LIMIT.max}` } };
   }
+  const releaseBackoff = context["release_refused_backoff_s"];
+  if (releaseBackoff !== undefined
+    && (!Number.isInteger(releaseBackoff) || (releaseBackoff as number) < RELEASE_REFUSED_BACKOFF.min || (releaseBackoff as number) > RELEASE_REFUSED_BACKOFF.max)) {
+    return { problem: { field: "release_refused_backoff_s", message: `seat-pool: release_refused_backoff_s must be a whole number of seconds from ${RELEASE_REFUSED_BACKOFF.min} to ${RELEASE_REFUSED_BACKOFF.max}` } };
+  }
   const adopt = context["adopt"] ?? [];
   if (!Array.isArray(adopt) || adopt.some((id) => typeof id !== "string" || !id.trim())) {
     return { problem: { field: "adopt", message: "seat-pool: adopt must be a list of logical ids" } };
@@ -468,6 +489,7 @@ export function parseSeatPoolSpec(context: Record<string, unknown>): { spec: Sea
       ...(noSeatGrace !== undefined ? { noSeatGraceSeconds: noSeatGrace as number } : {}),
       ...(priorityAging !== undefined ? { priorityAgingSeconds: priorityAging as number } : {}),
       ...(contextLimit !== undefined ? { contextLimitPercent: contextLimit as number } : {}),
+      ...(releaseBackoff !== undefined ? { releaseRefusedBackoffSeconds: releaseBackoff as number } : {}),
       // Only a pool that sets the key carries it, so the spec of one that doesn't reads as before it (T-012673).
       ...(longGates ? { returnLongGates: longGates } : {}),
     },

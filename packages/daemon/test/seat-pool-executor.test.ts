@@ -512,6 +512,151 @@ describe("seat-pool executor", () => {
     expect(history.at(-1)).toMatchObject({ reason: "seat_pool_returned", notes: { why: "release_refused", exitCode: 1 } });
   });
 
+  // The refused release's backoff as the spec's 1.2.4 and 1.2.6 ask it: its base, its log line, the reap's own hold and
+  // what forgets a seat's refusals (an agreeing release, a row the pool moves to it).
+  describe("the refused release's backoff: its base, its log line, the reap and what forgets it", () => {
+    let clock: number;
+    let told: Array<Record<string, unknown>>;
+    let failWith: string | undefined;
+    let failStderr: string | undefined;
+    let usageOut: boolean;
+    const backoffExecutor = (): SeatPoolExecutor => {
+      const effects = world.effects();
+      const executor: SeatPoolExecutor = new SeatPoolExecutor({
+        slots,
+        readJob: () => ({ active, targetSession: MODEL.sessionName, spec: jobSpec }),
+        readState: () => world.state(slots, executor, jobSpec),
+        outOfUsage: async () => usageOut,
+        effects: {
+          ...effects,
+          runCommand: async (command, env, signal) => {
+            const result = await effects.runCommand(command, env, signal);
+            if (command.argv[0] !== "release" || result.exitCode === 0) return result;
+            return { ...result, ...(failWith !== undefined ? { error: failWith } : {}), ...(failStderr !== undefined ? { stderr: failStderr } : {}) };
+          },
+        },
+        record: (_jobId, entry) => { history.push(entry); },
+        releaseRefusedLog: (_jobId, event) => { told.push({ ...event }); },
+        now: () => new Date(clock),
+      });
+      return executor;
+    };
+    const at = (seconds: number) => { clock = T0 + seconds * 1000; };
+    const releases = () => world.calls.filter((call) => call === "run release").length;
+    const until = (executor: SeatPoolExecutor, slot: SeatPoolSlot, openRows = 0) =>
+      executor.releaseRefusedUntilMs(JOB, { slotId: slot.slotId, nodeId: slot.nodeId, openRows });
+    /** One seat of the pool, live and free, whose release command refuses. */
+    const refusingSeat = async (executor: SeatPoolExecutor): Promise<SeatPoolSlot> => {
+      await run(executor, [{ kind: "add", count: 1 }]);
+      world.exit["release"] = 1;
+      world.calls = [];
+      return slots.listOpen(JOB)[0]!;
+    };
+    beforeEach(() => {
+      clock = T0;
+      told = [];
+      failWith = undefined;
+      failStderr = undefined;
+      usageOut = false;
+      jobSpec = spec({ release_cmd: { argv: ["release"] } });
+    });
+
+    it("with an empty stderr the log line says 'command failed (no stderr)', never the command's argv", async () => {
+      const executor = backoffExecutor();
+      const seat = await refusingSeat(executor);
+      failWith = "Command failed: release --pool build-dev --ticket 4711\n";
+      await run(executor, [drainOf(seat.slotId)]);
+      // An argv spanning lines (runSeatPoolCommand gives the stderr apart): still none of it.
+      failWith = "Command failed: release --script line-1\nline-2 of the script\n";
+      failStderr = "";
+      await run(executor, [drainOf(seat.slotId)]);
+      // With a stderr, its first line is the cause.
+      failStderr = "\n  refused: seat still busy\nmore\n";
+      await run(executor, [drainOf(seat.slotId)]);
+      expect(told.map((event) => event["error"])).toEqual(["command failed (no stderr)", "command failed (no stderr)", "refused: seat still busy"]);
+    });
+
+    it("release_refused_backoff_s sets the first hold, doubled per refusal up to 1800 s; the spec takes 1 to 1800", async () => {
+      for (const bad of [0, 1801, 1.5, "60"]) {
+        expect(parseSeatPoolSpec({ max: 3, cwd_template: "/work/{rig}/{slot}", release_refused_backoff_s: bad }))
+          .toMatchObject({ problem: { field: "release_refused_backoff_s" } });
+      }
+      jobSpec = spec({ release_cmd: { argv: ["release"] }, release_refused_backoff_s: 120 });
+      const executor = backoffExecutor();
+      const seat = await refusingSeat(executor);
+      const waits: number[] = [];
+      for (let refusal = 0; refusal < 6; refusal++) {
+        await run(executor, [drainOf(seat.slotId)]);
+        const end = Date.parse(told.at(-1)!["nextEligibleAt"] as string);
+        waits.push((end - clock) / 1000);
+        clock = end + 1000;
+      }
+      expect(waits).toEqual([120, 240, 480, 960, 1800, 1800]);
+    });
+
+    it("a release that agrees forgets the seat's refusals: kept by work that arrived meanwhile, its next refusal holds 300 s", async () => {
+      const executor = backoffExecutor();
+      const seat = await refusingSeat(executor);
+      const node = world.nodes.get(seat.nodeId!)!;
+      await run(executor, [drainOf(seat.slotId)]);
+      expect(told.map((event) => event["streak"])).toEqual([1]);
+      // Past the hold the release agrees, and a row arrives while it runs: the seat stays, working.
+      at(301);
+      world.exit["release"] = 0;
+      world.commandGate = async () => { if (world.calls.at(-1) === "run release") node.openRows = 1; };
+      await run(executor, [drainOf(seat.slotId)]);
+      expect(history.at(-1)).toMatchObject({ reason: "seat_pool_returned", notes: { why: "work_arrived" } });
+      world.commandGate = null;
+      node.openRows = 0;
+      expect(until(executor, seat)).toBeNull();
+      at(302);
+      world.exit["release"] = 1;
+      await run(executor, [drainOf(seat.slotId)]);
+      expect(told.at(-1)).toMatchObject({ streak: 1, nextEligibleAt: new Date(T0 + 302_000 + 300_000).toISOString() });
+    });
+
+    it("a row the pool moves to a seat forgets its refusals: once the seat closes it, between two plans, it drains at once", async () => {
+      const executor = backoffExecutor();
+      const seat = await refusingSeat(executor);
+      const node = world.nodes.get(seat.nodeId!)!;
+      await run(executor, [drainOf(seat.slotId)]);
+      expect(until(executor, seat)).toBe(T0 + 300_000);
+      world.rows.set("q-1", { destination: MODEL.sessionName, waitingSince: new Date(T0 - 600_000).toISOString() });
+      await run(executor, [{ kind: "dispatch", qitemId: "q-1", from: MODEL.sessionName, slotId: seat.slotId }]);
+      expect(world.rows.get("q-1")!.destination).toBe("dev-impl-s1@r");
+      // Done and closed before the next plan: no read of the seat ever saw the row open.
+      world.rows.delete("q-1");
+      node.openRows = 0;
+      expect(until(executor, seat)).toBeNull();
+    });
+
+    it("the reap honours the hold its own refusal set: no release asked inside it, 600 s after it, and the dead seat's rows keep it", async () => {
+      const executor = backoffExecutor();
+      const seat = await refusingSeat(executor);
+      // Out of usage from now: the relaunch the refusal asks for is held, so the occupant stays.
+      usageOut = true;
+      Object.assign(world.nodes.get(seat.nodeId!)!, { session: "stopped", idle: false, openRows: 1 });
+      world.rows.set("q-1", { destination: "dev-impl-s1@r", waitingSince: new Date(T0 - 600_000).toISOString(), state: "in-progress" });
+      await run(executor, [{ kind: "reap", slotId: seat.slotId }]);
+      expect(releases()).toBe(1);
+      expect(told.map((event) => [event["reason"], event["streak"], event["nextEligibleAt"]]))
+        .toEqual([["reap", 1, new Date(T0 + 300_000).toISOString()]]);
+      // Read as the plan reads it, with the row the seat held when it refused: not new work, so the hold stays.
+      expect(until(executor, seat, 1)).toBe(T0 + 300_000);
+      // Inside the hold the relaunch is tried again (held by the usage limit), the release command is not asked.
+      at(60);
+      await run(executor, [{ kind: "reap", slotId: seat.slotId }]);
+      expect(releases()).toBe(1);
+      expect(told).toHaveLength(1);
+      expect(history.at(-1)).toMatchObject({ reason: "seat_pool_held", notes: { reason: "usage_limit", why: "release_refused" } });
+      // Past it, the same occupant refuses again: 600 s, as the log line says.
+      at(301);
+      await run(executor, [{ kind: "reap", slotId: seat.slotId }]);
+      expect(releases()).toBe(2);
+      expect(told.at(-1)).toMatchObject({ reason: "reap", streak: 2, nextEligibleAt: new Date(T0 + 301_000 + 600_000).toISOString() });
+    });
+  });
+
   // T-004870 F3, r1 rule 2: the drain's clock is the job's history. Once the retention prunes a drain's entries, the
   // drain is over for the executor too (as for the job's stop): the next run starts a new one, from what it recorded
   // in memory neither.
@@ -1603,6 +1748,36 @@ describe("seat-pool executor", () => {
       jobSpec = spec({ drain: true, release_cmd: { argv: ["release"] } });
     });
 
+    // The forced pass asks a working seat, rows and all: those rows are not new work, so they keep the refusal's hold
+    // (the plan reads the seat with them), and the next refusal of the same occupant, once it is free, doubles it.
+    it("a working seat that refuses at the deadline keeps its hold through the rows it had, and its next refusal holds 600 s", async () => {
+      const row = await repo.create({ sourceSession: "lead@r", destinationSession: SEAT, body: "work", nudge: false });
+      repo.claim({ qitemId: row.qitemId, destinationSession: SEAT });
+      const slot = liveSeat();
+      world.exit["release"] = 1;
+      const told: Array<Record<string, unknown>> = [];
+      const executor: SeatPoolExecutor = new SeatPoolExecutor({
+        slots,
+        readJob: () => ({ active, targetSession: MODEL.sessionName, spec: jobSpec }),
+        readState: () => world.state(slots, executor, jobSpec),
+        effects: withQueue(),
+        record: (_jobId, entry) => { history.push(entry); },
+        releaseRefusedLog: (_jobId, event) => { told.push({ ...event }); },
+        now: () => new Date(clock),
+      });
+      await toDeadline(executor);
+      const first = clock;
+      expect(told).toEqual([expect.objectContaining({ reason: "drain-deadline", streak: 1, nextEligibleAt: new Date(first + 300_000).toISOString() })]);
+      expect(executor.releaseRefusedUntilMs(JOB, { slotId: slot.slotId, nodeId: "node-1", openRows: 1 })).toBe(first + 300_000);
+      // The seat finishes its row and is free; past the hold the drain asks it again, and it refuses again.
+      await repo.update({ qitemId: row.qitemId, actorSession: SEAT, state: "done", closureReason: "no-follow-on" } as never);
+      Object.assign(world.nodes.get("node-1")!, { openRows: 0, idle: true });
+      expect(executor.releaseRefusedUntilMs(JOB, { slotId: slot.slotId, nodeId: "node-1", openRows: 0 })).toBe(first + 300_000);
+      clock = first + 301_000;
+      await run(executor, [drainOf(slot.slotId)]);
+      expect(told.at(-1)).toMatchObject({ reason: "idle", streak: 2, nextEligibleAt: new Date(first + 301_000 + 600_000).toISOString() });
+    });
+
     // B1: the lifecycle lease holds deliveries back, not the claim. A turn already under way when the lease began claims
     // a pending row of the seat while the release command (drain-deadline) runs: the seat is working again.
     it("B1: a row the seat claims while the release command runs keeps the seat running: no stop, no unclaim, the row stays", async () => {
@@ -2206,6 +2381,13 @@ describe("runSeatPoolCommand", () => {
     expect(failed.exitCode).toBe(4);
     const slow = await runSeatPoolCommand({ argv: [node, "-e", "setTimeout(() => {}, 60000)"], timeoutSeconds: 1 }, {}, new AbortController().signal);
     expect(slow).toMatchObject({ exitCode: null, error: "timed out after 1s" });
+  });
+
+  it("gives a failed command's stderr apart from execFile's message, which carries the argv (one spanning lines too)", async () => {
+    const quiet = await runSeatPoolCommand({ argv: [node, "-e", "process.exit(3)", "line-1\nline-2"], timeoutSeconds: 10 }, {}, new AbortController().signal);
+    expect(quiet).toMatchObject({ exitCode: 3, stderr: "" });
+    const told = await runSeatPoolCommand({ argv: [node, "-e", "process.stderr.write('refused: busy\\n'); process.exit(3)"], timeoutSeconds: 10 }, {}, new AbortController().signal);
+    expect(told).toMatchObject({ exitCode: 3, stderr: "refused: busy\n" });
   });
 });
 
