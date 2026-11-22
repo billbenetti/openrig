@@ -2,6 +2,7 @@ import { isShellForeground } from "./shell-classifier.js";
 import { EMPTY_CLAUDE_MCP_CONFIG } from "./claude-mcp.js";
 import { isClaudePluginChannel } from "./claude-plugin-channels.js";
 import { runAsyncSite } from "./sync-site-wrap.js";
+import { currentProcessCaller } from "./process-caller.js";
 import { readNativeExecutablePaths } from "./native-process-executable.js";
 import { readNativeProcessArguments } from "./native-process-arguments.js";
 import { readProcessChildrenNow, readProcessTable, readProcessTableCensusNow } from "./process-table.js";
@@ -629,7 +630,8 @@ export async function listNativeProcesses(options: { claudeLaunchPaths?: boolean
 /** The same listing, but a failed enumeration rejects instead of reading as an empty table. A caller that shares or
  *  reuses one listing needs this: an empty array is a legitimate success, so it cannot also mean "failed". */
 export async function listNativeProcessesOrThrow(options: { claudeLaunchPaths?: boolean; frozenExecutable?: string } = {}): Promise<NativeProcessRow[]> {
-  const table: NativeProcessRow[] = await runAsyncSite("codex.runtime.list_processes", readProcessTable);
+  // The site keeps its old name (its readers group by it); `caller` says which entry point asked (T-018092).
+  const table: NativeProcessRow[] = await runAsyncSite("codex.runtime.list_processes", readProcessTable, { caller: currentProcessCaller() });
   // A table read is shared by all who asked while it was read: they get one enriched listing per set of options, computed
   // once (T-010555). Before, each of them copied and filtered the whole table on the loop, one after the other, and a
   // hundred observers sharing one read held the loop for seconds. Each caller still gets an array of its own.
@@ -1090,7 +1092,7 @@ export async function verifyPaneIdleShell(input: {
       const pid = await input.tmux.getPanePid(input.target);
       if (!pid) return null;
       // Idle proof needs the complete table, but no executable-path or argv enrichment.
-      const rows = await (input.listProcesses ?? (() => runAsyncSite("codex.runtime.list_processes", readProcessTable)))();
+      const rows = await (input.listProcesses ?? (() => runAsyncSite("codex.runtime.list_processes", readProcessTable, { caller: currentProcessCaller() })))();
       const root = idleShellRoot(rows, pid);
       return root ? shellFingerprint(root) : null;
     } catch { return null; }

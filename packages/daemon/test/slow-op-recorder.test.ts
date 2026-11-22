@@ -136,6 +136,34 @@ describe("SlowOpRecorder locked instrumentation contract", () => {
     }
   });
 
+  it("adds a stage's caller to its record without changing the site or the other fields", async () => {
+    const mod = await loadRecorderModule();
+    if (!mod) return;
+    const logPath = path.join(tempDir(), "slow-operations.jsonl");
+    const recorder = new mod.SlowOpRecorder({ logPath });
+    try {
+      await recorder.runStage("codex.runtime.list_processes", async () => [], undefined, { caller: "claude_delivery" });
+      await expect(recorder.runStage("codex.runtime.list_processes", async () => { throw new Error("read"); },
+        undefined, { caller: "reconciler" })).rejects.toThrow("read");
+      await recorder.runStage("codex.runtime.list_processes", async () => []);
+      await recorder.flush();
+      const records = await readRecords(logPath);
+      // A reader that groups by site keeps one series, and every field it read before is still there.
+      expect(records.map((r) => r.site)).toEqual(Array(3).fill("codex.runtime.list_processes"));
+      for (const record of records) {
+        for (const key of ["v", "ts", "spanId", "phase", "site", "durationMs", "outcome"]) expect(record).toHaveProperty(key);
+      }
+      expect(records.map((r) => [r.v, r.phase, r.outcome, r.caller])).toEqual([
+        [1, "end", "ok", "claude_delivery"],
+        [1, "end", "failed", "reconciler"],
+        [1, "end", "ok", undefined],
+      ]);
+      expect(records[2]).not.toHaveProperty("caller");
+    } finally {
+      await recorder.close();
+    }
+  });
+
   it("flushes a queued open span and exposes acknowledged write failure in health", async () => {
     const mod = await loadRecorderModule();
     if (!mod) throw new Error("recorder module missing");
