@@ -838,6 +838,8 @@ function seatPoolHeldBusy(spec: SeatPoolSpec, slot: SeatPoolSlotView): boolean {
  * the daemon and with a change of activity that ran no turn. Without this, the sample went stale 10 min after the
  * seat's last turn, which is when idle_grace_s (600 s in the pools that run it) lets a seat be drained, or at once after
  * a restart: the full seat read as free again, took a row, woke, read its fresh sample and gave the row back.
+ * A seat read as parked (at its prompt, each open row blocked with its park read) keeps it the same way (openrig#3841):
+ * it runs no turn while it waits, and the stale reading, read as none, sent it a 2nd row it gave straight back.
  */
 export function seatPoolContextOver(spec: Pick<SeatPoolSpec, "contextLimitPercent">, slot: SeatPoolSlotView, nowMs: number): boolean {
   const limit = seatPoolContextLimit(spec);
@@ -850,7 +852,16 @@ export function seatPoolContextOver(spec: Pick<SeatPoolSpec, "contextLimitPercen
   if (Math.max(0, nowMs - sampledMs) < SEAT_POOL_CONTEXT_MAX_AGE_SECONDS * 1000) return true;
   // A quiet seat keeps its reading, however old (REVISAO-seat-pool S5): it runs no turn, so nothing rewrote the sample,
   // and the reading is its live occupant's (the reader refuses another occupant's, and /clear writes none).
-  return slot.openRows === 0 && slot.heldMessages === 0 && slot.idleSince !== null;
+  if (slot.openRows === 0 && slot.heldMessages === 0 && slot.idleSince !== null) return true;
+  // So does a seat read as parked (openrig#3841): at its prompt, every open row blocked with its park read. It runs no
+  // turn either while it waits, and its stale reading, read as none, sent it a 2nd row it woke to give straight back.
+  return slot.openRows > 0 && slot.heldMessages === 0 && slot.atPrompt === true && seatPoolParks(slot).length === slot.openRows;
+}
+
+/** The parks read for a seat's open rows: `parked` with one open row, `parkedRows` with two or more (T-007036); fewer
+ *  than its open rows when one of them is pending or in progress, or the row facts were not read. */
+function seatPoolParks(slot: SeatPoolSlotView): readonly ParkFacts[] {
+  return slot.openRows === 1 ? (slot.parked ? [slot.parked] : []) : (slot.parkedRows ?? []);
 }
 
 /**
@@ -923,7 +934,7 @@ export function seatPoolCanReceive(spec: SeatPoolSpec, slot: SeatPoolSlotView, n
   // Every open row must be one of the seat's own parks: exactly one (`parked`), or with max_open_rows above 1 up to that
   // many (`parkedRows`, T-007036). A pending or in-progress row has no park, so the counts then differ and it refuses.
   const maxOpenRows = rule.maxOpenRows ?? DISPATCH_TO_PARKED_MAX_OPEN_ROWS_DEFAULT;
-  const parks = slot.openRows === 1 ? (slot.parked ? [slot.parked] : []) : (slot.parkedRows ?? []);
+  const parks = seatPoolParks(slot);
   if (slot.openRows < 1 || slot.openRows > maxOpenRows || parks.length !== slot.openRows) return null;
   if (slot.busyProcess) return null;
   if (seatPoolRefusedRecently(rule, slot, parks, nowMs)) return null;

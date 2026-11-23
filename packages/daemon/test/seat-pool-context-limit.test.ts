@@ -39,6 +39,7 @@ import {
   parseSeatPoolSpec,
   planSeatPool,
   SEAT_POOL_CONTEXT_LIMIT_DEFAULT_PERCENT,
+  SEAT_POOL_CONTEXT_MAX_AGE_SECONDS,
   seatPoolCanReceive,
   seatPoolContextOver,
   seatPoolHeldByContext,
@@ -313,6 +314,31 @@ describe("T-012383: seatPoolContextOver and seatPoolCanReceive (the reading)", (
     const s2 = spec({ dispatch_to_parked: {} });
     expect(seatPoolCanReceive(s2, parked(10), NOW)).toBe("parked");
     expect(seatPoolCanReceive(s2, parked(45), NOW)).toBeNull();
+  });
+
+  it("a slot parked on its own wait keeps its reading, however old: it runs no turn (openrig#3841)", () => {
+    const park = (qitemId: string): ParkFacts => ({
+      qitemId, blockedOn: `external:ci-${qitemId}`, timerIntervalS: 2700, timerArmedLive: true, parkActor: "build-dev-1-s7@fabrica",
+      parkedAt: ago(1800), takenAt: ago(3600),
+    });
+    const s2 = spec({ dispatch_to_parked: { max_open_rows: 2 } });
+    const parked = (pct: number, ageS: number, overrides: Partial<SeatPoolSlotView> = {}) => slot(7, {
+      ...full(pct, ageS), openRows: 1, idleSince: null, cause: "working", atPrompt: true, backgroundWork: true, parked: park("q-a"),
+      ...overrides,
+    });
+    const stale = SEAT_POOL_CONTEXT_MAX_AGE_SECONDS + 3000;
+    // past the limit, sampled 1 h ago at its last turn before it parked: still full, no 2nd row
+    expect(seatPoolContextOver(s2, parked(45, stale), NOW)).toBe(true);
+    expect(seatPoolCanReceive(s2, parked(45, stale), NOW)).toBeNull();
+    // two rows, each its own park: the same
+    const two = parked(45, stale, { openRows: 2, parked: undefined, parkedRows: [park("q-a"), park("q-b")] });
+    expect(seatPoolCanReceive(s2, two, NOW)).toBeNull();
+    // under the limit, the old reading lets it take the 2nd row
+    expect(seatPoolCanReceive(s2, parked(10, stale), NOW)).toBe("parked");
+    // not at its prompt (a turn may be running), or an open row without a park: the old reading is none, as before
+    expect(seatPoolContextOver(s2, parked(45, stale, { atPrompt: false }), NOW)).toBe(false);
+    expect(seatPoolContextOver(s2, parked(45, stale, { openRows: 2, parked: undefined, parkedRows: [park("q-a")] }), NOW)).toBe(false);
+    expect(seatPoolContextOver(s2, parked(45, stale, { heldMessages: 1 }), NOW)).toBe(false);
   });
 
   it("seatPoolHeldByContext: only a quiet slot in usage past the limit", () => {
