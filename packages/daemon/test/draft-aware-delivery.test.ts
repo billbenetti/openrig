@@ -1222,6 +1222,22 @@ describe("supported seat and queue integration", () => {
     expect(f.outbox.getById("wake-intent-" + item.qitemId)!.deliveryState).toBe("retained");
   });
 
+  it("leaves a queue-only seat's held created row in its queue past the window: no escalation and no sender notice", async () => {
+    const f = fixture(undefined, { runtime: "claude-code" }); await f.guard.set("a", { mode: "queue-only" }, "human@test", "a person types here");
+    f.db.prepare("UPDATE nodes SET runtime='claude-code' WHERE id='b'").run();
+    f.bodies.a = "a person's draft";
+    const item = await f.repo.create({ sourceSession: "sibling@test", destinationSession: "worker@test", body: "queued work" });
+    await vi.waitFor(() => expect(f.repo.getById(item.qitemId)!.lastNudgeResult).toBe("retained:draft_aware"));
+    const tick = await heldLadder(f, 30);
+    f.db.prepare("UPDATE queue_items SET ts_created = ? WHERE qitem_id = ?").run(new Date(Date.now() - 45 * 60_000).toISOString(), item.qitemId);
+    await tick(); await tick();
+    expect(notes(f, item.qitemId, "escalation-rung:")).toEqual([]);
+    expect(notes(f, item.qitemId, "held-sender-notice:")).toEqual([]);
+    expect(f.submissions.filter(s => s.includes(`Your queue row ${item.qitemId}`))).toEqual([]);
+    expect(typedInto(f, "a")).toEqual([]);
+    expect(f.repo.getById(item.qitemId)).toMatchObject({ state: "pending" });
+  });
+
   it("tells the owner and the sender once when a draft left in the box gives no idle report, once the window passes", async () => {
     const f = fixture(undefined, { runtime: "claude-code" }); await f.enable(); f.bodies.a = "draft";
     f.db.prepare("UPDATE nodes SET runtime='claude-code' WHERE id='b'").run();

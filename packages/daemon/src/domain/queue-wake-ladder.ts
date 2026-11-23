@@ -79,6 +79,7 @@ import {
   LADDER_RUNG_PREFIX,
   LADDER_EXHAUSTED_PREFIX,
   STUCK_SWEEP_FINDING_TAG,
+  defaultIsQueueOnlySeat,
   resolveOperatorSeat,
   resolveSessionNodeId,
 } from "./queue-stuck-sweep.js";
@@ -242,6 +243,9 @@ export interface WakeLadderDeps {
   /** The human registry the explicit-only rung uses to tell a handoff addressed to a
    *  person from agent-to-agent work. Defaults to the daemon's registry. */
   loadHumanRegistry?: () => LoadResult;
+  /** The seat's typing guard is at queue-only (#3076). Defaults to the seat's stored guard, as the stuck sweep reads it;
+   *  an unknown seat or an unreadable guard is not queue-only. */
+  isQueueOnlySeat?: (session: string) => boolean;
 }
 
 export interface WakeLadderAction {
@@ -809,6 +813,7 @@ export async function runWakeLadderTick(deps: WakeLadderDeps): Promise<WakeLadde
     const cap = deps.retryCap ?? resolveWakeRetryCap();
     const windowMin = deps.unconfirmedWindowMinutes ?? resolveWakeUnconfirmedWindowMinutes();
     const graceS = deps.swapGraceSeconds ?? resolveWakeSwapGraceSeconds();
+    const isQueueOnlySeat = deps.isQueueOnlySeat ?? defaultIsQueueOnlySeat(deps.db);
     const resolveOrch =
       deps.resolveOrchestrator ?? ((session: string) => {
         return resolveEscalationOwner(deps.db, session, target => deps.queueRepo.acceptsDestination(target)).owner;
@@ -933,7 +938,10 @@ export async function runWakeLadderTick(deps: WakeLadderDeps): Promise<WakeLadde
       // person (as in the stuck sweep), keeps its own path before any park or wake.
       const createdHeld = heldCreatedRow(row);
       if (row.state === "pending" && !row.handedOffFrom && (!createdHeld
-        || deps.queueRepo.isRegisteredHumanUpdate(row) || deps.queueRepo.isLocalHumanDecisionWithoutGateway(row))) continue;
+        || deps.queueRepo.isRegisteredHumanUpdate(row) || deps.queueRepo.isLocalHumanDecisionWithoutGateway(row)
+        // Fork parity (T-018877 D8): at a queue-only seat the held created row stays in its queue, as before #3580: no
+        // ladder escalation and no held-sender notice. The stuck sweep keeps its own net there.
+        || isQueueOnlySeat(row.destinationSession))) continue;
       const usagePool = usagePoolBySeat.get(row.destinationSession);
       // OPR.0.5.6.24: the usage-limit PARK mutation applies only to pending
       // batons — a claimed in-progress row is someone's live work and is never

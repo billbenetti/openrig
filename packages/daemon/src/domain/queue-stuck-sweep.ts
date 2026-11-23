@@ -819,7 +819,7 @@ export const STUCK_SWEEP_YIELD_EVERY_ROWS = 50;
 export const STUCK_SWEEP_YIELD_AFTER_MS = 50;
 
 /** The daemon's reading of a seat's queue-only level: an unknown seat or an unreadable guard is not queue-only. */
-function defaultIsQueueOnlySeat(db: Database.Database): (session: string) => boolean {
+export function defaultIsQueueOnlySeat(db: Database.Database): (session: string) => boolean {
   let guard: SeatDeliveryGuard | null = null;
   return (session) => {
     try {
