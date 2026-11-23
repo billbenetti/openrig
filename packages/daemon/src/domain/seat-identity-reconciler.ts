@@ -15,6 +15,8 @@ import { RESERVED_HOST_IDS, validateHostRegistry } from "./hosts/hosts-registry-
 import { communityHarnessOf } from "./built-in-runtimes.js";
 import { sessionCommunityHarnessSelect, sessionCommunityRunnerSelect, recordedRunner } from "./session-registry.js";
 import { SettingsStore } from "./user-settings/settings-store.js";
+import { runSyncSiteWhenSlow } from "./sync-site-wrap.js";
+import { withProcessCaller } from "./process-caller.js";
 
 /** Default identity-reconcile cadence: 5s. Process identity changes rarely
  *  (a seat's pane/process is stable for its whole life), and the check is
@@ -265,7 +267,7 @@ export class SeatIdentityReconciler {
     }
   }
 
-  private async reconcileSweep(generation: number): Promise<void> {
+  private sweepPrologue() {
     const seats = this.runningSeats();
     // Capture exact issuance before any observation awaits. A delayed verdict cannot revoke a successor.
     const grants = hasActivityGrantsTable(this.db) ? new ActivityGrantStore(this.db) : null;
@@ -288,6 +290,13 @@ export class SeatIdentityReconciler {
     }));
     // Prune verdicts for nodes no longer running (keep the table bounded), except a released seat's.
     this.store.pruneExcept([...seats.map((s) => s.node_id), ...this.releasedSeats()]);
+    return { seats, grants, observedGrants };
+  }
+
+  private async reconcileSweep(generation: number): Promise<void> {
+    // T-010230: the sweep is async; only its synchronous stretches are named (the whole sweep would only time its
+    // first stretch), each in the slow-operation log when it took the slow threshold.
+    const { seats, grants, observedGrants } = runSyncSiteWhenSlow("seat_identity.sweep_prologue", () => this.sweepPrologue());
     if (seats.length === 0) return;
 
     // One tmux availability probe per poll. If tmux is entirely unreachable
@@ -321,10 +330,13 @@ export class SeatIdentityReconciler {
         if (generation !== this.generation) return;
         const gone = absent && !elsewhere;
         if (!this.selectionIsCurrent(seat)) continue;
-        const published = this.store.upsert(gone ? this.sessionMissingVerdict(seat, probeAt) : this.tmuxUnavailableVerdict(seat, probeAt));
-        // As on the observed path below: the run whose grant was captured before this sweep has ended.
-        const observedGrant = observedGrants.get(seat.node_id);
-        if (published && gone && observedGrant) grants!.revoke({ grantId: observedGrant.grantId }, "runner_exit_observed");
+        // T-010230: the per-seat probes await, so only the synchronous persist is named.
+        runSyncSiteWhenSlow("seat_identity.tmux_unavailable", () => {
+          const published = this.store.upsert(gone ? this.sessionMissingVerdict(seat, probeAt) : this.tmuxUnavailableVerdict(seat, probeAt));
+          // As on the observed path below: the run whose grant was captured before this sweep has ended.
+          const observedGrant = observedGrants.get(seat.node_id);
+          if (published && gone && observedGrant) grants!.revoke({ grantId: observedGrant.grantId }, "runner_exit_observed");
+        });
       }
       return;
     }
@@ -411,12 +423,14 @@ export class SeatIdentityReconciler {
         const verdict = await this.computeVerdict(seat, liveSessions, observedAt, nativeProofs.get(seat.node_id) ?? null, panes, readRunnerProcesses);
         if (generation !== this.generation) return;
         if (!this.selectionIsCurrent(seat)) continue;
-        if (!this.store.upsert(verdict)) continue;
-        const observedGrant = observedGrants.get(seat.node_id);
-        if (observedGrant && (verdict.verdict === "pane_missing"
-          || (verdict.verdict === "mismatch" && verdict.reason === "process_identity_mismatch" && observedGrant.shellExitConfirmed))) {
-          grants!.revoke({ grantId: observedGrant.grantId }, "runner_exit_observed");
-        }
+        runSyncSiteWhenSlow("seat_identity.persist_verdict", () => {
+          if (!this.store.upsert(verdict)) return;
+          const observedGrant = observedGrants.get(seat.node_id);
+          if (observedGrant && (verdict.verdict === "pane_missing"
+            || (verdict.verdict === "mismatch" && verdict.reason === "process_identity_mismatch" && observedGrant.shellExitConfirmed))) {
+            grants!.revoke({ grantId: observedGrant.grantId }, "runner_exit_observed");
+          }
+        });
       } catch {
         if (generation !== this.generation) return;
         if (!this.selectionIsCurrent(seat)) continue;
@@ -597,7 +611,8 @@ export class SeatIdentityReconciler {
   start(intervalMs: number = DEFAULT_IDENTITY_POLL_INTERVAL_MS): void {
     if (this.timer) return;
     this.timer = setInterval(() => {
-      void this.reconcileAll();
+      // T-018092: telemetry attribution of the sweep's process reads.
+      void withProcessCaller("reconciler", () => this.reconcileAll());
     }, intervalMs);
     if (this.timer && typeof this.timer === "object" && "unref" in this.timer) {
       (this.timer as NodeJS.Timeout).unref();

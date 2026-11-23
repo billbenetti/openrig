@@ -1,7 +1,9 @@
 import { currentParkedOwnerNoInputFailure } from "./policies/parked-owner-consumer.js";
+import { currentParkArmSql } from "./current-park-arm.js";
 import { resolveEscalationOwner, ESCALATION_HOP_TAG, hasConsumedEscalationHop } from "./escalation-owner.js";
 import { BACKLOG_FOLDED_TAG, createRecoveryLookup, findQueueRecovery, freshRecoveryId, recoveryTag } from "./queue-recovery.js";
 export { BACKLOG_FOLDED_TAG };
+import { seatPoolQueueCustody } from "./seat-pool-sweep-custody.js";
 import { quietHoldCustody } from "./quiet-hold-custody.js";
 import { queueWaitNotice } from "./queue-wait-backoff.js";
 import { isQueueOnlyDeliveryCode } from "./watchdog-history-log.js";
@@ -817,7 +819,7 @@ export const STUCK_SWEEP_YIELD_EVERY_ROWS = 50;
 export const STUCK_SWEEP_YIELD_AFTER_MS = 50;
 
 /** The daemon's reading of a seat's queue-only level: an unknown seat or an unreadable guard is not queue-only. */
-function defaultIsQueueOnlySeat(db: Database.Database): (session: string) => boolean {
+export function defaultIsQueueOnlySeat(db: Database.Database): (session: string) => boolean {
   let guard: SeatDeliveryGuard | null = null;
   return (session) => {
     try {
@@ -951,7 +953,9 @@ export async function runStuckSweep(deps: StuckSweepDeps): Promise<StuckSweepRes
         .get(jobId) as { spec_yaml: string } | undefined;
       const notice = job ? queueWaitNotice(job.spec_yaml) : null;
       if (!notice || now.getTime() - Date.parse(notice.at) <= resolvePickupThresholdMinutes() * 60_000) return null;
-      const binding = deps.db.prepare("SELECT qitem_id FROM queue_transition_wakes WHERE wake_ref = ? AND phase = 'armed' ORDER BY transition_id DESC LIMIT 1").get(jobId) as { qitem_id: string } | undefined;
+      // The row whose current park this wait is (current-park-arm.ts), not merely the latest row ever armed with it.
+      const binding = deps.db.prepare(`SELECT w.qitem_id FROM queue_transition_wakes w WHERE w.wake_ref = ? AND ${currentParkArmSql("w")}
+        ORDER BY w.transition_id DESC LIMIT 1`).get(jobId) as { qitem_id: string } | undefined;
       const row = binding ? indexed(() => deps.queueRepo.getById(binding.qitem_id, { waiting: false })) : null;
       if (!row || row.state !== "blocked" || deps.queueRepo.getParkWakeStatus(row.qitemId)?.ref !== jobId) return null;
       const response = lastMeaningfulTransition(deps.db, row.qitemId);
@@ -1070,6 +1074,8 @@ export async function runStuckSweep(deps: StuckSweepDeps): Promise<StuckSweepRes
     // the config-keyed age. Parks (state=blocked) legitimately wait and never appear here;
     // failed-nudge rows already surfaced in half 2; laddered rows are S01's.
     const cutoff = new Date(now.getTime() - ageMinutes * 60_000).toISOString();
+    // T-007029 (#2988): a row waiting in an active seat pool's queue is the pool's to move to a seat, read once per pass.
+    const poolHolds = seatPoolQueueCustody(deps.db, now.getTime(), (session) => deps.queueRepo.addressesOf(session));
     const unclaimedCandidate = (qitemId: string, recordSuppression: boolean): Candidate | null => {
       const row = indexed(() => deps.queueRepo.getById(qitemId, { waiting: false }));
       if (!row || isFindingRow(row)) return null;
@@ -1099,6 +1105,9 @@ export async function runStuckSweep(deps: StuckSweepDeps): Promise<StuckSweepRes
       // A queue-only seat's cold watchdog reminder (#3076) waits, with no nudge, for a person or the seat's next turn:
       // held and readable at the seat, not stuck. A finding would be a poller compensating for the level.
       if (row.sourceSession === "watchdog@system" && row.tags?.includes("watchdog") && row.tags.includes("queue-only")) return null;
+      // A row waiting in an active seat pool's queue (to the pool's model, with its dispatch_tag) is the pool's to move,
+      // while the pool has a seat or had one within no_seat_grace_s; a draining or seatless pool's rows are findings.
+      if (poolHolds(row)) return null;
       // The ladder check runs LAST here too: a row the ladder alone would have stopped is
       // ladder-suppressed, and its finding stays open (#1419).
       if (hasLiveLadder(deps.db, row.qitemId, now, suppressionMinutes)) {
@@ -1218,7 +1227,7 @@ export async function runStuckSweep(deps: StuckSweepDeps): Promise<StuckSweepRes
     };
 
     const armedJobOf = (qitemId: string): string | undefined => (deps.db.prepare(
-      "SELECT wake_ref FROM queue_transition_wakes WHERE qitem_id = ? AND phase = 'armed' ORDER BY transition_id DESC LIMIT 1",
+      `SELECT w.wake_ref FROM queue_transition_wakes w WHERE w.qitem_id = ? AND ${currentParkArmSql("w")}`,
     ).get(qitemId) as { wake_ref: string } | undefined)?.wake_ref;
     /** A kind's rule, again, on the row as it is now (read live, without the lent indexes): the candidate it makes now,
      *  with its current route, reason and targets, or null when it no longer holds. */

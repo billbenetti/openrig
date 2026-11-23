@@ -414,7 +414,7 @@ function readLifecycleExecutions(db: Database.Database, mission: string, project
         `SELECT ts, state, transition_note, actor_session FROM queue_transitions
           WHERE qitem_id = ? ORDER BY transition_id DESC LIMIT 1`,
       ).get(packetId) ?? null : null;
-      const wake = wakes.getStatus(packetId);
+      const wake = wakes.getCurrentParkStatus(packetId);
       const blocker = typeof packet?.blocked_on === "string" ? db.prepare(
         `SELECT qitem_id, summary, destination_session, state, evidence_ref FROM queue_items WHERE qitem_id = ?`,
       ).get(packet.blocked_on) ?? null : null;

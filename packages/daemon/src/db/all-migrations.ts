@@ -32,6 +32,11 @@ import { contextUsageOccupantGenerationSchema } from "./migrations/168_context_u
 import { seatRuntimeHomeRecordsSchema } from "./migrations/169_seat_runtime_home_records.js";
 import { claudeAutoModeSchema } from "./migrations/171_claude_auto_mode.js";
 import { seatHookBridgeSchema } from "./migrations/171_seat_hook_bridge.js";
+import { seatPoolSlotsSchema } from "./migrations/158_seat_pool_slots.js";
+import { seatPoolSlotsStoppedSinceSchema } from "./migrations/159_seat_pool_slots_stopped_since.js";
+import { seatPoolSlotsLiveAtSchema } from "./migrations/159_seat_pool_slots_live_at.js";
+import { forkSeatPoolSlotsRenameSchema } from "./migrations/160_fork_seat_pool_slots_rename.js";
+import { forkSeatPoolPolicyIdSchema } from "./migrations/183_fork_seat_pool_policy_id.js";
 import { activityGrantsSchema } from "./migrations/143_activity_grants.js";
 import { environmentBindingsSchema } from "./migrations/144_environment_bindings.js";
 import { nodePermissionsToSchema } from "./migrations/145_node_permissions_to.js";
@@ -186,6 +191,9 @@ import { queueDelegatedDecisionSchema } from "./migrations/123_queue_delegated_d
 import { contextUsageWatchdogUnitsSchema } from "./migrations/124_context_usage_watchdog_units.js";
 import { nodeAdvisorSchema } from "./migrations/125_node_advisor.js";
 import { operationCorrelationSchema } from "./migrations/127_operation_correlation.js";
+import { queueListReceiptAndStateIndexesSchema } from "./migrations/170_queue_list_receipt_and_state_indexes.js";
+import { queueTransitionsPromptRefusalIndexSchema } from "./migrations/171_queue_transitions_prompt_refusal_index.js";
+import { queueTransitionsBlockedOnSchema } from "./migrations/174_queue_transitions_blocked_on.js";
 
 /** Ordered migrations; numbers may be reserved by independent changes. */
 
@@ -371,4 +379,12 @@ export const ALL_MIGRATIONS: Migration[] = [
   sessionStopAttemptSchema,
   nodeKeepAliveSchema,
   queueItemsBlockedOnIndexSchema,
+  seatPoolSlotsSchema,
+  seatPoolSlotsStoppedSinceSchema,
+  seatPoolSlotsLiveAtSchema,
+  forkSeatPoolSlotsRenameSchema,
+  queueListReceiptAndStateIndexesSchema,
+  queueTransitionsPromptRefusalIndexSchema,
+  queueTransitionsBlockedOnSchema,
+  forkSeatPoolPolicyIdSchema,
 ];

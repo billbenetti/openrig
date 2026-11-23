@@ -99,17 +99,16 @@ describe("queue routes", () => {
     temporaryWorkspace = undefined;
   });
 
-  it("`POST /:qitemId/fallback` keeps today's behaviour: it passes no guard, moves the row as before, and stages no fallback wake.", async () => {
+  it("`POST /:qitemId/fallback` with no guard or wake fields moves the row as before and stages no fallback wake.", async () => {
     const row = await queueRepo.create({ sourceSession: "a@r", destinationSession: "b@r", body: "x", nudge: false });
     const spy = vi.spyOn(queueRepo, "routeToFallback");
-    // Guard and wake fields in the body are not read by the route: the row is pending, not in-progress, and moves.
     const res = await app.request(`/api/queue/${row.qitemId}/fallback`, {
       method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ fallbackDestination: "c@r", reason: "b@r unreachable", expectState: "in-progress", expectDestination: "z@r", wake: true }),
+      body: JSON.stringify({ fallbackDestination: "c@r", reason: "b@r unreachable" }),
     });
     expect(res.status).toBe(200);
     expect(await res.json()).toMatchObject({ qitemId: row.qitemId, state: "pending", destinationSession: "c@r", chainOfRecord: ["fallback-from:b@r"] });
-    expect(spy.mock.calls).toEqual([[row.qitemId, "c@r", "b@r unreachable"]]);
+    expect(spy.mock.calls).toEqual([[row.qitemId, "c@r", "b@r unreachable", { expectState: undefined, expectDestination: undefined, wake: undefined }]]);
     const wakes = db.prepare("SELECT outbox_id FROM outbox_entries WHERE audit_pointer = ? AND outbox_id LIKE 'wake-intent-fallback-%'").all(row.qitemId);
     expect(wakes).toEqual([]);
   });
@@ -134,6 +133,63 @@ describe("queue routes", () => {
     expect(queueRepo.getById(created.qitemId)?.destinationSession).toBe("typo@r");
     expect(queueRepo.list()).toHaveLength(source ? 2 : 1);
     if (source) expect(queueRepo.getById(source.qitemId)?.state).toBe(verb === "handoff" ? "handed-off" : "done");
+  });
+
+  describe("POST /:qitemId/fallback with a guard and a wake", () => {
+    const fallback = (qitemId: string, body: Record<string, unknown>) => app.request(`/api/queue/${qitemId}/fallback`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ fallbackDestination: "c@r", reason: "slot free", ...body }),
+    });
+    const pendingRow = () => queueRepo.create({ sourceSession: "a@r", destinationSession: "b@r", body: "x", nudge: false });
+
+    it("moves the row when the guard holds and stages the wake for the new destination", async () => {
+      const row = await pendingRow();
+      const res = await fallback(row.qitemId, { expectState: "pending", expectDestination: "b@r", wake: true });
+      expect(res.status).toBe(200);
+      expect((await res.json()).destinationSession).toBe("c@r");
+      const wakes = db.prepare("SELECT destination_session FROM outbox_entries WHERE audit_pointer = ? AND outbox_id LIKE 'wake-intent-fallback-%'").all(row.qitemId);
+      expect(wakes).toEqual([{ destination_session: "c@r" }]);
+    });
+
+    it("answers 409 with the row's current state and owner when the state guard fails", async () => {
+      const row = await pendingRow();
+      queueRepo.claim({ qitemId: row.qitemId, destinationSession: "b@r" });
+      const res = await fallback(row.qitemId, { expectState: "pending" });
+      expect(res.status).toBe(409);
+      expect(await res.json()).toMatchObject({ error: "fallback_state_mismatch", state: "in-progress", destinationSession: "b@r" });
+      expect(queueRepo.getById(row.qitemId)!.destinationSession).toBe("b@r");
+    });
+
+    it("answers 409 when the destination guard fails", async () => {
+      const row = await pendingRow();
+      queueRepo.routeToFallback(row.qitemId, "d@r", "moved first");
+      const res = await fallback(row.qitemId, { expectDestination: "b@r", wake: true });
+      expect(res.status).toBe(409);
+      expect(await res.json()).toMatchObject({ error: "fallback_destination_mismatch", destinationSession: "d@r" });
+      expect(queueRepo.getById(row.qitemId)!.destinationSession).toBe("d@r");
+    });
+
+    it.each([
+      [{ expectState: "in_progress" }, "invalid_state"],
+      [{ expectState: 1 }, "invalid_state"],
+      [{ expectDestination: "" }, "expectDestination must be a non-empty session name"],
+      [{ wake: "yes" }, "wake must be a boolean"],
+    ])("answers 400 for %j and leaves the row alone", async (body, error) => {
+      const row = await pendingRow();
+      const res = await fallback(row.qitemId, body);
+      expect(res.status).toBe(400);
+      expect((await res.json()).error).toBe(error);
+      expect(queueRepo.getById(row.qitemId)!.destinationSession).toBe("b@r");
+    });
+
+    it("answers 400 for a wake on a row that is not pending", async () => {
+      const row = await pendingRow();
+      queueRepo.claim({ qitemId: row.qitemId, destinationSession: "b@r" });
+      const res = await fallback(row.qitemId, { wake: true });
+      expect(res.status).toBe(400);
+      expect((await res.json()).error).toBe("wake_not_admitted");
+      expect(queueRepo.getById(row.qitemId)!.destinationSession).toBe("b@r");
+    });
   });
 
   function createWakeContractTable(database: Database.Database): void {

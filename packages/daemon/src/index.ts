@@ -40,6 +40,11 @@ import type { ProviderService } from "./domain/provider/provider-service.js";
 import { SettingsStore } from "./domain/user-settings/settings-store.js";
 import { startSeatPollers } from "./domain/seat-activity-service.js";
 import { startIdentityReconciler } from "./domain/seat-identity-reconciler.js";
+import { startLongGcObserver } from "./domain/sync-site-wrap.js";
+import { closeReadOffLoop } from "./domain/read-off-loop.js";
+import { startWalCheckpointer, type WalCheckpointer } from "./db/wal-checkpointer.js";
+import { autoRehydrateRetentionEnabled } from "./domain/snapshot-repository.js";
+import { AUTO_REHYDRATE_RETENTION_INTERVAL_MS } from "./domain/auto-rehydrate-retention.js";
 import {
   ensureOpenRigInstance,
   formatInstanceInitializationConflicts,
@@ -118,6 +123,17 @@ export function startPeriodicSnapshotScheduler(deps: {
   const retentionKeep = settingsStore ? (settingsStore.resolveOne("snapshots.periodic.retention_keep").value as number) : 10;
   deps.periodicSnapshotScheduler.start(intervalS * 1000, retentionKeep);
   deps.psProjectionService.setPeriodicSnapshotState(true, intervalS);
+}
+
+/** P04-v2 PR-B — starts the auto-rehydrate backlog drain after the daemon listens: one bounded batch per interval, the
+ *  first one an interval after the start (never synchronously at boot). `OPENRIG_AUTO_REHYDRATE_RETENTION=off` keeps it
+ *  stopped, as it keeps the retention at capture off. */
+export function startAutoRehydrateRetentionScheduler(deps: {
+  autoRehydrateRetentionScheduler?: { start(intervalMs: number): void };
+}, env: NodeJS.ProcessEnv = process.env): boolean {
+  if (!deps.autoRehydrateRetentionScheduler || !autoRehydrateRetentionEnabled(env)) return false;
+  deps.autoRehydrateRetentionScheduler.start(AUTO_REHYDRATE_RETENTION_INTERVAL_MS);
+  return true;
 }
 
 /** OPR.0.4.6.FS-1 W2 — start the queue-retention maintenance sweep (arch D3): a
@@ -398,6 +414,9 @@ export async function startServer(port?: number) {
   // once after the first successful bind callback fires.
   let monitorsStarted = false;
   let retentionTimer: ReturnType<typeof setInterval> | null = null;
+  // T-010230: the WAL checkpoint off the event loop, and the long GCs named in the slow-operation log
+  let walCheckpointer: WalCheckpointer | null = null;
+  const stopLongGcObserver = deps.slowOpRecorder ? startLongGcObserver() : undefined;
   let stuckSweepTimer: ReturnType<typeof setInterval> | null = null;
   let wakeLadderScheduler: WakeLadderScheduler | null = null;
   // P7 — lifecycle heartbeat: advance last-seen every tick while running.
@@ -455,9 +474,12 @@ export async function startServer(port?: number) {
         // unchanged); startup-only: read once here.
         startIdentityReconciler(deps.seatIdentityReconciler);
         startPeriodicSnapshotScheduler(deps);
+        // P04-v2 PR-B — the auto-rehydrate backlog drain, post-bind, in bounded batches.
+        startAutoRehydrateRetentionScheduler(deps);
         // OPR.0.4.6.FS-1 W2 — boot sweep + daily retention tick (bounded,
         // yields between batches; a sweep failure is logged, never fatal).
         retentionTimer = startQueueRetentionScheduler(deps);
+        walCheckpointer = startWalCheckpointer(deps.rigRepo.db);
         // S02 — the standing stuck sweep: nobody has to remember to run the verbs.
         stuckSweepTimer = startStuckSweepScheduler(deps);
         // Issue #1856: stream intake for the queue worker.
@@ -506,7 +528,10 @@ export async function startServer(port?: number) {
       ["runtime-probes", () => stopRuntimeProbes()],
       ["proof-source-watch", () => deps.proofSourceWatch?.close()],
       ["health-diagnosis", () => deps.healthDiagnosis?.stop()],
-      ["watchdog", () => deps.watchdogScheduler?.stop()],
+      ["watchdog", async () => {
+        await deps.watchdogScheduler?.stop();
+        await deps.seatPoolExecutor?.stop();
+      }],
       ["terminal-reachability", () => deps.terminalReachability?.stop()],
       ["network-connector", () => deps.networkConnector?.stop()],
       ["stream-intake", () => deps.streamIntakeCoordinator?.stop()],
@@ -515,12 +540,19 @@ export async function startServer(port?: number) {
       ["seat-structural-activity", () => deps.seatStructuralActivityService?.stop()],
       ["seat-identity", () => deps.seatIdentityReconciler?.stop()],
       ["periodic-snapshot", () => deps.periodicSnapshotScheduler?.stop()],
+      ["auto-rehydrate-retention", () => deps.autoRehydrateRetentionScheduler?.stop()],
       ["gateway", () => deps.gatewaySubsystem?.stop()],
+      // T-010440: the read worker goes before the wake ladder waits for its tick: a read stuck on the worker ends now
+      // (a request fails as a 503, T-011538; the tick reads synchronously), instead of holding the shutdown for the
+      // job's deadline, and no worker starts again.
+      ["read-worker", () => closeReadOffLoop()],
       ["wake-ladder", () => wakeLadderScheduler?.stop()],
-      ["event-loop-monitor", () => eventLoopMonitor.stop()],
+      ["event-loop-monitor", () => { eventLoopMonitor.stop(); stopLongGcObserver?.(); }],
       ["connections", () => Promise.all(servers.map((srv) => closeHttpServer(srv)))],
       // After the last request: the tmux control client ends and its session goes with it.
       ["tmux-control", () => deps.tmuxAdapter.closeControlClient()],
+      // After the last request: the commits checkpoint again (the last writes of the shutdown included), then the worker goes.
+      ["wal-checkpointer", () => walCheckpointer?.stop()],
       ["recorder", async () => {
         deps.requestPhaseObserver?.close();
         if (await drainSlowOpRecorderOnShutdown(deps.slowOpRecorder) !== 0) {

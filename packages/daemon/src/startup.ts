@@ -21,7 +21,7 @@ import { discoverTailscaleSelfNames } from "./middleware/browser-boundary.js";
 import { configureShadowCapture } from "./domain/shadow-capture.js";
 import { SeatDeliveryGuard, resolveExternalCliOccupant, resolveGuardTarget } from "./domain/seat-delivery-guard.js";
 import { seatCodexCorePluginDir, vendoredCorePluginDir } from "./domain/claude-core-plugin-env.js";
-import { queueRecoveryOwnsWake } from "./domain/queue-wake-ladder.js";
+import { queueRecoveryOwnedAmong } from "./domain/queue-wake-ladder.js";
 import { HealthPolicyStore } from "./domain/health-policy.js";
 import { HealthCheckpointSource } from "./domain/health-checkpoints.js";
 import { PassiveCeremonySource } from "./domain/health-passive-ceremony.js";
@@ -82,6 +82,7 @@ import { resolveCodexGitAddDirs } from "./domain/codex-git-add-dirs.js";
 import { PiResumeAdapter } from "./adapters/pi-resume.js";
 import { OmpResumeAdapter } from "./adapters/omp-resume.js";
 import { OMP_PROVIDER_ENV_VARS, OMP_PROVIDER_EXTRA_ENV_VARS } from "./adapters/pi-runner-protocol.js";
+import { withProcessCaller } from "./domain/process-caller.js";
 import { RigSpecExporter } from "./domain/rigspec-exporter.js";
 import { PodRepository } from "./domain/pod-repository.js";
 import { RigSpecPreflight } from "./domain/rigspec-preflight.js";
@@ -140,7 +141,7 @@ import { ChatRepository } from "./domain/chat-repository.js";
 import { StreamStore } from "./domain/stream-store.js";
 import { StreamIntakeCoordinator } from "./domain/stream-intake.js";
 import { SlowOpRecorder, type SlowOperationInstrumentation } from "./domain/slow-op-recorder.js";
-import { configureSyncSiteRecorder } from "./domain/sync-site-wrap.js";
+import { configureSyncSiteRecorder, syncSitesDuring } from "./domain/sync-site-wrap.js";
 import { RequestPhaseObserver } from "./domain/request-phase-observer.js";
 import { QueueRepository, isBlockerLive, type QueueDestinationAdvisory } from "./domain/queue-repository.js";
 import { describeDefaultReceiver, permissionDeciderFor } from "./domain/default-receiver.js";
@@ -157,7 +158,9 @@ import { WatchdogAutoRegistration } from "./domain/watchdog-auto-registration.js
 import { WatchdogHistoryLog } from "./domain/watchdog-history-log.js";
 import {
   formatWatchdogDeliveryMessage,
+  parseWatchdogSpec,
   WatchdogPolicyEngine,
+  watchdogJobTarget,
 } from "./domain/watchdog-policy-engine.js";
 import { WatchdogScheduler } from "./domain/watchdog-scheduler.js";
 import { KeepAliveSupervisor } from "./domain/keep-alive-supervisor.js";
@@ -173,8 +176,28 @@ import { makeWorkflowKeepalivePolicy } from "./domain/policies/workflow-keepaliv
 import { makeIdleGateQitemPolicy } from "./domain/policies/idle-gate-qitem.js";
 import { makeParkedOwnerConsumerPolicy, makeRigAnchor, PARKED_OWNER_POLICY_NAME } from "./domain/policies/parked-owner-consumer.js";
 import { makeSeatPoolPolicy } from "./domain/policies/seat-pool.js";
+// Fork (T-018881): the fork's pool, which the engine runs as `fork-seat-pool`; the import above is the upstream's,
+// composed unarmed below.
+import {
+  makeSeatPoolPolicy as makeForkSeatPoolPolicy, parseSeatPoolSpec, seatPoolOutOfUsage, type SeatPoolSpec,
+} from "./domain/policies/fork-seat-pool.js";
 import { SeatPoolSlotsRepository } from "./domain/seat-pool-slots.js";
 import { escalateUnclaimedReminder } from "./domain/parked-owner-escalation.js";
+import { readProcTmuxPane } from "./domain/seat-pool-busy.js";
+import { readProcessTable } from "./domain/process-table.js";
+import {
+  readSeatPoolBusyCandidates, readSeatPoolState, runSeatPoolCommand, SeatPoolExecutor, SeatPoolSlots, seatPoolQueueEffects, slotMemberFragment,
+} from "./domain/seat-pool-executor.js";
+import { LaunchBudget, launchBudgetLimits, sampleHost } from "./domain/launch-budget.js";
+import { launchStatusIsRunning } from "./domain/restore-orchestrator.js";
+import { resolveEscalationOwner } from "./domain/escalation-owner.js";
+import { deriveUsageLimitPools } from "./domain/provider/provider-signals.js";
+import { SeatPoolUsageLimitMemory } from "./domain/seat-pool-usage-limit.js";
+import { resolveWakeRetryIntervalSeconds } from "./domain/queue-wake-ladder.js";
+import { SeatLifecycleService } from "./domain/seat-lifecycle-service.js";
+import { reserveOperation } from "./domain/operation-correlation.js";
+import { readClaudePermissionRules } from "./domain/claude-permission-rules.js";
+import { readCodexMemberPermissions } from "./domain/codex-member-permissions.js";
 import { diagnoseRigParked } from "./domain/parked-query.js";
 import { SpecReviewService } from "./domain/spec-review-service.js";
 import { SpecLibraryService } from "./domain/spec-library-service.js";
@@ -1655,12 +1678,13 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
     },
   });
   restoredSeatActivity = (sessionName, state) => {
-    void seatAttentionReconciler.onSeatActivity(sessionName, state)
+    // T-018092: telemetry attribution of the reconciler's process reads.
+    void withProcessCaller("reconciler", () => seatAttentionReconciler.onSeatActivity(sessionName, state))
       .catch(error => console.warn(`Restored-seat reconcile: ${error instanceof Error ? error.name : typeof error}`));
   };
   eventBus.subscribe(event => {
     if (event.type !== "restore.completed" && event.type !== "restore.subset_completed") return;
-    void seatAttentionReconciler.onRestoreCompleted(event.rigId)
+    void withProcessCaller("reconciler", () => seatAttentionReconciler.onRestoreCompleted(event.rigId))
       .catch(error => console.warn(`Restored-seat reconcile: ${error instanceof Error ? error.name : typeof error}`));
   });
 
@@ -2574,12 +2598,205 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
     // #3395 (Piece 1): the seat pool policy is composed here and not handed to the engine below, so the watchdog does
     // not run it and nothing registers a seat-pool job: the job stays unarmed until the activation change adds the
     // policy to additionalPolicies and calls the registration on launch, re-apply and daemon start.
-    const seatPoolSlots = new SeatPoolSlotsRepository(db);
+    // Fork: the upstream slots repository is named seatPoolSlotsRepository here, because seatPoolSlots below is the
+    // fork's pool (fork-seat-pool.ts and seat-pool-executor.ts, table fork_seat_pool_slots).
+    const seatPoolSlotsRepository = new SeatPoolSlotsRepository(db);
     const seatPoolPolicy = makeSeatPoolPolicy({
       readBlock: (modelNodeId) => rigRepo.getNodePool(modelNodeId),
-      readSlots: (modelNodeId) => seatPoolSlots.forModel(modelNodeId),
+      readSlots: (modelNodeId) => seatPoolSlotsRepository.forModel(modelNodeId),
     });
     void seatPoolPolicy;
+    // Seat pools: the fork-seat-pool policy plans, and this executor adds, launches, drains, reaps and removes the seats,
+    // moves waiting rows and wakes the seats holding them outside the scheduler tick, through the same services the
+    // member, launch, stop, clean, node and queue routes use.
+    const seatPoolSlots = new SeatPoolSlots(db);
+    const seatPoolStops = new SeatLifecycleService({ db, rigRepo, sessionRegistry, eventBus, tmuxAdapter, nodeLauncher });
+    const latestSession = (nodeId: string) =>
+      db.prepare("SELECT id, status FROM sessions WHERE node_id = ? ORDER BY id DESC LIMIT 1").get(nodeId) as { id: string; status: string } | undefined;
+    const readPoolState = (
+      job: { jobId: string; targetSession: string; spec: SeatPoolSpec }, usageLimited?: ReadonlySet<string>, busy?: ReadonlyMap<string, string | null>,
+    ) => readSeatPoolState({
+      db,
+      slots: seatPoolSlots,
+      openRows: (sessionName) => queueRepoInstance.listOpenObligations(sessionName, 500),
+      // Read only for a pool with dispatch_to_parked or return_long_gates (T-012673): the seat's open rows and their parks.
+      rowFacts: (sessionName, maxBlocked, opts) => queueRepoInstance.listPoolSeatRowFacts(sessionName, maxBlocked, opts),
+      // Read only for a pool with return_long_gates (T-012673): whether the queue takes its `to`.
+      acceptsDestination: (sessionName) => queueRepoInstance.acceptsDestination(sessionName),
+      sessionAddresses: (sessionName) => sessionRegistry.sessionAddresses(sessionName),
+      heldMessages: (nodeId) => outboxHandlerInstance.heldCount(nodeId),
+      // The live statuses getLatestLiveSessions reads, and the identity verdict that a "running" session is gone.
+      seatStopped: (nodeId) => !["running", "idle", "unknown"].includes(latestSession(nodeId)?.status ?? "") || nodeExecutorConfirmedStopped(db, nodeId),
+      seatState: (nodeId) => nodeExecutorConfirmedStopped(db, nodeId) ? null : seatActivityService.getSeatState(nodeId),
+      usageLimited: usageLimited ? (sessionName) => usageLimited.has(sessionName) : undefined,
+      restoring: (rigId) => restoreOrchestrator.restoreInProgress(rigId),
+      demand: (jobId) => seatPoolExecutor.demandSample(jobId),
+      // Read only for a spec with dispatch_to_parked.parked_max_load_per_cpu_percent: the plan holds a parked seat back.
+      hostSample: sampleHost,
+      // Read only for a spec with dispatch_to_parked.busy_processes: the seats busy with heavy local work (T-006090).
+      busyProcess: busy ? (sessionName) => busy.get(sessionName) : undefined,
+      // Read for a seat the pool added while context_limit_percent is above 0 (T-012383): its live occupant's
+      // status-line sidecar, the one the Billverso's orchestration gate reads (portao._contexto).
+      contextUsage: (nodeId, sessionName) => {
+        const usage = contextUsageStore.readSidecarForNode(nodeId, sessionName);
+        return usage.availability === "known" ? { usedPercentage: usage.usedPercentage, sampledAt: usage.sampledAt } : null;
+      },
+      // T-018090 (the head-of-line block): a seat whose release command refused it lately is out of the drain order.
+      releaseRefusedUntilMs: (jobId, slot) => seatPoolExecutor.releaseRefusedUntilMs(jobId, slot),
+    }, job);
+    // A seat's bound pane (`%12`), or null.
+    const poolPaneId = (sessionName: string): string | null => (db.prepare(
+      `SELECT b.tmux_pane FROM sessions s JOIN bindings b ON b.node_id = s.node_id AND b.tmux_session = s.session_name
+        WHERE s.session_name = ? ORDER BY s.id DESC LIMIT 1`,
+    ).get(physicalSessionName(db, sessionName)) as { tmux_pane: string | null } | undefined)?.tmux_pane ?? null;
+    // The TMUX_PANE a process inherited, read from /proc (Linux) off the event loop (T-006251 S1, readProcTmuxPane): null
+    // elsewhere, with none, for a process gone or another user's; any other failure rejects, which holds the seats.
+    const procEnvironmentIo = {
+      readFile: (path: string) => fs.promises.readFile(path, "latin1"),
+      ownerUid: async (path: string) => (await fs.promises.stat(path)).uid,
+      uid: process.getuid?.() ?? null,
+    };
+    const processTmuxPane = async (pid: number): Promise<string | null> =>
+      process.platform === "linux" ? readProcTmuxPane(pid, procEnvironmentIo) : null;
+    // For a spec with dispatch_to_parked.busy_processes: the seats that could take a row now (free or parked), and why
+    // each is busy with heavy local work, or null. Undefined for any other spec (nothing read).
+    const busyPoolSessions = async (
+      job: { jobId: string; targetSession: string; spec: SeatPoolSpec }, usageLimited?: ReadonlySet<string>,
+    ): Promise<ReadonlyMap<string, string | null> | undefined> => {
+      if (!job.spec.dispatchToParked?.busyProcesses?.length) return undefined;
+      return readSeatPoolBusyCandidates(job.spec, readPoolState(job, usageLimited).slots, Date.now(), {
+        panes: () => tmuxAdapter.listAllPanePids(),
+        paneOf: (sessionName) => ({ paneId: poolPaneId(sessionName), tmuxSession: physicalSessionName(db, sessionName) }),
+        processPane: processTmuxPane,
+        processes: readProcessTable,
+      });
+    };
+    // The seats whose provider account is out of usage, as the wake ladder reads them: the plan reads them, and the run
+    // again just before each add, launch and relaunch. A seat stays limited until the reset it stated (#2917), which the
+    // ladder parks it for, though the provider's signal is fresh for 5 minutes only (SeatPoolUsageLimitMemory).
+    const seatPoolUsageLimitMemory = new SeatPoolUsageLimitMemory();
+    const usageLimitedSessions = async (): Promise<ReadonlySet<string>> => {
+      if (!deps.providerService) return new Set();
+      const now = new Date();
+      try {
+        const pools = deriveUsageLimitPools({
+          ...(await deps.providerService.getReadModel()),
+          now,
+          fallbackSeconds: resolveWakeRetryIntervalSeconds(),
+          claudeHomeOf: (seatSession) => seatRuntimeHomeBySession(db, seatSession, "claude-code"),
+        });
+        return seatPoolUsageLimitMemory.limited(pools, now.getTime());
+      } catch {
+        // An unreadable read model reads no new limit; the limits already remembered still hold.
+        return seatPoolUsageLimitMemory.limited([], now.getTime());
+      }
+    };
+    // One budget for every pool of this daemon; its limits are the daemon's settings, read at each launch. The
+    // watchdog scheduler starts its next tick at each pass.
+    const seatPoolLaunchBudget = new LaunchBudget({
+      limits: () => {
+        const settings = new ContextPackSettingsStore();
+        return launchBudgetLimits((key) => settings.resolveOne(key).value as number);
+      },
+    });
+    const seatPoolExecutor: SeatPoolExecutor = new SeatPoolExecutor({
+      slots: seatPoolSlots,
+      launchBudget: seatPoolLaunchBudget,
+      readJob: (jobId) => {
+        const job = watchdogJobsRepoInstance.getById(jobId);
+        if (!job) return null;
+        try {
+          const parsed = parseWatchdogSpec(job.specYaml);
+          const pool = parseSeatPoolSpec(parsed.context);
+          return { active: job.state === "active", targetSession: watchdogJobTarget(job, parsed.target).session, spec: "spec" in pool ? pool.spec : null };
+        } catch {
+          return { active: job.state === "active", targetSession: job.targetSession, spec: null };
+        }
+      },
+      readState: readPoolState,
+      outOfUsage: async (job) => seatPoolOutOfUsage(readPoolState(job, await usageLimitedSessions())),
+      // The plan's own read: the dispatch recheck and the demand command's receives see the usage limit as the plan does.
+      usageLimited: usageLimitedSessions,
+      // The busy seats read again just before a parked row moves and before the demand command (T-006090).
+      busySessions: async (job) => (await busyPoolSessions(job)) ?? new Map(),
+      // T-018090 (the spec's 1.2.6): each refusal of the release command, its cause and the backoff it starts, one
+      // structured line in the daemon's log (the history entries stay as they were).
+      releaseRefusedLog: (jobId, event) => console.warn(`[seat-pool] release_refused job=${jobId} ${JSON.stringify(event)}`),
+      record: (jobId, entry) => {
+        watchdogHistoryLogInstance.record({
+          jobId, evaluatedAt: new Date().toISOString(), outcome: entry.failed ? "failed" : "skipped",
+          skipReason: entry.reason, evaluationNotes: entry.notes,
+        });
+      },
+      effects: {
+        addSlot: async ({ model, memberId, cwd, operationId }) => {
+          const logicalId = `${model.podNamespace}.${memberId}`;
+          const operation = reserveOperation(db, operationId, "member.add", [model.rigId, model.podNamespace], logicalId);
+          if (operation.state === "replay") {
+            const created = operation.operation.current.nodes.find((node) => node.exists);
+            return created ? { ok: true, nodeId: created.id } : { ok: false, code: "add_not_completed", error: `the earlier add of ${logicalId} created no node` };
+          }
+          if (operation.state !== "fresh") return { ok: false, code: "operation_id_conflict", error: `operation ${operationId} was used for another request` };
+          const source = rigRepo.getRig(model.rigId)?.nodes.find((node) => node.id === model.nodeId);
+          if (!source) return { ok: false, code: "model_not_found", error: `model seat ${model.logicalId} no longer exists` };
+          const member = slotMemberFragment(source, memberId, cwd, {
+            claude: source.runtime === "claude-code" ? readClaudePermissionRules(db, source.id) : undefined,
+            codex: source.runtime === "codex" ? readCodexMemberPermissions(db, source.id) : undefined,
+          });
+          const rigRoot = rigRepo.getNodeLaunchRecipe(source.id)?.rigRoot ?? ".";
+          const outcome = await podInstantiator.addMemberToPod(model.rigId, model.podNamespace, member, rigRoot,
+            { recordCreated: operation.recordCreated, launch: false });
+          if (!outcome.ok) return { ok: false, code: outcome.code, error: "message" in outcome ? outcome.message : outcome.errors.join("; ") };
+          return { ok: true, nodeId: outcome.result.node.nodeId };
+        },
+        operationNodeId: (operationId) => {
+          const row = db.prepare("SELECT node_ids_json FROM operation_correlations WHERE operation_id = ?").get(operationId) as { node_ids_json: string } | undefined;
+          return row ? (JSON.parse(row.node_ids_json) as string[])[0] ?? null : null;
+        },
+        launchSlot: async ({ rigId, nodeId }) => {
+          const started = await podInstantiator.launchFirstMaterializedNode(rigId, nodeId);
+          if (!started) return { ok: false, code: "not_first_start", error: "the seat already had a session, or its member declaration is gone" };
+          if (!started.ok) return { ok: false, code: started.code ?? "launch_failed", error: started.error ?? "launch failed" };
+          // As the launch route does after a first start, so a later restore knows the seat.
+          snapshotCapture.captureSnapshot(rigId, "auto-rehydrate");
+          return { ok: true };
+        },
+        sessionRunning: (nodeId) => latestSession(nodeId)?.status === "running",
+        lifecycle: (nodeId, fn) => tmuxAdapter.deliveryGuard ? tmuxAdapter.deliveryGuard.lifecycle([nodeId], fn) : fn(),
+        stopPrecondition: (nodeId) => ({ nodeId, sessionId: latestSession(nodeId)?.id ?? null }),
+        stopSlot: async ({ sessionName, expected }) => {
+          const stopped = await seatPoolStops.stopSeat({ seatRef: sessionName, reason: "seat-pool drain", operator: null, expected });
+          return stopped.ok ? { ok: true }
+            : { ok: false, code: stopped.code, error: stopped.message, ...(stopped.stopPhase === "kill_attempted" ? { killAttempted: true } : {}) };
+        },
+        removeSlot: async ({ rigId, nodeId, expected }) => {
+          const removed = await rigLifecycleService.removeNode(rigId, nodeId, { expected });
+          return removed.ok ? { ok: true } : { ok: false, code: removed.code, error: removed.error };
+        },
+        runCommand: runSeatPoolCommand,
+        cleanSlot: async ({ sessionName }) => {
+          const cleaned = await seatPoolStops.cleanSeat({ seatRef: sessionName, reason: "seat-pool reap", operator: null });
+          return cleaned.ok ? { ok: true } : { ok: false, code: cleaned.code, error: cleaned.message };
+        },
+        relaunchSeat: async ({ rigId, logicalId }) => {
+          // As the node launch route does for a seat that already had a session.
+          const result = await restoreOrchestrator.launchSingleNode(rigId, logicalId, { adapters: runtimeAdaptersMap, fsOps: { exists: (p) => fs.existsSync(p) } });
+          if (!result.ok) return { ok: false, code: result.code ?? "launch_failed", error: result.message ?? "launch failed" };
+          const launched = result.launched?.find((node) => node.logicalId === logicalId);
+          if (launched && !launchStatusIsRunning(launched.status)) return { ok: false, code: launched.status, error: launched.error ?? `the seat came up ${launched.status}` };
+          if (!launched && !result.alreadyRunning?.some((node) => node.logicalId === logicalId)) {
+            return { ok: false, code: "not_launched", error: result.failedTargets?.find((node) => node.logicalId === logicalId)?.reason ?? "the seat was not launched" };
+          }
+          return { ok: true };
+        },
+        ...seatPoolQueueEffects({
+          queueRepo: queueRepoInstance,
+          escalationOwner: (modelSession) => resolveEscalationOwner(db, modelSession, (target) => queueRepoInstance.acceptsDestination(target)),
+        }),
+      },
+    });
+    deps.seatPoolExecutor = seatPoolExecutor;
+
     const watchdogPolicyEngine = new WatchdogPolicyEngine({
       deliveryDeferred: (jobId, session) => queueRepoInstance.deliveryDrains.holds(session, jobId),
       jobsRepo: watchdogJobsRepoInstance,
@@ -2640,6 +2857,13 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
           reconcileStuckExceptions: (id) => workflowRuntime?.reconcileStuckExceptions(id) ?? 0,
         }),
         makeIdleGateQitemPolicy({ db, seatActivity: seatActivityService, isQueueOnlySeat: isQueueOnlyGuardSeat }),
+        makeForkSeatPoolPolicy({
+          readState: async (job) => {
+            const usageLimited = await usageLimitedSessions();
+            return readPoolState(job, usageLimited, await busyPoolSessions(job, usageLimited));
+          },
+          submit: (jobId, intents) => seatPoolExecutor.submit(jobId, intents),
+        }),
         // OPR.0.5.6.24 F-14: the parked-owner consumer — the WHOLE shipped
         // parked diagnosis (diagnoseRigParked over the arbitrated oracle +
         // destination-scoped obligations + wake status; the same derivation
@@ -2677,7 +2901,12 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
           },
           // Best-effort attempt reporting; actual prompt and failure recovery still use the existing ladder.
           rows: {
-            recoveryOwnsWake: (qitemId) => queueRecoveryOwnsWake(db, queueRepoInstance.getById(qitemId)),
+            // T-013820: the recheck asks this for every open row of a parked seat (hundreds, for a seat holding many) in
+            // one synchronous pass: from a few rows up they share one recovery index, and the custody read takes each
+            // row without its waiting view (it reads only the row's own state, claim, handoff and wake fields). Per row,
+            // outside the index, the pass held the loop 5-6 s for a seat with 233 open rows.
+            recoveryOwnedAmong: (qitemIds) =>
+              queueRecoveryOwnedAmong(db, qitemIds, (qitemId) => queueRepoInstance.getById(qitemId, { waiting: false })),
             listTransitions: (qitemId: string) =>
               queueRepoInstance
                 .listTransitions(qitemId)
@@ -2768,7 +2997,10 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
     const watchdogScheduler = new WatchdogScheduler({
       jobsRepo: watchdogJobsRepoInstance,
       policyEngine: watchdogPolicyEngine,
-      beforeTick: () => queueRepoInstance.reconcileWaitReminders(),
+      beforeTick: () => {
+        seatPoolLaunchBudget.nextTick();
+        queueRepoInstance.reconcileWaitReminders();
+      },
     });
     deps.watchdogPolicyEngine = watchdogPolicyEngine;
     deps.watchdogScheduler = watchdogScheduler;
@@ -3132,12 +3364,18 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
   });
   deps.periodicSnapshotScheduler = periodicSnapshotScheduler;
 
+  // P04-v2 PR-B — the auto-rehydrate backlog drains in bounded batches after the daemon listens (index.ts starts it in
+  // the serve callback); nothing is pruned here, during boot.
+  const { AutoRehydrateRetentionScheduler } = await import("./domain/auto-rehydrate-retention.js");
+  deps.autoRehydrateRetentionScheduler = new AutoRehydrateRetentionScheduler({ db, snapshotRepo });
+
   // OPR.0.4.3.21 — daemon event-loop health instrumentation. Constructed once
   // per daemon and wired into deps so `/healthz` can surface wedge evidence
   // (loop lag / last-tick age) and the expensive topology routes are timed.
   const { EventLoopMonitor } = await import("./domain/event-loop-monitor.js");
   const { RouteTimingRecorder } = await import("./domain/route-timing-recorder.js");
-  const requestPhaseObserver = slowOpRecorder?.recordDiagnostic ? new RequestPhaseObserver(slowOpRecorder) : undefined;
+  const requestPhaseObserver = slowOpRecorder?.recordDiagnostic
+    ? new RequestPhaseObserver(slowOpRecorder, undefined, undefined, syncSitesDuring) : undefined;
   deps.requestPhaseObserver = requestPhaseObserver;
   const eventLoopMonitor = new EventLoopMonitor({ onTick: (at, previous) => requestPhaseObserver?.tick(at, previous) });
   const routeTimingRecorder = new RouteTimingRecorder();

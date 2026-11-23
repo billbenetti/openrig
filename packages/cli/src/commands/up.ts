@@ -384,12 +384,21 @@ wait expires, check rig ps before deciding what to do next.
       let rigSummariesCache: Array<{ id: string; name: string; lifecycleState?: string }> | null = null;
       const fetchRigSummaries = async () => {
         if (rigSummariesCache !== null) return rigSummariesCache;
+        let res: { status: number; data: unknown };
         try {
-          const res = await client.get<Array<{ id: string; name: string; lifecycleState?: string }>>("/api/rigs/summary");
-          rigSummariesCache = res.data ?? [];
+          res = await client.get<Array<{ id: string; name: string; lifecycleState?: string }>>("/api/rigs/summary");
         } catch {
           rigSummariesCache = [];
+          return rigSummariesCache;
         }
+        // T-011538: a busy daemon answers 503 ({ error, message, retryAfterSeconds }), not the list; resolving the name
+        // without it would skip the collision checks, so the command stops and says why
+        if (res.data != null && !Array.isArray(res.data)) {
+          const body = res.data as { message?: string; retryAfterSeconds?: number };
+          throw new Error(`the daemon could not list the rigs (HTTP ${res.status})${body.message ? `: ${body.message}` : ""}`
+            + `${body.retryAfterSeconds ? `; try again in ${body.retryAfterSeconds} s` : ""}`);
+        }
+        rigSummariesCache = (res.data ?? []) as Array<{ id: string; name: string; lifecycleState?: string }>;
         return rigSummariesCache;
       };
       // OPR.0.3.3.19 (AC-7): archived rigs are excluded from default `rig up`

@@ -264,6 +264,8 @@ export interface AppDeps {
   keepAliveSupervisor?: import("./domain/keep-alive-supervisor.js").KeepAliveSupervisor;
   /** The outbound network connector (`rig network`); started after the listener binds. */
   networkConnector?: import("./domain/network/network-connector.js").NetworkConnectorService;
+  /** Applies seat-pool plans outside the watchdog tick; stopped with the scheduler. */
+  seatPoolExecutor?: import("./domain/seat-pool-executor.js").SeatPoolExecutor;
   /** B8 / slice-07 A3 — the model-divergence monitor (effective-vs-pinned, four-channel proclaim). */
   modelDivergenceMonitor?: import("./domain/model-divergence/model-divergence-monitor.js").ModelDivergenceMonitor;
   /** S10 — the in-daemon gateway subsystem (amended M1 §3: in-process, no second deployable).
@@ -273,6 +275,8 @@ export interface AppDeps {
   /** Concrete local relay inbound handler (`POST /api/gateway/relay/inbound`). */
   relayInboundHandler?: import("./domain/gateway/relay-inbound.js").RelayInboundHandler;
   periodicSnapshotScheduler?: import("./domain/periodic-snapshot-scheduler.js").PeriodicSnapshotScheduler;
+  /** P04-v2 PR-B — drains old `auto-rehydrate` captures in bounded batches, started only after the daemon listens. */
+  autoRehydrateRetentionScheduler?: import("./domain/auto-rehydrate-retention.js").AutoRehydrateRetentionScheduler;
   workflowRuntime?: WorkflowRuntime;
   /**
    * Absolute path to the daemon's bundled built-in workflow-specs

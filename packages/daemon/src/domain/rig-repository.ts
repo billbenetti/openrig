@@ -8,8 +8,7 @@ import { storedStatuslineThrottle, validateStatuslineThrottle } from "./claude-s
 import { parseStoredPoolBlock, storedPoolText, type SeatPoolNodeBlock, type StoredSeatPool } from "./seat-pool-spec.js";
 import { validateCodexMemberPermissions } from "./codex-member-permissions.js";
 import type Database from "better-sqlite3";
-import { resolveActiveOccupantRow } from "./active-occupant.js";
-import { decodeStoredSnapshotData } from "./snapshot-repository.js";
+import { decodeStoredSnapshotData, hasResolvedOccupantResumeToken } from "./snapshot-repository.js";
 import { posix, resolve } from "node:path";
 import { ulid } from "ulid";
 import { deriveComposeProjectName } from "./compose-project-name.js";
@@ -250,15 +249,7 @@ function snapshotFromRowIfUsable(row: SnapshotRow): Snapshot | null {
   // carrying a token (the same four-way ladder execution consumes). A
   // present-null/missing-key/dangling relation never counts — a historical
   // token on a non-occupant row must not read as recoverable.
-  const sessions = data.sessions ?? [];
-  const nodeIds = [...new Set(sessions.map((s) => s.nodeId))];
-  const hasResolvedOccupantToken = nodeIds.some((nodeId) => {
-    const resolution = resolveActiveOccupantRow(sessions, data.activeSessionIdByNode, nodeId);
-    return resolution.kind === "resolved"
-      && typeof resolution.session.resumeToken === "string"
-      && resolution.session.resumeToken.length > 0;
-  });
-  if (!hasResolvedOccupantToken) return null;
+  if (!hasResolvedOccupantResumeToken(data)) return null;
 
   return {
     id: row.id,

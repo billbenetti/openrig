@@ -14,19 +14,18 @@ import { joinAutomaticRestore, JOINED_AUTOMATIC_RESTORE_WARNING } from "../domai
 import { projectRigToGraph, type InventoryOverlay, type CurrentQitemSummary } from "../domain/graph-projection.js";
 import {
   getNodeInventory,
-  getNodeInventoryForRigs,
   getNodeInventoryWithContext,
   attachAgentActivity,
   attachTerminalActivityAndWork,
-  countAssignedWorkForEntry,
-  readAssignedWorkBySession,
 } from "../domain/node-inventory.js";
 import { projectionLane } from "../domain/projection-lane.js";
+import { readOffLoop } from "../domain/read-off-loop.js";
+import { readRigSummaryEntries } from "../domain/rig-summary-projection.js";
 import type { TmuxAdapter } from "../adapters/tmux.js";
 import type { AgentActivityStore } from "../domain/agent-activity-store.js";
 import type { SeatActivityService } from "../domain/seat-activity-service.js";
 import type { SeatStructuralActivityService } from "../domain/seat-structural-activity-service.js";
-import { deriveRigLifecycleState, deriveRigLifecycleFromInventory } from "../domain/ps-projection.js";
+import { deriveRigLifecycleState } from "../domain/ps-projection.js";
 import { identityVerdictConfirmsSessionMissing } from "../domain/types.js";
 import { assessCurrentStateRehydrateEligibility, snapshotMatchesCurrentOccupants } from "../domain/rehydrate-eligibility.js";
 import { buildRestorePlanPreview, collectPreviewSessionRows } from "../domain/restore-plan-preview.js";
@@ -142,22 +141,12 @@ rigsRoutes.get("/summary", (c) => {
   //     active-only; archived variants pass their archived rig-ids), so the per-node
   //     fold never widens to excluded rigs — one fleet startup + one restore scan.
   //   - Live per request; NO cache/staleness (getRigSummaries + fold read live db).
-  return projectionLane.run(() => {
-    const summaries = repo.getRigSummaries({ includeArchived, archivedOnly });
-    const invByRig = getNodeInventoryForRigs(repo.db, new Set(summaries.map((s) => s.id)));
-    const assignedByDest = readAssignedWorkBySession(repo.db);
-    const enriched = summaries.map((s) => {
-      const inventory = invByRig.get(s.id) ?? [];
-      const lifecycleState = deriveRigLifecycleFromInventory(inventory, (node) => countAssignedWorkForEntry(node, assignedByDest).assignedWorkCount);
-      // Restore eligibility still accounts for every seat, including intentional stops.
-      const restoreLifecycleState = deriveRigLifecycleState(inventory.map((entry) => entry.lifecycleState));
-      const agents = inventory.filter((e) => e.nodeKind === "agent");
-      // Presence is separate from lifecycle/attention, and uses this same inventory fold.
-      const hasLiveAgents = agents.some((e) => e.sessionStatus === "running" || e.sessionStatus === "idle")
-        ? true : agents.every((e) => e.sessionStatus === null || e.sessionStatus === "stopped" || e.sessionStatus === "exited") ? false : null;
-      return { ...s, lifecycleState, restoreLifecycleState, hasLiveAgents };
-    });
-    return c.json(enriched);
+  // T-010231: the read (summaries + inventory fold) runs on the read worker, off the
+  // event loop, and the lane job holds the loop only for the JSON.
+  return projectionLane.run(async () => {
+    const filter = { includeArchived, archivedOnly };
+    return c.json(await readOffLoop(repo.db, "rigSummaries", { filter }, () => readRigSummaryEntries(repo.db, filter),
+      { site: "rigs.summary.read", record: "whenSlow" }));
   });
 });
 
@@ -773,6 +762,11 @@ rigsRoutes.post("/:rigId/pods/:podNamespace/members", async (c) => {
   const edges = Array.isArray(rawEdges)
     ? (rawEdges as Array<{ from: string; to: string; kind: string }>)
     : undefined;
+  // `launch: false` creates the seat without a session, for a caller that prepares it before `rig launch`.
+  const launch = body["launch"];
+  if (launch !== undefined && typeof launch !== "boolean") {
+    return c.json({ ok: false, code: "validation_failed", errors: ["launch: must be a boolean"] }, 400);
+  }
 
   const operation = reserveOperation(getRepo(c).db, header, "member.add", [rigId, podNamespace], text);
   if (operation.state === "conflict") return c.json({ code: "operation_id_conflict" }, 409);
@@ -783,7 +777,7 @@ rigsRoutes.post("/:rigId/pods/:podNamespace/members", async (c) => {
     rigId,
     { kind: "add_member", pod: podNamespace, member: member as Record<string, unknown>, edges },
     rigRoot,
-    operation.state === "fresh" ? { recordCreated: operation.recordCreated } : undefined,
+    { ...(operation.state === "fresh" ? { recordCreated: operation.recordCreated } : {}), launch },
   );
   // This route is the add_member sugar over the converge interface.
   if (converged.kind !== "add_member" || !converged.supported) {
@@ -807,8 +801,9 @@ rigsRoutes.post("/:rigId/pods/:podNamespace/members", async (c) => {
     }
   }
 
-  // 201 created. The node may still be failed/attention_required at launch; that
-  // is carried in outcome.result.node.status (mirrors expand's per-node status).
+  // 201 created. The node may still be failed/attention_required at launch, or
+  // materialized when not launched; that is carried in outcome.result.node.status
+  // (mirrors expand's per-node status).
   return c.json(operation.state === "fresh" ? { ...outcome, operation: operation.read() } : outcome, 201);
 });
 

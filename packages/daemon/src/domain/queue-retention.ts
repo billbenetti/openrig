@@ -248,7 +248,10 @@ export function archiveAgedTerminalTransitions(
     .every((column) => activeColumns.has(column) && archiveColumns.has(column));
   // A row's principal moves with it (migration 140 gave both tables the column).
   const carriesPrincipal = activeColumns.has("identity_principal") && archiveColumns.has("identity_principal");
-  const ownerInsert = (carriesOwnerNotification ? ", owner_notification_kind, owner_notification_level" : "") + (carriesPrincipal ? ", identity_principal" : "");
+  // T-012748: the gate of each park moves with it too (migration 174 gave both tables the column).
+  const carriesBlockedOn = activeColumns.has("blocked_on") && archiveColumns.has("blocked_on");
+  const ownerInsert = (carriesOwnerNotification ? ", owner_notification_kind, owner_notification_level" : "") + (carriesPrincipal ? ", identity_principal" : "")
+    + (carriesBlockedOn ? ", blocked_on" : "");
   const ownerSelect = ownerInsert;
   const selectRows = db.prepare(
     `INSERT INTO queue_transitions_archive (

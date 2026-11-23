@@ -22,6 +22,7 @@ import { EventBus } from "../src/domain/event-bus.js";
 import { QueueRepository, defaultParkWakeMessage } from "../src/domain/queue-repository.js";
 import { isDefaultParkWakeMessage, queuedAsRowNote, withContinuationPreview } from "../src/domain/park-wake-text.js";
 import { updateWatchdogJob } from "../src/domain/watchdog-job-update.js";
+import { refreshQueueWaits } from "../src/domain/queue-wait-backoff.js";
 import { WatchdogJobsRepository } from "../src/domain/watchdog-jobs-repository.js";
 import { WatchdogHistoryLog } from "../src/domain/watchdog-history-log.js";
 import { WatchdogPolicyEngine } from "../src/domain/watchdog-policy-engine.js";
@@ -1165,5 +1166,175 @@ describe("queue-only seat: a watchdog reminder is never typed (#3076)", () => {
     expect(receipt.delivery_state).toBe("delivered");
     expect(JSON.parse(receipt.guard_delivery).watchdog).toMatchObject({ queueOnly: { code: "queued_as_row", qitemId: written[0]!.qitem_id } });
     expect(next.f.submissions).toEqual([]);
+  });
+
+  // T-007715 (the fork's redesign, volta 4 of the openrig#9): what the fork's current-park rule adds over #3441, read by
+  // the fork's own readers (getParkWakeStatus via getCurrentParkStatus, the wait reuse on a re-park, refreshQueueWaits,
+  // rerouteParked, the pool facts, the seat swap's attached timers, an archived arm).
+  const resume = (s: ReturnType<typeof scheduled>, qitemId: string) =>
+    s.repo.update({ qitemId, actorSession: seat, state: "in-progress", transitionNote: "resumed" } as never);
+  const gate = (s: ReturnType<typeof scheduled>, qitemId: string, blockedOn = "external:gate") =>
+    s.repo.update({ qitemId, actorSession: seat, state: "blocked", blockedOn, transitionNote: "parked on a gate, no wake" } as never);
+
+  it("T-007715 B1 (queue-only seat): a shared park timer retires when its row leaves, though a row once attached was parked again with no wake", async () => {
+    const { f, s, wdRows, parkWith, notes } = queueOnly();
+    const a = await s.park("A's wait");
+    const b = await parkWith("B attached", { wakeWatchdogId: a.jobId });
+    resume(s, b.qitemId);
+    gate(s, b.qitemId);
+    // S2: B's current park has no wake of its own, so its park status is not A's live timer
+    expect(s.repo.getParkWakeStatus(b.qitemId)).toBeNull();
+    resume(s, a.qitemId);
+    expect(s.jobs.getByIdOrThrow(a.jobId).state).toBe("terminal");
+    for (let i = 0; i < 3; i++) {
+      s.due(a.jobId);
+      await s.scheduler.runTickNow();
+    }
+    expect(wdRows()).toEqual([]);
+    expect(notes(b.qitemId, a.jobId)).toEqual([]);
+    // the net for a timer an older daemon left active: it is retired before delivery, and nothing is sent
+    f.db.prepare("UPDATE watchdog_jobs SET state = 'active', terminal_reason = NULL WHERE job_id = ?").run(a.jobId);
+    s.due(a.jobId);
+    await s.scheduler.runTickNow();
+    expect(s.jobs.getByIdOrThrow(a.jobId).state).toBe("terminal");
+    expect(wdRows()).toEqual([]);
+    expect(f.submissions).toEqual([]);
+  });
+
+  it("T-007715 B1 (terminal seat): the same timer is never typed again at A's owner", async () => {
+    const f = fixture();
+    const s = scheduled(f);
+    const a = await s.park("A's wait");
+    const row = await s.repo.create({ sourceSession: "orch@test", destinationSession: seat, body: "B", summary: "B", nudge: false } as never) as unknown as { qitemId: string };
+    s.repo.update({ qitemId: row.qitemId, actorSession: seat, state: "blocked", blockedOn: "external:wait", transitionNote: "attached", wakeWatchdogId: a.jobId } as never);
+    resume(s, row.qitemId);
+    gate(s, row.qitemId);
+    expect(s.repo.getParkWakeStatus(row.qitemId)).toBeNull();
+    resume(s, a.qitemId);
+    expect(s.jobs.getByIdOrThrow(a.jobId).state).toBe("terminal");
+    for (let i = 0; i < 3; i++) {
+      s.due(a.jobId);
+      await s.scheduler.runTickNow();
+    }
+    expect(f.submissions.filter(t => t.includes(`Wake timer fired for parked qitem ${a.qitemId}`))).toEqual([]);
+  });
+
+  it("T-007715 N2: a re-park blocked → blocked with no wake keeps the attachment (the same park)", async () => {
+    const { s, wdRows, parkWith, notes, operatorReminder, tick } = queueOnly();
+    const job = operatorReminder();
+    const b = await parkWith("bound to the operator's reminder", { wakeWatchdogId: job.jobId });
+    gate(s, b.qitemId, "external:another-gate");
+    expect(s.repo.getParkWakeStatus(b.qitemId)).toMatchObject({ kind: "watchdog", ref: job.jobId });
+    await tick(job.jobId);
+    expect(notes(b.qitemId, job.jobId).filter(n => n.includes("check your rows"))).toHaveLength(1);
+    expect(wdRows()).toEqual([]);
+  });
+
+  it("T-007715: the repeating wait a row once attached to ends when no current park holds it (refreshQueueWaits)", async () => {
+    const { s, parkWith } = queueOnly();
+    const a = await parkWith("A waits on X", { wakeAfterSeconds: 600, wakeMaxSeconds: 2400 });
+    const b = await parkWith("B attached", { wakeWatchdogId: a.jobId });
+    resume(s, a.qitemId);
+    // B's current park still holds the wait
+    refreshQueueWaits(s.repo.db, s.jobs);
+    expect(s.jobs.getByIdOrThrow(a.jobId).state).toBe("active");
+    resume(s, b.qitemId);
+    gate(s, b.qitemId);
+    refreshQueueWaits(s.repo.db, s.jobs);
+    expect(s.jobs.getByIdOrThrow(a.jobId).state).toBe("terminal");
+  });
+
+  it("T-007715: the generating row parked again on a gate: the attached row is the shared timer's only target, and the timer then ends", async () => {
+    const { s, wdRows, parkWith, notes, tick } = queueOnly();
+    const a = await s.park("A's wait");
+    const b = await parkWith("B attached", { wakeWatchdogId: a.jobId });
+    resume(s, a.qitemId);
+    gate(s, a.qitemId);
+    expect(s.jobs.getByIdOrThrow(a.jobId).state).toBe("active"); // B's current park still holds it
+    expect(s.repo.getParkWakeStatus(a.qitemId)).toBeNull();
+    await tick(a.jobId);
+    expect(notes(a.qitemId, a.jobId)).toEqual([]);
+    expect(notes(b.qitemId, a.jobId)).toHaveLength(1);
+    expect(wdRows()).toEqual([]);
+    expect(s.jobs.getByIdOrThrow(a.jobId)).toMatchObject({ state: "terminal", terminalReason: "park_timer_target_terminal" });
+  });
+
+  it("T-007715: the last attached row leaving: the shared timer no current park holds ends before delivery, with nothing sent", async () => {
+    const { f, s, wdRows, parkWith, tick } = queueOnly();
+    const a = await s.park("A's wait");
+    const b = await parkWith("B attached", { wakeWatchdogId: a.jobId });
+    resume(s, a.qitemId);
+    gate(s, a.qitemId);
+    resume(s, b.qitemId);
+    await tick(a.jobId);
+    expect(wdRows()).toEqual([]);
+    expect(f.submissions).toEqual([]);
+    expect(s.jobs.getByIdOrThrow(a.jobId)).toMatchObject({ state: "terminal", terminalReason: "park_timer_target_terminal" });
+  });
+
+  it("T-007715: rerouteParked reads the current park: a past park's timer, still active, is not rearmed for a row now on a gate", async () => {
+    const { f, s, parkWith } = queueOnly();
+    const a = await s.park("A's wait");
+    const b = await parkWith("B attached", { wakeWatchdogId: a.jobId });
+    resume(s, a.qitemId);
+    gate(s, a.qitemId);
+    resume(s, b.qitemId);
+    // a timer an older daemon left active
+    f.db.prepare("UPDATE watchdog_jobs SET state = 'active', terminal_reason = NULL WHERE job_id = ?").run(a.jobId);
+    const routed = s.repo.rerouteParked(a.qitemId, "other@test", "owner gone");
+    expect(routed.park).toBe("unparked");
+    expect(s.repo.getById(a.qitemId)!.state).toBe("pending");
+  });
+
+  // A wait J whose own row A moved on (parked again on the same blocker, no wake) while B held it, and whose B
+  // attachment a fire then consumed: no current park holds J any more.
+  const waitLeftBehind = async () => {
+    const q = queueOnly();
+    const a = await q.parkWith("A waits on X", { wakeAfterSeconds: 600, wakeMaxSeconds: 2400 });
+    await q.parkWith("B attached", { wakeWatchdogId: a.jobId });
+    resume(q.s, a.qitemId);
+    gate(q.s, a.qitemId, "external:wait");
+    q.s.repo.recordWatchdogWakeAttempt(a.jobId, "noted_on_parked_row");
+    expect(q.s.jobs.getByIdOrThrow(a.jobId).state).toBe("active");
+    return { ...q, a };
+  };
+
+  it("T-007715: a wait no current park holds ends at its refresh, though its row is parked again on the same blocker", async () => {
+    const { s, a } = await waitLeftBehind();
+    refreshQueueWaits(s.repo.db, s.jobs);
+    expect(s.jobs.getByIdOrThrow(a.jobId)).toMatchObject({ state: "terminal", terminalReason: "park_wait_ended" });
+  });
+
+  it("T-007715: a row that parks again with a wait gets its own, never the wait of a park it left", async () => {
+    const { s, a } = await waitLeftBehind();
+    s.repo.update({ qitemId: a.qitemId, actorSession: seat, state: "blocked", blockedOn: "external:wait", transitionNote: "wait again",
+      wakeAfterSeconds: 600, wakeMaxSeconds: 2400 } as never);
+    expect(s.repo.getParkWakeStatus(a.qitemId)!.ref).not.toBe(a.jobId);
+  });
+
+  it("T-007715: the pool facts of a parked row see no wake when the current park has none", async () => {
+    const { s, parkWith, operatorReminder } = queueOnly();
+    const job = operatorReminder();
+    const b = await parkWith("B on the operator's reminder", { wakeWatchdogId: job.jobId });
+    resume(s, b.qitemId);
+    gate(s, b.qitemId);
+    expect(s.repo.listPoolSeatRowFacts(seat).parked).toMatchObject({ qitemId: b.qitemId, blockedOn: "external:gate",
+      timerIntervalS: null, timerArmedLive: false, parkActor: null, parkedAt: null });
+  });
+
+  it("T-007715 F2: a seat swap keeps a park timer an attached row of the same owner still holds, after its own row moved on", async () => {
+    const { s, parkWith } = queueOnly();
+    const a = await s.park("A's wait");
+    await parkWith("B attached", { wakeWatchdogId: a.jobId });
+    resume(s, a.qitemId);
+    gate(s, a.qitemId);
+    expect(s.repo.currentParkTimerIds()).toContain(a.jobId);
+  });
+
+  it("T-007715: an arm whose transition is no longer in the history (retention archived it, then a reopen) is not the current park's", async () => {
+    const { f, s } = queueOnly();
+    const a = await s.park("A's wait");
+    f.db.prepare("DELETE FROM queue_transitions WHERE qitem_id = ?").run(a.qitemId);
+    expect(s.repo.getParkWakeStatus(a.qitemId)).toBeNull();
   });
 });

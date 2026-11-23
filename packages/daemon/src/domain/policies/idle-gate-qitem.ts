@@ -208,6 +208,9 @@ const WAKE_MACHINERY_NOTE_PREFIXES = [
   // A queue-only seat's park wake records (#3076).
   "park wake noted on this row:",
   "park wake queued as row:",
+  // T-007715 (delta review N1): the other park wake notes written by recordWatchdogWakeAttempt are machinery too
+  "park wake retained:",
+  "park wake failed:",
   "idle-gate:",
 ];
 

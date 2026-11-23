@@ -374,3 +374,21 @@ describe("VM-005 B1 — read-after-write coherence at the daemon's own API", () 
     expect(indexer.missionAuthoredStatuses()["relx"]).toEqual({ authoredStatus: "complete" });
   });
 });
+
+describe("POST complete when a slice name repeats across missions", () => {
+  it("finds the mission the listing would show when a slice name repeats across missions", async () => {
+    writeSliceInMission(missionsRoot, "alpha", "shared");
+    writeSliceInMission(missionsRoot, "beta", "shared");
+    writeSliceInMission(missionsRoot, "beta", "own");
+    writeMissionReadme(missionsRoot, "alpha", "---\nstatus: active\n---\n# Alpha\n");
+    writeMissionReadme(missionsRoot, "beta", "---\nstatus: active\n---\n# Beta\n");
+    const listed = new Set(indexer.list().map((s) => s.missionId));
+    indexer.invalidate();
+    const app = buildApp(indexer);
+    for (const missionId of ["alpha", "beta"]) {
+      const res = await app.request(`/api/missions/${missionId}/complete`, { method: "POST" });
+      expect(res.status).toBe(listed.has(missionId) ? 200 : 404);
+    }
+    expect(fs.readFileSync(path.join(missionsRoot, "beta", "README.md"), "utf8")).toContain("status: complete");
+  });
+});

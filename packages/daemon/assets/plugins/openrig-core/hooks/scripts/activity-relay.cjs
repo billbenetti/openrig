@@ -318,26 +318,44 @@ function resolveEndpoint(env = process.env) {
   }
 
   if (!baseUrl || !token) {
-    try {
-      const fs = require("node:fs");
-      const path = require("node:path");
-      const os = require("node:os");
-      const home = firstString(env.OPENRIG_HOME, env.RIGGED_HOME) || path.join(os.homedir(), ".openrig");
-      const parsed = JSON.parse(fs.readFileSync(path.join(home, "activity-endpoint.json"), "utf8"));
-      if (!baseUrl && typeof parsed.baseUrl === "string" && parsed.baseUrl.length > 0) baseUrl = parsed.baseUrl;
-      if (!token && typeof parsed.token === "string" && parsed.token.length > 0) token = parsed.token;
-    } catch {
-      // absent/malformed — the caller no-ops safely below.
-    }
+    const file = readEndpointFile(env);
+    if (!baseUrl && file.baseUrl) baseUrl = file.baseUrl;
+    if (!token && file.token) token = file.token;
   }
 
   return { baseUrl, token };
 }
 
+/** {baseUrl, token} of OPENRIG_HOME/activity-endpoint.json (default ~/.openrig), each only when a non-empty string;
+ *  {} when the file is absent or malformed. The daemon rewrites it at every start with the token in force. */
+function readEndpointFile(env = process.env) {
+  try {
+    const fs = require("node:fs");
+    const path = require("node:path");
+    const os = require("node:os");
+    const home = firstString(env.OPENRIG_HOME, env.RIGGED_HOME) || path.join(os.homedir(), ".openrig");
+    const parsed = JSON.parse(fs.readFileSync(path.join(home, "activity-endpoint.json"), "utf8"));
+    return {
+      baseUrl: typeof parsed.baseUrl === "string" && parsed.baseUrl.length > 0 ? parsed.baseUrl : undefined,
+      token: typeof parsed.token === "string" && parsed.token.length > 0 ? parsed.token : undefined,
+    };
+  } catch {
+    return {}; // absent/malformed — the caller no-ops safely.
+  }
+}
+
+function sameOrigin(a, b) {
+  try { return new URL(a).origin === new URL(b).origin; } catch { return false; }
+}
+
+// A seat activity grant (src/domain/activity-grants.ts): the seat's own credential, never replaced by the file's.
+const ACTIVITY_GRANT_PREFIX = "oag_";
+
 // #3416 (2): node:http rather than the global fetch. This script runs once per hook event, and the first fetch call
 // loads Node's bundled HTTP client (undici), which more than doubles the CPU of a run; node:http is already in the binary.
 // The post carries the same JSON body and bearer token, waits at most 1.5 s for the answer, closes the connection when the
 // answer arrives, and swallows every error.
+// One budget for the post, the retry included: the hook's own timeout (5 s for up to 2 posts) still holds.
 const POST_TIMEOUT_MS = 1500;
 
 function postHookPayload(payload, env = process.env) {
@@ -345,32 +363,60 @@ function postHookPayload(payload, env = process.env) {
   if (!baseUrl || !token || !payload) return Promise.resolve();
   return new Promise((resolve) => {
     let request = null;
-    const timer = setTimeout(() => { if (request) request.destroy(); resolve(); }, POST_TIMEOUT_MS);
-    const done = () => { clearTimeout(timer); resolve(); };
+    let finished = false;
+    const done = () => {
+      if (finished) return;
+      finished = true;
+      clearTimeout(timer);
+      resolve();
+    };
+    const timer = setTimeout(() => { if (request) request.destroy(); done(); }, POST_TIMEOUT_MS);
     try {
       const url = new URL("/api/activity/hooks", baseUrl);
       const client = url.protocol === "http:" ? require("node:http") : url.protocol === "https:" ? require("node:https") : null;
       if (!client) return done();
       const body = Buffer.from(JSON.stringify(payload), "utf8");
-      // A fresh connection, closed after the answer: nothing pooled keeps this short-lived process waiting.
-      request = client.request(url, {
-        method: "POST",
-        agent: false,
-        headers: {
-          "content-type": "application/json",
-          "authorization": `Bearer ${token}`,
-          "content-length": body.length,
-        },
-      }, (response) => {
-        // As with fetch, the answer's arrival ends the post. Its body is not needed, so the connection closes here: a
-        // daemon that sends headers and then stalls can't hold the hook past the answer.
-        response.on("error", () => {});
-        request.destroy();
+      const send = (bearer, onStatus) => {
+        if (finished) return;
+        try {
+          // A fresh connection, closed after the answer: nothing pooled keeps this short-lived process waiting.
+          const current = client.request(url, {
+            method: "POST",
+            agent: false,
+            headers: {
+              "content-type": "application/json",
+              "authorization": `Bearer ${bearer}`,
+              "content-length": body.length,
+            },
+          }, (response) => {
+            // As with fetch, the answer's arrival ends the post. Its body is not needed, so the connection closes here: a
+            // daemon that sends headers and then stalls can't hold the hook past the answer.
+            response.on("error", () => {});
+            current.destroy();
+            onStatus(response.statusCode);
+          });
+          request = current;
+          // Provider hooks must not block the agent loop if OpenRig is unavailable. A late error from an earlier,
+          // already answered attempt does not end the retry.
+          current.on("error", () => { if (request === current) done(); });
+          current.end(body);
+        } catch {
+          done();
+        }
+      };
+      send(token, (status) => {
+        // The install-wide token rotated under a live seat: its process kept the token it was launched with, and the
+        // daemon rewrote activity-endpoint.json with the one in force. On a 401 (not a 403) for a token that is not a seat
+        // grant, post once more with the file's token, only when it is a different value and the file names this same
+        // daemon: one retry, never a loop.
+        // The file's token is the credential of the daemon that wrote the file: it goes only to that daemon's origin,
+        // never to another one an inherited OPENRIG_URL points at.
+        if (status === 401 && !token.startsWith(ACTIVITY_GRANT_PREFIX)) {
+          const file = readEndpointFile(env);
+          if (file.token && file.token !== token && sameOrigin(file.baseUrl, url.toString())) return send(file.token, done);
+        }
         done();
       });
-      // Provider hooks must not block the agent loop if OpenRig is unavailable.
-      request.on("error", done);
-      request.end(body);
     } catch {
       done();
     }

@@ -2,6 +2,39 @@ import type Database from "better-sqlite3";
 import { ulid } from "ulid";
 import type { RestoreSnapshotSelection, RestoreSnapshotSummary, Snapshot, SnapshotData } from "./types.js";
 import { parseSqliteUtcMs } from "./sqlite-time.js";
+import { resolveActiveOccupantRow } from "./active-occupant.js";
+
+/** Retention of `auto-rehydrate` captures (P04-v2 PR-B): every capture younger than `minAgeMs` stays, the `keep`
+ *  newest older ones stay, and one call deletes at most `batchSize` rows. */
+export const AUTO_REHYDRATE_RETENTION_DEFAULTS = Object.freeze({ keep: 5, batchSize: 25, minAgeMs: 24 * 60 * 60 * 1000 });
+
+/** Operator off-switch without a rebuild: `OPENRIG_AUTO_REHYDRATE_RETENTION=off` (or `0`/`false`) in the daemon's
+ *  environment turns the auto-rehydrate retention off, at capture and in the backlog drain. Read on every call. */
+export function autoRehydrateRetentionEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  const value = env.OPENRIG_AUTO_REHYDRATE_RETENTION?.trim().toLowerCase();
+  return value !== "off" && value !== "0" && value !== "false";
+}
+
+export interface AutoRehydratePruneOptions {
+  keep?: number;
+  batchSize?: number;
+  nowMs?: number;
+  /** The caller knows a row of the rig newer than every prune candidate resolves with a resume token (the capture
+   *  that was just written, younger than 24 h): no candidate can be the newest usable one, so no data is read. */
+  newerUsable?: boolean;
+  /** Read no row newer than the usable candidate (the capture's bound): the candidate stays held back this call, and
+   *  the drain's scan reads on later. */
+  skipResumeScan?: boolean;
+}
+
+/** SQLite pre-filter for "some session carries a non-empty string resume token": a superset of the occupant rule
+ *  (`hasResolvedOccupantResumeToken`), so a row it drops can never be usable. Data SQLite can't parse passes, and the
+ *  exact rule decides in JS. It spares parsing large captures that carry no token at all. */
+const MAY_CARRY_RESUME_TOKEN = `(CASE WHEN json_valid(data) THEN EXISTS (
+  SELECT 1 FROM json_each(data, '$.sessions') AS s
+  WHERE CASE WHEN s.type = 'object'
+    THEN json_type(s.value, '$.resumeToken') = 'text' AND json_extract(s.value, '$.resumeToken') <> '' ELSE 0 END
+) ELSE 1 END)`;
 
 export type RestoreSnapshotSelectionOutcome =
   | { ok: true; snapshot: Snapshot; selection: RestoreSnapshotSelection }
@@ -10,6 +43,25 @@ export type RestoreSnapshotSelectionOutcome =
 interface ListOptions {
   kind?: string;
   limit?: number;
+}
+
+/** Per database: the snapshot ids an in-flight restore or launch names, with how many attempts hold each. Every
+ *  repository on the same database sees them, so retention never deletes them whichever instance prunes. */
+const heldForRestoreByDb = new WeakMap<object, Map<string, number>>();
+
+/** Rows of the rig a prune reads at most, looking for a usable copy newer than the candidate it would keep. */
+const RESUME_SCAN_ROWS_PER_PRUNE = 50;
+
+/** Per database and rig: the resume-usable prune candidate kept back (`usableId`) and the newest of the rig's rows
+ *  newer than it already read without a usable one (`throughAt`, `throughId`, in (created_at, id) order). Snapshot
+ *  rows never change after insert, so each prune reads on from there, at most RESUME_SCAN_ROWS_PER_PRUNE rows. Until a
+ *  newer usable row turns up the candidate stays, so a row the scan misses (inserted out of order, with an older
+ *  `created_at`) only ever keeps it longer, never deletes a usable row. */
+const resumeScanByDb = new WeakMap<object, Map<string, { usableId: string; throughAt: string; throughId: string }>>();
+
+/** SQLite UTC stamp ("YYYY-MM-DD HH:MM:SS", the form `datetime('now')` stores in `snapshots.created_at`). */
+function sqliteUtcStamp(ms: number): string {
+  return new Date(ms).toISOString().replace("T", " ").slice(0, 19);
 }
 
 export class SnapshotRepository {
@@ -196,6 +248,114 @@ export class SnapshotRepository {
       )`).run(rigId, kind, rigId, kind, effectiveKeep).changes;
   }
 
+  /** Hold a snapshot for an in-flight restore or launch: retention never deletes it until the returned function
+   *  runs (idempotent). Holds count, so the id stays held until the last attempt that holds it returns. */
+  holdForRestore(snapshotId: string): () => void {
+    let held = heldForRestoreByDb.get(this.db);
+    if (!held) {
+      held = new Map();
+      heldForRestoreByDb.set(this.db, held);
+    }
+    const map = held;
+    map.set(snapshotId, (map.get(snapshotId) ?? 0) + 1);
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      const left = (map.get(snapshotId) ?? 1) - 1;
+      if (left <= 0) map.delete(snapshotId);
+      else map.set(snapshotId, left);
+    };
+  }
+
+  /** The one retention policy of `auto-rehydrate` captures, shared by every capture origin (through
+   *  `SnapshotCapture`) and by the backlog drain (`AutoRehydrateRetentionScheduler`). Deletes at most `batchSize` of
+   *  the rig's `auto-rehydrate` rows, oldest first, and returns how many (`keep` and `batchSize` below 1 count as 1).
+   *  Never deletes: a capture younger than 24 h (`created_at >= now - 24 h`, UTC), the `keep` newest older
+   *  `auto-rehydrate` ones, another kind, the rig's newest snapshot whose occupant resolves with a resume token
+   *  (`findLatestUsableSnapshot`'s rule), the one `findLatestRestoreUsable` returns (what `selectRestoreUsable` picks
+   *  without an id), or one an in-flight restore or launch holds (`holdForRestore`). The capture bounds the data it
+   *  reads (`newerUsable`, `skipResumeScan`); the drain reads on. */
+  pruneAutoRehydrate(rigId: string, opts?: AutoRehydratePruneOptions): number {
+    if (!autoRehydrateRetentionEnabled()) return 0;
+    const keep = Math.max(1, Math.floor(opts?.keep ?? AUTO_REHYDRATE_RETENTION_DEFAULTS.keep));
+    const batchSize = Math.max(1, Math.floor(opts?.batchSize ?? AUTO_REHYDRATE_RETENTION_DEFAULTS.batchSize));
+    const cutoff = sqliteUtcStamp((opts?.nowMs ?? Date.now()) - AUTO_REHYDRATE_RETENTION_DEFAULTS.minAgeMs);
+    const older = this.db.prepare(
+      "SELECT id, created_at FROM snapshots WHERE rig_id = ? AND kind = 'auto-rehydrate' AND created_at < ? ORDER BY created_at DESC, rowid DESC"
+    ).all(rigId, cutoff) as Array<{ id: string; created_at: string }>;
+    if (older.length <= keep) return 0;
+
+    const held = heldForRestoreByDb.get(this.db);
+    const restoreUsable = this.findLatestRestoreUsable(rigId)?.id;
+    // Oldest first, without the held ones and the restore pick. At most one more row (the newest resume-usable) can be
+    // held back below, so batchSize + 1 candidates are enough to fill a batch.
+    const window = older.slice(keep).reverse()
+      .filter(({ id }) => !held?.has(id) && id !== restoreUsable)
+      .slice(0, batchSize + 1);
+    if (window.length === 0) return 0;
+    const resumeUsable = opts?.newerUsable ? null
+      : this.newestResumeUsableIn(rigId, window, opts?.skipResumeScan ? 0 : RESUME_SCAN_ROWS_PER_PRUNE);
+    const victims = window.map(({ id }) => id).filter((id) => id !== resumeUsable).slice(0, batchSize);
+    if (victims.length === 0) return 0;
+    return this.db.prepare(`DELETE FROM snapshots WHERE id IN (${victims.map(() => "?").join(",")})`).run(...victims).changes;
+  }
+
+  /** The rig ids whose `auto-rehydrate` captures older than 24 h outnumber `keep`: the drain's work list. */
+  rigIdsWithAutoRehydrateOverKeep(keep: number, nowMs: number = Date.now()): string[] {
+    const cutoff = sqliteUtcStamp(nowMs - AUTO_REHYDRATE_RETENTION_DEFAULTS.minAgeMs);
+    return (this.db.prepare(
+      "SELECT rig_id FROM snapshots WHERE kind = 'auto-rehydrate' AND created_at < ? GROUP BY rig_id HAVING COUNT(*) > ? ORDER BY rig_id"
+    ).all(cutoff, Math.max(1, Math.floor(keep))) as Array<{ rig_id: string }>).map((row) => row.rig_id);
+  }
+
+  /** Which of the candidates is the rig's newest snapshot (any kind, in `findLatestUsableSnapshot`'s order) whose
+   *  occupant resolves with a resume token, as far as the rows read so far tell, or null when none of the candidates
+   *  is usable or a newer usable row was found. The candidates are read newest first until the first usable one, U;
+   *  then, oldest first, at most `scanRows` of the rig's rows newer than U that no earlier prune read
+   *  (`resumeScanByDb`; with 0, none, and the scan state stays as it was). U stays held back until one of them is usable: an unfinished scan never lets it go. A row's
+   *  data is parsed in JS only when SQLite sees a token in it (`MAY_CARRY_RESUME_TOKEN`). */
+  private newestResumeUsableIn(rigId: string, candidates: Array<{ id: string; created_at: string }>, scanRows: number): string | null {
+    const newestFirst = [...candidates].sort((a, b) =>
+      a.created_at === b.created_at ? (a.id < b.id ? 1 : a.id > b.id ? -1 : 0) : (a.created_at < b.created_at ? 1 : -1));
+    const usable = newestFirst.find(({ id }) => this.rowHasResumeToken(id));
+    if (!usable) return null;
+    if (scanRows === 0) return usable.id;
+    let scans = resumeScanByDb.get(this.db);
+    if (!scans) {
+      scans = new Map();
+      resumeScanByDb.set(this.db, scans);
+    }
+    const known = scans.get(rigId);
+    let through = known?.usableId === usable.id ? { at: known.throughAt, id: known.throughId } : { at: usable.created_at, id: usable.id };
+    // Ids and keys only (small rows), oldest first so the part already read stays contiguous, listed before reading any
+    // data: better-sqlite3 refuses other statements while an iterator is open.
+    const next = this.db.prepare(
+      "SELECT id, created_at FROM snapshots WHERE rig_id = ? AND (created_at > ? OR (created_at = ? AND id > ?)) ORDER BY created_at ASC, id ASC LIMIT ?"
+    ).all(rigId, through.at, through.at, through.id, scanRows) as Array<{ id: string; created_at: string }>;
+    for (const row of next) {
+      if (this.rowHasResumeToken(row.id)) {
+        scans.delete(rigId);
+        return null;
+      }
+      through = { at: row.created_at, id: row.id };
+    }
+    scans.set(rigId, { usableId: usable.id, throughAt: through.at, throughId: through.id });
+    return usable.id;
+  }
+
+  private rowHasResumeToken(id: string): boolean {
+    const may = this.db.prepare(`SELECT ${MAY_CARRY_RESUME_TOKEN} AS may FROM snapshots WHERE id = ?`).get(id) as { may: number } | undefined;
+    if (!may?.may) return false;
+    const row = this.db.prepare("SELECT data FROM snapshots WHERE id = ?").get(id) as Pick<SnapshotRow, "data"> | undefined;
+    if (!row) return false;
+    try {
+      return hasResolvedOccupantResumeToken(decodeStoredSnapshotData(row.data));
+    } catch {
+      return false;
+    }
+  }
+
   private rowById(id: string): SnapshotRow | undefined {
     return this.db.prepare("SELECT * FROM snapshots WHERE id = ?").get(id) as SnapshotRow | undefined;
   }
@@ -237,6 +397,19 @@ export function decodeStoredSnapshotData(json: string): SnapshotData {
     }
   }
   return data;
+}
+
+/** `findLatestUsableSnapshot`'s usability rule (OPR.0.5.7.1): at least one node RESOLVES to an active occupant
+ *  carrying a non-empty resume token. A present-null, missing-key or dangling relation never counts. */
+export function hasResolvedOccupantResumeToken(data: SnapshotData): boolean {
+  const sessions = data.sessions ?? [];
+  const nodeIds = [...new Set(sessions.map((s) => s.nodeId))];
+  return nodeIds.some((nodeId) => {
+    const resolution = resolveActiveOccupantRow(sessions, data.activeSessionIdByNode, nodeId);
+    return resolution.kind === "resolved"
+      && typeof resolution.session.resumeToken === "string"
+      && resolution.session.resumeToken.length > 0;
+  });
 }
 
 export function summarizeSnapshot(snapshot: Snapshot, nowMs: number = Date.now()): RestoreSnapshotSummary {
