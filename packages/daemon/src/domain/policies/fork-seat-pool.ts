@@ -736,10 +736,10 @@ export interface SeatPoolPendingRow {
   waitingSince: string;
   tags: string[];
   /** Only with `dispatch_to_parked.refused_cooldown_s` above 0: the pool's seats (session names) that gave this row, or
-   *  a row it succeeds by handoff, straight back to the model after the pool moved it to them as parked, without taking
-   *  it: every such move of the row, not only the latest (a reroute keeps the row's id, so two parked seats could
-   *  otherwise hand it back and forth, T-008466 SH-A). It is never moved to one of them while that seat is parked.
-   *  Absent: none. */
+   *  a row it succeeds by handoff, straight back to the model after the pool moved it to them, free or parked, without
+   *  taking it: every such move of the row, not only the latest (a reroute keeps the row's id, so two parked seats could
+   *  otherwise hand it back and forth, T-008466 SH-A). It is never moved to one of them while that seat is parked, and
+   *  to one that is free only when no other seat takes it and the pool can add none (planSeatPool). Absent: none. */
   refusedBy?: string[];
 }
 
@@ -1154,17 +1154,30 @@ export function planSeatPool(spec: SeatPoolSpec, state: SeatPoolState, nowMs: nu
     ...live.filter((slot) => modes.get(slot) === "free"),
     ...live.filter((slot) => modes.get(slot) === "parked").sort((a, b) => a.slotId - b.slotId),
   ];
-  // In order, each waiting row goes to the first receiver not taken yet, except a PARKED receiver that refused it (or
-  // a row it succeeds: refusedBy): a row a parked seat gave back waits for another seat, or for that seat once it is
-  // free (no open row: what made it give the row back is gone, and the row never waits with no seat able to take it,
-  // whatever the demand command counts: T-008296 B1).
+  // In order, each waiting row goes to the first receiver not taken yet that did not refuse it (or a row it succeeds:
+  // refusedBy). A PARKED receiver that refused it never gets it: the row waits for another seat, or for that seat once
+  // it is free. A FREE receiver that refused it gets it only when no other receiver takes it, no seat is starting and the
+  // pool can add none (at `max`, or out of usage): the row never waits with no seat able to take it (T-008296 B1), and
+  // while the pool can grow it waits for the seat it adds (below, `refusedLeft`), not for the seat that gave it back.
+  const leavingNow = new Set([...state.slots.filter((slot) => !present.includes(slot)), ...present.filter(seatPoolReapable)]);
+  const keptNow = state.slots.filter((slot) => !leavingNow.has(slot));
+  const roomNow = seatPoolRoom(spec, keptNow, state.adoptable.length);
+  const canGrow = roomNow > 0 && !usageLimited;
+  const refusedBy = (row: SeatPoolPendingRow, slot: SeatPoolSlotView) => row.refusedBy?.includes(slot.sessionName) === true;
   const receiving = new Set<SeatPoolSlotView>();
   const dispatched = new Set<SeatPoolPendingRow>();
+  // The rows left waiting because the free seats that could take them refused them: each needs a seat the pool adds,
+  // also when its refusing seat then takes another row in this same plan.
+  const refusedLeft: SeatPoolPendingRow[] = [];
   for (const row of movable) {
-    if (receiving.size === receivers.length) break;
-    const receiver = receivers.find((slot) => !receiving.has(slot)
-      && !(modes.get(slot) === "parked" && row.refusedBy?.includes(slot.sessionName)));
-    if (!receiver) continue;
+    // Every receiver taken: the rest wait, but a row a free seat refused still counts in refusedLeft (no early break).
+    const open = (slot: SeatPoolSlotView) => !receiving.has(slot) && !(modes.get(slot) === "parked" && refusedBy(row, slot));
+    const receiver = receivers.find((slot) => open(slot) && !refusedBy(row, slot))
+      ?? (canGrow || starting.length > 0 ? undefined : receivers.find(open));
+    if (!receiver) {
+      if (receivers.some((slot) => modes.get(slot) === "free" && refusedBy(row, slot))) refusedLeft.push(row);
+      continue;
+    }
     receiving.add(receiver);
     dispatched.add(row);
     intents.push({
@@ -1205,9 +1218,16 @@ export function planSeatPool(spec: SeatPoolSpec, state: SeatPoolState, nowMs: nu
   // target up, and they leave the pool after the free seats.
   const full = live.filter((slot) => seatPoolContextDrainable(spec, slot, nowMs, { usageLimited })).sort((a, b) => b.slotId - a.slotId);
   const fullSet = new Set(full);
-  const occupied = live.filter((slot) => ((!idle(slot) && !heldUnread(slot)) || receiving.has(slot)) && !fullSet.has(slot));
+  // A free seat that refused a row left waiting (refusedLeft: no other seat took it, and the pool can grow or a seat is
+  // starting) and takes no row now holds the target up (occupied, never drained as free) until that row is taken or
+  // leaves the queue. The demand command may count such a seat as free for the row (it can't tell): the target is at
+  // least one seat for each such row.
+  const heldRefused = new Set(live.filter((slot) => modes.get(slot) === "free" && !receiving.has(slot)
+    && refusedLeft.some((row) => refusedBy(row, slot))));
+  const occupied = live.filter((slot) => ((!idle(slot) && !heldUnread(slot)) || receiving.has(slot) || heldRefused.has(slot)) && !fullSet.has(slot));
   const unread = live.filter((slot) => heldUnread(slot) && !receiving.has(slot));
-  const free = live.filter((slot) => idle(slot) && !receiving.has(slot) && nowMs - Date.parse(slot.idleSince!) >= spec.idleGraceSeconds * 1000);
+  const free = live.filter((slot) => idle(slot) && !receiving.has(slot) && !heldRefused.has(slot)
+    && nowMs - Date.parse(slot.idleSince!) >= spec.idleGraceSeconds * 1000);
   const current = live.length + starting.length;
   const cooling = !spec.drain && state.lastScaleAt !== null && nowMs - Date.parse(state.lastScaleAt) < spec.cooldownSeconds * 1000;
 
@@ -1230,7 +1250,8 @@ export function planSeatPool(spec: SeatPoolSpec, state: SeatPoolState, nowMs: nu
       if (!usageLimited) for (const slot of starting) intents.push({ kind: "launch", slotId: slot.slotId });
       return { intents, reason: "demand_sample_stale", target: null, current };
     }
-    target = Math.min(spec.max, Math.max(spec.min, desired, occupied.length + unread.length + starting.length));
+    target = Math.min(spec.max, Math.max(spec.min, desired,
+      occupied.length + unread.length + starting.length + Math.max(0, refusedLeft.length - starting.length)));
     reason = target > current ? "scale_up" : target < current ? "scale_down" : "steady";
     if (usageLimited && target > current) {
       target = current;
@@ -1247,9 +1268,6 @@ export function planSeatPool(spec: SeatPoolSpec, state: SeatPoolState, nowMs: nu
   // at 0: a pool over `max` must first drain back to it before a drain makes room for a seat that takes a row. The free
   // seats still go first for the surplus, as before: a full seat whose release command refuses (the executor puts it
   // back, and the next plan picks it again) holds back only the full seats behind it, never a free seat that would go.
-  const leavingNow = new Set([...state.slots.filter((slot) => !present.includes(slot)), ...present.filter(seatPoolReapable)]);
-  const keptNow = state.slots.filter((slot) => !leavingNow.has(slot));
-  const roomNow = seatPoolRoom(spec, keptNow, state.adoptable.length);
   const rowsLeft = movable.length - dispatched.size - starting.length;
   // With demand_cmd every full seat goes while such a row waits, also below `max` (REVISAO-seat-pool B5): the add is the
   // demand's target alone, and a demand that does not count the full seat asks for no more than `current`, so the row

@@ -54,7 +54,7 @@ context:
     busy_processes: [suite-flock]   # a seat with one of these programs running gets no row: no 2nd row parked, and no row free either (default: none)
     busy_orphan_max_age_s: 43200    # only with busy_processes: the oldest a process that left the pane's tree may be and still hold the seat (60..172800, default 43200)
     max_open_rows: 4                # a seat with up to this many open rows, ALL parked on its own waits, may receive (1..20, default 1)
-    refused_cooldown_s: 1800        # a parked seat that gave a row straight back untaken gets no row as parked for this long, or until its open rows change (0..86400, default 1800; 0: off)
+    refused_cooldown_s: 1800        # a parked seat that gave a row straight back untaken gets no row as parked for this long, or until its open rows change; above 0, a row is also kept from a seat that gave it back (0..86400, default 1800; 0: off)
   return_long_gates:                # absent (the default): off; see "A seat holding only a long wait"
     gates: [external:github-review] # required: the long waits, each external:<name> (1..32)
     min_blocked_s: 1800             # how long each row must have been blocked, unbroken, on these gates (0..604800, default 1800)
@@ -332,16 +332,20 @@ to one of the model's addresses, or a reroute of the queue's fallback from the s
 own drain or reap) with no move to in-progress in between (a claim, or `--state in-progress`). The reroute records no
 caller, so a reroute to the model of a row the seat held counts whoever made it (the seat, a lead, a coord, a routine); a
 handoff or a reroute to anyone but the model is routing, not a refusal, and a seat that took the row and handed it on
-later is no refusal either. A free seat (no open row) that gives a row back is not remembered: the pool can't read why it
-did, and the seat's own rule handles it (in the fabrica, a dev seat at its cap parks the row on its own gate).
+later is no refusal either. A free seat (no open row) that gives back a row the pool moved to it as free is remembered
+the same way for that row (the seat itself keeps receiving other rows: see **The row** below).
 
 - **The seat:** when the latest row moved to it as parked went back that way, the seat is out of the parked receivers
   until `refused_cooldown_s` has passed since it gave the row back, or until its open rows are no longer the parks it
   held when the row was moved (one closed, or a new one), whichever comes first.
 - **The row:** that row, and any row that succeeds it by handoff however many hops back, is never moved to a seat that
   refused it at any move (a reroute keeps the row's id, so every move of the row counts, not only the latest) while that
-  seat is parked: it goes to another seat that may receive, or waits. Once the seat is free (no open row) it takes any
-  row, that one included.
+  seat is parked: it goes to another seat that may receive, or waits. While the seat is free (no open row) it gets that
+  row only when no other seat takes it, no seat is starting and the pool can add none (at `max`, or out of usage): with
+  room, the plan holds the free seat that refused a waiting row as occupied (never drained as free, not counted as the
+  row's receiver) and its target is at least one seat for each such row, whatever `demand_cmd` answers (the demand
+  command can't tell the seat refused the row), so the pool adds the seat that takes it. The row never waits with no
+  seat able to take it.
 - **The demand command:** while a row a parked seat refused waits, that seat goes to the demand command as
   `receives: null`, as a seat that takes no row, so a refused row is never left waiting on a seat counted as a receiver.
   The cost is at most one seat more than needed for each parked seat that refused a waiting row, when it would still

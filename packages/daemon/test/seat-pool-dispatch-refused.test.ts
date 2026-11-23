@@ -611,7 +611,7 @@ describe("seat pool: every move of a row counts, and the demand command (T-00846
     expect(h.get(r)).toMatchObject({ destinationSession: MODEL, state: "pending" });
   });
 
-  it("a free seat that gives a row back is not remembered: it is given the next row (the lead's decision on the T-008466; the seat's own cap holds it, T-008600)", async () => {
+  it("a free seat that gives a row back is given it again only with no other seat and no room to add one (max 1, the only seat)", async () => {
     h.register({ ...BASE, max: 1, dispatch_to_parked: { max_open_rows: 2 } });
     const s = h.poolSeat("dev.impl-s1", "idle");
     await h.row(MODEL);
@@ -705,6 +705,94 @@ describe("seat pool: every move of a row counts, and the demand command (T-00846
     h.db.prepare("UPDATE watchdog_history SET evaluation_notes = ? WHERE rowid = ?").run(JSON.stringify(notes), entry.rowid);
     await giveBack(h, p);
     expect(h.state().slots[0]!.parkedRefusal).toMatchObject({ openRowIds: null });
+  });
+});
+
+describe("seat pool: a free seat that gives a row back untaken does not get it again while another seat or room can take it", () => {
+  let h: Harness;
+
+  beforeEach(() => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    h = new Harness();
+  });
+  afterEach(async () => {
+    await h.executor.stop();
+    h.db.close();
+    vi.useRealTimers();
+  });
+
+  const adds = () => h.calls.filter((c) => c.startsWith("add "));
+
+  it("the row a free seat gave back goes to the other free seat, never back to the one that gave it", async () => {
+    h.register({ ...BASE, max: 2, dispatch_to_parked: { max_open_rows: 2 } });
+    const s1 = h.poolSeat("dev.impl-s1", "idle");
+    const s2 = h.poolSeat("dev.impl-s2", "idle");
+    const r = await h.row(MODEL);
+    await h.tickAt(61);
+    expect(to(h, s1).map((n) => n["qitemId"])).toEqual([r]);
+    const successor = await giveBack(h, s1);
+    expect(h.state().pending.find((row) => row.qitemId === successor)?.refusedBy).toEqual([s1.session]);
+    await h.tickAt(122);
+    expect(to(h, s1)).toHaveLength(1);
+    expect(to(h, s2).map((n) => n["qitemId"])).toEqual([successor]);
+  });
+
+  it("with the free seat that gave it back the only one and room below max, the row waits for a seat the pool adds", async () => {
+    h.register({ ...BASE, max: 2, dispatch_to_parked: { max_open_rows: 2 } });
+    const s1 = h.poolSeat("dev.impl-s1", "idle");
+    await h.row(MODEL);
+    await h.tickAt(61);
+    const successor = await giveBack(h, s1);
+    h.nowMs = T0 + 122_000;
+    const plan = planSeatPool(h.spec(), h.state(), h.nowMs, 600_000);
+    expect(plan.intents.filter((i) => i.kind === "dispatch")).toEqual([]);
+    expect(plan.intents).toContainEqual({ kind: "add", count: 1 });
+    await h.tickAt(122);
+    expect(to(h, s1)).toHaveLength(1);
+    expect(adds()).toHaveLength(1);
+    expect(h.get(successor)).toMatchObject({ destinationSession: MODEL, state: "pending" });
+  });
+
+  it("with demand_cmd the pool adds that seat also when the demand counts the seat that gave the row back as free", async () => {
+    h.register({ ...BASE, max: 2, demand_cmd: { argv: ["demand"] }, dispatch_to_parked: { max_open_rows: 2 } });
+    const s1 = h.poolSeat("dev.impl-s1", "idle");
+    h.demandDesired = 1;
+    await h.row(MODEL);
+    await h.tickAt(61);
+    expect(to(h, s1)).toHaveLength(1);
+    await giveBack(h, s1);
+    // The plan reads the demand sampled at the tick before (the first tick after the give-back finds it stale).
+    await h.tickAt(122);
+    await h.tickAt(124);
+    expect(to(h, s1)).toHaveLength(1);
+    expect(adds()).toHaveLength(1);
+  });
+
+  it("the free seat that gave a row back takes a new row, and the pool still adds the seat for the row it gave back", async () => {
+    h.register({ ...BASE, max: 2, demand_cmd: { argv: ["demand"] }, dispatch_to_parked: { max_open_rows: 2 } });
+    const s1 = h.poolSeat("dev.impl-s1", "idle");
+    h.demandDesired = 1;
+    await h.row(MODEL);
+    await h.tickAt(61);
+    const successor = await giveBack(h, s1);
+    const fresh = await h.row(MODEL);
+    await h.tickAt(100);
+    await h.tickAt(122);
+    expect(to(h, s1).map((n) => n["qitemId"]).slice(1)).toEqual([fresh]);
+    expect(h.get(successor)).toMatchObject({ destinationSession: MODEL, state: "pending" });
+    expect(adds()).toHaveLength(1);
+  });
+
+  it("at max with no other seat the row goes back to the free seat that gave it, rather than wait with no seat to take it", async () => {
+    h.register({ ...BASE, max: 2, dispatch_to_parked: { max_open_rows: 2 } });
+    const s1 = h.poolSeat("dev.impl-s1", "idle");
+    h.poolSeat("dev.impl-s2", "working");
+    await h.row(MODEL);
+    await h.tickAt(61);
+    const successor = await giveBack(h, s1);
+    await h.tickAt(122);
+    expect(to(h, s1).map((n) => n["qitemId"]).at(-1)).toBe(successor);
+    expect(adds()).toEqual([]);
   });
 });
 
