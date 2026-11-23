@@ -415,21 +415,24 @@ interface SeatPoolRefusalContext {
 
 const FALLBACK_NOTE = /^fallback-routed: (\S+) → (\S+) \((.*)\)$/s;
 const PARKED_MOVE_REASON = /^seat pool (\S+): .+ was parked on .+ \(2nd row\)$/s;
+const FREE_MOVE_REASON = /^seat pool (\S+): .+ had not taken it; .+ was free$/s;
 
-/** One of the pool's moves of a row to a seat as parked, read from the queue, and how it ended: `refusedAt` when the
- *  seat gave the row straight back to the model (seatPoolMovesOf), else null. */
+/** One of the pool's moves of a row to a seat, free or parked, read from the queue, and how it ended: `refusedAt` when
+ *  the seat gave the row straight back to the model (seatPoolMovesOf), else null. */
 interface SeatPoolRowMove {
   seat: string;
+  parked: boolean;
   refusedAt: string | null;
 }
 
 /**
- * Every move the pool made of this row to one of its seats as parked, oldest first, each with how it ended (T-008466
- * SH-A: a reroute keeps the row's id, so a row two parked seats handed back and forth carries both refusals; reading
- * only the latest move lost the first). A move is the note seatPoolMoveReason wrote, on the queue's own transition, live
- * or archived (it lives as long as the row does, past the job's history). A move to a free seat is no parked move: it
- * only ends the one before it, and a free seat that gives a row back is not remembered (the pool can't tell why; the
- * fabrica's dev seats park the row on their own cap, T-008600). The seat REFUSED the row when, after
+ * Every move the pool made of this row to one of its seats, free or parked, oldest first, each with how it ended
+ * (T-008466 SH-A: a reroute keeps the row's id, so a row two parked seats handed back and forth carries both refusals;
+ * reading only the latest move lost the first). A move is the note seatPoolMoveReason wrote, on the queue's own
+ * transition, live or archived (it lives as long as the row does, past the job's history). A free seat that gives a row
+ * back is remembered too (`parked: false`): the row then goes to another seat, or to one the pool adds, before it goes
+ * back to that seat (planSeatPool; a free seat gave back an urgent row for its context and the pool, with room to add,
+ * gave it the same row again 9 minutes later). The seat REFUSED the row when, after
  * that move and before the next one, with no move to in-progress in between (a claim, or an update by the seat;
  * claimed_at can't say it: an unclaim clears it), the row went back TO THE MODEL: a handoff the seat made whose target is
  * one of the model's addresses, or a reroute of the queue's fallback from the seat to the model that is not the pool's
@@ -453,8 +456,9 @@ function seatPoolMovesOf(ctx: SeatPoolRefusalContext, qitemId: string): SeatPool
       const [, from, to, reason] = note as unknown as [string, string, string, string];
       if (reason.startsWith(`seat pool ${ctx.jobId}: `)) {
         const seat = new Set(ctx.addressesOf(to));
-        if (!PARKED_MOVE_REASON.test(reason) || seat.size === 0) { open = null; continue; }
-        const move: SeatPoolRowMove = { seat: to, refusedAt: null };
+        const parked = PARKED_MOVE_REASON.test(reason);
+        if ((!parked && !FREE_MOVE_REASON.test(reason)) || seat.size === 0) { open = null; continue; }
+        const move: SeatPoolRowMove = { seat: to, parked, refusedAt: null };
         moves.push(move);
         open = { move, seat };
         continue;
@@ -489,7 +493,7 @@ function parkedRefusalOf(
 ): { at: string; openRowIds: string[] | null } | null {
   const latest = moves.find((move) => move.to === sessionName);
   if (!latest || latest.mode !== "parked") return null;
-  const move = seatPoolMovesOf(ctx, latest.qitemId).filter((m) => m.seat === sessionName).at(-1);
+  const move = seatPoolMovesOf(ctx, latest.qitemId).filter((m) => m.seat === sessionName && m.parked).at(-1);
   if (!move || move.refusedAt === null || !(nowMs - Date.parse(move.refusedAt) < cooldownSeconds * 1000)) return null;
   return { at: move.refusedAt, openRowIds: latest.openRowIds };
 }
