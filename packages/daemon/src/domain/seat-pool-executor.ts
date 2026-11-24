@@ -1096,8 +1096,10 @@ export const SEAT_POOL_RELAUNCH_BACKOFF_MAX_MS = 30 * 60_000;
 /** T-018090 (the head-of-line block): a seat whose release command refused it is held out of the drain order for
  *  `release_refused_backoff_s` (default 300 s, T-018178), doubled by each refusal in a row of the same occupant, at most
  *  30 min (SEAT_POOL_RELEASE_REFUSAL_MAX_SECONDS); a full seat (the context drain, T-017384), whose context only grows,
- *  for a minute only. */
+ *  for a minute first, doubled by each refusal in a row of the same occupant for the same cause, at most 15 min
+ *  (SEAT_POOL_RELEASE_REFUSAL_CONTEXT_MAX_MS; T-020474: the fixed minute asked the full seat again ~6 times an hour). */
 export const SEAT_POOL_RELEASE_REFUSAL_CONTEXT_MS = 60_000;
+export const SEAT_POOL_RELEASE_REFUSAL_CONTEXT_MAX_MS = 15 * 60_000;
 /** A refusal of the release command as releaseRefusedLog is told it: where it was asked (`reason`, the variable the
  *  command got), its exit code and the first line of its error (control characters out, secrets redacted, at most
  *  200 characters), the refusals in a row of this occupant and when the plan may ask the seat again. */
@@ -1117,6 +1119,8 @@ export interface SeatPoolReleaseRefusal {
  *  then (not new work: they keep the hold). */
 interface ReleaseRefusalBackoff {
   sessionId: string | null; streak: number; untilMs: number; reason: SeatPoolReleaseReason; sessionName: string; rows: string[];
+  /** Whether the refusal was of a full seat (the context drain): the streak goes on only for the same cause (T-020474). */
+  contextDrain: boolean;
 }
 /** What the log line says of a failed command with an empty stderr: never its `Command failed: <argv>` (T-018178). */
 export const SEAT_POOL_RELEASE_REFUSAL_NO_STDERR = "command failed (no stderr)";
@@ -2303,7 +2307,8 @@ export class SeatPoolExecutor {
   /**
    * T-018090: one more refusal of the release command in a row for the seat's current occupant (its latest session, the
    * one the stop's precondition reads): the plan leaves it out of the drain order for 300 s, doubled per refusal, at
-   * most 30 min, or for a minute when it is a full seat (`contextDrain`). Another occupant starts the count over.
+   * most 30 min, or, when it is a full seat (`contextDrain`), for a minute doubled per refusal, at most 15 min
+   * (T-020474). Another occupant, or a refusal for the other cause (full seat or not), starts the count over.
    */
   private releaseRefused(
     jobId: string, spec: SeatPoolSpec, slot: SeatPoolSlot, sessionName: string, reason: SeatPoolReleaseReason, contextDrain: boolean,
@@ -2313,13 +2318,14 @@ export class SeatPoolExecutor {
     const key = `${jobId}|${slot.slotId}`;
     const sessionId = this.deps.effects.stopPrecondition(slot.nodeId).sessionId ?? null;
     const before = this.releaseRefusalBackoff.get(key);
-    const streak = (before && before.sessionId === sessionId ? before.streak : 0) + 1;
-    const holdMs = contextDrain ? SEAT_POOL_RELEASE_REFUSAL_CONTEXT_MS
+    const streak = (before && before.sessionId === sessionId && before.contextDrain === contextDrain ? before.streak : 0) + 1;
+    const holdMs = contextDrain
+      ? Math.min(SEAT_POOL_RELEASE_REFUSAL_CONTEXT_MAX_MS, SEAT_POOL_RELEASE_REFUSAL_CONTEXT_MS * 2 ** Math.min(streak - 1, 16))
       : Math.min(SEAT_POOL_RELEASE_REFUSAL_MAX_SECONDS, seatPoolReleaseRefusalBaseSeconds(spec) * 2 ** Math.min(streak - 1, 16)) * 1000;
     const untilMs = this.now().getTime() + holdMs;
     // The rows the seat held as the command was asked (the forced pass and the reap ask a seat with rows): not new work.
     // A row that arrived while the command ran is.
-    this.releaseRefusalBackoff.set(key, { sessionId, streak, untilMs, reason, sessionName, rows: rowsAsked });
+    this.releaseRefusalBackoff.set(key, { sessionId, streak, untilMs, reason, sessionName, rows: rowsAsked, contextDrain });
     this.deps.releaseRefusedLog?.(jobId, {
       slot: slot.logicalId, sessionName, sessionId, reason, contextDrain, exitCode: result.exitCode, error: errorLine(result),
       streak, nextEligibleAt: new Date(untilMs).toISOString(),
