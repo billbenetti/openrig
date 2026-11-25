@@ -2438,6 +2438,43 @@ describe("readSeatPoolState", () => {
     expect(slots.nextLogicalId(state.model!)).toBe("dev.impl-s3");
   });
 
+  it("keeps a free seat the pool added receiving while its model is out of usage", () => {
+    db = createFullTestDb();
+    const rigRepo = new RigRepository(db);
+    const rig = rigRepo.createRig("r");
+    const pod = new PodRepository(db).createPod(rig.id, "dev", "Dev");
+    const add = (logicalId: string, session: string) => {
+      const node = rigRepo.addNode(rig.id, logicalId, { runtime: "claude-code", cwd: "/tmp", podId: pod.id });
+      db.prepare("INSERT INTO sessions (id, node_id, session_name, status) VALUES (?, ?, ?, 'running')").run(`s-${logicalId}`, node.id, session);
+      return node;
+    };
+    add("dev.impl", "dev-impl@r");
+    const added = add("dev.impl-s1", "dev-impl-s1@r");
+    const slots = new SeatPoolSlots(db);
+    slots.insert({ poolJobId: JOB, logicalId: "dev.impl-s1", nodeId: added.id, phase: "live", intent: null, opId: "op-1", at: "2026-11-09T11:00:00.000Z" });
+    const ts = "2026-11-09T11:20:00.000Z";
+    db.prepare(
+      `INSERT INTO queue_items (qitem_id, ts_created, ts_updated, source_session, destination_session, state, priority, body)
+       VALUES ('q-1', ?, ?, 'lead@r', 'dev-impl@r', 'pending', 'routine', 'work')`,
+    ).run(ts, ts);
+    const state = readSeatPoolState({
+      db, slots,
+      openRows: () => [],
+      sessionAddresses: (session) => [session],
+      heldMessages: () => 0,
+      seatStopped: () => false,
+      seatState: () => ({ activity: "idle-at-prompt", needsInput: { count: 0 }, backgroundWork: null, changedAt: "2026-11-09T11:00:00.000Z" }) as never,
+      // Only the model failed (its own reactive limit); the seat it runs on its launch shape did not.
+      usageLimited: (session) => session === "dev-impl@r",
+      restoring: () => false,
+      demand: () => null,
+    }, { jobId: JOB, targetSession: "dev-impl@r", spec: spec() });
+    expect(state.modelCause).toBe("usage_limit");
+    expect(state.slots.map((slot) => [slot.sessionName, slot.cause])).toEqual([["dev-impl-s1@r", "idle"]]);
+    expect(planSeatPool(spec(), state, Date.parse("2026-11-09T12:00:00.000Z"), 120_000).intents)
+      .toContainEqual({ kind: "dispatch", qitemId: "q-1", from: "dev-impl@r", slotId: 1 });
+  });
+
   it("frees the seats of a pool that has ended, so another pool adopts them, and keeps a live pool's", () => {
     db = createFullTestDb();
     const rigRepo = new RigRepository(db);
@@ -2736,11 +2773,11 @@ describe("readSeatPoolState", () => {
       { qitemId: "q-removed", destination: "dev-impl-s3@r", waitingSince: "2026-11-09T11:40:00.000Z", tags: [] },
       { qitemId: "q-moved", destination: "dev-impl@r", waitingSince: "2026-11-09T11:50:00.000Z", tags: [] },
     ]);
-    // The model, which the pool can only launch, waits out the limit; a seat whose session is gone is reaped. A seat
-    // the pool runs counts as out of usage by its own limit or by its model's (T-021588): s1 waits the limit out too.
+    // The model, which the pool can only launch, waits out the limit; a seat whose session is gone is reaped. A seat is
+    // out of usage by its own limit only, never by its model's: s1 shows its own state.
     expect(state.modelCause).toBe("usage_limit");
     expect(state.slots.map((slot) => [slot.sessionName, slot.cause])).toEqual([
-      ["dev-impl-s1@r", "usage_limit"],
+      ["dev-impl-s1@r", "needs_input"],
       ["dev-impl-s2@r", "stopped"],
     ]);
     expect(planSeatPool(spec(), state, Date.parse("2026-11-09T12:00:00.000Z"), 120_000).intents.filter((i) => i.kind === "reap"))
@@ -2888,7 +2925,7 @@ describe("the usage limit a seat pool reads (T-021588)", () => {
     const view = (sessionName: string, slotId: number) => ({
       slotId, logicalId: `qualidade.revisor-s${slotId}`, sessionName, nodeId: `node-${slotId}`, phase: "live" as const, adopted: false,
       nodeExists: true, openRows: 0, heldMessages: 0, idleSince: "2026-11-25T15:00:00.000Z",
-      cause: (limited.has(sessionName) || limited.has(MODEL) ? "usage_limit" : "idle") as SeatPoolSeatCause,
+      cause: (limited.has(sessionName) ? "usage_limit" : "idle") as SeatPoolSeatCause,
     });
     const poolState: SeatPoolState = {
       model: { rigId: "rig-f", rigName: "fabrica", podNamespace: "qualidade", memberId: "revisor", logicalId: "qualidade.revisor", nodeId: "model", sessionName: MODEL },
@@ -2901,11 +2938,11 @@ describe("the usage limit a seat pool reads (T-021588)", () => {
     expect(plan.intents).toContainEqual({ kind: "dispatch", qitemId: "q-1", from: MODEL, slotId: 1 });
   });
 
-  it("limits a seat of the pool by its model's own failure, and only by it or its own", () => {
+  it("limits the model and a seat each by its own failure, never a seat by its model's", () => {
     const signals = [...[ORQ, MODEL, ...SLOTS].flatMap(noWindows), failed(MODEL, -30_000), failed(SLOTS[1]!, -20_000)];
     const { pools } = read(signals);
     expect(pools.map((pool) => pool.seatSessions)).toEqual([[MODEL], [SLOTS[1]!]].sort());
-    // The set holds the seats with their own failure; the pool's state then holds every seat of the model (readSeatPoolState).
+    // The set holds the seats with their own failure, and only them: s446 and s448 stay out with the model limited.
     expect([...new SeatPoolUsageLimitMemory().limited(pools, now.getTime())].sort()).toEqual([MODEL, SLOTS[1]!].sort());
   });
 
