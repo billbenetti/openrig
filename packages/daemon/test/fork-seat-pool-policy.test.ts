@@ -355,6 +355,31 @@ describe("planSeatPool: dispatch and wake", () => {
     expect(evaluated).toMatchObject({ reason: "seat_pool_held", notes: { reason: "usage_limit" } });
   });
 
+  it("says usage_limit in its history while a waiting row finds no seat in usage, also when the demand asks for no more seats (T-021588)", async () => {
+    // 25/11: the demand command asked for the 2 seats there were (target = current), every seat read out of usage, and
+    // the rows waited with a plan that said steady, which the history leaves out.
+    const limited = [slot({ cause: "usage_limit" }), slot({ cause: "usage_limit" })];
+    const waiting = rows(2);
+    const context = { max: 2, cwd_template: "/w/{slot}", demand_cmd: { argv: ["/bin/demand"] } };
+    const held = state({ modelCause: "usage_limit", slots: limited, pending: waiting, demand: { desired: 2, sampledAt: ago(30) } });
+    expect(plan(spec(context), held)).toMatchObject({ intents: [], reason: "usage_limit", target: 2, current: 2 });
+    const evaluated = await makeSeatPoolPolicy({ readState: async () => held, submit: () => true, now: () => NOW })
+      .evaluate({ jobId: "pool-1", policy: FORK_SEAT_POOL_POLICY_NAME, target: { session: "dev-impl@r" }, intervalSeconds: 60, context } as PolicyJob);
+    expect(evaluated).toMatchObject({ reason: "seat_pool_held", notes: { reason: "usage_limit" } });
+    // Also in a cooldown with fewer seats wanted than there are (the drain waits, the plan would read cooldown, quiet).
+    const cooling = state({ ...held, demand: { desired: 1, sampledAt: ago(30) }, lastScaleAt: ago(10) });
+    expect(plan(spec({ ...context, cooldown_s: 60 }), cooling)).toMatchObject({ intents: [], reason: "usage_limit", target: 1, current: 2 });
+    // With no row waiting, or with every waiting row taken by a seat in usage, the limit holds nothing: the plan is steady.
+    // A seat out of usage that holds its own row and a pool at max: the row waits for room, not for the limit.
+    const busy = [slot({ cause: "usage_limit", openRows: 1, idleSince: null }), slot({ cause: "working", openRows: 1, idleSince: null })];
+    expect(plan(spec(context), state({ slots: busy, pending: rows(1), demand: { desired: 2, sampledAt: ago(30) } })).reason).toBe("steady");
+    expect(plan(spec(context), { ...held, pending: [] }).reason).toBe("steady");
+    const free = slot();
+    const one = rows(1);
+    expect(plan(spec(context), state({ slots: [limited[0]!, free], pending: one, demand: { desired: 2, sampledAt: ago(30) } })))
+      .toMatchObject({ intents: [{ kind: "dispatch", qitemId: one[0]!.qitemId, from: "dev-impl@r", slotId: free.slotId }], reason: "steady" });
+  });
+
   it("launches no seat it added and hasn't started while a seat is out of usage, and still removes an unwanted one", () => {
     const added = slot({ phase: "added", cause: "stopped", idleSince: null });
     const held = plan(spec(), state({ modelCause: "usage_limit", slots: [added] }));

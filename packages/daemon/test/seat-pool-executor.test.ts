@@ -28,6 +28,7 @@ import {
   SeatPoolExecutor,
   seatPoolQueueEffects,
   SeatPoolSlots,
+  seatPoolUsageLimitPools,
   seatSessionName,
   slotMemberFragment,
   type SeatPoolEffectResult,
@@ -45,6 +46,9 @@ import {
   type SeatPoolState,
 } from "../src/domain/policies/fork-seat-pool.js";
 import type { Node } from "../src/domain/types.js";
+import { claudeStatuslineSignals, deriveUsageLimitPools, reactiveEventSignal } from "../src/domain/provider/provider-signals.js";
+import type { ProviderSignal } from "../src/domain/provider/provider-types.js";
+import { SeatPoolUsageLimitMemory } from "../src/domain/seat-pool-usage-limit.js";
 import { LaunchBudget } from "../src/domain/launch-budget.js";
 
 const JOB = "pool-job";
@@ -2732,10 +2736,11 @@ describe("readSeatPoolState", () => {
       { qitemId: "q-removed", destination: "dev-impl-s3@r", waitingSince: "2026-11-09T11:40:00.000Z", tags: [] },
       { qitemId: "q-moved", destination: "dev-impl@r", waitingSince: "2026-11-09T11:50:00.000Z", tags: [] },
     ]);
-    // The model, which the pool can only launch, waits out the limit; a seat whose session is gone is reaped.
+    // The model, which the pool can only launch, waits out the limit; a seat whose session is gone is reaped. A seat
+    // the pool runs counts as out of usage by its own limit or by its model's (T-021588): s1 waits the limit out too.
     expect(state.modelCause).toBe("usage_limit");
     expect(state.slots.map((slot) => [slot.sessionName, slot.cause])).toEqual([
-      ["dev-impl-s1@r", "needs_input"],
+      ["dev-impl-s1@r", "usage_limit"],
       ["dev-impl-s2@r", "stopped"],
     ]);
     expect(planSeatPool(spec(), state, Date.parse("2026-11-09T12:00:00.000Z"), 120_000).intents.filter((i) => i.kind === "reap"))
@@ -2849,5 +2854,96 @@ describe("seatPoolQueueEffects", () => {
     owner = { owner: null, reason: "no escalation destination declared" };
     expect(await effects.escalate({ jobId: "pool-1", seat: "dev-impl-s2@r", model: "dev-impl@r", qitemIds: ["q-3"] }))
       .toEqual({ ok: false, code: "no_escalation_owner", error: "no escalation destination declared" });
+  });
+});
+
+describe("the usage limit a seat pool reads (T-021588)", () => {
+  const now = new Date("2026-11-25T15:10:00.000Z");
+  const at = (offsetMs: number) => new Date(now.getTime() + offsetMs).toISOString();
+  const ORQ = "coordenacao-orquestradora@comando";
+  const MODEL = "qualidade-revisor@fabrica";
+  const SLOTS = ["qualidade-revisor-s446@fabrica", "qualidade-revisor-s447@fabrica", "qualidade-revisor-s448@fabrica"];
+  // Behind the proxy the statusline carries no windows: every seat reads unknown (claude_statusline_cache_had_no_windows).
+  const noWindows = (seat: string) => claudeStatuslineSignals({ seatSession: seat, cachePresent: true, reading: {}, asOf: at(-10_000), staleAfter: at(290_000) });
+  const failed = (seat: string, asOfMs: number, resetsAt?: string): ProviderSignal => reactiveEventSignal({
+    kind: "at_limit", provider: "claude", seatSession: seat, asOf: at(asOfMs), staleAfter: at(asOfMs + 300_000), ...(resetsAt ? { resetsAt } : {}),
+  });
+  const read = (signals: ProviderSignal[]) => {
+    const wide = deriveUsageLimitPools({ signals, bindings: [], now, fallbackSeconds: 300 });
+    return { wide, pools: seatPoolUsageLimitPools({ pools: wide, signals, now, fallbackSeconds: 300 }) };
+  };
+
+  it("limits only the seat whose own Claude failure is fresh, not every seat of the host, when no seat has a window (25/11)", () => {
+    // 25/11: the orchestrator of another rig failed with rate_limit at 15:08:54Z; the reviewers ran normal turns.
+    const signals = [...[ORQ, MODEL, ...SLOTS].flatMap(noWindows), failed(ORQ, -66_000)];
+    const { wide, pools } = read(signals);
+    // The shared reader puts the whole host in one claude:local pool for 300 s, the pool's seats with it.
+    expect(wide).toMatchObject([{ poolKey: "claude:local", seatSessions: [ORQ, MODEL, ...SLOTS].sort() }]);
+    expect(pools).toEqual([
+      { poolKey: `claude:seat:${ORQ}`, provider: "claude", seatSessions: [ORQ], expiresAt: at(234_000), source: "config-fallback" },
+    ]);
+    const limited = new SeatPoolUsageLimitMemory().limited(pools, now.getTime());
+    expect([...limited]).toEqual([ORQ]);
+    // The reviewers' pool reads its model and its seats in usage: the plan gives the waiting rows to its free seats.
+    const view = (sessionName: string, slotId: number) => ({
+      slotId, logicalId: `qualidade.revisor-s${slotId}`, sessionName, nodeId: `node-${slotId}`, phase: "live" as const, adopted: false,
+      nodeExists: true, openRows: 0, heldMessages: 0, idleSince: "2026-11-25T15:00:00.000Z",
+      cause: (limited.has(sessionName) || limited.has(MODEL) ? "usage_limit" : "idle") as SeatPoolSeatCause,
+    });
+    const poolState: SeatPoolState = {
+      model: { rigId: "rig-f", rigName: "fabrica", podNamespace: "qualidade", memberId: "revisor", logicalId: "qualidade.revisor", nodeId: "model", sessionName: MODEL },
+      modelCause: limited.has(MODEL) ? "usage_limit" : "idle", restoring: false, adoptable: [], demand: null, lastScaleAt: null,
+      slots: SLOTS.map((seat, i) => view(seat, i + 1)),
+      pending: [{ qitemId: "q-1", destination: MODEL, waitingSince: "2026-11-25T15:05:00.000Z", tags: [] }],
+    };
+    expect(seatPoolOutOfUsage(poolState)).toBe(false);
+    const plan = planSeatPool(spec(), poolState, now.getTime(), 120_000);
+    expect(plan.intents).toContainEqual({ kind: "dispatch", qitemId: "q-1", from: MODEL, slotId: 1 });
+  });
+
+  it("limits a seat of the pool by its model's own failure, and only by it or its own", () => {
+    const signals = [...[ORQ, MODEL, ...SLOTS].flatMap(noWindows), failed(MODEL, -30_000), failed(SLOTS[1]!, -20_000)];
+    const { pools } = read(signals);
+    expect(pools.map((pool) => pool.seatSessions)).toEqual([[MODEL], [SLOTS[1]!]].sort());
+    // The set holds the seats with their own failure; the pool's state then holds every seat of the model (readSeatPoolState).
+    expect([...new SeatPoolUsageLimitMemory().limited(pools, now.getTime())].sort()).toEqual([MODEL, SLOTS[1]!].sort());
+  });
+
+  it("keeps the shared pool when a seat under the same key shows a statusline window", () => {
+    const windowed = claudeStatuslineSignals({
+      seatSession: SLOTS[0]!, cachePresent: true, asOf: at(-10_000), staleAfter: at(290_000),
+      reading: { five_hour: { usedPercent: 40, resetsAt: at(3_600_000) } },
+    });
+    const signals = [...[ORQ, MODEL, SLOTS[1]!, SLOTS[2]!].flatMap(noWindows), ...windowed, failed(ORQ, -66_000)];
+    const { wide, pools } = read(signals);
+    expect(pools).toEqual(wide);
+    // A window gone stale (a cache left by a seat that once ran on a direct login) proves no sharing now.
+    const stale = claudeStatuslineSignals({
+      seatSession: SLOTS[0]!, cachePresent: true, asOf: at(-7_200_000), staleAfter: at(-6_900_000),
+      reading: { five_hour: { usedPercent: 40, resetsAt: at(3_600_000) } },
+    });
+    expect(read([...[ORQ, MODEL, SLOTS[1]!, SLOTS[2]!].flatMap(noWindows), ...stale, failed(ORQ, -66_000)]).pools.map((pool) => pool.poolKey))
+      .toEqual([`claude:seat:${ORQ}`]);
+  });
+
+  it("leaves a declared home's pool shared: its seats run on one login", () => {
+    const home = { poolKey: "claude:home:/h", provider: "claude" as const, seatSessions: [ORQ, MODEL], expiresAt: at(234_000), source: "config-fallback" as const };
+    expect(seatPoolUsageLimitPools({ pools: [home], signals: [...[ORQ, MODEL].flatMap(noWindows), failed(ORQ, -66_000)], now, fallbackSeconds: 300 }))
+      .toEqual([home]);
+  });
+
+  it("gives each failing seat its own expiry: its stated reset, else its own failure plus the retry interval", () => {
+    const reset = at(7_200_000);
+    const signals = [...[ORQ, MODEL].flatMap(noWindows), failed(ORQ, -240_000), failed(MODEL, -10_000, reset)];
+    const { pools } = read(signals);
+    expect(pools).toEqual([
+      { poolKey: `claude:seat:${ORQ}`, provider: "claude", seatSessions: [ORQ], expiresAt: at(60_000), source: "config-fallback" },
+      { poolKey: `claude:seat:${MODEL}`, provider: "claude", seatSessions: [MODEL], expiresAt: reset, source: "provider-reset" },
+    ]);
+  });
+
+  it("leaves a Codex pool as the reader derived it", () => {
+    const codex = { poolKey: "codex:acct-1", provider: "codex" as const, seatSessions: ["a@r", "b@r"], expiresAt: at(300_000), source: "config-fallback" as const };
+    expect(seatPoolUsageLimitPools({ pools: [codex], signals: [], now, fallbackSeconds: 300 })).toEqual([codex]);
   });
 });

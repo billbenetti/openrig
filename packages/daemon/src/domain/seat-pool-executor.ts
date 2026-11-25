@@ -11,6 +11,9 @@ import type { Node } from "./types.js";
 import { sampleHost, type HostSample, type LaunchBudget, type LaunchTick } from "./launch-budget.js";
 import { readSeatPoolBusySessions, type SeatPoolBusyReadDeps } from "./seat-pool-busy.js";
 import { redactTranscriptContent } from "./transcript-redaction.js";
+import { signalEligibleForAutomation } from "./provider/provider-policy.js";
+import type { UsageLimitPool } from "./provider/provider-signals.js";
+import type { ProviderSignal } from "./provider/provider-types.js";
 import {
   seatPoolLeftStopped,
   SEAT_POOL_DRAIN_ENDED,
@@ -639,6 +642,63 @@ export function readSeatPoolBusyCandidates(
   });
 }
 
+/** T-021588: a seat of the pool is out of usage by its own limit or, one the pool added, by its model's (readSeatPoolState's cause). */
+function seatPoolSeatLimited(usageLimited: ReadonlySet<string>, slot: Pick<SeatPoolSlotView, "sessionName" | "adopted">, model: string): boolean {
+  return usageLimited.has(slot.sessionName) || (!slot.adopted && usageLimited.has(model));
+}
+
+/**
+ * T-021588: the usage-limit pools as a seat pool reads them. The provider reader (deriveUsageLimitPools) puts every Claude
+ * seat that declares no home of its own in one pool (`claude:local`), so one seat's reactive failure limits every Claude
+ * seat on the host. Behind a proxy that spreads the seats over several accounts, the statusline carries no windows and
+ * that pool can't be split, and a seat of another rig out of usage held every seat pool for the retry interval (25/11).
+ * The `claude:local` pool whose seats show no fresh statusline window (signalEligibleForAutomation), so the only
+ * evidence is a reactive failure, becomes one pool per seat that failed (`claude:seat:<session>`, as the reader's
+ * conflicting-windows branch keys it), each with its own expiry: its own stated reset, else its own failure plus
+ * `fallbackSeconds`. A pool with a fresh window keeps the reader's sharing; a declared home (`claude:home:<home>`), the
+ * seat-keyed pools and a Codex pool are left as they are. The wake ladder reads the provider's
+ * pools on its own; this changes only the pools' read (startup.ts, usageLimitedSessions).
+ */
+export function seatPoolUsageLimitPools(input: {
+  pools: readonly UsageLimitPool[]; signals: readonly ProviderSignal[]; now: Date; fallbackSeconds: number;
+}): UsageLimitPool[] {
+  const nowMs = input.now.getTime();
+  const nowIso = input.now.toISOString();
+  const result: UsageLimitPool[] = [];
+  for (const pool of input.pools) {
+    if (pool.poolKey !== "claude:local") {
+      result.push(pool);
+      continue;
+    }
+    const seats = new Set(pool.seatSessions);
+    const lane = input.signals.filter((signal) => signal.provider === "claude" && signal.seatSession !== undefined && seats.has(signal.seatSession));
+    if (lane.some((signal) => signal.window !== undefined && signalEligibleForAutomation(signal, nowIso).eligible)) {
+      result.push(pool);
+      continue;
+    }
+    const own = new Map<string, { stated: number[]; fallback: number[] }>();
+    for (const signal of lane) {
+      if (signal.sourceClass !== "provider_event" || signal.authority !== "reactive_error") continue;
+      if (!signalEligibleForAutomation(signal, nowIso).eligible) continue;
+      const entry = own.get(signal.seatSession!) ?? { stated: [], fallback: [] };
+      const stated = Date.parse(signal.resetsAt ?? "");
+      if (Number.isFinite(stated) && stated > nowMs) entry.stated.push(stated);
+      const fallback = Date.parse(signal.asOf) + input.fallbackSeconds * 1000;
+      if (Number.isFinite(fallback) && fallback > nowMs) entry.fallback.push(fallback);
+      own.set(signal.seatSession!, entry);
+    }
+    for (const [seat, { stated, fallback }] of own) {
+      const expiryMs = stated.length > 0 ? Math.max(...stated) : fallback.length > 0 ? Math.max(...fallback) : null;
+      if (expiryMs === null) continue;
+      result.push({
+        poolKey: `claude:seat:${seat}`, provider: "claude", seatSessions: [seat],
+        expiresAt: new Date(expiryMs).toISOString(), source: stated.length > 0 ? "provider-reset" : "config-fallback",
+      });
+    }
+  }
+  return result.sort((a, b) => a.poolKey.localeCompare(b.poolKey));
+}
+
 /** The pool's state as the planner sees it. */
 export function readSeatPoolState(deps: SeatPoolStateReaderDeps, job: { jobId: string; targetSession: string; spec: SeatPoolSpec }): SeatPoolState {
   const { db } = deps;
@@ -658,8 +718,11 @@ export function readSeatPoolState(deps: SeatPoolStateReaderDeps, job: { jobId: s
   const empty: SeatPoolState = { model, modelCause: "working", restoring: false, slots: [], adoptable: [], pending: [], demand: null, lastScaleAt: null };
   if (!model) return empty;
 
-  const causeOf = (nodeId: string, sessionName: string, state: ArbitratedSeatState | null): SeatPoolSeatCause => {
-    if (deps.usageLimited?.(sessionName)) return "usage_limit";
+  // T-021588: a seat the pool added runs on its model's launch shape (slotMemberFragment: runtime, env, home, profile),
+  // so it is out of usage by its own limit or by its model's; an adopted seat, by its own only. Never by another seat's.
+  const modelLimited = deps.usageLimited?.(model.sessionName) === true;
+  const causeOf = (nodeId: string, sessionName: string, state: ArbitratedSeatState | null, added = false): SeatPoolSeatCause => {
+    if (deps.usageLimited?.(sessionName) || (added && modelLimited)) return "usage_limit";
     if (deps.seatStopped(nodeId)) return "stopped";
     if (state && state.needsInput.count > 0) return "needs_input";
     return state?.activity === "idle-at-prompt" && !state.backgroundWork ? "idle" : "working";
@@ -715,7 +778,7 @@ export function readSeatPoolState(deps: SeatPoolStateReaderDeps, job: { jobId: s
       idleSince: idle ? state!.changedAt : null,
       // A seat of the pool whose session is gone is reaped, which a usage limit doesn't hold, so for it a stopped session
       // comes before its account's usage; for the model, which the pool can only launch, the usage limit comes first.
-      cause: !present || deps.seatStopped(slot.nodeId!) ? "stopped" : causeOf(slot.nodeId!, sessionName, state),
+      cause: !present || deps.seatStopped(slot.nodeId!) ? "stopped" : causeOf(slot.nodeId!, sessionName, state, slot.opId !== null),
       ...(present && readFacts
         ? { atPrompt: state?.activity === "idle-at-prompt" && state.needsInput.count === 0, backgroundWork: !!state?.backgroundWork }
         : {}),
@@ -2159,7 +2222,7 @@ export class SeatPoolExecutor {
     if (!read) return true;
     const slot = withBusy(read, busy);
     const nowMs = this.now().getTime();
-    const limited = usageLimited.has(slot.sessionName);
+    const limited = seatPoolSeatLimited(usageLimited, slot, ctx.model.sessionName);
     const mode = seatPoolReceives(ctx.spec, slot, nowMs, { usageLimited: limited });
     const base = { qitemId: intent.qitemId, from: intent.from, to: slot.sessionName };
     // A row the seat refused (T-008296) never goes to it while it is parked. The plan already leaves such a pair out
@@ -2441,7 +2504,7 @@ export class SeatPoolExecutor {
     const refusing = new Set(ctx.state.pending.flatMap((row) => row.refusedBy ?? []));
     const slots = ctx.state.slots.map((slot) => {
       const read = withBusy(slot, busy);
-      const limited = usageLimited.has(slot.sessionName);
+      const limited = seatPoolSeatLimited(usageLimited, slot, ctx.model.sessionName);
       const receives = seatPoolReceives(ctx.spec, read, nowMs, { usageLimited: limited, loadPerCpuPercent });
       return {
         session: seatSessionName(slot.logicalId, ctx.model.rigName), phase: slot.phase,

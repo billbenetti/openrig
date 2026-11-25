@@ -186,7 +186,8 @@ import { escalateUnclaimedReminder } from "./domain/parked-owner-escalation.js";
 import { readProcTmuxPane } from "./domain/seat-pool-busy.js";
 import { readProcessTable } from "./domain/process-table.js";
 import {
-  readSeatPoolBusyCandidates, readSeatPoolState, runSeatPoolCommand, SeatPoolExecutor, SeatPoolSlots, seatPoolQueueEffects, slotMemberFragment,
+  readSeatPoolBusyCandidates, readSeatPoolState, runSeatPoolCommand, SeatPoolExecutor, SeatPoolSlots, seatPoolQueueEffects, seatPoolUsageLimitPools,
+  slotMemberFragment,
 } from "./domain/seat-pool-executor.js";
 import { LaunchBudget, launchBudgetLimits, sampleHost } from "./domain/launch-budget.js";
 import { launchStatusIsRunning } from "./domain/restore-orchestrator.js";
@@ -2679,11 +2680,19 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
       if (!deps.providerService) return new Set();
       const now = new Date();
       try {
-        const pools = deriveUsageLimitPools({
-          ...(await deps.providerService.getReadModel()),
+        const readModel = await deps.providerService.getReadModel();
+        const fallbackSeconds = resolveWakeRetryIntervalSeconds();
+        // T-021588: a Claude seat is limited for the pools by its own failure, not by every seat's on the host.
+        const pools = seatPoolUsageLimitPools({
+          pools: deriveUsageLimitPools({
+            ...readModel,
+            now,
+            fallbackSeconds,
+            claudeHomeOf: (seatSession) => seatRuntimeHomeBySession(db, seatSession, "claude-code"),
+          }),
+          signals: readModel.signals,
           now,
-          fallbackSeconds: resolveWakeRetryIntervalSeconds(),
-          claudeHomeOf: (seatSession) => seatRuntimeHomeBySession(db, seatSession, "claude-code"),
+          fallbackSeconds,
         });
         return seatPoolUsageLimitMemory.limited(pools, now.getTime());
       } catch {

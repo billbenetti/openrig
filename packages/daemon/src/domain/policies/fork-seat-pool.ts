@@ -1324,6 +1324,14 @@ export function planSeatPool(spec: SeatPoolSpec, state: SeatPoolState, nowMs: nu
     else if (target > current) reason = "max_reached";
   }
   if (cooling && target !== current) reason = "cooldown";
+  // T-021588: a row the pool would move that waits undispatched because of the limit (the pool has room but can't add,
+  // or a seat would take it but for its limit) is held by the limit, also when the demand asks for no more seats than
+  // there are (target <= current, a plan that would read steady and leave nothing in the job's history), and also in a
+  // cooldown, which would read quiet as well.
+  const heldByLimit = usageLimited && !spec.drain && movable.length > dispatched.size && (roomNow > 0
+    || live.some((slot) => slot.cause === "usage_limit" && !returning.has(slot)
+      && seatPoolReceives(spec, { ...slot, cause: "idle" }, nowMs, { loadPerCpuPercent }) !== null));
+  if (heldByLimit) reason = "usage_limit";
   return { intents, reason, target, current };
 }
 
