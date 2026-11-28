@@ -328,7 +328,7 @@ The slot reports the stop under `stop`, with `cause: rig_down` and the `seq` of 
 | `stop.result` | When | The slot |
 | --- | --- | --- |
 | `stopped` | The stop succeeded: the session is marked stopped on purpose. | `live`, stopped on purpose, with no hold. |
-| `absent` | The stop found the session absent in tmux (`session_not_live`): the down had already stopped it. A confirmed absence, not a stop. | `live`, with no hold. |
+| `absent` | The stop found the session absent in tmux (`session_not_live`, or a `keep_alive` seat already down, `already_down`): a confirmed absence, not a stop; the pool does not say what ended it. | `live`, with no hold. |
 | `changed_owner` | The node's latest session is no longer the attempt's (`selection_changed` with no partial effect): nothing is stopped, and the newer session keeps running. | `live` and held (`changed_owner`), measured from the attempt's own session, so the newer session is a later change, read as any held slot once the down's hold ends. |
 | `unconfirmed` | Anything else, with the real code and message (for example `stop_uncertain`, or `selection_changed` while the attempt's session is still the node's latest). | `live` and held (`compensating_stop`): it takes room, receives no row, and is kept across daemon restarts. Every evaluation of the active job stops the same session again, while the pool is held too, until the stop is confirmed (`stopped`) or tmux confirms the session absent (`absent`, never `stopped`). |
 

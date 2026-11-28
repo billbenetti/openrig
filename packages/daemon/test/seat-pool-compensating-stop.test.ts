@@ -178,11 +178,13 @@ function stopWorld() {
     ],
   });
 
-  /** The add's call: the real converge path, with a hook before it and one after it, before the executor reads it. */
-  const hooks: { beforeAdd?: () => Promise<void>; afterAdd?: (result: ConvergeResult) => Promise<void> | void } = {};
+  /** The add's call: the real converge path, with a hook before it and one after it, before the executor reads it.
+   *  `untold` drops the add's `onSessionRegistered`, as a launch that tells no session of its own. */
+  const hooks: { beforeAdd?: () => Promise<void>; afterAdd?: (result: ConvergeResult) => Promise<void> | void; untold?: boolean } = {};
   const converge = vi.fn<SeatPoolAddDeps["converge"]>(async (rigId, op, rigRoot, opts): Promise<ConvergeResult> => {
     await hooks.beforeAdd?.();
-    const result = await convergeOp({ instantiator: inst }, rigId, op, rigRoot, opts);
+    const { onSessionRegistered: _told, ...untold } = opts;
+    const result = await convergeOp({ instantiator: inst }, rigId, op, rigRoot, hooks.untold ? untold : opts);
     await hooks.afterAdd?.(result);
     return result;
   });
@@ -435,6 +437,24 @@ describe("seat-pool compensating stop bound to the attempt (#3395 Piece 1)", () 
     expect(w.everyStopExpected()).toBe(true);
   });
 
+  it("An add whose launch settles running after `rig down` without telling the session it produced has no session of its own: the pool stops nothing and reports why.", async () => {
+    const w = stopWorld();
+    const m = await w.model({ max: 1, min: 1 });
+    w.hooks.untold = true;
+    const { attemptId } = await addSettlingAfterDown(w, m);
+    const agent = w.nodeOf(m.rigId, "dev.impl-s1")!;
+
+    expect(w.stopSeat).not.toHaveBeenCalled();
+    expect(w.latestOf(agent.id)).toMatchObject({ status: "running" });
+    expect(w.slots.forModel(m.nodeId)[0]!.attemptResult).toBeNull();
+    const notes = await w.notesOf(m.jobId);
+    expect(notes.settled).toEqual([{
+      slotNumber: 1, logicalId: "dev.impl-s1", nodeId: agent.id,
+      attempt: { id: attemptId, status: "running", code: "own_session_unknown", message: expect.any(String) },
+    }]);
+    expect(JSON.stringify(notes)).not.toContain("\"stop\"");
+  });
+
   it("A failed or uncertain compensating stop stays held and counted across a restart, reported with its real code and `message`.", async () => {
     const w = stopWorld();
     const m = await w.model({ max: 1, min: 1 });
@@ -448,6 +468,9 @@ describe("seat-pool compensating stop bound to the attempt (#3395 Piece 1)", () 
       reuseHold: { code: "compensating_stop", seq },
     };
     expect(w.slotsOf(await w.notesOf(m.jobId))).toEqual([held]);
+    // every stop the first executor makes is over before the restart
+    await w.executor().idle();
+    const before = w.stopSeat.mock.calls.length;
 
     w.restart();
     const after = await w.notesOf(m.jobId);
@@ -456,9 +479,14 @@ describe("seat-pool compensating stop bound to the attempt (#3395 Piece 1)", () 
     await w.executor().idle();
     // read again after the restart, and still unconfirmed: held, and it takes the pool's only room
     expect(w.slotsOf(await w.notesOf(m.jobId))).toEqual([held]);
+    await w.executor().idle();
     expect(w.room(m.nodeId, 1)).toBe(0);
-    expect(w.stopSeat.mock.calls.length).toBeGreaterThanOrEqual(2);
-    expect(w.stopSeat.mock.calls.every(([input]) => input.expected?.sessionId === w.attemptResult(m.nodeId).sessionId)).toBe(true);
+    // the new executor stops the same session again
+    const own = w.attemptResult(m.nodeId);
+    const again = w.stopSeat.mock.calls.slice(before);
+    expect(again.length).toBeGreaterThan(0);
+    expect(again.every(([input]) => input.expected?.nodeId === own.nodeId && input.expected?.sessionId === own.sessionId)).toBe(true);
+    expect(w.stopSeat.mock.calls.every(([input]) => input.expected?.sessionId === own.sessionId)).toBe(true);
     expect(w.everyStopExpected()).toBe(true);
   });
 
