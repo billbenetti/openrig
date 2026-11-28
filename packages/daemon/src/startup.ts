@@ -2679,10 +2679,11 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
       },
       comeback: {
         select: (rigId, nodeId, logicalId) => snapshotRepo.selectComebackSnapshot(rigId, nodeId, logicalId),
-        launch: (rigId, logicalId, { snapshotId }) => restoreOrchestrator.launchSingleNode(rigId, logicalId, {
+        launch: (rigId, logicalId, { snapshotId, onSessionLaunched }) => restoreOrchestrator.launchSingleNode(rigId, logicalId, {
           snapshotId,
           adapters: runtimeAdaptersMap,
           fsOps: { exists: (path: string) => fs.existsSync(path) },
+          ...(onSessionLaunched ? { onSessionLaunched } : {}),
         }),
       },
       // #4061: the block's `dispatch_guard`, run as an argv with a short timeout, once per planned move.

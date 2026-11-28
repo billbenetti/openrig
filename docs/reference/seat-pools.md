@@ -303,12 +303,17 @@ stop yet, or it waited for the launch's lifecycle lease and stopped the session 
 attempt settles running and the rig's latest `rig.stopped` is newer than what the attempt was issued on, with no
 `restore.completed` after it, the pool stops that attempt's own session, and only it:
 
+- the attempt's own session is the one its own launch registered, as the launch tells it (the add's member add, the
+  comeback's `launchSingleNode`), never the node's latest session read after the launch: a session that replaced it in
+  between is not the attempt's, and the stop's `expected` makes the checked stop refuse it;
 - the slot is settled `live` with the attempt's own session as `attempt_result`, and held while the stop runs, with the
   stop on record first, so a daemon exit before its result leaves the slot held;
 - the stop is the checked stop, `stopSeat({ seatRef, reason, expected: attempt_result })`. The pool never calls it
   without `expected`, and never stops a slot with no `attempt_result`: a comeback that found the agent already running
-  (`already_running`), or one whose session can't be told apart, is not stopped;
-- an add whose call launched it and whose session that down already stopped on purpose settles running with that
+  (`already_running`) is not stopped. An attempt whose launch told no session of its own is not stopped either: it
+  settles `live` with no `attempt_result`, and its report carries `own_session_unknown`;
+- an add whose call launched it and whose own session is marked stopped on purpose (`intentionally_stopped`, which any
+  checked stop sets, the down's included; the pool reads only the mark, not who set it) settles running with that
   session, so the stop confirms the absence;
 - a `restore.completed` after that `rig.stopped`, read before the stop and again at its final step, stops nothing: the
   hold goes, and the agent stays as any `live` one. An attempt whose result is unknown is not stopped; it is read again

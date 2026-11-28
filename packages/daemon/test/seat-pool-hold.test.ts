@@ -928,7 +928,7 @@ describe("seat-pool holds: no comeback while held (#3395 Piece 1)", () => {
         expect.objectContaining({ slotNumber: 1, nodeId: s1.nodeId, snapshotId, attempt: expect.objectContaining({ status: "in_flight" }) }),
       ]);
       await w.executor.idle();
-      expect(w.launch.mock.calls).toEqual([[m.rigId, "dev.impl-s1", { snapshotId }]]);
+      expect(w.launch.mock.calls).toEqual([[m.rigId, "dev.impl-s1", { snapshotId, onSessionLaunched: expect.any(Function) }]]);
       // the comeback settled: the same slot is `live` and its node has a new running session
       expect(w.slots.forModel(m.nodeId).map((s) => [s.slotNumber, s.nodeId, s.phase])).toEqual([[1, s1.nodeId, "live"]]);
       const after = sessionsOf(w, s1.nodeId) as Array<{ status: string }>;

@@ -340,7 +340,7 @@ describe("seat-pool comeback: the drained agent comes back on its own node (#339
     }]);
     // no new number: the add is the comeback
     expect(add).not.toHaveProperty("issued");
-    expect(w.launch.mock.calls).toEqual([[m.rigId, "dev.impl-s1", { snapshotId: b }]]);
+    expect(w.launch.mock.calls).toEqual([[m.rigId, "dev.impl-s1", { snapshotId: b, onSessionLaunched: expect.any(Function) }]]);
     expect(w.converge).toHaveBeenCalledTimes(1);
     expect(settled).toEqual([expect.objectContaining({ slotNumber: 1, logicalId: "dev.impl-s1", nodeId: w1.nodeId, attempt: expect.objectContaining({ status: "running" }) })]);
     expect(w.slots.forModel(m.nodeId).map((s) => [s.slotNumber, s.nodeId, s.phase])).toEqual([[1, w1.nodeId, "live"]]);
@@ -546,7 +546,7 @@ describe("seat-pool comeback: the drained agent comes back on its own node (#339
     // past `cooldown_s` since the settle, slot 1 comes back
     w.clock.now = new Date(w.clock.now.getTime() + cooldownMs - 30_000 + 1_000);
     const { settled } = await comeBack(w, m.jobId);
-    expect(w.launch.mock.calls).toEqual([[m.rigId, "dev.impl-s1", { snapshotId: b }]]);
+    expect(w.launch.mock.calls).toEqual([[m.rigId, "dev.impl-s1", { snapshotId: b, onSessionLaunched: expect.any(Function) }]]);
     expect(settled).toEqual([expect.objectContaining({ slotNumber: 1, nodeId: w1.nodeId, attempt: expect.objectContaining({ status: "running" }) })]);
   });
 
@@ -609,7 +609,7 @@ describe("seat-pool comeback: the drained agent comes back on its own node (#339
     // past `cooldown_s` since the settle (the drain left the model's pool on `DRAINING`), slot 1 comes back
     w.clock.now = new Date(w.clock.now.getTime() + DRAINING.cooldownSeconds * 1000 + 1_000);
     const { settled } = await comeBack(w, m.jobId);
-    expect(w.launch.mock.calls).toEqual([[m.rigId, "dev.impl-s1", { snapshotId: b }]]);
+    expect(w.launch.mock.calls).toEqual([[m.rigId, "dev.impl-s1", { snapshotId: b, onSessionLaunched: expect.any(Function) }]]);
     expect(settled).toEqual([expect.objectContaining({ slotNumber: 1, nodeId: s1!.nodeId, attempt: expect.objectContaining({ status: "running" }) })]);
   });
 });
@@ -638,7 +638,7 @@ describe("seat-pool comeback: which snapshot it sends (#3395 Piece 1)", () => {
     await w.wantOne(m);
 
     const { next, settled } = await comeBack(w, m.jobId);
-    expect(w.launch.mock.calls).toEqual([[m.rigId, "dev.impl-s1", { snapshotId: b }]]);
+    expect(w.launch.mock.calls).toEqual([[m.rigId, "dev.impl-s1", { snapshotId: b, onSessionLaunched: expect.any(Function) }]]);
     expect(settled).toEqual([{
       slotNumber: 1, logicalId: "dev.impl-s1", nodeId: w1.nodeId,
       attempt: { id: expect.any(String), status: "running", snapshotSelection: { snapshotId: b, mode: "explicit" } },
@@ -728,7 +728,7 @@ describe("seat-pool comeback: recorded conflicting occupants (#3395 Piece 1)", (
     expect(selection.conflict).toBeUndefined();
     expect(selection.failed).toEqual([{ snapshotId: d, condition: 1 }]);
     expect((notes.add as { comebacks: ComebackEntry[] }).comebacks).toEqual([{ slotNumber: 1, logicalId: "dev.impl-s1", nodeId: w1.nodeId, snapshotId: b, attempt: expect.any(Object) }]);
-    expect(w.launch.mock.calls).toEqual([[m.rigId, "dev.impl-s1", { snapshotId: b }]]);
+    expect(w.launch.mock.calls).toEqual([[m.rigId, "dev.impl-s1", { snapshotId: b, onSessionLaunched: expect.any(Function) }]]);
     expect(settled[0]!.attempt).toMatchObject({ status: "running", snapshotSelection: { snapshotId: b, mode: "explicit" } });
   });
 
@@ -746,7 +746,7 @@ describe("seat-pool comeback: recorded conflicting occupants (#3395 Piece 1)", (
       slotNumber: 1, logicalId: "dev.impl-s1", nodeId: w1.nodeId, snapshotId: b, attempt: expect.any(Object),
       unknownOccupants: [{ snapshotId: d, candidateIds, detail: expect.stringContaining("multiple live occupant candidates") }],
     }]);
-    expect(w.launch.mock.calls).toEqual([[m.rigId, "dev.impl-s1", { snapshotId: b }]]);
+    expect(w.launch.mock.calls).toEqual([[m.rigId, "dev.impl-s1", { snapshotId: b, onSessionLaunched: expect.any(Function) }]]);
     expect(settled[0]!.attempt).toMatchObject({ status: "running", snapshotSelection: { snapshotId: b, mode: "explicit" } });
   });
 });
@@ -812,7 +812,7 @@ describe("seat-pool comeback: no qualifying snapshot, and a refusal before the l
 
     const { notes, next, settled } = await comeBack(w, m.jobId);
     expect((notes.add as { comebacks: ComebackEntry[] }).comebacks[0]).toMatchObject({ slotNumber: 1, snapshotId: b, attempt: { status: "in_flight" } });
-    expect(w.launch.mock.calls).toEqual([[m.rigId, "dev.impl-s1", { snapshotId: b }]]);
+    expect(w.launch.mock.calls).toEqual([[m.rigId, "dev.impl-s1", { snapshotId: b, onSessionLaunched: expect.any(Function) }]]);
     expect(settled).toEqual([{
       slotNumber: 1, logicalId: "dev.impl-s1", nodeId: w1.nodeId,
       attempt: { id: expect.any(String), status: "refused", code: "snapshot_not_found", message: expect.any(String) },
@@ -844,7 +844,7 @@ describe("seat-pool comeback: no qualifying snapshot, and a refusal before the l
     await w.wantOne(m);
 
     const { settled } = await comeBack(w, m.jobId);
-    expect(w.launch.mock.calls).toEqual([[m.rigId, "dev.impl-s1", { snapshotId: b }]]);
+    expect(w.launch.mock.calls).toEqual([[m.rigId, "dev.impl-s1", { snapshotId: b, onSessionLaunched: expect.any(Function) }]]);
     expect(settled).toEqual([expect.objectContaining({ slotNumber: 1, attempt: expect.objectContaining({ status: "refused", code: "snapshot_unusable" }) })]);
     expect(JSON.stringify(settled)).not.toContain("\"stop\"");
     const slot = w.slots.forModel(m.nodeId).find((s) => s.slotNumber === 1)!;
@@ -862,7 +862,7 @@ describe("seat-pool comeback: a launch not settled, and one never made (#3395 Pi
     await w.wantOne(m);
 
     const { settled } = await comeBack(w, m.jobId);
-    expect(w.launch.mock.calls).toEqual([[m.rigId, "dev.impl-s1", { snapshotId: b }]]);
+    expect(w.launch.mock.calls).toEqual([[m.rigId, "dev.impl-s1", { snapshotId: b, onSessionLaunched: expect.any(Function) }]]);
     expect(settled).toEqual([{
       slotNumber: 1, logicalId: "dev.impl-s1", nodeId: w1.nodeId,
       attempt: { id: expect.any(String), status: "in_flight", code: "snapshot_not_found", message: "the launch went away" },
@@ -923,7 +923,7 @@ describe("seat-pool comeback: a launch not settled, and one never made (#3395 Pi
     expect(w.sessionsOf(w1.nodeId).map((s) => s.status)).toEqual(["stopped"]);
 
     const { settled } = await comeBack(w, m.jobId);
-    expect(w.launch.mock.calls).toEqual([[m.rigId, "dev.impl-s1", { snapshotId: b }]]);
+    expect(w.launch.mock.calls).toEqual([[m.rigId, "dev.impl-s1", { snapshotId: b, onSessionLaunched: expect.any(Function) }]]);
     expect(settled).toEqual([expect.objectContaining({ slotNumber: 1, nodeId: w1.nodeId, attempt: expect.objectContaining({ status: "running" }) })]);
     expect(w.slots.forModel(m.nodeId).map((s) => [s.slotNumber, s.phase])).toEqual([[1, "live"]]);
   });
@@ -948,7 +948,7 @@ describe("seat-pool comeback: a launch not settled, and one never made (#3395 Pi
     back.mockRestore();
 
     const { settled } = await comeBack(w, m.jobId);
-    expect(w.launch.mock.calls).toEqual([[m.rigId, "dev.impl-s1", { snapshotId: b }]]);
+    expect(w.launch.mock.calls).toEqual([[m.rigId, "dev.impl-s1", { snapshotId: b, onSessionLaunched: expect.any(Function) }]]);
     expect(settled).toEqual([expect.objectContaining({ slotNumber: 1, nodeId: w1.nodeId, attempt: expect.objectContaining({ status: "running" }) })]);
     expect(w.slots.forModel(m.nodeId).map((s) => [s.slotNumber, s.phase])).toEqual([[1, "live"]]);
   });

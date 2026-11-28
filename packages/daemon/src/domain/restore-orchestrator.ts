@@ -847,6 +847,9 @@ export class RestoreOrchestrator {
     requireCurrentOccupant?: boolean;
     standby?: StandbyStop;
     keepAlive?: boolean | { shouldContinue?: () => boolean };
+    /** Told each session this launch registers, with its node, as soon as its row is committed (#3395: the seat pool's
+     *  comeback stops only the session its own launch produced). */
+    onSessionLaunched?: (nodeId: string, sessionId: string) => void;
   }): Promise<NarrowLaunchResult> {
     if (opts?.standby) return this.resumeStandby(rigId, logicalId, opts.standby, opts);
     return this.launchNodeTargets(rigId, [logicalId], { ...opts, namedAgent: true, nonTargetMode: "unchanged" });
@@ -891,6 +894,7 @@ export class RestoreOrchestrator {
     requireCurrentOccupant?: boolean;
     namedAgent?: boolean;
     keepAlive?: boolean | { shouldContinue?: () => boolean };
+    onSessionLaunched?: (nodeId: string, sessionId: string) => void;
     nonTargetMode: "unchanged" | "detach_and_hold";
   }): Promise<NarrowLaunchResult> {
     const rig = this.rigRepo.getRig(rigId);
@@ -965,7 +969,7 @@ export class RestoreOrchestrator {
         launched.push(await this.restoreNodeWithCompensation({ node }, rigId, snapshot.id, snapshot.data,
           { adapters: opts.adapters, fsOps: opts.fsOps, keepPane: true, keepClaudeLaunch: opts.keepClaudeLaunch, resumePeriodicCarry,
             ...(opts.keepEffort ? { keepEffort: opts.keepEffort } : {}), ...(opts.onLaunchEffort ? { onLaunchEffort: opts.onLaunchEffort } : {}),
-            ...(beforeDispatch ? { beforeDispatch } : {}) }, subsetWarnings));
+            ...(beforeDispatch ? { beforeDispatch } : {}), ...(opts.onSessionLaunched ? { onSessionLaunched: opts.onSessionLaunched } : {}) }, subsetWarnings));
         // The seat's own result goes with the refusal: it says whether the relaunch left anything behind.
         if (refusedForShutdown) return { ...shuttingDown, launched };
         continue;
@@ -1072,7 +1076,7 @@ export class RestoreOrchestrator {
         effort: currentEffort?.effective ?? null, effortChoice: currentEffort?.choice ?? null } : node };
       const result = await this.restoreNodeWithCompensation(
         planEntry, rigId, snapshot.id, snapshot.data, { adapters: opts?.adapters, fsOps: opts?.fsOps, selectedHistory: opts.selectedHistory, resumePeriodicCarry, requireCurrentOccupant: opts.requireCurrentOccupant,
-          ...(beforeDispatch ? { beforeDispatch } : {}) }, subsetWarnings,
+          ...(beforeDispatch ? { beforeDispatch } : {}), ...(opts.onSessionLaunched ? { onSessionLaunched: opts.onSessionLaunched } : {}) }, subsetWarnings,
       );
       launched.push(result);
       // The seat's own result goes with the refusal: it says whether the relaunch left anything behind.

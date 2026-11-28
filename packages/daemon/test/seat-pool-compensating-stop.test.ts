@@ -285,9 +285,12 @@ function stopWorld() {
     typeof input.expected?.nodeId === "string" && input.expected.nodeId !== "" && typeof input.expected.sessionId === "string" && input.expected.sessionId !== "");
   /** `rig up` from the down's snapshot. */
   const up = (snapshotId: string) => restorer.restore(snapshotId, { adapters: { "claude-code": claude } });
+  /** The restore's single-node launch, as the daemon composes the comeback's (`launchSingleNode` with a snapshot id). */
+  const launchOne = (rigId: string, logicalId: string, opts: ComebackLaunchOpts) =>
+    restorer.launchSingleNode(rigId, logicalId, { ...opts, adapters: { "claude-code": claude } });
   return {
     db, bus, rigRepo, slots, sessions, panes, tmux, hooks, stopHooks, converge, launchHarness, stopSeat, comeback,
-    model, notesOf, slotsOf, nodeOf, events, down, up, restart, composeComeback, sessionOf, latestOf, attemptResult, room, everyStopExpected,
+    model, notesOf, slotsOf, nodeOf, events, down, up, launchOne, restart, composeComeback, sessionOf, latestOf, attemptResult, room, everyStopExpected,
     deps: () => proc.deps, executor: () => proc.executor,
   };
 }
@@ -396,6 +399,39 @@ describe("seat-pool compensating stop bound to the attempt (#3395 Piece 1)", () 
     // measured from the attempt's own session: the newer one is a later change, which the pool classifies by L13
     expect(w.attemptResult(m.nodeId)).toMatchObject({ held: true, nodeId: agent.id, sessionId: own.sessionId });
     expect(w.stopSeat).toHaveBeenCalledTimes(1);
+    expect(w.everyStopExpected()).toBe(true);
+  });
+
+  it("A replacement between the add's launch and its settlement is not the attempt's session: the pool's stop carries the session the add's launch produced, gets `selection_changed`, and the newer session keeps running.", async () => {
+    const w = stopWorld();
+    const m = await w.model({ max: 1, min: 1 });
+    let launched: string | undefined;
+    let newer: string | undefined;
+    // someone relaunches the agent after the add's call returned and before the pool reads and settles it
+    w.hooks.afterAdd = () => {
+      const agent = w.nodeOf(m.rigId, "dev.impl-s1")!;
+      launched = w.latestOf(agent.id)!.id;
+      const session = w.sessions.registerSession(agent.id, "dev-impl-s1@pool-rig");
+      w.sessions.updateStatus(session.id, "running");
+      w.db.prepare("UPDATE sessions SET startup_status = 'ready' WHERE id = ?").run(session.id);
+      newer = session.id;
+    };
+    const { attemptId, seq } = await addSettlingAfterDown(w, m);
+    const agent = w.nodeOf(m.rigId, "dev.impl-s1")!;
+
+    expect(launched).not.toBe(newer);
+    expect(w.stopSeat).toHaveBeenCalledTimes(1);
+    expect(w.stopSeat.mock.calls[0]![0].expected).toEqual({ nodeId: agent.id, sessionId: launched });
+    expect(w.latestOf(agent.id)).toMatchObject({ id: newer, status: "running" });
+    expect(w.sessionOf(newer!)).toMatchObject({ status: "running", onPurpose: 0 });
+    expect(w.panes.has("dev-impl-s1@pool-rig")).toBe(true);
+    const notes = await w.notesOf(m.jobId);
+    expect(w.slotsOf(notes)).toEqual([{
+      slotNumber: 1, nodeId: agent.id, phase: "live", attempt: { id: attemptId, status: "running" },
+      stop: { cause: "rig_down", seq, result: "changed_owner", code: "selection_changed", message: expect.any(String) },
+      reuseHold: { code: "changed_owner", seq },
+    }]);
+    expect(w.attemptResult(m.nodeId)).toMatchObject({ held: true, nodeId: agent.id, sessionId: launched });
     expect(w.everyStopExpected()).toBe(true);
   });
 
@@ -612,11 +648,12 @@ describe("seat-pool compensating stop bound to the attempt (#3395 Piece 1)", () 
     const launching = deferred();
     const gate = deferred();
     let launchedSession: string | undefined;
-    w.comeback.launch.mockImplementationOnce(async (): Promise<SeatPoolComebackLaunch> => {
+    w.comeback.launch.mockImplementationOnce(async (_rigId: string, _logicalId: string, opts?: ComebackLaunchOpts): Promise<SeatPoolComebackLaunch> => {
       launching.resolve();
       await gate.promise;
-      // the launch starts the agent's session after the down
+      // the launch starts the agent's session after the down, and tells it as the restore's launch does
       const session = w.sessions.registerSession(agent.id, "dev-impl-s1@pool-rig");
+      opts?.onSessionLaunched?.(agent.id, session.id);
       w.sessions.updateStatus(session.id, "running");
       w.panes.set("dev-impl-s1@pool-rig", 900);
       launchedSession = session.id;
@@ -640,4 +677,105 @@ describe("seat-pool compensating stop bound to the attempt (#3395 Piece 1)", () 
     expect(w.slotsOf(notes)).toEqual([{ slotNumber: 1, nodeId: agent.id, phase: "live", attempt: { id: comebackId, status: "running" }, stop }]);
     expect(w.everyStopExpected()).toBe(true);
   });
+
+  it("A replacement between the comeback's launch and its settlement is not the attempt's session: the pool's stop carries the session the comeback's launch produced, gets `selection_changed`, and the newer session keeps running.", async () => {
+    const w = stopWorld();
+    const m = await w.model({ max: 1, min: 1 });
+    let launched: string | undefined;
+    let newer: string | undefined;
+    const { agent, comebackId, seq } = await comebackSettlingAfterDown(w, m, (agentId, opts) => {
+      const session = w.sessions.registerSession(agentId, "dev-impl-s1@pool-rig");
+      opts?.onSessionLaunched?.(agentId, session.id);
+      w.sessions.updateStatus(session.id, "running");
+      w.panes.set("dev-impl-s1@pool-rig", 900);
+      launched = session.id;
+      // someone relaunches the agent before the launch returns and the pool settles it
+      const replacement = w.sessions.registerSession(agentId, "dev-impl-s1@pool-rig");
+      w.sessions.updateStatus(replacement.id, "running");
+      newer = replacement.id;
+    });
+
+    expect(launched).not.toBe(newer);
+    expect(w.stopSeat).toHaveBeenCalledTimes(1);
+    expect(w.stopSeat.mock.calls[0]![0].expected).toEqual({ nodeId: agent.id, sessionId: launched });
+    expect(w.latestOf(agent.id)).toMatchObject({ id: newer, status: "running" });
+    expect(w.sessionOf(newer!)).toMatchObject({ status: "running", onPurpose: 0 });
+    expect(w.panes.has("dev-impl-s1@pool-rig")).toBe(true);
+    const notes = await w.notesOf(m.jobId);
+    expect(w.slotsOf(notes)).toEqual([{
+      slotNumber: 1, nodeId: agent.id, phase: "live", attempt: { id: comebackId, status: "running" },
+      stop: { cause: "rig_down", seq, result: "changed_owner", code: "selection_changed", message: expect.any(String) },
+      reuseHold: { code: "changed_owner", seq },
+    }]);
+    expect(w.attemptResult(m.nodeId)).toMatchObject({ held: true, nodeId: agent.id, sessionId: launched });
+    expect(w.everyStopExpected()).toBe(true);
+  });
+
+  it("The restore's single-node launch, which the comeback calls, tells the session it registers on the slot's node, and that session is the node's latest.", async () => {
+    const w = stopWorld();
+    const m = await w.model({ max: 1, min: 1 });
+    await w.notesOf(m.jobId);
+    await w.executor().idle();
+    const agent = w.nodeOf(m.rigId, "dev.impl-s1")!;
+    const before = w.latestOf(agent.id)!.id;
+    const { snapshotId } = await w.down(m.rigId);
+    const told: Array<[string, string]> = [];
+    const launched = await w.launchOne(m.rigId, "dev.impl-s1", { snapshotId: snapshotId!, onSessionLaunched: (nodeId, sessionId) => { told.push([nodeId, sessionId]); } });
+
+    expect(launched.ok).toBe(true);
+    expect(told).toHaveLength(1);
+    expect(told[0]![0]).toBe(agent.id);
+    expect(told[0]![1]).not.toBe(before);
+    expect(w.latestOf(agent.id)!.id).toBe(told[0]![1]);
+  });
+
+  it("A comeback whose launch settles running after `rig down` without telling the session it produced has no session of its own: the pool stops nothing and reports why.", async () => {
+    const w = stopWorld();
+    const m = await w.model({ max: 1, min: 1 });
+    const { agent, comebackId } = await comebackSettlingAfterDown(w, m, (agentId) => {
+      const session = w.sessions.registerSession(agentId, "dev-impl-s1@pool-rig");
+      w.sessions.updateStatus(session.id, "running");
+      w.panes.set("dev-impl-s1@pool-rig", 900);
+    });
+
+    expect(w.stopSeat).not.toHaveBeenCalled();
+    expect(w.latestOf(agent.id)).toMatchObject({ status: "running" });
+    expect(w.slots.forModel(m.nodeId)[0]!.attemptResult).toBeNull();
+    const notes = await w.notesOf(m.jobId);
+    expect(notes.settled).toEqual([{
+      slotNumber: 1, logicalId: "dev.impl-s1", nodeId: agent.id,
+      attempt: { id: comebackId, status: "running", code: "own_session_unknown", message: expect.any(String) },
+    }]);
+    expect(JSON.stringify(notes)).not.toContain("\"stop\"");
+  });
 });
+
+type ComebackLaunchOpts = { snapshotId: string; onSessionLaunched?: (nodeId: string, sessionId: string) => void };
+
+/** The slot's agent drained, then brought back by a comeback whose launch is held while `rig down` runs; `start` is what
+ *  the launch does on the node when it is let go, before it returns `launched`. */
+async function comebackSettlingAfterDown(w: ReturnType<typeof stopWorld>, m: { rigId: string; nodeId: string; jobId: string },
+  start: (agentId: string, opts?: ComebackLaunchOpts) => void) {
+  await w.notesOf(m.jobId);
+  await w.executor().idle();
+  const agent = w.nodeOf(m.rigId, "dev.impl-s1")!;
+  const slot = w.slots.forModel(m.nodeId)[0]!;
+  expect(w.slots.setPhase({ slotId: slot.slotId, from: "live", to: "drained", at: new Date().toISOString() })).toBe(true);
+  w.composeComeback();
+  const launching = deferred();
+  const gate = deferred();
+  w.comeback.launch.mockImplementationOnce(async (_rigId: string, _logicalId: string, opts?: ComebackLaunchOpts): Promise<SeatPoolComebackLaunch> => {
+    launching.resolve();
+    await gate.promise;
+    start(agent.id, opts);
+    return { ok: true, launched: [{ nodeId: agent.id, logicalId: "dev.impl-s1", status: "launched" }] };
+  });
+  const issued = await w.notesOf(m.jobId);
+  const comebackId = (issued.add as { comebacks: Array<{ attempt: { id: string } }> }).comebacks[0]!.attempt.id;
+  await launching.promise;
+  await w.down(m.rigId);
+  const seq = w.events(m.rigId, "rig.stopped").at(-1)!;
+  gate.resolve();
+  await w.executor().idle();
+  return { agent, comebackId, seq };
+}

@@ -501,6 +501,10 @@ describe("the seat-pool comeback's composition (#3395)", () => {
       expect(Object.keys(opts!.adapters!)).toEqual(expect.arrayContaining(["claude-code", "codex", "terminal"]));
       expect(opts!.fsOps!.exists(scratch)).toBe(true);
       expect(opts!.fsOps!.exists(path.join(scratch, "no-such-path"))).toBe(false);
+      // the session the launch registers goes back to the pool, which stops only that session after `rig down`
+      const told = vi.fn();
+      await comeback!.launch("rig-pin", "dev.impl-s1", { snapshotId: "snap-pin", onSessionLaunched: told });
+      expect(launch.mock.calls[1]![2]).toEqual({ snapshotId: "snap-pin", adapters: expect.any(Object), fsOps: { exists: expect.any(Function) }, onSessionLaunched: told });
     } finally {
       select.mockRestore(); launch.mockRestore();
     }

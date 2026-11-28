@@ -1077,7 +1077,7 @@ export class PodRigInstantiator {
     rigRoot: string,
     targetRigId: string,
     cwdOverride?: string,
-    launchOpts?: { keepRecordedAdditions?: boolean; authoredKeepAlive?: boolean },
+    launchOpts?: { keepRecordedAdditions?: boolean; authoredKeepAlive?: boolean; onSessionRegistered?: (sessionId: string) => void },
   ): Promise<LaunchMaterializedOutcome> {
     const launchOrder = this.computePodLaunchOrder(rigSpec);
     const podWarnings: string[] = [];
@@ -1123,6 +1123,7 @@ export class PodRigInstantiator {
         nodeId: node.id,
         cwdOverride,
         ...(launchOpts?.keepRecordedAdditions ? { keepRecordedAdditions: true } : {}),
+        ...(launchOpts?.onSessionRegistered ? { onSessionRegistered: launchOpts.onSessionRegistered } : {}),
       });
 
       if (launched.warnings?.length) {
@@ -1175,7 +1176,9 @@ export class PodRigInstantiator {
     rigRoot: string,
     opts?: { cwdOverride?: string; edges?: Array<{ from: string; to: string; kind: string }>;
       /** A fork's source seat: its launch additions are copied into this new seat once it is validated, and kept. */
-      launchAdditionsFrom?: SeatSkillPaths; recordCreated?: RecordCreated },
+      launchAdditionsFrom?: SeatSkillPaths; recordCreated?: RecordCreated;
+      /** Told the new session's id as soon as its row is committed (NodeLauncher's onSessionRegistered). */
+      onSessionRegistered?: (sessionId: string) => void },
   ): Promise<AddMemberOutcome> {
     // 1. Resolve the rig.
     const rig = this.deps.rigRepo.getRig(rigId);
@@ -1334,7 +1337,9 @@ export class PodRigInstantiator {
     // 9. The shared launch effect owns startup projection + delivery +
     // readiness + `@rigged_*` for both expansion and ordinary growth.
     const launchOutcome = await this.launchValidatedSpec(rigSpec, rigRoot, rigId, opts?.cwdOverride,
-      launchAdditions?.kept ? { keepRecordedAdditions: true } : undefined);
+      launchAdditions?.kept || opts?.onSessionRegistered
+        ? { ...(launchAdditions?.kept ? { keepRecordedAdditions: true } : {}), ...(opts?.onSessionRegistered ? { onSessionRegistered: opts.onSessionRegistered } : {}) }
+        : undefined);
     if (!launchOutcome.ok) {
       const message = "message" in launchOutcome
         ? launchOutcome.message

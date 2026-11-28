@@ -139,9 +139,9 @@ export interface SeatPoolAddDeps {
    *  Throws when the member can't be exported. */
   exportMember(rigId: string, modelNodeId: string): Record<string, unknown>;
   /** One member added to a pod and launched, as `POST /rigs/:rigId/pods/:pod/members` does it: convergeOp over the
-   *  daemon's instantiator. */
+   *  daemon's instantiator. `onSessionRegistered` is told the id of the session the add's own launch registers. */
   converge(rigId: string, op: SeatPoolAddOp, rigRoot: string,
-    opts: { recordCreated: RecordCreated; launchAdditionsFrom?: SeatSkillPaths }): Promise<ConvergeResult>;
+    opts: { recordCreated: RecordCreated; launchAdditionsFrom?: SeatSkillPaths; onSessionRegistered?: (sessionId: string) => void }): Promise<ConvergeResult>;
   /** Creates a folder and its parents (mkdir -p): all the daemon does for a `cwd_template` folder. */
   makeFolder(path: string): void;
 }
@@ -162,8 +162,10 @@ export interface SeatPoolComebackDeps {
    *  failed (SnapshotRepository.selectComebackSnapshot). Read only. */
   select(rigId: string, nodeId: string, logicalId: string): ComebackSnapshotSelection;
   /** Launch the slot's own node from exactly this snapshot (RestoreOrchestrator.launchSingleNode with the explicit
-   *  `snapshotId`, the daemon's runtime adapters and the filesystem). There is no call without a snapshot id. */
-  launch(rigId: string, logicalId: string, opts: { snapshotId: string }): Promise<SeatPoolComebackLaunch>;
+   *  `snapshotId`, the daemon's runtime adapters and the filesystem). There is no call without a snapshot id.
+   *  `onSessionLaunched` is told each session the launch itself registers, with its node. */
+  launch(rigId: string, logicalId: string,
+    opts: { snapshotId: string; onSessionLaunched?: (nodeId: string, sessionId: string) => void }): Promise<SeatPoolComebackLaunch>;
 }
 
 /** One comeback issued under the model's custody lease, for the executor's `comeback` to launch after it. */
@@ -976,6 +978,12 @@ function heldComeback(nodeStatus: string, sessionRuns: boolean): { as: "not_runn
  *  unconfirmed: only that stop's result ends it, never a later change. */
 const COMPENSATING_STOP = "compensating_stop";
 
+/** An attempt that settled running after `rig down` whose own launch told no session: nothing is stopped. */
+const OWN_SESSION_UNKNOWN = {
+  code: "own_session_unknown",
+  message: "settled running after rig down, but the session this attempt's launch produced can't be told apart; nothing was stopped",
+};
+
 function holdCode(slot: SeatPoolSlot): unknown {
   return slotRecord(slot.reuseHold)?.["code"];
 }
@@ -1103,24 +1111,33 @@ export function makeSeatPoolExecutor(deps: SeatPoolExecutorDeps): SeatPoolExecut
 
   /** An add with a node, settled by its latest session (classifyAdd). Running: `live`. Not running: `drained`, with a
    *  reuse hold. Unknown: it stays issued, with what was read kept on its row. What settled is returned for the report;
-   *  nothing while unknown, or when the row no longer holds the attempt. */
+   *  nothing while unknown, or when the row no longer holds the attempt. `own` is the session the add's own launch
+   *  registered: null when none was told (a leftover read again, or a launch that registered none). */
   const settleWithNode = (
     add: { jobId: string; modelNodeId: string; slotId: string; slotNumber: number; logicalId: string; attemptId: string; nodeId: string },
     call: AddCallOutcome | null,
     latest: { id: string; status: string; startupStatus: string | null } | null,
+    own: string | null = null,
   ): (SettledAdd & { compensate?: SeatPoolCompensatingStopRequest }) | null => {
     const settlement = classifyAdd(call, latest, deps.confirmedStopped(add.nodeId));
     const entry = (attempt: AttemptView): SettledAdd => ({ slotNumber: add.slotNumber, logicalId: add.logicalId, nodeId: add.nodeId, attempt });
-    // After a `rig down` newer than what the add was issued on, an add that settles running is stopped. So is one its
-    // call launched whose session that down stopped on purpose: it settles running with that session, and the stop
-    // confirms the absence.
+    // After a `rig down` newer than what the add was issued on, an add that settles running is stopped: only the session
+    // its own launch registered, never the node's latest read after the call (a replacement in between is not the
+    // attempt's). So is one its call launched whose own session that down stopped on purpose: it settles running with
+    // that session, and the stop confirms the absence. With no session of its own, nothing is stopped, and the report
+    // says why.
     const rigId = nodeRig(deps.db, add.nodeId);
     const down = rigId === null ? null : downSince(deps.db, rigId, basisEventSeq(deps.slots.get(add.slotId)?.attemptBasis ?? null));
     const launched = call !== null && call.ok && call.status === "launched";
-    const stoppedByDown = settlement.status === "not_running" && launched && latest !== null && stoppedOnPurpose(deps.db, latest.id);
-    if (down !== null && rigId !== null && latest !== null && (settlement.status === "running" || stoppedByDown)) {
-      const toStop = settleToStop({ ...add, rigId, sessionId: latest.id, seq: down }, JSON.stringify(call ?? { replayed: true }));
+    const stoppedByDown = settlement.status === "not_running" && launched && own !== null && stoppedOnPurpose(deps.db, own);
+    if (down !== null && rigId !== null && own !== null && (settlement.status === "running" || stoppedByDown)) {
+      const toStop = settleToStop({ ...add, rigId, sessionId: own, seq: down }, JSON.stringify(call ?? { replayed: true }));
       return toStop === null ? null : { ...entry({ id: add.attemptId, status: "running" }), compensate: toStop };
+    }
+    if (down !== null && rigId !== null && settlement.status === "running") {
+      return deps.slots.settleAdd(add.slotId, add.attemptId, {
+        outcome: JSON.stringify({ ...(call ?? { replayed: true }), ownSession: "unknown" }), result: null, at: at(),
+      }) ? entry({ id: add.attemptId, status: "running", ...OWN_SESSION_UNKNOWN }) : null;
     }
     if (settlement.status === "running") {
       return deps.slots.settleAdd(add.slotId, add.attemptId, {
@@ -1241,6 +1258,8 @@ export function makeSeatPoolExecutor(deps: SeatPoolExecutorDeps): SeatPoolExecut
   const runAdd = async (modelNodeId: string, add: IssuedAdd): Promise<void> => {
     const report = (entry: SettledAdd) => reportSettled(modelNodeId, entry);
     let outcome: AddCallOutcome | undefined;
+    /** The session the add's own launch registered, told by the launch itself: the only one a compensating stop stops. */
+    const own: { sessionId: string | null } = { sessionId: null };
     try {
       if (add.folder !== null) {
         try { deps.add!.makeFolder(add.folder); } catch (error) { outcome = { ok: false, code: "cwd_unavailable", message: errorMessage(error) }; }
@@ -1255,6 +1274,7 @@ export function makeSeatPoolExecutor(deps: SeatPoolExecutorDeps): SeatPoolExecut
         try {
           const converged = await deps.add!.converge(add.rigId, add.op, add.rigRoot, {
             recordCreated, ...(add.launchAdditionsFrom ? { launchAdditionsFrom: add.launchAdditionsFrom } : {}),
+            onSessionRegistered: (sessionId) => { own.sessionId = sessionId; },
           });
           outcome = converged.kind === "add_member" && converged.supported
             ? addCallOutcome(converged.outcome)
@@ -1278,7 +1298,7 @@ export function makeSeatPoolExecutor(deps: SeatPoolExecutorDeps): SeatPoolExecut
       }
       const latest = add.operation.read().current.nodes.find((node) => node.id === slot.nodeId)?.latestSession ?? null;
       // An unknown result stays issued; once this call is over, a later cycle reads it again.
-      const settledNow = settleWithNode({ ...add, modelNodeId, nodeId: slot.nodeId }, outcome, latest);
+      const settledNow = settleWithNode({ ...add, modelNodeId, nodeId: slot.nodeId }, outcome, latest, own.sessionId);
       if (settledNow === null) return;
       const { compensate, ...entry } = settledNow;
       // Settled running after `rig down`: stopped through the executor's own `compensatingStop`, after this settle.
@@ -1348,8 +1368,13 @@ export function makeSeatPoolExecutor(deps: SeatPoolExecutorDeps): SeatPoolExecut
         : {};
       let launch: SeatPoolComebackLaunch;
       let threw = false;
+      /** The session the comeback's own launch registered on the slot's node: the only one a compensating stop stops. */
+      const own: { sessionId: string | null } = { sessionId: null };
       try {
-        launch = await deps.comeback.launch(request.rigId, request.logicalId, { snapshotId: request.snapshotId });
+        launch = await deps.comeback.launch(request.rigId, request.logicalId, {
+          snapshotId: request.snapshotId,
+          onSessionLaunched: (nodeId, sessionId) => { if (nodeId === request.nodeId) own.sessionId = sessionId; },
+        });
       } catch (error) {
         threw = true;
         const code = (error as { code?: unknown } | null | undefined)?.code;
@@ -1372,20 +1397,29 @@ export function makeSeatPoolExecutor(deps: SeatPoolExecutorDeps): SeatPoolExecut
       // Running, on the same node: settled, and the slot `live`.
       if (!threw && launch.ok && node && node.nodeId === request.nodeId && launchStatusIsRunning(node.status)) {
         const sessionId = latestSession(deps.db, request.nodeId)?.id ?? null;
-        // After a `rig down` newer than what the comeback was issued on, its own session is stopped. With no session of
-        // its own (none can be told apart), nothing is stopped.
-        const down = sessionId === null ? null : downSince(deps.db, request.rigId, basisEventSeq(slot.attemptBasis));
-        if (down !== null && sessionId !== null) {
+        // After a `rig down` newer than what the comeback was issued on, the session its own launch registered is stopped,
+        // never the node's latest read after the launch (a replacement in between is not the attempt's). With no session
+        // of its own, nothing is stopped, and the report says why.
+        const down = downSince(deps.db, request.rigId, basisEventSeq(slot.attemptBasis));
+        if (down !== null && own.sessionId !== null) {
           const toStop = settleToStop({
             jobId: request.jobId, modelNodeId: request.modelNodeId, rigId: request.rigId, slotId: request.slotId, slotNumber: request.slotNumber,
-            attemptId: request.attemptId, nodeId: request.nodeId, sessionId, seq: down,
+            attemptId: request.attemptId, nodeId: request.nodeId, sessionId: own.sessionId, seq: down,
           }, stored);
           if (toStop !== null) {
             const stopped = await compensatingStopCall(toStop);
             report({ ...base, attempt: { id: request.attemptId, status: "running", ...(selection ? { snapshotSelection: selection } : {}) },
               ...(stopped !== null ? { stop: stopped } : {}), ...warning });
-            return;
           }
+          return;
+        }
+        if (down !== null) {
+          if (deps.slots.settleAdd(request.slotId, request.attemptId, {
+            outcome: JSON.stringify({ ...storedOutcome, ownSession: "unknown" }), result: null, at: at(),
+          })) {
+            report({ ...base, attempt: { id: request.attemptId, status: "running", ...OWN_SESSION_UNKNOWN, ...(selection ? { snapshotSelection: selection } : {}) }, ...warning });
+          }
+          return;
         }
         if (deps.slots.settleAdd(request.slotId, request.attemptId, {
           outcome: stored, result: JSON.stringify({ nodeId: request.nodeId, sessionId }), at: at(),
