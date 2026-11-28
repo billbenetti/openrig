@@ -16,7 +16,7 @@ import type { SeatPoolSpec } from "../src/domain/seat-pool-spec.js";
 import { WatchdogJobsRepository, type WatchdogJob } from "../src/domain/watchdog-jobs-repository.js";
 import { WatchdogHistoryLog } from "../src/domain/watchdog-history-log.js";
 import { WatchdogPolicyEngine } from "../src/domain/watchdog-policy-engine.js";
-import { makeSeatPoolPolicy, planSeatPool } from "../src/domain/policies/seat-pool.js";
+import { makeSeatPoolPolicy, planSeatPool, seatPoolMovesModelRow } from "../src/domain/policies/seat-pool.js";
 import { QueueRepository } from "../src/domain/queue-repository.js";
 import { OutboxHandler } from "../src/domain/outbox-handler.js";
 import { SeatDeliveryGuard, resolveGuardTarget } from "../src/domain/seat-delivery-guard.js";
@@ -31,6 +31,7 @@ import type { ArbitratedSeatState } from "../src/domain/activity-taxonomy.js";
 import {
   reconcileSeatPoolNode,
   reconcileSeatPoolsAtStartup,
+  movingSeatPoolOfModel,
   resolveSeatPoolModel,
   seatPoolJobInput,
   type SeatPoolReconcileResult,
@@ -468,6 +469,34 @@ describe("seat-pool job registration: also tested, without a numbered control", 
       expect(ensured).toMatchObject({ outcome: "stopped", job: { jobId: job.jobId, state: "stopped" } });
       expect(contextOf(jobOf(ensured)).pool).toMatchObject({ max: 7 });
       expect(w.jobRows(m.session)).toEqual([{ jobId: job.jobId, state: "stopped" }]);
+    } finally {
+      w.db.close();
+    }
+  });
+
+  it("The pool that moves a model's rows is found by the model's session only while its job is active and the block reads and does not drain; the dispatch rule is the plan's.", () => {
+    const w = world();
+    try {
+      const m = w.model("pool-rig");
+      const moving = () => movingSeatPoolOfModel(w.db, w.jobsRepo.listActive(), (id) => w.rigRepo.getNodePool(id), m.session);
+      // a block with no job yet: nothing moves the rows
+      expect(moving()).toBeNull();
+      const job = jobOf(reconcileSeatPoolNode(w.reg, m.nodeId));
+      expect(moving()).toEqual(SPEC);
+      // another seat of the rig is no model
+      expect(movingSeatPoolOfModel(w.db, w.jobsRepo.listActive(), (id) => w.rigRepo.getNodePool(id), "dev-other@pool-rig")).toBeNull();
+      // the dispatch tag: only a tagged row moves; with no tag set, every row
+      expect(seatPoolMovesModelRow(SPEC, ["role:impl", "x"])).toBe(true);
+      expect(seatPoolMovesModelRow(SPEC, ["x"])).toBe(false);
+      expect(seatPoolMovesModelRow({ ...SPEC, dispatchTag: null }, [])).toBe(true);
+      // drain: nothing moves
+      w.rigRepo.setNodePool(m.nodeId, { spec: { ...SPEC, drain: true } });
+      expect(moving()).toBeNull();
+      w.rigRepo.setNodePool(m.nodeId, { spec: SPEC });
+      expect(moving()).toEqual(SPEC);
+      // the job stopped: nothing moves
+      w.jobsRepo.stop(job.jobId);
+      expect(moving()).toBeNull();
     } finally {
       w.db.close();
     }

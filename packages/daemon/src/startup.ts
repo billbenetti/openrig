@@ -173,7 +173,8 @@ import { resolveWorkflowHumanDestination } from "./domain/workflow-human-destina
 import { makeWorkflowKeepalivePolicy } from "./domain/policies/workflow-keepalive.js";
 import { makeIdleGateQitemPolicy } from "./domain/policies/idle-gate-qitem.js";
 import { makeParkedOwnerConsumerPolicy, makeRigAnchor, PARKED_OWNER_POLICY_NAME } from "./domain/policies/parked-owner-consumer.js";
-import { makeSeatPoolPolicy } from "./domain/policies/seat-pool.js";
+import { makeSeatPoolPolicy, seatPoolMovesModelRow } from "./domain/policies/seat-pool.js";
+import { movingSeatPoolOfModel } from "./domain/seat-pool-registration.js";
 import { SeatPoolSlotsRepository } from "./domain/seat-pool-slots.js";
 import { escalateUnclaimedReminder } from "./domain/parked-owner-escalation.js";
 import { makeSeatPoolExecutor, seatPoolQueueEffects } from "./domain/seat-pool-executor.js";
@@ -2800,6 +2801,15 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
           // The enforcer is constructed below; read its shared instance at evaluation time.
           hasPendingPostCompactStage: (sessionName) => deps.compactionEnforcer?.hasPendingPostCompactStage(sessionName) ?? false,
           escalateUnclaimed: (input) => escalateUnclaimedReminder(db, queueRepoInstance, input),
+          // A seat pool's model: the pending rows its pool moves (the pool's dispatch rule) are not the model's to take.
+          poolMovesRows: (sessionName, pendingQitemIds) => {
+            const spec = movingSeatPoolOfModel(db, watchdogJobsRepoInstance.listActive(), (nodeId) => rigRepo.getNodePool(nodeId), sessionName);
+            if (spec === null) return new Set<string>();
+            return new Set(pendingQitemIds.filter((qitemId) => {
+              const row = queueRepoInstance.getById(qitemId);
+              return row !== null && row.state === "pending" && seatPoolMovesModelRow(spec, row.tags ?? []);
+            }));
+          },
         }),
         // OPR.0.5.6.1 AM-F1 — the delivery engine's two timing legs on THIS
         // substrate. The gateway dispatch binds late (the subsystem is built

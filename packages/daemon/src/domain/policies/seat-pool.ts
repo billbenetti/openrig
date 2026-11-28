@@ -185,6 +185,11 @@ function canReceive(
   return !spec.drain && isFree(agent) && !aboveMax.has(agent.slotNumber);
 }
 
+/** A row addressed to the model is the pool's to move: with `dispatch_tag` set, only a row that carries it. */
+export function seatPoolMovesModelRow(spec: Pick<SeatPoolPlanSpec, "dispatchTag">, tags: readonly string[]): boolean {
+  return spec.dispatchTag === null || tags.includes(spec.dispatchTag);
+}
+
 /** How many more agents `max` leaves room for: every slot on record but a `drained` one takes room. */
 export function seatPoolRoom(spec: Pick<SeatPoolPlanSpec, "max">, agents: readonly SeatPoolAgentFacts[]): number {
   return Math.max(0, spec.max - agents.filter(takesRoom).length);
@@ -203,7 +208,7 @@ export function planSeatPool(spec: SeatPoolPlanSpec, state: SeatPoolPlanState, n
   const movable = state.pending
     .filter((row) => elapsed(row.waitingSince, spec.dispatchAfterSeconds, nowMs))
     .filter((row) => drainedSessions.has(row.destination)
-      || (row.destination === state.modelSession && (spec.dispatchTag === null || row.tags.includes(spec.dispatchTag))))
+      || (row.destination === state.modelSession && seatPoolMovesModelRow(spec, row.tags)))
     .sort((a, b) => Date.parse(a.waitingSince) - Date.parse(b.waitingSince) || compareIds(a.qitemId, b.qitemId));
 
   // Oldest row first, each to the lowest-numbered free agent not taken yet. Under `drain` nothing moves.

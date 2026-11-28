@@ -1,10 +1,10 @@
 import type Database from "better-sqlite3";
-import { stringify as stringifyYaml } from "yaml";
+import { parse as parseYaml, stringify as stringifyYaml } from "yaml";
 import { SEAT_POOL_POLICY_NAME } from "./policies/seat-pool.js";
 import type { PolicyJob } from "./policies/types.js";
 import type { RigRepository } from "./rig-repository.js";
 import { deriveCanonicalSessionName, parseSessionName, validateSessionName } from "./session-name.js";
-import { serializePoolBlock, type SeatPoolSpec } from "./seat-pool-spec.js";
+import { serializePoolBlock, type SeatPoolSpec, type StoredSeatPool } from "./seat-pool-spec.js";
 import { formatWatchdogRegistrationError } from "./watchdog-auto-registration.js";
 import {
   WatchdogJobsError,
@@ -119,6 +119,31 @@ export function seatPoolModelOfJob(db: Database.Database, job: Pick<PolicyJob, "
   const model = resolveSeatPoolModel(db, id);
   if (!model) return { found: false, modelNodeId: id, cause: "no_canonical_session" };
   return { found: true, modelNodeId: id, rigId: node.rig_id, model };
+}
+
+/**
+ * The spec of the pool that moves rows addressed to <sessionName> right now: an active `seat-pool` job acts for a model
+ * whose canonical session (or a recorded alias) is <sessionName>, and the model's node carries a readable pool block
+ * that does not drain. Null otherwise (no pool, a stopped job, `drain`, a removed or unreadable block): then nothing
+ * moves the model's rows, and they stay its own.
+ */
+export function movingSeatPoolOfModel(
+  db: Database.Database,
+  activeJobs: readonly Pick<WatchdogJob, "policy" | "specYaml">[],
+  getNodePool: (nodeId: string) => StoredSeatPool | undefined,
+  sessionName: string,
+): SeatPoolSpec | null {
+  for (const job of activeJobs) {
+    if (job.policy !== SEAT_POOL_POLICY_NAME) continue;
+    let context: unknown;
+    try { context = (parseYaml(job.specYaml) as { context?: unknown } | null)?.context; } catch { continue; }
+    if (context === null || typeof context !== "object") continue;
+    const found = seatPoolModelOfJob(db, { context: context as Record<string, unknown> });
+    if (!found.found || !found.model.aliases.includes(sessionName)) continue;
+    const stored = getNodePool(found.modelNodeId);
+    return stored !== undefined && "spec" in stored && !stored.spec.drain ? stored.spec : null;
+  }
+  return null;
 }
 
 function isCanonicalInRig(sessionName: string, rigName: string): boolean {

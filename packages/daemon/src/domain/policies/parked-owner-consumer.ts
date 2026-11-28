@@ -89,6 +89,10 @@ export interface ParkedOwnerConsumerDeps {
   /** A delivered reminder whose rows are still pending and unclaimed past PARKED_OWNER_ESCALATE_AFTER_MS: tell someone who can
    *  act, once per episode. Returns who was told; nothing is held, refused or re-sent to the seat. */
   escalateUnclaimed?: (input: { seat: string; qitemIds: string[]; deliveredAt: string; episodeKey: string }) => Promise<string[]>;
+  /** The seat is a seat pool's model: of these pending rows addressed to it, the ones its pool moves to a pool agent
+   *  (with the pool's `dispatch_tag`, or any row when the pool sets none). They are the pool's to dispatch, not the
+   *  model's to take, so they drive no reminder to the model. Absent, or an empty set: every row counts, as before. */
+  poolMovesRows?: (sessionName: string, pendingQitemIds: string[]) => ReadonlySet<string>;
 }
 
 export const PARKED_OWNER_POLICY_NAME = "parked-owner-consumer";
@@ -304,15 +308,21 @@ export function makeParkedOwnerConsumerPolicy(deps: ParkedOwnerConsumerDeps): Po
           continue;
         }
 
+        // A pending row the seat's own pool moves to a pool agent is the pool's, not the model's: it drives no reminder.
+        const pending = seat.obligations.items.filter((r) => r.state === "pending").map((r) => r.qitemId);
+        let poolRows: ReadonlySet<string> = new Set();
+        if (pending.length > 0 && deps.poolMovesRows) {
+          try { poolRows = deps.poolMovesRows(seat.sessionName, pending); } catch { /* unknown: every row counts, as before */ }
+        }
         // Whole diagnosis inherited: open items PLUS unhealthy HELD rows.
         const ids = [
-          ...seat.obligations.items.map((r) => r.qitemId),
+          ...seat.obligations.items.filter((r) => !(r.state === "pending" && poolRows.has(r.qitemId))).map((r) => r.qitemId),
           ...seat.obligations.held.filter((h) => h.healthy === false).map((h) => h.qitemId),
         ]
           .filter((v, i, a) => a.indexOf(v) === i)
           .sort();
         if (ids.length === 0) {
-          skipped.push({ seat: seat.sessionName, why: "no-park-driving-obligation" });
+          skipped.push({ seat: seat.sessionName, why: poolRows.size > 0 ? "only-rows-its-seat-pool-moves" : "no-park-driving-obligation" });
           continue;
         }
 
