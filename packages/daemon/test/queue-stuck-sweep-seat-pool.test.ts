@@ -454,4 +454,53 @@ describe("stuck sweep: rows waiting in an active seat pool's queue (T-007029, #2
     const none = parseSeatPoolSpec({ max: 2, cwd_template: "/w/{slot}" });
     expect("spec" in none && none.spec).not.toHaveProperty("noSeatGraceSeconds");
   });
+
+  // T-023783: the parked-owner reminder reads the pool's queue the same way, so the model of a fork-seat-pool is not
+  // reminded of the pending rows its pool holds to move to a seat.
+  it("T-023783: a model's pending rows the pool holds are left out of its parked-owner reminder, and only those", async () => {
+    const { seatPoolPendingRows } = await import("../src/domain/seat-pool-sweep-custody.js");
+    const { makeParkedOwnerConsumerPolicy, makeRigAnchor, PARKED_OWNER_POLICY_NAME } = await import("../src/domain/policies/parked-owner-consumer.js");
+    const jobId = pool({});
+    slot(jobId, { live: true });
+    const held = await work();                  // tagged, to the model: the pool's to move
+    const aliased = await work([TAG], ALIAS);   // tagged, to another address of the model: the pool's too
+    const own = await work(["other"]);          // without the tag: the model's own
+    const claimed = await work();               // tagged, but the model claimed it: its own
+    db.prepare("UPDATE queue_items SET state = 'in-progress', claimed_at = ? WHERE qitem_id = ?").run(minutesAgo(1), claimed.qitemId);
+    const ids = [held, aliased, own, claimed].map((r) => r.qitemId);
+    const poolRows = (qitemIds: string[]) => seatPoolPendingRows(db, Date.now(), (s) => queue.addressesOf(s),
+      (qitemId) => queue.getById(qitemId, { waiting: false }), qitemIds);
+    expect([...poolRows(ids)].sort()).toEqual([held.qitemId, aliased.qitemId].sort());
+
+    // Through the policy: only the pool's rows open → no reminder; with the model's own row → it names only that one.
+    const seat = (rows: QueueItem[]) => ({
+      sessionName: MODEL, parked: true as const, activity: { value: "idle-at-prompt", needsInput: { count: 0, reason: null } },
+      obligations: { items: rows.map((r) => ({ qitemId: r.qitemId, state: "pending", summary: null })), held: [] },
+    });
+    const evaluate = (rows: QueueItem[]) => makeParkedOwnerConsumerPolicy({
+      diagnoseRig: () => ({ seats: [seat(rows)] }) as never,
+      history: { listForJob: () => [], countForJob: () => 0 },
+      rows: { listTransitions: () => [], appendNote: () => ({ ok: true }), recordNudgeResult: () => {}, listOpenIds: () => rows.map((r) => r.qitemId) },
+      occupantGeneration: () => "gen-1",
+      poolMovesRows: (_session, pending) => poolRows(pending),
+    }).evaluate({ jobId: "job-poc", policy: PARKED_OWNER_POLICY_NAME, target: { session: makeRigAnchor("dev") }, intervalSeconds: 120,
+      activeWakeIntervalSeconds: null, scanIntervalSeconds: null, context: {}, lastEvaluationAt: null, lastFireAt: null,
+      registeredBySession: "daemon@kernel", registeredAt: minutesAgo(600) } as never);
+    const onlyPool = await evaluate([held, aliased]);
+    expect(onlyPool.action).toBe("skip");
+    expect(JSON.stringify(onlyPool.notes)).toContain("only-rows-its-seat-pool-moves");
+    const mixed = await evaluate([held, own]);
+    expect(mixed.action).toBe("send");
+    expect(JSON.stringify(mixed.notes)).toContain(own.qitemId);
+    expect(JSON.stringify(mixed.notes)).not.toContain(held.qitemId);
+
+    // The pool drains, or its job stops: nothing is the pool's, and every row is the model's again.
+    db.prepare("UPDATE watchdog_jobs SET spec_yaml = ? WHERE job_id = ?")
+      .run(`context:\n  max: 4\n  cwd_template: "/w/{slot}"\n  dispatch_tag: "${TAG}"\n  drain: true\n`, jobId);
+    expect([...poolRows(ids)]).toEqual([]);
+    expect((await evaluate([held, aliased])).action).toBe("send");
+    db.prepare("UPDATE watchdog_jobs SET spec_yaml = ?, state = 'stopped' WHERE job_id = ?")
+      .run(`context:\n  max: 4\n  cwd_template: "/w/{slot}"\n  dispatch_tag: "${TAG}"\n`, jobId);
+    expect([...poolRows(ids)]).toEqual([]);
+  });
 });

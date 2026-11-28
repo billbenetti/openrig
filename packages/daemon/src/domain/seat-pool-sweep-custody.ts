@@ -117,3 +117,24 @@ export function seatPoolQueueCustody(
       tags.includes(pool.dispatchTag) && (pool.hasSeat || nowMs - pool.lastSeatMs <= pool.graceMs));
   };
 }
+
+/**
+ * Of these rows, the ones still pending in an active seat pool's queue, by the same reading as the stuck sweep
+ * (seatPoolQueueCustody): addressed to the pool's model on any of its addresses, carrying the pool's dispatch_tag, the
+ * pool not draining and with a live seat or one within `no_seat_grace_s`. The pool moves them to a seat, so they are not
+ * the model's to take: the parked-owner reminder leaves them out (T-023783). A row gone, claimed or no longer pending is
+ * not among them.
+ */
+export function seatPoolPendingRows(
+  db: Database.Database,
+  nowMs: number,
+  addressesOf: (sessionName: string) => string[],
+  getRow: (qitemId: string) => { state: string; destinationSession: string | null; tags?: string[] | null } | null,
+  qitemIds: readonly string[],
+): Set<string> {
+  const holds = seatPoolQueueCustody(db, nowMs, addressesOf);
+  return new Set(qitemIds.filter((qitemId) => {
+    const row = getRow(qitemId);
+    return row !== null && row.state === "pending" && holds(row);
+  }));
+}

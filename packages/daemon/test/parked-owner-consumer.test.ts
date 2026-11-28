@@ -1214,3 +1214,63 @@ describe("#3315 a parked owner on a tmux server the daemon can't reach", () => {
     expect((await policy().evaluate(makeJob())).action).toBe("send");
   });
 });
+
+
+describe("parked-owner-consumer — a seat pool's model is not reminded of the rows its pool moves", () => {
+  const POOL_ROW = "qitem-pool-0a1b2c3d";
+  const OWN_ROW = "qitem-own-4e5f6a7b";
+  const model = (items: Array<{ qitemId: string; state: string }>) =>
+    parkedSeat({ obligations: { items: items.map((i) => ({ ...i, summary: null })), held: [] } });
+  const policyWith = (seat: ParkedSeatDiagnosisView, store: RowStore, moved: (s: string, ids: string[]) => ReadonlySet<string>) =>
+    makeParkedOwnerConsumerPolicy({ ...makeDeps([seat], store), poolMovesRows: moved });
+
+  it("a model whose only open rows are pending rows its pool moves gets no reminder", async () => {
+    const store = new RowStore();
+    store.openIds = () => [POOL_ROW];
+    store.record(POOL_ROW, "lead@test-rig", "pending", "created");
+    const asked: string[][] = [];
+    const result = await policyWith(model([{ qitemId: POOL_ROW, state: "pending" }]), store, (_s, ids) => {
+      asked.push(ids);
+      return new Set(ids);
+    }).evaluate(makeJob());
+    expect(result.action).toBe("skip");
+    expect(JSON.stringify(result.notes)).toContain("only-rows-its-seat-pool-moves");
+    expect(asked).toEqual([[POOL_ROW]]);
+    expect(store.appended).toEqual([]);
+  });
+
+  it("the reminder names the model's own rows and leaves out the rows its pool moves", async () => {
+    const store = new RowStore();
+    store.openIds = () => [POOL_ROW, OWN_ROW];
+    store.record(POOL_ROW, "lead@test-rig", "pending", "created");
+    store.record(OWN_ROW, "lead@test-rig", "pending", "created");
+    const result = await policyWith(model([{ qitemId: POOL_ROW, state: "pending" }, { qitemId: OWN_ROW, state: "pending" }]), store,
+      (_s, ids) => new Set(ids.filter((id) => id === POOL_ROW))).evaluate(makeJob());
+    expect(result.action).toBe("send");
+    const named = JSON.stringify(result.notes ?? {});
+    expect(named).toContain(OWN_ROW);
+    expect(named).not.toContain(POOL_ROW);
+  });
+
+  it("a row the model already claimed stays its own: only pending rows are asked about", async () => {
+    const store = new RowStore();
+    const asked: string[][] = [];
+    const result = await policyWith(parkedSeat(), store, (_s, ids) => {
+      asked.push(ids);
+      return new Set(ROW_IDS);
+    }).evaluate(makeJob());
+    expect(asked).toEqual([]);
+    expect(result.action).toBe("send");
+  });
+
+  it("when the pool read fails, every row counts, as before", async () => {
+    const store = new RowStore();
+    store.openIds = () => [POOL_ROW];
+    store.record(POOL_ROW, "lead@test-rig", "pending", "created");
+    const result = await policyWith(model([{ qitemId: POOL_ROW, state: "pending" }]), store, () => {
+      throw new Error("db busy");
+    }).evaluate(makeJob());
+    expect(result.action).toBe("send");
+    expect(JSON.stringify(result.notes ?? {})).toContain(POOL_ROW);
+  });
+});
